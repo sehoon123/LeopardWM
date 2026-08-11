@@ -44,7 +44,8 @@ mod tests {
         assert_eq!(ws.focused_column_index(), 1);
 
         // New column at slot 0 shifts the focused window right; focus follows it.
-        ws.insert_window_at_column_no_focus(3, Some(400), 0).unwrap();
+        ws.insert_window_at_column_no_focus(3, Some(400), 0)
+            .unwrap();
         assert_eq!(ws.column_count(), 3);
         assert_eq!(ws.focused_window(), Some(2));
         assert_eq!(ws.focused_column_index(), 2);
@@ -469,6 +470,162 @@ mod tests {
     }
 
     #[test]
+    fn test_remove_column_clears_per_window_runtime_state() {
+        let mut ws = Workspace::new();
+        ws.insert_window(1, Some(400)).unwrap();
+        ws.insert_window(2, Some(400)).unwrap();
+        assert!(ws.set_window_min_width(2, 700));
+        assert!(ws.set_window_min_height(2, 300));
+        ws.pending_min_size_clears.insert(2);
+        assert!(ws.toggle_maximize_column(1920));
+        assert!(ws.mark_minimized(2));
+        ws.fullscreen_window = Some(2);
+
+        let removed = ws.remove_column(1).unwrap();
+        assert_eq!(removed.windows(), &[2]);
+        assert!(!ws.window_min_widths.contains_key(&2));
+        assert!(!ws.window_min_heights.contains_key(&2));
+        assert!(!ws.pending_min_size_clears.contains(&2));
+        assert!(!ws.is_minimized(2));
+        assert_eq!(ws.fullscreen_window_id(), None);
+        assert!(ws.maximized_column.is_none());
+        assert!(
+            ws.toggle_maximize_column(1920),
+            "the first maximize after a cross-monitor move must not be a stale-state no-op"
+        );
+    }
+
+    #[test]
+    fn test_clamp_scroll_to_bounds_corrects_overscroll() {
+        // Two 600px columns (1200px) fit inside a 1920px viewport, so
+        // max_scroll is 0. A stale over-scroll left by a shrink must snap
+        // back to 0 — otherwise the strip renders pushed left (content
+        // clipped off-screen, blank desktop at the right edge).
+        let mut ws = Workspace::with_gaps(0, 0);
+        ws.insert_window(1, Some(600)).unwrap();
+        ws.insert_window(2, Some(600)).unwrap();
+        ws.set_scroll_offset(400.0);
+        ws.clamp_scroll_to_bounds(1920);
+        assert_eq!(
+            ws.scroll_offset(),
+            0.0,
+            "over-scroll past content clamps to 0"
+        );
+
+        // Add a wide column so the strip (2400px) overflows: max_scroll = 480.
+        ws.insert_window(3, Some(1200)).unwrap();
+        ws.set_scroll_offset(300.0);
+        ws.clamp_scroll_to_bounds(1920);
+        assert_eq!(
+            ws.scroll_offset(),
+            300.0,
+            "a valid offset is left untouched"
+        );
+
+        ws.set_scroll_offset(999.0);
+        ws.clamp_scroll_to_bounds(1920);
+        assert_eq!(
+            ws.scroll_offset(),
+            480.0,
+            "over-scroll beyond max clamps to max"
+        );
+
+        // center_past_edges permits intentional empty space only on the edge
+        // containing the focused column. Both first- and last-column true
+        // centering remain available.
+        ws.set_center_past_edges(true);
+        ws.focus_window(1).unwrap();
+        ws.set_scroll_offset(-120.0);
+        ws.clamp_scroll_to_bounds(1920);
+        assert_eq!(
+            ws.scroll_offset(),
+            -120.0,
+            "intentional first-column centering remains allowed"
+        );
+        ws.focus_window(3).unwrap();
+        ws.set_scroll_offset(999.0);
+        ws.clamp_scroll_to_bounds(1920);
+        assert_eq!(
+            ws.scroll_offset(),
+            840.0,
+            "last column may extend past normal max_scroll to stay centered"
+        );
+
+        // Once that edge column disappears and the remaining strip fits, the
+        // old positive target is stale and must clamp to zero. Otherwise all
+        // content is clipped left while blank desktop appears on the right.
+        ws.remove_window(3).unwrap();
+        ws.set_scroll_offset(999.0);
+        ws.clamp_scroll_to_bounds(1920);
+        assert_eq!(ws.scroll_offset(), 0.0);
+    }
+
+    #[test]
+    fn test_explicit_center_past_edges_survives_just_in_view_safety_clamp() {
+        let mut ws = Workspace::with_gaps(0, 0);
+        ws.insert_window(1, Some(400)).unwrap();
+        ws.insert_window(2, Some(400)).unwrap();
+        ws.insert_window(3, Some(400)).unwrap();
+        ws.set_centering_mode(CenteringMode::JustInView);
+        ws.set_center_past_edges(true);
+        ws.set_reduce_motion(true);
+
+        ws.focus_window(1).unwrap();
+        ws.center_focused_column_animated(1000);
+        assert_eq!(ws.scroll_offset(), -300.0);
+        ws.clamp_scroll_to_bounds(1000);
+        assert_eq!(ws.scroll_offset(), -300.0);
+
+        ws.focus_window(3).unwrap();
+        ws.center_focused_column_animated(1000);
+        assert_eq!(ws.scroll_offset(), 500.0);
+        ws.clamp_scroll_to_bounds(1000);
+        assert_eq!(ws.scroll_offset(), 500.0);
+
+        // Structural shrink changes the legitimate centered target; the old
+        // one no longer qualifies and must not retain blank-space overscroll.
+        ws.remove_window(3).unwrap();
+        ws.clamp_scroll_to_bounds(1000);
+        assert_eq!(ws.scroll_offset(), 0.0);
+    }
+
+    #[test]
+    fn test_remove_column_cancels_stale_scroll_animation() {
+        let mut ws = Workspace::with_gaps(10, 0);
+        ws.insert_window(1, Some(400)).unwrap();
+        ws.insert_window(2, Some(400)).unwrap();
+        ws.insert_window(3, Some(400)).unwrap();
+        ws.start_scroll_animation(800.0, 400, Some(1000), Some(Easing::Linear));
+        assert!(ws.is_animating());
+        assert!(ws.tick_animation(100));
+
+        ws.remove_column(2).unwrap();
+        let offset_after_removal = ws.scroll_offset();
+
+        assert!(!ws.is_animating());
+        assert!(!ws.tick_animation(1000));
+        assert_eq!(ws.scroll_offset(), offset_after_removal);
+    }
+
+    #[test]
+    fn test_remove_last_window_column_cancels_stale_scroll_animation() {
+        let mut ws = Workspace::with_gaps(10, 0);
+        ws.insert_window(1, Some(400)).unwrap();
+        ws.insert_window(2, Some(400)).unwrap();
+        ws.insert_window(3, Some(400)).unwrap();
+        ws.start_scroll_animation(800.0, 400, Some(1000), Some(Easing::Linear));
+        assert!(ws.tick_animation(100));
+
+        ws.remove_window(3).unwrap();
+        assert!(!ws.is_animating());
+        ws.clamp_scroll_to_bounds(400);
+        assert!(
+            ws.scroll_offset() <= 410.0,
+            "offset must fit the two remaining 400px columns plus one 10px gap"
+        );
+    }
+
+    #[test]
     fn test_remove_column_out_of_bounds() {
         let mut ws = Workspace::new();
         ws.insert_window(1, Some(400)).unwrap();
@@ -788,6 +945,17 @@ mod tests {
         let width = ws.total_width();
         assert!(width > 0); // Should not wrap to negative
         assert_eq!(width, i32::MAX); // Should saturate at max
+    }
+
+    #[test]
+    fn test_total_width_skips_minimized_columns_without_extra_gaps() {
+        let mut ws = Workspace::with_gaps(10, 0);
+        ws.insert_window(1, Some(200)).unwrap();
+        ws.insert_window(2, Some(300)).unwrap();
+        ws.insert_window(3, Some(400)).unwrap();
+        assert!(ws.mark_minimized(2));
+
+        assert_eq!(ws.total_width(), 200 + 10 + 400);
     }
 
     // ====== Tests added from code review ======
@@ -1811,6 +1979,30 @@ mod tests {
     // ========================================================================
 
     #[test]
+    fn test_floating_size_clamps_dimensions_to_one_pixel() {
+        assert_eq!(FloatingSize::new(0, -10), FloatingSize::new(1, 1));
+    }
+
+    #[test]
+    fn test_centered_rect_for_size_centers_requested_size() {
+        let viewport = Rect::new(100, 50, 1920, 1080);
+        let rect = centered_rect_for_size(viewport, FloatingSize::new(800, 600), 40);
+
+        assert_eq!(rect, Rect::new(660, 290, 800, 600));
+    }
+
+    #[test]
+    fn test_centered_rect_for_size_clamps_with_margin_and_tiny_viewport() {
+        let viewport = Rect::new(0, 0, 1000, 700);
+        let rect = centered_rect_for_size(viewport, FloatingSize::new(2000, 2000), 40);
+        assert_eq!(rect, Rect::new(20, 20, 960, 660));
+
+        let tiny =
+            centered_rect_for_size(Rect::new(10, 20, 50, 30), FloatingSize::new(900, 600), 80);
+        assert_eq!(tiny, Rect::new(34, 34, 1, 1));
+    }
+
+    #[test]
     fn test_add_floating_window() {
         let mut ws = Workspace::new();
         let rect = Rect::new(100, 100, 400, 300);
@@ -1873,6 +2065,20 @@ mod tests {
 
         let placements = ws.compute_placements(Rect::new(0, 0, 1920, 1080));
         assert_eq!(placements[0].rect, rect2);
+    }
+
+    #[test]
+    fn test_clamp_floating_to_keeps_all_four_edges_in_work_area() {
+        let mut ws = Workspace::new();
+        ws.add_floating(1, Rect::new(-200, -100, 2400, 1600))
+            .unwrap();
+        ws.add_floating(2, Rect::new(1850, 1050, 300, 200)).unwrap();
+        let work_area = Rect::new(0, 0, 1920, 1040);
+
+        assert!(ws.clamp_floating_to(work_area));
+        assert_eq!(ws.floating_rect(1), Some(Rect::new(0, 0, 1920, 1040)));
+        assert_eq!(ws.floating_rect(2), Some(Rect::new(1620, 840, 300, 200)));
+        assert!(!ws.clamp_floating_to(work_area));
     }
 
     #[test]
@@ -1997,6 +2203,25 @@ mod tests {
 
         // apply_min_width_constraints should not widen anything
         assert!(!ws.apply_min_width_constraints());
+    }
+
+    #[test]
+    fn test_viewport_sized_minimums_sacrifice_outer_gaps_not_edges() {
+        let viewport = Rect::new(0, 0, 1920, 1040);
+        let mut ws = Workspace::with_gaps(10, 10);
+        ws.insert_window(1, Some(1900)).unwrap();
+        ws.set_centering_mode(CenteringMode::JustInView);
+        assert!(ws.set_window_min_width(1, viewport.width));
+        assert!(ws.apply_min_width_constraints());
+        assert!(ws.set_window_min_height(1, viewport.height));
+        ws.ensure_focused_visible(viewport.width);
+
+        let placement = ws
+            .compute_placements(viewport)
+            .into_iter()
+            .find(|placement| placement.window_id == 1)
+            .unwrap();
+        assert_eq!(placement.rect, viewport);
     }
 
     #[test]
@@ -2204,8 +2429,16 @@ mod tests {
         // Hidden tiled window keeps its real (nonzero) layout rect.
         let w2 = placements.iter().find(|p| p.window_id == 2).unwrap();
         assert_ne!(w2.visibility, Visibility::Visible);
-        assert!(w2.rect.width > 0, "tiled rect width stays real, got {:?}", w2.rect);
-        assert!(w2.rect.height > 0, "tiled rect height stays real, got {:?}", w2.rect);
+        assert!(
+            w2.rect.width > 0,
+            "tiled rect width stays real, got {:?}",
+            w2.rect
+        );
+        assert!(
+            w2.rect.height > 0,
+            "tiled rect height stays real, got {:?}",
+            w2.rect
+        );
 
         // Hidden floating window keeps its real rect.
         let fl = placements.iter().find(|p| p.window_id == 10).unwrap();
@@ -2230,7 +2463,11 @@ mod tests {
 
         let placements = ws.compute_placements(viewport);
         let fl = placements.iter().find(|p| p.window_id == 10).unwrap();
-        assert_eq!(fl.visibility, Visibility::Visible, "pinned floating stays visible");
+        assert_eq!(
+            fl.visibility,
+            Visibility::Visible,
+            "pinned floating stays visible"
+        );
         assert_eq!(fl.rect, float_rect, "pinned floating keeps its rect");
     }
 
@@ -2316,15 +2553,16 @@ mod tests {
     #[test]
     fn test_toggle_floating_tiled_to_float() {
         let mut ws = Workspace::new();
-        let viewport = Rect::new(0, 0, 1920, 1080);
+        let rect = Rect::new(560, 240, 800, 600);
 
         ws.insert_window(1, Some(400)).unwrap();
         ws.insert_window(2, Some(400)).unwrap();
 
         // Focus window 2 and toggle to floating
-        let wid = ws.toggle_floating(viewport);
+        let wid = ws.toggle_floating(rect);
         assert_eq!(wid, Some(2));
         assert!(ws.is_floating(2));
+        assert_eq!(ws.floating_rect(2), Some(rect));
         assert_eq!(ws.column_count(), 1); // Only window 1 tiled
         assert_eq!(ws.floating_count(), 1);
     }
@@ -2332,14 +2570,14 @@ mod tests {
     #[test]
     fn test_toggle_floating_clears_fullscreen_for_focused_window() {
         let mut ws = Workspace::new();
-        let viewport = Rect::new(0, 0, 1920, 1080);
+        let rect = Rect::new(560, 240, 800, 600);
 
         ws.insert_window(1, Some(400)).unwrap();
         ws.insert_window(2, Some(400)).unwrap();
         ws.toggle_fullscreen();
         assert_eq!(ws.fullscreen_window_id(), Some(2));
 
-        let wid = ws.toggle_floating(viewport);
+        let wid = ws.toggle_floating(rect);
         assert_eq!(wid, Some(2));
         assert!(ws.is_floating(2));
         assert_eq!(ws.fullscreen_window_id(), None);
@@ -2348,12 +2586,12 @@ mod tests {
     #[test]
     fn test_toggle_floating_back() {
         let mut ws = Workspace::new();
-        let viewport = Rect::new(0, 0, 1920, 1080);
+        let rect = Rect::new(560, 240, 800, 600);
 
         ws.insert_window(1, Some(400)).unwrap();
 
         // Toggle to floating
-        let wid = ws.toggle_floating(viewport);
+        let wid = ws.toggle_floating(rect);
         assert_eq!(wid, Some(1));
         assert!(ws.is_floating(1));
         assert_eq!(ws.column_count(), 0);
@@ -2368,8 +2606,7 @@ mod tests {
     #[test]
     fn test_toggle_floating_empty_workspace() {
         let mut ws = Workspace::new();
-        let viewport = Rect::new(0, 0, 1920, 1080);
-        let wid = ws.toggle_floating(viewport);
+        let wid = ws.toggle_floating(Rect::new(0, 0, 800, 600));
         assert_eq!(wid, None);
     }
 
@@ -3086,7 +3323,7 @@ mod tests {
         ws.insert_window(1, Some(400)).unwrap(); // col 0: [A]
         ws.insert_window(2, Some(400)).unwrap(); // col 1: [B]
         ws.insert_window_in_column(3, 1).unwrap(); // col 1: [B, C]
-        // Focus B (idx 0 in col 1)
+                                                   // Focus B (idx 0 in col 1)
         ws.test_set_focus_unchecked(1, 0);
 
         ws.move_window_left();
@@ -3132,7 +3369,7 @@ mod tests {
         ws.insert_window(1, Some(400)).unwrap(); // col 0: [A]
         ws.insert_window_in_column(2, 0).unwrap(); // col 0: [A, B]
         ws.insert_window(3, Some(400)).unwrap(); // col 1: [C]
-        // Focus A (idx 0 in col 0)
+                                                 // Focus A (idx 0 in col 0)
         ws.test_set_focus_unchecked(0, 0);
 
         ws.move_window_right();
@@ -3403,6 +3640,33 @@ mod tests {
         assert_eq!(col.height_weights().len(), 3);
         let sum: f64 = col.height_weights().iter().sum();
         assert!((sum - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_column_height_weight_is_safe_for_large_stacks() {
+        let mut col = Column::new(1, 400);
+        for id in 2..=21 {
+            col.add_window(id);
+        }
+
+        col.set_height_weight(0, 0.5);
+
+        assert!(col.height_weights().iter().all(|weight| weight.is_finite()));
+        let total: f64 = col.height_weights().iter().sum();
+        assert!((total - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_min_size_setters_report_only_real_changes() {
+        let mut ws = Workspace::new();
+        ws.insert_window(1, Some(400)).unwrap();
+
+        assert!(ws.set_window_min_width(1, 700));
+        assert!(!ws.set_window_min_width(1, 700));
+        assert!(ws.set_window_min_width(1, 701));
+        assert!(ws.set_window_min_height(1, 300));
+        assert!(!ws.set_window_min_height(1, 300));
+        assert!(ws.set_window_min_height(1, 301));
     }
 
     #[test]
@@ -4019,7 +4283,7 @@ mod tests {
         ws.toggle_focused_column_tabbed_mode();
         ws.set_active_tab(0, 0).unwrap();
         ws.mark_minimized(2); // window at idx 1 minimized
-        // focus_down from 0 should skip 1 and land on 2.
+                              // focus_down from 0 should skip 1 and land on 2.
         ws.focus_down();
         assert_eq!(ws.focused_window_in_column, 2);
     }

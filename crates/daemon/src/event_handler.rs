@@ -7,8 +7,7 @@ use crate::state::{
 };
 use leopardwm_core_layout::Rect;
 use leopardwm_platform_win32::{
-    enumerate_monitors, find_monitor_for_rect, get_process_executable, is_shift_key_pressed,
-    WindowEvent,
+    enumerate_monitors, get_process_executable, is_shift_key_pressed, WindowEvent,
 };
 use tracing::{debug, info, warn};
 
@@ -105,6 +104,7 @@ impl AppState {
             | WindowEvent::TitleChanged(id) => Some(*id),
             WindowEvent::DisplayChange
             | WindowEvent::WorkAreaChanged
+            | WindowEvent::AppearanceChanged
             | WindowEvent::MouseEnterWindow(_)
             | WindowEvent::MouseLeftManaged => None,
         };
@@ -139,6 +139,27 @@ impl AppState {
             // DisplayChangeSettled path (see process_window_event), so a raw
             // event here is a no-op; reconcile defensively if one arrives.
             WindowEvent::WorkAreaChanged => self.on_display_change(),
+            WindowEvent::AppearanceChanged => {
+                leopardwm_platform_win32::clear_inset_cache();
+                self.refresh_high_contrast();
+                // The daemon's desired-rect fast path sits above the platform
+                // inset generation. Evict it and reapply now, or an unchanged
+                // layout could keep stale outer-frame metrics indefinitely.
+                self.last_placed_layout_rects.clear();
+                if let Err(error) = self.apply_layout() {
+                    warn!(
+                        "Failed to reapply layout after appearance change: {}",
+                        error
+                    );
+                }
+                // Repaint immediately so an idle desktop does not retain the
+                // old accessibility color until the next focus/layout event.
+                if let Some(hwnd) = self.previous_focused_hwnd {
+                    if self.config.appearance.active_border {
+                        self.show_border(hwnd);
+                    }
+                }
+            }
             WindowEvent::MouseEnterWindow(_) | WindowEvent::MouseLeftManaged => {
                 // Both are handled by the main event loop's focus-follows-mouse
                 // debouncing (schedule on enter, cancel on leave).
@@ -160,6 +181,9 @@ impl AppState {
                     })
                     .unwrap_or(false);
                 if in_visible_tabbed_column {
+                    // Preserve immediate freshness for title-driven icon
+                    // changes without re-probing every other tab.
+                    self.tab_strip_icon_cache.remove(&hwnd);
                     self.update_tab_strip();
                 }
             }
@@ -646,11 +670,15 @@ impl AppState {
         if !is_hidden_event {
             self.scratchpad_on_window_destroyed(hwnd);
             self.sticky_on_window_destroyed(hwnd);
+            // A destroyed HWND can be recycled for an unrelated window, so
+            // its session-only manual floating size must not survive it.
+            self.floating_size_history.remove(&hwnd);
             // Forget any remembered floating focus for this window so
             // a recycled HWND can't wrongly re-focus on workspace return.
             self.floating_focus.retain(|_, &mut h| h != hwnd);
-            // Drop the cached window icon: the HICON dies with its
-            // window, and a recycled HWND must re-probe.
+            // Drop cached window icons: the HICON dies with its window,
+            // and a recycled HWND must re-probe.
+            self.tab_strip_icon_cache.remove(&hwnd);
             self.overview_icon_cache.remove(&hwnd);
             // Drop it from the taskbar hidden set so a recycled HWND isn't
             // skipped by the hide change-gate.
@@ -703,6 +731,19 @@ impl AppState {
                 hwnd
             );
             return;
+        }
+
+        // A real destruction may be the final event for an active drag. Clear
+        // its sentinel and state now; never restore the dead HWND. Column mode
+        // still restores the surviving column's pre-drag order.
+        let aborted_destroyed_drag = !is_hidden_event
+            && self
+                .drag_state
+                .as_ref()
+                .is_some_and(|drag| drag.hwnd == hwnd)
+            && self.abort_active_drag(false).is_some();
+        if aborted_destroyed_drag {
+            leopardwm_platform_win32::set_dwm_transitions_disabled(hwnd, false);
         }
 
         // Drop the recorded layout rect so the map doesn't retain
@@ -806,6 +847,16 @@ impl AppState {
             }
             if let Err(e) = self.apply_layout() {
                 warn!("Failed to apply layout after window {}: {}", event_name, e);
+            }
+        } else if aborted_destroyed_drag {
+            // A live plain-drag preview may already have detached the destroyed
+            // HWND, so no workspace lookup succeeds. The placeholder cleanup
+            // still changed layout and must land immediately.
+            if let Err(error) = self.apply_layout() {
+                warn!(
+                    "Failed to apply layout after destroying dragged window {}: {}",
+                    hwnd, error
+                );
             }
         }
     }
@@ -1029,26 +1080,12 @@ impl AppState {
                     monitor_id
                 );
 
-                // Clean up any in-progress drag: reinsert window if it was
-                // removed from source during live preview, then remove placeholders.
-                // Only reinsert if the window still exists (it may have been closed).
-                if let Some(drag) = self.drag_state.take() {
-                    if drag.removed_from_source
-                        && drag.is_tiled
-                        && leopardwm_platform_win32::is_valid_window(drag.hwnd)
-                    {
-                        if let Some(ws) = self
-                            .workspaces
-                            .get_mut(&drag.source_monitor)
-                            .and_then(|v| v.get_mut(drag.source_workspace_idx))
-                        {
-                            let _ = ws.insert_window(drag.hwnd, None);
-                        }
-                    }
-                    for ws_vec in self.workspaces.values_mut() {
-                        for ws in ws_vec.iter_mut() {
-                            let _ = ws.remove_window(crate::state::DRAG_PLACEHOLDER_HWND);
-                        }
+                // Cancel any in-progress drag before switching ownership.
+                // Restore both detached plain-preview state and Shift reorder.
+                if let Some(drag_hwnd) = self.drag_state.as_ref().map(|drag| drag.hwnd) {
+                    let restore_window = leopardwm_platform_win32::is_valid_window(drag_hwnd);
+                    if let Some(aborted_hwnd) = self.abort_active_drag(restore_window) {
+                        leopardwm_platform_win32::set_dwm_transitions_disabled(aborted_hwnd, false);
                     }
                 }
                 self.pending_drag_hint = Some(crate::state::DragHintAction::Hide);
@@ -1493,37 +1530,61 @@ impl AppState {
             return;
         }
 
-        let (is_tiled, source_monitor, source_ws_idx, col_idx) =
+        let (is_tiled, source_monitor, source_ws_idx, col_idx, win_idx, source_sibling, col_width) =
             if let Some((monitor_id, ws_idx)) = self.find_window_workspace(hwnd) {
-                let is_floating = self
-                    .workspaces
-                    .get(&monitor_id)
-                    .and_then(|v| v.get(ws_idx))
-                    .is_none_or(|ws| ws.is_floating(hwnd));
-                let col_idx = if !is_floating {
-                    self.workspaces
-                        .get(&monitor_id)
-                        .and_then(|v| v.get(ws_idx))
-                        .and_then(|ws| ws.find_window_location(hwnd))
-                        .map(|(col, _)| col)
-                        .unwrap_or(0)
+                let workspace = self.workspaces.get(&monitor_id).and_then(|v| v.get(ws_idx));
+                let is_floating = workspace.is_none_or(|ws| ws.is_floating(hwnd));
+                let (col_idx, win_idx, source_sibling, col_width) = if !is_floating {
+                    workspace
+                        .and_then(|ws| {
+                            let (col, win) = ws.find_window_location(hwnd)?;
+                            let column = ws.column(col)?;
+                            let sibling = column
+                                .windows()
+                                .iter()
+                                .copied()
+                                .find(|window| *window != hwnd);
+                            Some((col, win, sibling, column.width()))
+                        })
+                        .unwrap_or((0, 0, None, 0))
                 } else {
-                    0
+                    (0, 0, None, 0)
                 };
-                (!is_floating, monitor_id, ws_idx, col_idx)
+                (
+                    !is_floating,
+                    monitor_id,
+                    ws_idx,
+                    col_idx,
+                    win_idx,
+                    source_sibling,
+                    col_width,
+                )
             } else {
                 (
                     false,
                     self.focused_monitor,
                     self.active_workspace_idx(self.focused_monitor),
                     0,
+                    0,
+                    None,
+                    0,
                 )
             };
+        let mode = if is_tiled && is_shift_key_pressed() {
+            crate::state::DragMode::Column
+        } else {
+            crate::state::DragMode::Window
+        };
         self.drag_state = Some(DragState {
             hwnd,
             is_tiled,
+            mode,
             source_monitor,
             source_workspace_idx: source_ws_idx,
+            source_column_index: col_idx,
+            source_window_index: win_idx,
+            source_sibling,
+            source_column_width: col_width,
             current_column_index: col_idx,
             last_drop_target: None,
             last_hint_update: None,
@@ -1589,21 +1650,23 @@ impl AppState {
         };
 
         if !drag.is_tiled {
-            // Floating window: store the VISIBLE rect (DWM extended frame), the
-            // same convention used when a window is floated and on live moves.
-            // Using the outer GetWindowRect here made apply_placements re-add the
-            // border insets on each drop, growing the window ~14px per cycle.
-            if let Some((monitor_id, ws_idx)) = self.find_window_workspace(hwnd) {
-                if let Some(visible_rect) = leopardwm_platform_win32::get_window_visible_rect(hwnd)
-                {
-                    if let Some(workspace) = self
-                        .workspaces
-                        .get_mut(&monitor_id)
-                        .and_then(|v| v.get_mut(ws_idx))
-                    {
-                        workspace.update_floating(hwnd, visible_rect);
-                        debug!("Floating window {} dropped at {:?}", hwnd, visible_rect);
-                    }
+            // Floating window: use the VISIBLE rect (DWM extended frame), then
+            // transfer workspace ownership when the cursor crossed a monitor
+            // seam and clamp all four edges inside the destination work area.
+            // Using GetWindowRect here would re-add invisible frame insets and
+            // grow the window on every drag/drop cycle.
+            if let Some(visible_rect) = leopardwm_platform_win32::get_window_visible_rect(hwnd) {
+                let (cursor_x, cursor_y) = leopardwm_platform_win32::get_cursor_pos().unwrap_or((
+                    visible_rect.x + visible_rect.width / 2,
+                    visible_rect.y + visible_rect.height / 2,
+                ));
+                let target_monitor =
+                    self.monitor_for_drag_point(cursor_x, cursor_y, drag.source_monitor);
+                if self.finish_floating_drag(hwnd, &drag, target_monitor, visible_rect) {
+                    debug!(
+                        "Floating window {} dropped on monitor {} at {:?}",
+                        hwnd, target_monitor, visible_rect
+                    );
                 }
             }
             leopardwm_platform_win32::set_dwm_transitions_disabled(hwnd, false);
@@ -1626,14 +1689,14 @@ impl AppState {
             leopardwm_platform_win32::set_dwm_transitions_disabled(hwnd, false);
             return;
         };
-        let monitors: Vec<_> = self.monitors.values().cloned().collect();
-        let target_monitor = find_monitor_for_rect(&monitors, &win_info.rect)
-            .map(|m| m.id)
-            .unwrap_or(drag.source_monitor);
+        let (cursor_x, cursor_y) = leopardwm_platform_win32::get_cursor_pos().unwrap_or((
+            win_info.rect.x + win_info.rect.width / 2,
+            win_info.rect.y + win_info.rect.height / 2,
+        ));
+        let target_monitor =
+            self.monitor_for_drag_point(cursor_x, cursor_y, drag.source_monitor);
 
-        let shift_held = is_shift_key_pressed();
-
-        if shift_held {
+        if drag.mode == crate::state::DragMode::Column {
             // Clean up placeholder (shouldn't exist in shift mode, but be safe).
             for ws_vec in self.workspaces.values_mut() {
                 for ws in ws_vec.iter_mut() {
@@ -1748,6 +1811,10 @@ impl AppState {
                 .is_none_or(|ws| ws.is_floating(hwnd));
 
             if is_floating {
+                if let Some(visible_rect) = leopardwm_platform_win32::get_window_visible_rect(hwnd)
+                {
+                    self.update_floating_geometry(hwnd, visible_rect);
+                }
                 if self.previous_focused_hwnd == Some(hwnd) {
                     self.show_border(hwnd);
                 }
@@ -1877,6 +1944,16 @@ impl AppState {
         // immediately on WM_DISPLAYCHANGE receipt (before debounce) in the
         // event loop. This handler runs after the debounce settles.
         info!("Display configuration changed - reconciling monitors");
+
+        // Restore preview-detached/reordered source state while the old monitor
+        // workspaces still exist. Reconciliation may remove the source monitor;
+        // waiting until MoveSizeEnd would then make rollback impossible.
+        if let Some(drag_hwnd) = self.drag_state.as_ref().map(|drag| drag.hwnd) {
+            let restore_window = leopardwm_platform_win32::is_valid_window(drag_hwnd);
+            if let Some(aborted_hwnd) = self.abort_active_drag(restore_window) {
+                leopardwm_platform_win32::set_dwm_transitions_disabled(aborted_hwnd, false);
+            }
+        }
 
         // Re-enumerate monitors
         match enumerate_monitors() {
@@ -2017,14 +2094,24 @@ impl AppState {
             .is_none_or(|ws| ws.is_floating(hwnd));
 
         if is_floating {
-            // Floating: just update stored rect from the visible area.
+            // Floating: keep both the physical workspace rect and its
+            // session-only logical size history in sync. A resize can leave
+            // any edge outside the work area, so shrink an oversized axis and
+            // clamp the final visible frame before storing it.
             if let Some(visible_rect) = leopardwm_platform_win32::get_window_visible_rect(hwnd) {
-                if let Some(ws) = self
-                    .workspaces
-                    .get_mut(&monitor_id)
-                    .and_then(|v| v.get_mut(ws_idx))
+                let clamped_rect = self
+                    .monitors
+                    .get(&monitor_id)
+                    .map(|monitor| {
+                        crate::drag::clamp_rect_to_work_area(visible_rect, monitor.work_area)
+                    })
+                    .unwrap_or(visible_rect);
+                if self.update_floating_geometry(hwnd, clamped_rect) && clamped_rect != visible_rect
                 {
-                    ws.update_floating(hwnd, visible_rect);
+                    self.last_placed_layout_rects.remove(&hwnd);
+                    if let Err(error) = self.apply_layout() {
+                        warn!("Failed to clamp floating resize {}: {}", hwnd, error);
+                    }
                 }
             }
             return;
@@ -2127,7 +2214,7 @@ impl AppState {
                 }
                 if let Err(e) = workspace.focus_window(hwnd) {
                     debug!(
-                        "Failed to focus window {} for focus-follows-mouse: {}",
+            "Failed to focus window {} for focus-follows-mouse: {}",
                         hwnd, e
                     );
                     return false;

@@ -95,19 +95,19 @@ impl AppState {
         Ok(json)
     }
 
-    /// Cheap deterministic hash of the PERSISTED state (everything
-    /// `build_state_json` would serialize): focused monitor, per-monitor
-    /// active workspace index, every workspace's column membership +
-    /// floating windows + rounded scroll offset, and tab title override
-    /// keys/value lengths. Used to dedup save requests so unchanged
-    /// state (e.g. mid-animation frames with no structural delta) does
-    /// not enqueue a write.
+    /// Cheap deterministic hash of the persisted workspace state. Used to
+    /// deduplicate save requests so unchanged state does not enqueue a write.
+    /// Runtime-only fields marked `serde(skip)` are intentionally excluded.
     pub(crate) fn persisted_signature(&self) -> u64 {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
         let mut hasher = DefaultHasher::new();
         self.focused_monitor.hash(&mut hasher);
+        self.monitors
+            .get(&self.focused_monitor)
+            .map(|monitor| monitor.device_name.as_str())
+            .hash(&mut hasher);
 
         // Sort monitor ids for a deterministic traversal order.
         let mut monitor_ids: Vec<MonitorId> = self.workspaces.keys().copied().collect();
@@ -115,37 +115,76 @@ impl AppState {
 
         for monitor_id in monitor_ids {
             monitor_id.hash(&mut hasher);
+            self.monitors
+                .get(&monitor_id)
+                .map(|monitor| monitor.device_name.as_str())
+                .hash(&mut hasher);
             self.active_workspace_idx(monitor_id).hash(&mut hasher);
             if let Some(ws_vec) = self.workspaces.get(&monitor_id) {
-                for workspace in ws_vec {
-                    // Column window-id membership (Vec<Vec<u64>>).
+                ws_vec.len().hash(&mut hasher);
+                for (workspace_idx, workspace) in ws_vec.iter().enumerate() {
+                    workspace_idx.hash(&mut hasher);
+                    workspace.focused_column_index().hash(&mut hasher);
+                    workspace.focused_window_index_in_column().hash(&mut hasher);
+                    workspace.fullscreen_window_id().hash(&mut hasher);
+
+                    workspace.columns().len().hash(&mut hasher);
                     for column in workspace.columns() {
+                        column.width().hash(&mut hasher);
                         column.windows().len().hash(&mut hasher);
                         for &wid in column.windows() {
                             wid.hash(&mut hasher);
+                            workspace.is_minimized(wid).hash(&mut hasher);
+                        }
+                        column.height_weights().len().hash(&mut hasher);
+                        for weight in column.height_weights() {
+                            weight.to_bits().hash(&mut hasher);
+                        }
+                        match column.mode() {
+                            leopardwm_core_layout::ColumnMode::Vertical => {
+                                0u8.hash(&mut hasher);
+                            }
+                            leopardwm_core_layout::ColumnMode::Tabbed { active_idx } => {
+                                1u8.hash(&mut hasher);
+                                active_idx.hash(&mut hasher);
+                            }
                         }
                     }
-                    // Floating windows: id + rect.
-                    for f in workspace.floating_windows() {
-                        f.id.hash(&mut hasher);
-                        f.rect.x.hash(&mut hasher);
-                        f.rect.y.hash(&mut hasher);
-                        f.rect.width.hash(&mut hasher);
-                        f.rect.height.hash(&mut hasher);
+
+                    workspace.floating_windows().len().hash(&mut hasher);
+                    for floating in workspace.floating_windows() {
+                        floating.id.hash(&mut hasher);
+                        floating.rect.x.hash(&mut hasher);
+                        floating.rect.y.hash(&mut hasher);
+                        floating.rect.width.hash(&mut hasher);
+                        floating.rect.height.hash(&mut hasher);
+                        floating.pinned.hash(&mut hasher);
+                        workspace.is_minimized(floating.id).hash(&mut hasher);
                     }
-                    // Scroll offset rounded to whole pixels.
+
+                    // Keep animation-frame churn bounded while tracking the
+                    // persisted scroll position at whole-pixel precision.
                     (workspace.scroll_offset().round() as i64).hash(&mut hasher);
+                    workspace.gap().hash(&mut hasher);
+                    workspace.outer_gaps().hash(&mut hasher);
+                    workspace.default_column_width().hash(&mut hasher);
+                    match workspace.centering_mode() {
+                        leopardwm_core_layout::CenteringMode::Center => 0u8.hash(&mut hasher),
+                        leopardwm_core_layout::CenteringMode::JustInView => 1u8.hash(&mut hasher),
+                        leopardwm_core_layout::CenteringMode::OnOverflow => 2u8.hash(&mut hasher),
+                    }
                 }
             }
         }
 
-        // Tab title overrides: sorted keys + value lengths (cheap).
-        let mut overrides: Vec<(u64, usize)> = self
+        // Hash full title values, not just lengths: equal-length renames are
+        // distinct persisted states.
+        let mut overrides: Vec<(u64, &str)> = self
             .tab_title_overrides
             .iter()
-            .map(|(&k, v)| (k, v.len()))
+            .map(|(&key, value)| (key, value.as_str()))
             .collect();
-        overrides.sort_unstable();
+        overrides.sort_unstable_by_key(|(key, _)| *key);
         overrides.hash(&mut hasher);
 
         hasher.finish()

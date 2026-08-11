@@ -3,7 +3,7 @@
 use crate::config;
 use crate::state::*;
 use anyhow::Result;
-use leopardwm_core_layout::{Rect, Workspace};
+use leopardwm_core_layout::{centered_rect_for_size, FloatingSize, Rect, Workspace};
 #[cfg(not(test))]
 use leopardwm_platform_win32::{is_excluded_tool_window_hwnd, is_window_alive_and_visible};
 use leopardwm_platform_win32::{scale_px, MonitorId};
@@ -96,6 +96,178 @@ impl AppState {
         leopardwm_platform_win32::get_window_info(hwnd)
     }
 
+    /// Default size for a manually floated window, in logical pixels.
+    pub(crate) fn default_floating_size(&self) -> FloatingSize {
+        FloatingSize::new(
+            self.config.layout.default_floating_width,
+            self.config.layout.default_floating_height,
+        )
+    }
+
+    /// Default size for a scratchpad window, in logical pixels.
+    pub(crate) fn default_scratchpad_size(&self) -> FloatingSize {
+        FloatingSize::new(
+            self.config.layout.default_scratchpad_width,
+            self.config.layout.default_scratchpad_height,
+        )
+    }
+
+    /// Return a usable DPI scale for a monitor, falling back to 100% for a
+    /// missing or malformed monitor record.
+    fn monitor_scale_factor(&self, monitor_id: MonitorId) -> f64 {
+        self.monitors
+            .get(&monitor_id)
+            .map(|monitor| monitor.scale_factor)
+            .filter(|scale| scale.is_finite() && *scale > 0.0)
+            .unwrap_or(1.0)
+    }
+
+    /// Preserve a physical dimension's logical size across monitor DPI.
+    pub(crate) fn scale_px_between_monitors(
+        &self,
+        pixels: i32,
+        source_monitor: MonitorId,
+        target_monitor: MonitorId,
+    ) -> i32 {
+        let source_scale = self.monitor_scale_factor(source_monitor);
+        let target_scale = self.monitor_scale_factor(target_monitor);
+        ((pixels.max(1) as f64 / source_scale) * target_scale)
+            .round()
+            .clamp(1.0, i32::MAX as f64) as i32
+    }
+
+    /// Resolve the monitor containing a screen point without cloning or
+    /// allocating monitor records. Drag mouse-move events call this at up to
+    /// 60 Hz, so it deliberately walks the small monitor map in place.
+    pub(crate) fn monitor_for_point(&self, x: i32, y: i32) -> Option<MonitorId> {
+        self.monitors
+            .values()
+            .find(|monitor| monitor.contains_point(x, y))
+            .map(|monitor| monitor.id)
+    }
+
+    /// Resolve the cursor-selected monitor for a title-bar drag, honoring the
+    /// user setting that can keep every drop on its source monitor.
+    pub(crate) fn monitor_for_drag_point(
+        &self,
+        x: i32,
+        y: i32,
+        source_monitor: MonitorId,
+    ) -> MonitorId {
+        if self.config.behavior.cross_monitor_drag {
+            self.monitor_for_point(x, y).unwrap_or(source_monitor)
+        } else {
+            source_monitor
+        }
+    }
+
+    /// Resolve the monitor containing a floating rectangle's center, falling
+    /// back to the primary monitor when it lies outside every display.
+    fn monitor_for_floating_rect(&self, rect: Rect) -> Option<MonitorId> {
+        let center_x = rect.x.saturating_add(rect.width / 2);
+        let center_y = rect.y.saturating_add(rect.height / 2);
+        self.monitor_for_point(center_x, center_y).or_else(|| {
+            self.monitors
+                .values()
+                .find(|monitor| monitor.is_primary)
+                .map(|m| m.id)
+        })
+    }
+
+    /// Convert a physical floating rectangle to a logical size using the DPI
+    /// of the monitor that actually contains it, not its workspace owner.
+    pub(crate) fn logical_floating_size_for_rect(&self, rect: Rect) -> FloatingSize {
+        let scale = self
+            .monitor_for_floating_rect(rect)
+            .map(|monitor| self.monitor_scale_factor(monitor))
+            .unwrap_or(1.0);
+        FloatingSize::new(
+            ((rect.width.max(1) as f64 / scale).round() as i32).max(1),
+            ((rect.height.max(1) as f64 / scale).round() as i32).max(1),
+        )
+    }
+
+    /// Scale a logical floating size for `monitor_id`, clamp it to that
+    /// monitor's work area, and center it. Only size is carried across
+    /// monitors; callers deliberately receive newly calculated coordinates.
+    pub(crate) fn centered_rect_for_logical_floating_size(
+        &self,
+        monitor_id: MonitorId,
+        logical_size: FloatingSize,
+        margin: i32,
+    ) -> Rect {
+        let scale = self.monitor_scale_factor(monitor_id);
+        let physical_size = FloatingSize::new(
+            scale_px(logical_size.width, scale),
+            scale_px(logical_size.height, scale),
+        );
+        let viewport = self
+            .monitors
+            .get(&monitor_id)
+            .map(|monitor| monitor.work_area)
+            .unwrap_or_else(|| Rect::new(0, 0, FALLBACK_VIEWPORT_WIDTH, FALLBACK_VIEWPORT_HEIGHT));
+        centered_rect_for_size(viewport, physical_size, margin)
+    }
+
+    /// Return the saved physical rectangle for a managed floating window.
+    pub(crate) fn floating_rect_for_window(&self, hwnd: u64) -> Option<Rect> {
+        let (monitor_id, ws_idx) = self.find_window_workspace(hwnd)?;
+        self.workspaces
+            .get(&monitor_id)
+            .and_then(|workspaces| workspaces.get(ws_idx))
+            .and_then(|workspace| workspace.floating_rect(hwnd))
+    }
+
+    /// Update a managed floating rectangle and remember only its logical size.
+    /// A scratchpad-owned float uses its own size memory; ordinary floats use
+    /// the per-HWND session history.
+    pub(crate) fn update_floating_geometry(&mut self, hwnd: u64, rect: Rect) -> bool {
+        let Some((monitor_id, ws_idx)) = self.find_window_workspace(hwnd) else {
+            return false;
+        };
+        let updated = self
+            .workspaces
+            .get_mut(&monitor_id)
+            .and_then(|workspaces| workspaces.get_mut(ws_idx))
+            .map(|workspace| workspace.update_floating(hwnd, rect))
+            .unwrap_or(false);
+        if !updated {
+            return false;
+        }
+        let logical_size = self.logical_floating_size_for_rect(rect);
+
+        if self
+            .scratchpad
+            .is_some_and(|scratchpad| scratchpad.window_id == hwnd)
+        {
+            if self.config.layout.remember_scratchpad_size {
+                if let Some(scratchpad) = self.scratchpad.as_mut() {
+                    scratchpad.last_size = Some(logical_size);
+                }
+            }
+        } else if self.config.layout.remember_floating_sizes {
+            self.floating_size_history.insert(hwnd, logical_size);
+        }
+        true
+    }
+
+    /// Capture the latest geometry for a managed floating window before it is
+    /// removed from its workspace. A stored floating entry is required before
+    /// probing DWM, so tiled windows can never seed floating-size history.
+    pub(crate) fn capture_floating_geometry(&mut self, hwnd: u64) -> Option<Rect> {
+        let stored_rect = self.floating_rect_for_window(hwnd)?;
+        #[cfg(not(test))]
+        let rect = leopardwm_platform_win32::get_window_visible_rect(hwnd).unwrap_or(stored_rect);
+        #[cfg(test)]
+        let rect = stored_rect;
+
+        if self.update_floating_geometry(hwnd, rect) {
+            Some(rect)
+        } else {
+            None
+        }
+    }
+
     /// Check whether a window ID is known to this state (managed or injected).
     ///
     /// Used by event validation to skip `is_valid_window` for windows we have
@@ -124,6 +296,16 @@ impl AppState {
         self.compiled_rules = config.compile_window_rules();
 
         self.config = config;
+        // Turning memory off is immediate and irreversible for the current
+        // session; re-enabling starts learning from the next user resize.
+        if !self.config.layout.remember_floating_sizes {
+            self.floating_size_history.clear();
+        }
+        if !self.config.layout.remember_scratchpad_size {
+            if let Some(scratchpad) = self.scratchpad.as_mut() {
+                scratchpad.last_size = None;
+            }
+        }
 
         // Update scroll modifier for the gesture hook
         leopardwm_platform_win32::set_scroll_modifier(&self.config.hotkeys.scroll_modifier);
@@ -344,9 +526,27 @@ impl AppState {
 
     /// Find which workspace contains a window.
     /// Returns `(monitor_id, workspace_index)` so callers can index into the correct workspace.
+    ///
+    /// A managed window lives in exactly one workspace, so the first match is
+    /// authoritative. The focused monitor's active workspace is checked first
+    /// because the hot callers (border/focus/layout for the focused window)
+    /// almost always hit it, avoiding a linear `contains_window` scan across
+    /// every monitor's nine workspaces on each animation frame.
     pub(crate) fn find_window_workspace(&self, window_id: u64) -> Option<(MonitorId, usize)> {
+        let focused_active_idx = self.active_workspace_idx(self.focused_monitor);
+        if self
+            .workspaces
+            .get(&self.focused_monitor)
+            .and_then(|ws_vec| ws_vec.get(focused_active_idx))
+            .is_some_and(|workspace| workspace.contains_window(window_id))
+        {
+            return Some((self.focused_monitor, focused_active_idx));
+        }
         for (monitor_id, ws_vec) in &self.workspaces {
             for (idx, workspace) in ws_vec.iter().enumerate() {
+                if *monitor_id == self.focused_monitor && idx == focused_active_idx {
+                    continue;
+                }
                 if workspace.contains_window(window_id) {
                     return Some((*monitor_id, idx));
                 }

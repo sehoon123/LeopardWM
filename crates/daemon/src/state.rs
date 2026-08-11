@@ -1,7 +1,7 @@
 //! AppState struct definition, constructor, and basic accessors.
 
 use crate::config::{self, Config};
-use leopardwm_core_layout::{Rect, Workspace};
+use leopardwm_core_layout::{FloatingSize, Rect, Workspace};
 use leopardwm_platform_win32::{MonitorId, MonitorInfo, PlatformConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -12,16 +12,39 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::info;
 
+/// Drag operation selected at MoveSizeStart. Latching prevents a modifier
+/// change at mouse-up from combining window-merge preview state with the
+/// whole-column drop path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DragMode {
+    Window,
+    Column,
+}
+
 /// Tracks an in-progress window drag for column reorder.
 pub(crate) struct DragState {
     /// HWND being dragged.
     pub(crate) hwnd: u64,
     /// Whether the dragged window is tiled (vs floating).
     pub(crate) is_tiled: bool,
+    /// Plain drag moves one window; Shift held at drag start moves its entire
+    /// column. The mode stays fixed for the lifetime of this drag.
+    pub(crate) mode: DragMode,
     /// Source monitor at drag start.
     pub(crate) source_monitor: MonitorId,
     /// Source workspace index at drag start (0-based).
     pub(crate) source_workspace_idx: usize,
+    /// Original source column and window slot. These remain stable while the
+    /// live preview temporarily removes the window or Shift-drag reorders its
+    /// column, so an invalid/cancelled drop can restore it transactionally.
+    pub(crate) source_column_index: usize,
+    pub(crate) source_window_index: usize,
+    /// A sibling from the original source column. This identifies that column
+    /// even if earlier columns shift while live preview has detached `hwnd`.
+    pub(crate) source_sibling: Option<u64>,
+    /// Width carried when a plain cross-monitor drop creates a standalone
+    /// column on an empty target or in a target gap.
+    pub(crate) source_column_width: i32,
     /// Current column index (initialized to source, changes as we live-reorder during drag).
     pub(crate) current_column_index: usize,
     /// Last computed drop target (for change detection).
@@ -60,6 +83,9 @@ pub(crate) struct ScratchpadState {
     /// columns added/removed while stashed); `None` means it was alone in its
     /// column, so it returns as its own column at `origin_column`.
     pub(crate) origin_sibling: Option<u64>,
+    /// Last user-selected scratchpad size in logical pixels. Position is
+    /// intentionally omitted so each summon can re-center on its target monitor.
+    pub(crate) last_size: Option<FloatingSize>,
 }
 
 /// Where a tiled window sat before it was moved off a workspace, so that
@@ -90,6 +116,10 @@ pub(crate) enum DragHintAction {
 pub(crate) const FALLBACK_VIEWPORT_WIDTH: i32 = 1920;
 pub(crate) const FALLBACK_VIEWPORT_HEIGHT: i32 = 1080;
 pub(crate) const FALLBACK_WORK_AREA_HEIGHT: i32 = 1040;
+/// Total free space reserved on each axis for manually floated windows.
+pub(crate) const FLOATING_TOTAL_MARGIN: i32 = 40;
+/// Total free space reserved on each axis for scratchpad windows.
+pub(crate) const SCRATCHPAD_TOTAL_MARGIN: i32 = 80;
 pub(crate) const MIN_SET_WIDTH_FRACTION: f64 = 0.1;
 pub(crate) const MAX_SET_WIDTH_FRACTION: f64 = 1.0;
 /// Sentinel window ID used as a placeholder during drag to reserve space in the
@@ -299,6 +329,10 @@ pub(crate) struct AppState {
     /// restored by the workspace's column state on switch, but floating
     /// focus is not, so we remember it here and re-focus it on return.
     pub(crate) floating_focus: HashMap<(MonitorId, usize), u64>,
+    /// Last manual floating size per HWND in logical pixels. This is session
+    /// state only: unlike `Workspace`, it is never serialized into a saved
+    /// workspace snapshot.
+    pub(crate) floating_size_history: HashMap<u64, FloatingSize>,
     /// Monitor info indexed by monitor ID.
     pub(crate) monitors: HashMap<MonitorId, MonitorInfo>,
     /// Currently focused monitor.
@@ -355,6 +389,11 @@ pub(crate) struct AppState {
     /// afterward.
     pub(crate) tab_strip_action_tx:
         Option<std::sync::mpsc::Sender<leopardwm_platform_win32::tab_strip::TabActionEvent>>,
+    /// Per-window shared HICON results reused across tab-strip renders.
+    /// Animation frames can refresh strip geometry at 60 Hz, while probing
+    /// another process for an icon may block for up to several 50 ms timeouts.
+    /// The low-frequency icon poll clears this cache to preserve freshness.
+    pub(crate) tab_strip_icon_cache: HashMap<u64, Option<isize>>,
     /// Whether the workspace overview overlay is currently shown.
     pub(crate) overview_open: bool,
     /// Overview overlay. NOT constructed in `new` — lazily created on the
@@ -705,6 +744,7 @@ impl AppState {
             workspaces,
             active_workspace: active_workspace_map,
             floating_focus: HashMap::new(),
+            floating_size_history: HashMap::new(),
             monitors: monitor_map,
             focused_monitor,
             platform_config,
@@ -729,6 +769,7 @@ impl AppState {
             // it to the same DaemonEvent drain.
             tab_strip_overlays: std::collections::HashMap::new(),
             tab_strip_action_tx: None,
+            tab_strip_icon_cache: HashMap::new(),
             overview_open: false,
             overview_overlay: None,
             overview_event_tx: None,

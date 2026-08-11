@@ -4,6 +4,7 @@ use crate::types::{PlatformConfig, Win32Error};
 use crate::window_id_to_hwnd;
 use leopardwm_core_layout::{Rect, Visibility, WindowId, WindowPlacement};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use windows::core::BOOL;
 use windows::Win32::Foundation::{HWND, RECT};
@@ -241,11 +242,7 @@ pub fn dwm_uncloak_all() {
     // present in more than one set. dwm_set_cloak is idempotent.
     let mut seen: HashSet<WindowId> =
         HashSet::with_capacity(global_ids.len() + ghost_ids.len() + direct_ids.len());
-    for wid in global_ids
-        .into_iter()
-        .chain(ghost_ids)
-        .chain(direct_ids)
-    {
+    for wid in global_ids.into_iter().chain(ghost_ids).chain(direct_ids) {
         if seen.insert(wid) {
             if let Ok(hwnd) = window_id_to_hwnd(wid) {
                 unsafe { dwm_set_cloak(hwnd, false) };
@@ -295,6 +292,10 @@ static GLOBAL_CLOAKED: Mutex<Option<HashSet<WindowId>>> = Mutex::new(None);
 pub struct PlacementCache {
     positions: HashMap<WindowId, (Rect, Visibility)>,
     insets: HashMap<WindowId, (i32, i32, i32, i32)>,
+    /// Generation of `GLOBAL_INSET_CACHE` reflected by `insets`. An atomic
+    /// generation lets display/theme/DPI changes invalidate the animation
+    /// worker's thread-local cache without locking on every frame.
+    inset_generation: u64,
 }
 
 impl Default for PlacementCache {
@@ -308,6 +309,7 @@ impl PlacementCache {
         Self {
             positions: HashMap::new(),
             insets: HashMap::new(),
+            inset_generation: INSET_CACHE_GENERATION.load(Ordering::Acquire),
         }
     }
 
@@ -321,6 +323,21 @@ impl PlacementCache {
     /// values don't cause incorrect window sizing.
     pub fn clear_insets(&mut self) {
         self.insets.clear();
+        self.inset_generation = INSET_CACHE_GENERATION.load(Ordering::Acquire);
+    }
+
+    /// Lazily observe a global inset invalidation. This is one atomic load per
+    /// placement batch and avoids both stale cross-DPI metrics and a mutex/DWM
+    /// query on every animation-frame window.
+    fn sync_inset_generation(&mut self) {
+        let current = INSET_CACHE_GENERATION.load(Ordering::Acquire);
+        if self.inset_generation != current {
+            self.insets.clear();
+            // Position cache entries must also be cleared: an unchanged layout
+            // rect still needs a SetWindowPos when its frame insets changed.
+            self.positions.clear();
+            self.inset_generation = current;
+        }
     }
 }
 
@@ -332,6 +349,13 @@ pub struct WidthViolation {
     pub window_id: WindowId,
     /// Minimum width in layout coordinates.
     pub min_width: i32,
+    /// Whether the window honored the requested left edge. This distinguishes
+    /// a real viewport-sized minimum from an app-owned fullscreen surface that
+    /// ignored placement and stayed at the monitor origin.
+    pub position_matches: bool,
+    /// Requested visible left edge, compared with the work-area origin by the
+    /// daemon so equality is accepted only when the comparison discriminates.
+    pub requested_left: i32,
 }
 
 /// A window whose actual visible height exceeds the requested placement height.
@@ -341,6 +365,10 @@ pub struct HeightViolation {
     pub window_id: WindowId,
     /// Minimum height in layout coordinates.
     pub min_height: i32,
+    /// Whether the window honored the requested top edge.
+    pub position_matches: bool,
+    /// Requested visible top edge; height analogue of `requested_left`.
+    pub requested_top: i32,
 }
 
 /// Result of apply_placements, including any detected size violations.
@@ -349,6 +377,10 @@ pub struct ApplyPlacementsResult {
     pub width_violations: Vec<WidthViolation>,
     /// Height violations detected after positioning (windows taller than requested).
     pub height_violations: Vec<HeightViolation>,
+    /// Visible tiled windows whose DWM frame did not land on the requested
+    /// left/top/right/bottom edges. The daemon performs one guarded corrective
+    /// landing after stale insets have been invalidated.
+    pub geometry_mismatches: Vec<WindowId>,
 }
 
 // Collect all (hwnd, adjusted_rect, flags) entries for deferred positioning.
@@ -361,12 +393,14 @@ struct DeferEntry {
     y: i32,
     w: i32,
     h: i32,
-    /// Layout-coordinate width requested by the layout engine (pre-insets).
-    /// Used for size-violation detection, which compares DWM visible bounds
-    /// directly and is immune to stale cached border insets.
-    layout_w: i32,
-    /// Layout-coordinate height requested by the layout engine (pre-insets).
-    layout_h: i32,
+    /// Exact visible rectangle requested by the layout engine (pre-insets).
+    /// Landing verification compares all four DWM edges against it.
+    layout_rect: Rect,
+    /// Insets used to translate `layout_rect` into the outer chrome rectangle.
+    used_insets: (i32, i32, i32, i32),
+    /// High-contrast deliberately bypasses regular invisible insets, so a
+    /// fresh non-zero DWM inset must not be mistaken for stale cache state.
+    validate_insets: bool,
     visibility: Visibility,
     flags: windows::Win32::UI::WindowsAndMessaging::SET_WINDOW_POS_FLAGS,
     column_index: usize,
@@ -389,6 +423,7 @@ pub fn apply_placements(
     let empty_result = ApplyPlacementsResult {
         width_violations: Vec::new(),
         height_violations: Vec::new(),
+        geometry_mismatches: Vec::new(),
     };
     if placements.is_empty() {
         if let Some(cache) = cache {
@@ -398,6 +433,10 @@ pub fn apply_placements(
         // windows have left this layout (e.g., workspace switch to empty workspace).
         uncloak_all_tracked();
         return Ok(empty_result);
+    }
+
+    if let Some(ref mut cache) = cache {
+        cache.sync_inset_generation();
     }
 
     // Animation frames (cache present) use async positioning so hung windows
@@ -413,7 +452,10 @@ pub fn apply_placements(
     // All windows get full position + size with border inset adjustment.
     // Off-screen windows are kept at their layout-flow position; DWM cloaking
     // makes them invisible.
-    let offscreen_count = placements.iter().filter(|p| p.visibility != Visibility::Visible).count();
+    let offscreen_count = placements
+        .iter()
+        .filter(|p| p.visibility != Visibility::Visible)
+        .count();
 
     // In high contrast mode, DWM paints a visible border in the normally-invisible
     // frame area.  If we expand by the usual insets, adjacent windows' visible borders
@@ -450,11 +492,12 @@ pub fn apply_placements(
     // bounds which would create false constraints that prevent columns from
     // shrinking. The synchronous landing pass detects real violations
     // authoritatively.
-    let (width_violations, height_violations) = if async_flag == SET_WINDOW_POS_FLAGS(0) {
+    let (width_violations, height_violations, geometry_mismatches) =
+        if async_flag == SET_WINDOW_POS_FLAGS(0) {
         detect_size_violations(&entries, &failed_window_ids, &mut cache)
     } else {
-        (Vec::new(), Vec::new())
-    }; // end: skip size violation detection during async frames
+            (Vec::new(), Vec::new(), Vec::new())
+        }; // end: skip landing verification during async frames
 
     // Update cache: remove stale entries (windows no longer in placements),
     // update positioned entries, and keep skipped-unchanged entries intact.
@@ -465,8 +508,8 @@ pub fn apply_placements(
         cache.positions.retain(|id, _| current_ids.contains(id));
         cache.insets.retain(|id, _| current_ids.contains(id));
         // Update entries for windows that were actually positioned
-        let positioned: std::collections::HashSet<u64> =
-            entries.iter()
+        let positioned: std::collections::HashSet<u64> = entries
+            .iter()
                 .filter(|e| !failed_window_ids.contains(&e.window_id))
                 .map(|e| e.window_id)
                 .collect();
@@ -526,6 +569,7 @@ pub fn apply_placements(
     Ok(ApplyPlacementsResult {
         width_violations,
         height_violations,
+        geometry_mismatches,
     })
 }
 
@@ -541,12 +585,16 @@ fn build_defer_entries(
 
     for placement in placements {
         if let Some(ref cache) = *cache {
-            if cache.positions.get(&placement.window_id) == Some(&(placement.rect, placement.visibility)) {
+            if cache.positions.get(&placement.window_id)
+                == Some(&(placement.rect, placement.visibility))
+            {
                 skipped += 1;
                 continue;
             }
         }
-        let Ok(hwnd) = window_id_to_hwnd(placement.window_id) else { continue };
+        let Ok(hwnd) = window_id_to_hwnd(placement.window_id) else {
+            continue;
+        };
         unsafe {
             if !IsWindow(Some(hwnd)).as_bool() || IsIconic(hwnd).as_bool() {
                 continue;
@@ -590,8 +638,9 @@ fn build_defer_entries(
                 y: placement.rect.y - inset_t,
                 w: frame_w,
                 h: frame_h,
-                layout_w: placement.rect.width,
-                layout_h: placement.rect.height,
+                layout_rect: placement.rect,
+                used_insets: (inset_l, inset_t, inset_r, inset_b),
+                validate_insets: !high_contrast,
                 visibility: placement.visibility,
                 flags,
                 column_index: placement.column_index,
@@ -607,8 +656,9 @@ fn build_defer_entries(
                 y: placement.rect.y - inset_t,
                 w: frame_w,
                 h: 0,
-                layout_w: placement.rect.width,
-                layout_h: placement.rect.height,
+                layout_rect: placement.rect,
+                used_insets: (inset_l, inset_t, inset_r, inset_b),
+                validate_insets: !high_contrast,
                 visibility: placement.visibility,
                 flags: SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | async_flag,
                 column_index: placement.column_index,
@@ -653,10 +703,16 @@ fn position_entries(entries: &[DeferEntry]) -> (u32, HashSet<u64>) {
                 // Fallback: apply individually if batching fails
                 for entry in entries {
                     if SetWindowPos(
-                        entry.hwnd, None,
-                        entry.x, entry.y, entry.w, entry.h,
+                            entry.hwnd,
+                            None,
+                            entry.x,
+                            entry.y,
+                            entry.w,
+                            entry.h,
                         entry.flags,
-                    ).is_err() {
+                        )
+                        .is_err()
+                        {
                         failed_window_ids.insert(entry.window_id);
                     }
                 }
@@ -667,8 +723,13 @@ fn position_entries(entries: &[DeferEntry]) -> (u32, HashSet<u64>) {
                 let mut batch_ok = true;
                 for entry in entries {
                     match DeferWindowPos(
-                        hdwp, entry.hwnd, None,
-                        entry.x, entry.y, entry.w, entry.h,
+                            hdwp,
+                            entry.hwnd,
+                            None,
+                            entry.x,
+                            entry.y,
+                            entry.w,
+                            entry.h,
                         entry.flags,
                     ) {
                         Ok(new_hdwp) => hdwp = new_hdwp,
@@ -683,10 +744,16 @@ fn position_entries(entries: &[DeferEntry]) -> (u32, HashSet<u64>) {
                         // EndDeferWindowPos failed — fall back to individual calls
                         for entry in entries {
                             if SetWindowPos(
-                                entry.hwnd, None,
-                                entry.x, entry.y, entry.w, entry.h,
+                                    entry.hwnd,
+                                    None,
+                                    entry.x,
+                                    entry.y,
+                                    entry.w,
+                                    entry.h,
                                 entry.flags,
-                            ).is_err() {
+                                )
+                                .is_err()
+                                {
                                 failed_window_ids.insert(entry.window_id);
                             }
                         }
@@ -699,10 +766,16 @@ fn position_entries(entries: &[DeferEntry]) -> (u32, HashSet<u64>) {
                     // Fall back to individual SetWindowPos calls.
                     for entry in entries {
                         if SetWindowPos(
-                            entry.hwnd, None,
-                            entry.x, entry.y, entry.w, entry.h,
+                                entry.hwnd,
+                                None,
+                                entry.x,
+                                entry.y,
+                                entry.w,
+                                entry.h,
                             entry.flags,
-                        ).is_err() {
+                            )
+                            .is_err()
+                            {
                             failed_window_ids.insert(entry.window_id);
                         }
                     }
@@ -757,7 +830,12 @@ pub fn clear_suspected_oversize(window_id: WindowId) {
 /// and is honored, so the column stops re-resizing on every switch. An absurd
 /// excess is never trusted, even if it reproduces, so a chronically-lagging app
 /// can't inflate the layout (the case the original ratio guard protected).
-fn classify_oversize(over: bool, looks_stale: bool, was_suspected: bool, absurd: bool) -> (bool, bool) {
+fn classify_oversize(
+    over: bool,
+    looks_stale: bool,
+    was_suspected: bool,
+    absurd: bool,
+) -> (bool, bool) {
     if !over {
         (false, false)
     } else if !looks_stale {
@@ -771,14 +849,35 @@ fn classify_oversize(over: bool, looks_stale: bool, was_suspected: bool, absurd:
     }
 }
 
-/// Detect min-size violations on the landing pass via DWM visible bounds.
+/// Tolerance used when comparing requested and compositor-reported frame edges.
+pub const EDGE_EPSILON_PX: i32 = 2;
+
+/// Return `(position_mismatch, any_edge_mismatch, undersized)` for a visible
+/// DWM frame against the layout's requested visible rectangle.
+fn geometry_mismatch_flags(visible: Rect, requested: Rect) -> (bool, bool, bool) {
+    let position_mismatch = (visible.x - requested.x).abs() > EDGE_EPSILON_PX
+        || (visible.y - requested.y).abs() > EDGE_EPSILON_PX;
+    let right_mismatch = (visible.right() - requested.right()).abs() > EDGE_EPSILON_PX;
+    let bottom_mismatch = (visible.bottom() - requested.bottom()).abs() > EDGE_EPSILON_PX;
+    let undersized = visible.width + EDGE_EPSILON_PX < requested.width
+        || visible.height + EDGE_EPSILON_PX < requested.height;
+    (
+        position_mismatch,
+        position_mismatch || right_mismatch || bottom_mismatch,
+        undersized,
+    )
+}
+
+/// Verify all four visible DWM edges and detect genuine min-size violations
+/// on the synchronous landing pass.
 fn detect_size_violations(
     entries: &[DeferEntry],
     failed_window_ids: &HashSet<u64>,
     cache: &mut Option<&mut PlacementCache>,
-) -> (Vec<WidthViolation>, Vec<HeightViolation>) {
+) -> (Vec<WidthViolation>, Vec<HeightViolation>, Vec<WindowId>) {
     let mut width_violations = Vec::new();
     let mut height_violations = Vec::new();
+    let mut geometry_mismatches = Vec::new();
     // Wait for the compositor to composite a frame before reading DWM
     // bounds. Sync SetWindowPos only guarantees the target thread received
     // WM_WINDOWPOSCHANGED — it does NOT wait for the target to process and
@@ -801,9 +900,12 @@ fn detect_size_violations(
         {
             continue;
         }
-        // Query DWM for the current visible bounds. This ignores any
-        // invisible-border metrics and reports what the user actually sees.
-        let (visible_w, visible_h) = unsafe {
+
+        // Query the exact visible bounds. Comparing all four edges catches
+        // stale left/top insets and under-sized frames that width/height-only
+        // validation missed (visible symptom: one side clipped and blank
+        // desktop on the opposite side).
+        let visible_rect = unsafe {
             let mut ext = RECT::default();
             if DwmGetWindowAttribute(
                 entry.hwnd,
@@ -815,8 +917,43 @@ fn detect_size_violations(
             {
                 continue;
             }
-            (ext.right - ext.left, ext.bottom - ext.top)
+            Rect::new(
+                ext.left,
+                ext.top,
+                ext.right - ext.left,
+                ext.bottom - ext.top,
+            )
         };
+        let visible_w = visible_rect.width;
+        let visible_h = visible_rect.height;
+        let requested = entry.layout_rect;
+        let (position_mismatch, edge_mismatch, undersized) =
+            geometry_mismatch_flags(visible_rect, requested);
+
+        // An inset can change during a window's lifetime (custom chrome, theme,
+        // or a cross-monitor DPI transition). If the fresh chrome-vs-DWM inset
+        // differs from what this SetWindowPos used, retry with the fresh metric
+        // before recording any min-size constraint; otherwise one stale frame
+        // permanently inflates the column/stack.
+        if edge_mismatch && entry.validate_insets {
+            let fresh_insets = invisible_border_insets(entry.hwnd);
+            if fresh_insets != entry.used_insets {
+                tracing::debug!(
+                    "Stale frame insets for {:?}: used {:?}, fresh {:?}, requested {:?}, visible {:?}",
+                    entry.hwnd,
+                    entry.used_insets,
+                    fresh_insets,
+                    requested,
+                    visible_rect,
+                );
+                invalidate_window_insets(entry.window_id, cache);
+                if let Some(map) = lock_suspected_oversize().as_mut() {
+                    map.remove(&entry.window_id);
+                }
+                geometry_mismatches.push(entry.window_id);
+                continue;
+            }
+        }
 
         // Stale-bounds ratio — a genuine min-size violation usually has the
         // window just barely larger than requested. If DWM reports bounds >1.5x
@@ -831,14 +968,14 @@ fn detect_size_violations(
         // honored; a one-off stale read resolves by the next pass and is dropped.
         const STALE_BOUNDS_RATIO: i32 = 3; // visible > requested * 3/2 → suspect
         const ABSURD_BOUNDS_RATIO: i32 = 4; // visible > requested * 4 → never trust
-        let looks_stale_w = entry.layout_w > 0
-            && visible_w * 2 > entry.layout_w * STALE_BOUNDS_RATIO;
-        let looks_stale_h = entry.layout_h > 0
-            && visible_h * 2 > entry.layout_h * STALE_BOUNDS_RATIO;
-        let absurd_w = entry.layout_w > 0 && visible_w > entry.layout_w * ABSURD_BOUNDS_RATIO;
-        let absurd_h = entry.layout_h > 0 && visible_h > entry.layout_h * ABSURD_BOUNDS_RATIO;
-        let w_over = visible_w > entry.layout_w + 2;
-        let h_over = visible_h > entry.layout_h + 2;
+        let looks_stale_w =
+            requested.width > 0 && visible_w * 2 > requested.width * STALE_BOUNDS_RATIO;
+        let looks_stale_h =
+            requested.height > 0 && visible_h * 2 > requested.height * STALE_BOUNDS_RATIO;
+        let absurd_w = requested.width > 0 && visible_w > requested.width * ABSURD_BOUNDS_RATIO;
+        let absurd_h = requested.height > 0 && visible_h > requested.height * ABSURD_BOUNDS_RATIO;
+        let w_over = visible_w > requested.width + EDGE_EPSILON_PX;
+        let h_over = visible_h > requested.height + EDGE_EPSILON_PX;
 
         // Read the prior-pass per-axis suspect state and update it for this
         // window in one locked section.
@@ -856,58 +993,59 @@ fn detect_size_violations(
             (record_w, suspect_w, record_h, suspect_h)
         };
 
-        let mut mismatched = false;
         if record_w {
             tracing::debug!(
                 "Width violation: {:?} requested {}px, visible {}px",
-                entry.hwnd, entry.layout_w, visible_w,
+                entry.hwnd,
+                requested.width,
+                visible_w,
             );
             width_violations.push(WidthViolation {
                 window_id: entry.window_id,
                 min_width: visible_w,
+                position_matches: (visible_rect.x - requested.x).abs() <= EDGE_EPSILON_PX,
+                requested_left: requested.x,
             });
-            mismatched = true;
         } else if suspect_w {
             tracing::debug!(
                 "Deferring suspect width until next landing confirms: {:?} \
                  requested {}px, visible {}px",
-                entry.hwnd, entry.layout_w, visible_w,
+                entry.hwnd,
+                requested.width,
+                visible_w,
             );
         }
         if record_h {
             tracing::debug!(
                 "Height violation: {:?} requested {}px, visible {}px",
-                entry.hwnd, entry.layout_h, visible_h,
+                entry.hwnd,
+                requested.height,
+                visible_h,
             );
             height_violations.push(HeightViolation {
                 window_id: entry.window_id,
                 min_height: visible_h,
+                position_matches: (visible_rect.y - requested.y).abs() <= EDGE_EPSILON_PX,
+                requested_top: requested.y,
             });
-            mismatched = true;
         } else if suspect_h {
             tracing::debug!(
                 "Deferring suspect height until next landing confirms: {:?} \
                  requested {}px, visible {}px",
-                entry.hwnd, entry.layout_h, visible_h,
+                entry.hwnd,
+                requested.height,
+                visible_h,
             );
         }
 
-        // On any mismatch, invalidate the cached border insets for this
-        // window. Stale insets are the most likely reason a prior frame
-        // sized the frame incorrectly, and the next SetWindowPos should
-        // re-query DWM for fresh values.
-        if mismatched {
-            if let Some(ref mut cache) = *cache {
-                cache.insets.remove(&entry.window_id);
-            }
-            if let Ok(mut global) = GLOBAL_INSET_CACHE.lock() {
-                if let Some(ref mut m) = *global {
-                    m.remove(&entry.window_id);
-                }
-            }
+        // A left/top displacement or an under-sized frame is not explained by
+        // a minimum-size constraint. Request one guarded corrective landing.
+        // Oversize-only mismatches use the existing constraint re-apply path.
+        if position_mismatch || undersized {
+            geometry_mismatches.push(entry.window_id);
         }
     }
-    (width_violations, height_violations)
+    (width_violations, height_violations, geometry_mismatches)
 }
 
 /// Cloak newly off-screen entries and prune cloaks for windows no longer in the layout.
@@ -1037,6 +1175,10 @@ type InsetMap = HashMap<WindowId, (i32, i32, i32, i32)>;
 /// Ensures windows returning from off-screen get correct insets even without
 /// a per-worker PlacementCache.
 static GLOBAL_INSET_CACHE: Mutex<Option<InsetMap>> = Mutex::new(None);
+/// Invalidates thread-local `PlacementCache` inset/position entries without a
+/// per-frame global lock. Incremented for display/theme changes and when a
+/// landing pass proves that one window's cached insets went stale.
+static INSET_CACHE_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 /// Clear the global inset cache. Must be called when system theme or DWM
 /// metrics change (e.g., high contrast toggle, display change) so that stale
@@ -1045,13 +1187,31 @@ pub fn clear_inset_cache() {
     if let Ok(mut global) = GLOBAL_INSET_CACHE.lock() {
         *global = None;
     }
+    INSET_CACHE_GENERATION.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Evict one proven-stale inset and invalidate the animation worker's local
+/// cache. The local cache cannot be addressed directly from the landing
+/// worker, so the generation performs the cross-thread handoff.
+fn invalidate_window_insets(window_id: WindowId, cache: &mut Option<&mut PlacementCache>) {
+    if let Some(ref mut cache) = *cache {
+        cache.insets.remove(&window_id);
+        cache.positions.remove(&window_id);
+    }
+    if let Ok(mut global) = GLOBAL_INSET_CACHE.lock() {
+        if let Some(ref mut map) = *global {
+            map.remove(&window_id);
+        }
+    }
+    INSET_CACHE_GENERATION.fetch_add(1, Ordering::AcqRel);
 }
 
 /// Look up border insets for a window, using a sticky cache to protect against
 /// stale DWM data for windows that were parked off-screen.
 ///
 /// Border insets are determined by window style and DPI, not position, so they
-/// should be stable for a window's lifetime. Once cached, we never re-query DWM.
+/// are cached until display/theme invalidation or landing verification proves
+/// that a window changed its frame metrics.
 fn cached_border_insets(
     hwnd: HWND,
     window_id: WindowId,
@@ -1081,7 +1241,9 @@ fn cached_border_insets(
             cache.insets.insert(window_id, fresh);
         }
         if let Ok(mut global) = GLOBAL_INSET_CACHE.lock() {
-            global.get_or_insert_with(HashMap::new).insert(window_id, fresh);
+            global
+                .get_or_insert_with(HashMap::new)
+                .insert(window_id, fresh);
         }
     }
     fresh
@@ -1093,7 +1255,9 @@ fn cached_border_insets(
 /// translate between chrome (`GetWindowRect`) coordinates and visible-
 /// content (layout) coordinates without reaching into placement internals.
 pub fn get_window_invisible_insets(window_id: WindowId) -> (i32, i32, i32, i32) {
-    let Ok(hwnd) = window_id_to_hwnd(window_id) else { return (0, 0, 0, 0) };
+    let Ok(hwnd) = window_id_to_hwnd(window_id) else {
+        return (0, 0, 0, 0);
+    };
     invisible_border_insets(hwnd)
 }
 
@@ -1142,7 +1306,10 @@ mod tests {
     fn test_classify_oversize() {
         // (over, looks_stale, was_suspected, absurd)
         // Not oversize -> never record, never suspect.
-        assert_eq!(classify_oversize(false, false, false, false), (false, false));
+        assert_eq!(
+            classify_oversize(false, false, false, false),
+            (false, false)
+        );
         // Oversize but within the stale ratio -> genuine, record immediately.
         assert_eq!(classify_oversize(true, false, false, false), (true, false));
         // Suspiciously large, first sighting -> defer (suspect), don't record.
@@ -1152,6 +1319,56 @@ mod tests {
         // Absurdly large -> never trusted, even reproduced (chronic stale read).
         assert_eq!(classify_oversize(true, true, true, true), (false, false));
         assert_eq!(classify_oversize(true, true, false, true), (false, false));
+    }
+
+    #[test]
+    fn test_geometry_mismatch_flags_cover_all_edges_with_tolerance() {
+        let requested = Rect::new(100, 200, 800, 600);
+        assert_eq!(
+            geometry_mismatch_flags(requested, requested),
+            (false, false, false)
+        );
+        assert_eq!(
+            geometry_mismatch_flags(Rect::new(102, 198, 800, 600), requested),
+            (false, false, false),
+            "two-pixel DWM rounding is tolerated on every edge"
+        );
+        assert_eq!(
+            geometry_mismatch_flags(Rect::new(97, 200, 800, 600), requested),
+            (true, true, false),
+            "left displacement is a positional edge mismatch"
+        );
+        assert_eq!(
+            geometry_mismatch_flags(Rect::new(100, 197, 800, 600), requested),
+            (true, true, false),
+            "top displacement is a positional edge mismatch"
+        );
+        assert_eq!(
+            geometry_mismatch_flags(Rect::new(100, 200, 790, 600), requested),
+            (false, true, true),
+            "right-edge undersize is retried without a min-width constraint"
+        );
+        assert_eq!(
+            geometry_mismatch_flags(Rect::new(100, 200, 800, 590), requested),
+            (false, true, true),
+            "bottom-edge undersize is retried without a min-height constraint"
+        );
+    }
+
+    #[test]
+    fn test_global_inset_generation_invalidates_local_positions_and_insets() {
+        let mut cache = PlacementCache::new();
+        let wid = 0x7FFF_FF02;
+        cache
+            .positions
+            .insert(wid, (Rect::new(1, 2, 300, 200), Visibility::Visible));
+        cache.insets.insert(wid, (8, 0, 8, 8));
+
+        clear_inset_cache();
+        cache.sync_inset_generation();
+
+        assert!(cache.positions.is_empty());
+        assert!(cache.insets.is_empty());
     }
 
     #[test]
@@ -1217,11 +1434,15 @@ mod tests {
         // Case 1: neither set → false.
         {
             let mut g = lock_cloaked();
-            if let Some(ref mut s) = *g { s.remove(&wid); }
+            if let Some(ref mut s) = *g {
+                s.remove(&wid);
+            }
         }
         {
             let mut g = lock_ghost_cloaked();
-            if let Some(ref mut s) = *g { s.remove(&wid); }
+            if let Some(ref mut s) = *g {
+                s.remove(&wid);
+            }
         }
         assert!(!is_placement_cloaked(wid), "neither set should give false");
 
@@ -1240,13 +1461,18 @@ mod tests {
         // Case 4: ghost only → true.
         {
             let mut g = lock_cloaked();
-            if let Some(ref mut s) = *g { s.remove(&wid); }
+            if let Some(ref mut s) = *g {
+                s.remove(&wid);
+            }
         }
         assert!(is_placement_cloaked(wid), "ghost only should give true");
 
         // Case 5: neither → false again.
         unmark_ghost_cloaked(wid);
-        assert!(!is_placement_cloaked(wid), "neither again should give false");
+        assert!(
+            !is_placement_cloaked(wid),
+            "neither again should give false"
+        );
 
         // Restore pre-existing state for whatever ran before this test.
         if had_global_before {

@@ -8,11 +8,7 @@ impl Workspace {
     }
 
     /// Compute the X position of a column, optionally skipping minimized columns.
-    fn column_x_with_minimized_handling(
-        &self,
-        column_index: usize,
-        skip_minimized: bool,
-    ) -> i32 {
+    fn column_x_with_minimized_handling(&self, column_index: usize, skip_minimized: bool) -> i32 {
         // Defensively clamp gaps to >= 0
         let gap = self.gap.max(0);
 
@@ -59,6 +55,48 @@ impl Workspace {
         }
     }
 
+    /// Valid scroll limits for the current focus. Normal scrolling stays in
+    /// `[0, max_scroll]`; `center_past_edges` extends only the edge containing
+    /// a column centered by the active mode or the explicit center command.
+    fn focused_scroll_bounds(&self, vis_w: i32) -> (f64, f64) {
+        let normal_max = (self.total_width() - vis_w).max(0) as f64;
+        if !self.center_past_edges {
+            return (0.0, normal_max);
+        }
+        let Some((col_x, col_width)) = self.focused_column_bounds() else {
+            return (0.0, normal_max);
+        };
+        let centered = col_x
+            .saturating_add(col_width / 2)
+            .saturating_sub(vis_w / 2) as f64;
+        // The explicit center command intentionally overrides JustInView. Once
+        // its animation lands, preserve that exact edge target; a structural
+        // change alters `centered`, so a stale old target stops qualifying.
+        let explicitly_centered = (self.scroll_offset - centered).abs() < 0.5;
+        if !self.should_center(col_width, vis_w) && !explicitly_centered {
+            return (0.0, normal_max);
+        }
+        let first_active = self
+            .columns
+            .iter()
+            .position(|column| self.is_column_active(column));
+        let last_active = self
+            .columns
+            .iter()
+            .rposition(|column| self.is_column_active(column));
+        let min_scroll = if first_active == Some(self.focused_column) {
+            centered.min(0.0)
+        } else {
+            0.0
+        };
+        let max_scroll = if last_active == Some(self.focused_column) {
+            centered.max(normal_max)
+        } else {
+            normal_max
+        };
+        (min_scroll, max_scroll)
+    }
+
     /// Ensure the focused column is visible in the viewport.
     /// Adjusts scroll_offset according to the centering mode.
     ///
@@ -90,11 +128,33 @@ impl Workspace {
             }
         }
 
-        let max_scroll = (self.total_width() - vis_w).max(0);
-        if self.center_past_edges {
-            self.scroll_offset = self.scroll_offset.min(max_scroll as f64);
-        } else {
-            self.scroll_offset = self.scroll_offset.clamp(0.0, max_scroll as f64);
+        let (min_scroll, max_scroll) = self.focused_scroll_bounds(vis_w);
+        self.scroll_offset = self.scroll_offset.clamp(min_scroll, max_scroll);
+    }
+
+    /// Enforce the scroll bounds for the current content and focus.
+    ///
+    /// A structural change that shrinks the strip (closing a window, moving a
+    /// column to another workspace, unfloating, etc.) reduces `total_width`
+    /// without necessarily re-running `ensure_focused_visible`. That can leave
+    /// `scroll_offset` past the content, which renders as the strip pushed too
+    /// far left: the leftmost content is clipped off-screen and blank desktop
+    /// shows at the right edge. This is a render-time safety net that only
+    /// corrects an out-of-range offset; a valid offset is left untouched.
+    ///
+    /// No-op while an animation owns the offset. `center_past_edges` extends
+    /// the appropriate bound only when the focused first/last active column is
+    /// intentionally centered; it does not legalize arbitrary stale blank
+    /// space after a shrink.
+    pub fn clamp_scroll_to_bounds(&mut self, viewport_width: i32) {
+        if self.active_animation.is_some() {
+            return;
+        }
+        let vis_w = self.visible_width(viewport_width);
+        let (min_scroll, max_scroll) = self.focused_scroll_bounds(vis_w);
+        let clamped = self.scroll_offset.clamp(min_scroll, max_scroll);
+        if clamped != self.scroll_offset {
+            self.scroll_offset = clamped;
         }
     }
 
@@ -175,12 +235,27 @@ impl Workspace {
         if index >= self.columns.len() {
             return None;
         }
+        // The animation target was computed from the old strip geometry and
+        // can restore an invalid offset after this column disappears.
+        self.cancel_animation();
         let col = self.columns.remove(index);
         for wid in col.windows() {
+            // Mirror remove_window's per-window cleanup. Cross-monitor column
+            // moves must not leave stale constraints or a maximize sentinel
+            // behind in the source workspace.
             self.minimized_windows.remove(wid);
-            // Clear fullscreen if the removed column contained the fullscreen window
+            self.window_min_widths.remove(wid);
+            self.window_min_heights.remove(wid);
+            self.pending_min_size_clears.remove(wid);
             if self.fullscreen_window == Some(*wid) {
                 self.fullscreen_window = None;
+            }
+            if self
+                .maximized_column
+                .as_ref()
+                .is_some_and(|m| m.sentinel_window == *wid)
+            {
+                self.maximized_column = None;
             }
         }
         if self.columns.is_empty() {
@@ -207,7 +282,11 @@ impl Workspace {
             return;
         }
         // Reject if any window already exists in this workspace
-        if column.windows().iter().any(|wid| self.contains_window(*wid)) {
+        if column
+            .windows()
+            .iter()
+            .any(|wid| self.contains_window(*wid))
+        {
             return;
         }
         let clamped = index.min(self.columns.len());
@@ -233,8 +312,8 @@ impl Workspace {
             self.expel_to_left();
             return;
         }
-        let Some(wid) = self.columns[self.focused_column]
-            .remove_at_index(self.focused_window_in_column)
+        let Some(wid) =
+            self.columns[self.focused_column].remove_at_index(self.focused_window_in_column)
         else {
             return;
         };
@@ -260,8 +339,8 @@ impl Workspace {
             self.expel_to_right();
             return;
         }
-        let Some(wid) = self.columns[self.focused_column]
-            .remove_at_index(self.focused_window_in_column)
+        let Some(wid) =
+            self.columns[self.focused_column].remove_at_index(self.focused_window_in_column)
         else {
             return;
         };
@@ -286,8 +365,8 @@ impl Workspace {
         if self.columns.is_empty() || self.columns[self.focused_column].len() <= 1 {
             return;
         }
-        let Some(wid) = self.columns[self.focused_column]
-            .remove_at_index(self.focused_window_in_column)
+        let Some(wid) =
+            self.columns[self.focused_column].remove_at_index(self.focused_window_in_column)
         else {
             return;
         };
@@ -311,8 +390,8 @@ impl Workspace {
         if self.columns.is_empty() || self.columns[self.focused_column].len() <= 1 {
             return;
         }
-        let Some(wid) = self.columns[self.focused_column]
-            .remove_at_index(self.focused_window_in_column)
+        let Some(wid) =
+            self.columns[self.focused_column].remove_at_index(self.focused_window_in_column)
         else {
             return;
         };
@@ -380,8 +459,10 @@ impl Workspace {
         if self.focused_window_in_column == 0 {
             return;
         }
-        self.columns[self.focused_column]
-            .swap_windows(self.focused_window_in_column, self.focused_window_in_column - 1);
+        self.columns[self.focused_column].swap_windows(
+            self.focused_window_in_column,
+            self.focused_window_in_column - 1,
+        );
         self.focused_window_in_column -= 1;
         self.sync_active_tab_to_focus();
     }
@@ -391,8 +472,10 @@ impl Workspace {
         if self.focused_window_in_column + 1 >= self.columns[self.focused_column].len() {
             return;
         }
-        self.columns[self.focused_column]
-            .swap_windows(self.focused_window_in_column, self.focused_window_in_column + 1);
+        self.columns[self.focused_column].swap_windows(
+            self.focused_window_in_column,
+            self.focused_window_in_column + 1,
+        );
         self.focused_window_in_column += 1;
         self.sync_active_tab_to_focus();
     }

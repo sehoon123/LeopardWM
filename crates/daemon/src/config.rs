@@ -130,6 +130,30 @@ pub struct LayoutConfig {
     #[serde(default = "default_outer_gap")]
     pub outer_gap_bottom: i32,
 
+    /// Default width for manually floated windows, in logical pixels.
+    #[serde(default = "default_floating_width")]
+    pub default_floating_width: i32,
+
+    /// Default height for manually floated windows, in logical pixels.
+    #[serde(default = "default_floating_height")]
+    pub default_floating_height: i32,
+
+    /// Default width for scratchpad windows, in logical pixels.
+    #[serde(default = "default_scratchpad_width")]
+    pub default_scratchpad_width: i32,
+
+    /// Default height for scratchpad windows, in logical pixels.
+    #[serde(default = "default_scratchpad_height")]
+    pub default_scratchpad_height: i32,
+
+    /// Remember each ordinary floating window's logical size for this session.
+    #[serde(default = "default_true")]
+    pub remember_floating_sizes: bool,
+
+    /// Remember the scratchpad's logical size for this session.
+    #[serde(default = "default_true")]
+    pub remember_scratchpad_size: bool,
+
     /// Centering mode for focus navigation.
     #[serde(default)]
     pub centering_mode: CenteringModeConfig,
@@ -181,6 +205,22 @@ fn default_height_presets() -> Vec<f64> {
     vec![0.333, 0.5, 0.667]
 }
 
+fn default_floating_width() -> i32 {
+    800
+}
+
+fn default_floating_height() -> i32 {
+    600
+}
+
+fn default_scratchpad_width() -> i32 {
+    900
+}
+
+fn default_scratchpad_height() -> i32 {
+    600
+}
+
 impl Default for LayoutConfig {
     fn default() -> Self {
         Self {
@@ -189,6 +229,12 @@ impl Default for LayoutConfig {
             outer_gap_right: default_outer_gap(),
             outer_gap_top: default_outer_gap(),
             outer_gap_bottom: default_outer_gap(),
+            default_floating_width: default_floating_width(),
+            default_floating_height: default_floating_height(),
+            default_scratchpad_width: default_scratchpad_width(),
+            default_scratchpad_height: default_scratchpad_height(),
+            remember_floating_sizes: true,
+            remember_scratchpad_size: true,
             centering_mode: CenteringModeConfig::default(),
             center_past_edges: false,
             width_presets: default_width_presets(),
@@ -398,6 +444,12 @@ pub struct BehaviorConfig {
     #[serde(default = "default_true")]
     pub disable_snap_layouts: bool,
 
+    /// Allow title-bar drags to transfer managed windows/columns to the monitor
+    /// under the cursor. Plain drag moves one window; Shift-at-start moves its
+    /// entire column. When false, drops stay on the source monitor.
+    #[serde(default = "default_true")]
+    pub cross_monitor_drag: bool,
+
     /// Whether to check GitHub Releases once a day for a newer version.
     /// Single anonymous HTTPS GET to api.github.com; no other telemetry.
     #[serde(default = "default_true")]
@@ -469,6 +521,7 @@ impl Default for BehaviorConfig {
             focus_follows_mouse: false,
             focus_follows_mouse_delay_ms: default_focus_delay(),
             disable_snap_layouts: true,
+            cross_monitor_drag: true,
             check_for_updates: true,
             tab_close_action: TabCloseAction::default(),
             swap_chain_ghost_animation: true,
@@ -1105,6 +1158,42 @@ impl Config {
             }
         }
 
+        // Floating and scratchpad dimensions are logical pixels and must be
+        // positive before they are DPI-scaled for a monitor.
+        for (field, value, default) in [
+            (
+                "layout.default_floating_width",
+                &mut self.layout.default_floating_width,
+                default_floating_width(),
+            ),
+            (
+                "layout.default_floating_height",
+                &mut self.layout.default_floating_height,
+                default_floating_height(),
+            ),
+            (
+                "layout.default_scratchpad_width",
+                &mut self.layout.default_scratchpad_width,
+                default_scratchpad_width(),
+            ),
+            (
+                "layout.default_scratchpad_height",
+                &mut self.layout.default_scratchpad_height,
+                default_scratchpad_height(),
+            ),
+        ] {
+            if *value < 1 {
+                warnings.push(ConfigWarning {
+                    field: field.to_string(),
+                    message: format!(
+                        "{} ({}) must be positive, reset to {}",
+                        field, *value, default
+                    ),
+                });
+                *value = default;
+            }
+        }
+
         // width_presets must not be empty
         if self.layout.width_presets.is_empty() {
             warnings.push(ConfigWarning {
@@ -1510,9 +1599,35 @@ mod tests {
         assert_eq!(config.layout.outer_gap_right, 10);
         assert_eq!(config.layout.outer_gap_top, 10);
         assert_eq!(config.layout.outer_gap_bottom, 10);
+        assert_eq!(config.layout.default_floating_width, 800);
+        assert_eq!(config.layout.default_floating_height, 600);
+        assert_eq!(config.layout.default_scratchpad_width, 900);
+        assert_eq!(config.layout.default_scratchpad_height, 600);
+        assert!(config.layout.remember_floating_sizes);
+        assert!(config.layout.remember_scratchpad_size);
         assert_eq!(config.layout.width_presets, vec![0.333, 0.5, 0.667]);
         assert_eq!(config.layout.centering_mode, CenteringModeConfig::Center);
         assert!(config.behavior.focus_new_windows);
+        assert!(config.behavior.cross_monitor_drag);
+    }
+
+    #[test]
+    fn test_new_session_and_drag_features_can_be_disabled() {
+        let config: Config = toml::from_str(
+            r#"
+            [layout]
+            remember_floating_sizes = false
+            remember_scratchpad_size = false
+
+            [behavior]
+            cross_monitor_drag = false
+            "#,
+        )
+        .unwrap();
+
+        assert!(!config.layout.remember_floating_sizes);
+        assert!(!config.layout.remember_scratchpad_size);
+        assert!(!config.behavior.cross_monitor_drag);
     }
 
     #[test]
@@ -1534,6 +1649,11 @@ mod tests {
         let config: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(config.layout.gap, 20);
         assert_eq!(config.layout.outer_gap_left, 10); // default
+        assert_eq!(config.layout.default_floating_width, 800); // default
+        assert_eq!(config.layout.default_scratchpad_width, 900); // default
+        assert!(config.layout.remember_floating_sizes); // default
+        assert!(config.layout.remember_scratchpad_size); // default
+        assert!(config.behavior.cross_monitor_drag); // default
         assert_eq!(config.layout.width_presets, vec![0.333, 0.5, 0.667]); // default
     }
 
@@ -2320,6 +2440,28 @@ mod tests {
         assert_eq!(config.layout.outer_gap_left, 0);
         assert_eq!(config.layout.outer_gap_top, 0);
         assert!(warnings.iter().any(|w| w.field == "layout.outer_gap_left"));
+    }
+
+    #[test]
+    fn test_validate_nonpositive_floating_sizes_reset_to_defaults() {
+        let mut config = Config::default();
+        config.layout.default_floating_width = 0;
+        config.layout.default_floating_height = -1;
+        config.layout.default_scratchpad_width = 0;
+        config.layout.default_scratchpad_height = -1;
+
+        let warnings = config.validate();
+
+        assert_eq!(config.layout.default_floating_width, 800);
+        assert_eq!(config.layout.default_floating_height, 600);
+        assert_eq!(config.layout.default_scratchpad_width, 900);
+        assert_eq!(config.layout.default_scratchpad_height, 600);
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.field == "layout.default_floating_width"));
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.field == "layout.default_scratchpad_height"));
     }
 
     #[test]

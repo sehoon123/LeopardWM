@@ -289,9 +289,7 @@ fn install_console_control_signal_handlers(
             apply_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             uncloak_all_visible_windows();
             if source == "ctrl_c" {
-                info!(
-                    "Ctrl+C received; restored off-screen windows, initiating shutdown..."
-                );
+                info!("Ctrl+C received; restored off-screen windows, initiating shutdown...");
             } else {
                 info!(
                     "Console control signal ({}) received; restored off-screen windows, initiating shutdown...",
@@ -2262,13 +2260,11 @@ async fn handle_tab_strip_icon_poll(state: &Arc<Mutex<AppState>>) {
     // a Tabbed column exists, not paused) can't shift between
     // the check and the refresh call.
     let mut s = state.lock().await;
-    let needs_refresh = !s.tab_strip_overlays.is_empty()
-        && !s.paused
-        && s.focused_workspace().is_some_and(|ws| {
-            !ws.is_fullscreen()
-                && (0..ws.column_count()).any(|i| ws.column(i).is_some_and(|c| c.is_tabbed()))
-        });
+    let needs_refresh = !s.tab_strip_overlays.is_empty() && !s.paused;
     if needs_refresh {
+        // Re-probe icons only on this low-frequency tick, not on each
+        // animation-frame geometry refresh.
+        s.tab_strip_icon_cache.clear();
         s.update_tab_strip();
     }
 }
@@ -2714,17 +2710,29 @@ async fn handle_animation_frame_applied(
         // allocate correct column widths on subsequent frames.
         if !frame_result.width_violations.is_empty() {
             for violation in &frame_result.width_violations {
-                // Skip violations where min_width >= viewport width —
-                // the window is temporarily fullscreen/maximized by
-                // the app, not enforcing a genuine minimum.
-                let vw = state
+                // Reject impossible widths and ambiguous exact-viewport
+                // surfaces whose requested origin cannot distinguish fullscreen.
+                let (vw, work_left) = state
                     .find_window_workspace(violation.window_id)
-                    .map(|(mid, _)| state.viewport_width_for(mid))
-                    .unwrap_or(i32::MAX);
-                if violation.min_width >= vw {
+                    .map(|(mid, _)| {
+                        let work_area = state.layout_viewport(mid);
+                        (work_area.width, work_area.x)
+                    })
+                    .unwrap_or((i32::MAX, 0));
+                let equality_is_proven = crate::layout_apply::viewport_equality_is_proven(
+                    violation.position_matches,
+                    violation.requested_left,
+                    work_left,
+                );
+                if violation.min_width > vw || (violation.min_width == vw && !equality_is_proven) {
                     debug!(
-                        "Ignoring viewport-sized width violation for window {} ({}px >= {}px viewport)",
-                        violation.window_id, violation.min_width, vw
+                        "Ignoring impossible/fullscreen-like width violation for window {} ({}px vs {}px viewport, position_matches={}, requested_left={}, work_left={})",
+                        violation.window_id,
+                        violation.min_width,
+                        vw,
+                        violation.position_matches,
+                        violation.requested_left,
+                        work_left
                     );
                     continue;
                 }
@@ -2774,18 +2782,30 @@ async fn handle_animation_frame_applied(
         // frames.
         if !frame_result.height_violations.is_empty() {
             for violation in &frame_result.height_violations {
-                // Skip violations where min_height >= viewport
-                // height — the window is temporarily fullscreen
-                // /maximized by the app, not enforcing a genuine
-                // minimum that large.
-                let vh = state
+                // Reject impossible heights and ambiguous exact-viewport
+                // surfaces whose requested origin cannot distinguish fullscreen.
+                let (vh, work_top) = state
                     .find_window_workspace(violation.window_id)
-                    .and_then(|(mid, _)| state.monitors.get(&mid).map(|m| m.work_area.height))
-                    .unwrap_or(i32::MAX);
-                if violation.min_height >= vh {
+                    .map(|(mid, _)| {
+                        let work_area = state.layout_viewport(mid);
+                        (work_area.height, work_area.y)
+                    })
+                    .unwrap_or((i32::MAX, 0));
+                let equality_is_proven = crate::layout_apply::viewport_equality_is_proven(
+                    violation.position_matches,
+                    violation.requested_top,
+                    work_top,
+                );
+                if violation.min_height > vh || (violation.min_height == vh && !equality_is_proven)
+                {
                     debug!(
-                        "Ignoring viewport-sized height violation for window {} ({}px >= {}px viewport)",
-                        violation.window_id, violation.min_height, vh
+                        "Ignoring impossible/fullscreen-like height violation for window {} ({}px vs {}px viewport, position_matches={}, requested_top={}, work_top={})",
+                        violation.window_id,
+                        violation.min_height,
+                        vh,
+                        violation.position_matches,
+                        violation.requested_top,
+                        work_top
                     );
                     continue;
                 }
@@ -2812,26 +2832,22 @@ async fn handle_animation_frame_applied(
     let still_animating = {
         let mut state = ctx.state.lock().await;
         let running = state.tick_animations(delta_ms);
-        // Reposition the border AFTER the tick so it reflects the
-        // SAME interpolated state the next animation frame will
-        // position windows at. The border SetWindowPos and the
-        // worker's window SetWindowPos calls below both commit
-        // before the next DwmFlush vsync, so the border arrives
-        // on screen in the same frame as the windows. Doing
-        // show_border BEFORE tick (the previous order) lagged the
-        // border by one vsync — windows updated at vsync N,
-        // border at vsync N+1 — which is what the user noticed
-        // as "border scrolling at a different framerate".
-        if let Some(hwnd) = state.previous_focused_hwnd {
-            if state.config.appearance.active_border {
-                state.show_border(hwnd);
-            }
-        }
-        if running || state.is_animating() {
+        let frame_sent = if running || state.is_animating() {
             matches!(state.send_animation_frame(ctx.animation_worker), Ok(true))
         } else {
             false
+        };
+        // send_animation_frame positions the border for a dispatched frame.
+        // Only do it here when no frame was sent; the previous unconditional
+        // call rendered the same interpolated border twice per frame.
+        if !frame_sent {
+            if let Some(hwnd) = state.previous_focused_hwnd {
+                if state.config.appearance.active_border {
+                    state.show_border(hwnd);
+                }
+            }
         }
+        frame_sent
     };
     if !still_animating {
         *ctx.animation_active = false;

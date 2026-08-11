@@ -26,6 +26,11 @@ pub enum BorderPosition {
 /// radius. Matches Windows 11's `DWMWCP_ROUND` default.
 pub const DEFAULT_CORNER_RADIUS: f32 = 8.0;
 
+/// Private message used to stop the border UI thread. `WM_QUIT` must not be
+/// sent with `PostMessageW`; the message loop exits explicitly when this is
+/// received, matching the other overlay threads in this crate.
+const WM_QUIT_BORDER_THREAD: u32 = WM_USER + 7;
+
 /// Signed distance field for a rounded rectangle.
 ///
 /// Returns negative values inside, positive outside, zero on the boundary.
@@ -82,6 +87,7 @@ static BORDER_STATE: Mutex<BorderState> = Mutex::new(BorderState {
 /// around the focused window with anti-aliased rounded corners.
 pub struct BorderFrame {
     hwnd: HWND,
+    thread_id: u32,
     _thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -91,11 +97,12 @@ impl BorderFrame {
         #[cfg(test)]
         panic!("BorderFrame::new spawns a layered DWM window; gate the call behind cfg(test)");
         #[allow(unreachable_code)]
-        let (tx, rx) = mpsc::channel::<Result<isize, Win32Error>>();
+        let (tx, rx) = mpsc::channel::<Result<(isize, u32), Win32Error>>();
 
         let thread = std::thread::Builder::new()
             .name("border-frame".into())
             .spawn(move || unsafe {
+                let thread_id = windows::Win32::System::Threading::GetCurrentThreadId();
                 let class_name: Vec<u16> = "LeopardWMBorderFrame\0".encode_utf16().collect();
                 let wc = WNDCLASSW {
                     lpfnWndProc: Some(border_frame_proc),
@@ -124,9 +131,12 @@ impl BorderFrame {
                     None,
                 ) {
                     Ok(h) => {
-                        let _ = tx.send(Ok(h.0 as isize));
+                        let _ = tx.send(Ok((h.0 as isize, thread_id)));
                         let mut msg = MSG::default();
                         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                            if msg.message == WM_QUIT_BORDER_THREAD {
+                                break;
+                            }
                             let _ = DispatchMessageW(&msg);
                         }
                         let _ = DestroyWindow(h);
@@ -145,8 +155,8 @@ impl BorderFrame {
             })
             .map_err(|e| Win32Error::HookInstallFailed(format!("BorderFrame thread: {}", e)))?;
 
-        let hwnd_raw = match rx.recv() {
-            Ok(Ok(raw)) => raw,
+        let (hwnd_raw, thread_id) = match rx.recv() {
+            Ok(Ok(handles)) => handles,
             Ok(Err(e)) => return Err(e),
             Err(_) => {
                 return Err(Win32Error::HookInstallFailed(
@@ -157,6 +167,7 @@ impl BorderFrame {
 
         Ok(Self {
             hwnd: HWND(hwnd_raw as *mut c_void),
+            thread_id,
             _thread: Some(thread),
         })
     }
@@ -313,6 +324,7 @@ impl BorderFrame {
                     || width != state.cached_width
                     || position != state.cached_position
                     || state.color_bgr != state.cached_color
+                    || (state.corner_radius - state.cached_corner_radius).abs() > f32::EPSILON
             };
 
             if needs_render {
@@ -519,8 +531,13 @@ impl BorderFrame {
 
 impl Drop for BorderFrame {
     fn drop(&mut self) {
-        unsafe {
-            let _ = PostMessageW(Some(self.hwnd), WM_QUIT, WPARAM(0), LPARAM(0));
+        let posted_via_window = unsafe {
+            PostMessageW(Some(self.hwnd), WM_QUIT_BORDER_THREAD, WPARAM(0), LPARAM(0)).is_ok()
+        };
+        if !posted_via_window {
+            let _ = unsafe {
+                PostThreadMessageW(self.thread_id, WM_QUIT_BORDER_THREAD, WPARAM(0), LPARAM(0))
+            };
         }
         if let Some(thread) = self._thread.take() {
             let _ = thread.join();

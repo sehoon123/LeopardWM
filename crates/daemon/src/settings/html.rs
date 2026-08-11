@@ -970,6 +970,30 @@ input[type="range"]::-webkit-slider-thumb {
             <div class="field-info"><div class="field-label">Center past edges</div><div class="field-desc">Allow centering to scroll past content boundaries</div></div>
             <label class="toggle"><input type="checkbox" id="layout-center_past_edges"><span class="track"></span><span class="thumb"></span></label>
           </div>
+          <div class="field">
+            <div class="field-info"><div class="field-label">Default floating width</div><div class="field-desc">Initial manual floating-window width (logical px)</div></div>
+            <input type="number" id="layout-default_floating_width" min="1">
+          </div>
+          <div class="field">
+            <div class="field-info"><div class="field-label">Default floating height</div><div class="field-desc">Initial manual floating-window height (logical px)</div></div>
+            <input type="number" id="layout-default_floating_height" min="1">
+          </div>
+          <div class="field">
+            <div class="field-info"><div class="field-label">Default scratchpad width</div><div class="field-desc">Initial scratchpad width (logical px)</div></div>
+            <input type="number" id="layout-default_scratchpad_width" min="1">
+          </div>
+          <div class="field">
+            <div class="field-info"><div class="field-label">Default scratchpad height</div><div class="field-desc">Initial scratchpad height (logical px)</div></div>
+            <input type="number" id="layout-default_scratchpad_height" min="1">
+          </div>
+          <div class="field">
+            <div class="field-info"><div class="field-label">Remember floating window sizes</div><div class="field-desc">Restore each floating window's last logical size during this daemon session</div></div>
+            <label class="toggle"><input type="checkbox" id="layout-remember_floating_sizes"><span class="track"></span><span class="thumb"></span></label>
+          </div>
+          <div class="field">
+            <div class="field-info"><div class="field-label">Remember scratchpad size</div><div class="field-desc">Restore the scratchpad's last logical size during this daemon session</div></div>
+            <label class="toggle"><input type="checkbox" id="layout-remember_scratchpad_size"><span class="track"></span><span class="thumb"></span></label>
+          </div>
         </div>
         <h3 class="section-subtitle">Width presets</h3>
         <p class="section-desc">Column width presets as viewport fractions, used for width cycling.</p>
@@ -1101,6 +1125,10 @@ input[type="range"]::-webkit-slider-thumb {
           <div class="field">
             <div class="field-info"><div class="field-label">Disable snap layouts</div><div class="field-desc">Prevent Windows 11 edge-drag snapping for tiled windows</div></div>
             <label class="toggle"><input type="checkbox" id="behavior-disable_snap_layouts"><span class="track"></span><span class="thumb"></span></label>
+          </div>
+          <div class="field">
+            <div class="field-info"><div class="field-label">Cross-monitor window drag</div><div class="field-desc">Drop on the monitor under the cursor; plain drag moves one window and Shift held at drag start moves its whole column</div></div>
+            <label class="toggle"><input type="checkbox" id="behavior-cross_monitor_drag"><span class="track"></span><span class="thumb"></span></label>
           </div>
           <div class="field">
             <div class="field-info"><div class="field-label">Smooth app animations (experimental)</div><div class="field-desc">Use DWM thumbnails to animate Chromium / Electron / Firefox / Terminal / .NET windows during column scrolls. Eliminates the 1px wobble and repaint stutter on Chrome, Slack, Discord, WinForms/WPF apps, etc.</div></div>
@@ -1513,11 +1541,18 @@ function inputToHex(v) { return v.replace('#', '').toUpperCase(); }
 
 /* ── Init ────────────────────────────────────────────────────────────── */
 function init(cfg) {
+  window._initConfig = cfg;
   setVal('layout-gap', cfg.layout.gap);
   setVal('layout-outer_gap_left', cfg.layout.outer_gap_left);
   setVal('layout-outer_gap_right', cfg.layout.outer_gap_right);
   setVal('layout-outer_gap_top', cfg.layout.outer_gap_top);
   setVal('layout-outer_gap_bottom', cfg.layout.outer_gap_bottom);
+  setVal('layout-default_floating_width', cfg.layout.default_floating_width || 800);
+  setVal('layout-default_floating_height', cfg.layout.default_floating_height || 600);
+  setVal('layout-default_scratchpad_width', cfg.layout.default_scratchpad_width || 900);
+  setVal('layout-default_scratchpad_height', cfg.layout.default_scratchpad_height || 600);
+  setChecked('layout-remember_floating_sizes', cfg.layout.remember_floating_sizes !== false);
+  setChecked('layout-remember_scratchpad_size', cfg.layout.remember_scratchpad_size !== false);
   document.getElementById('width-presets-body').innerHTML = '';
   (cfg.layout.width_presets || [0.333,0.5,0.667]).forEach(function(v) { addPresetRow('width', v); });
   refreshDefaultWidthPresetOptions(cfg.layout.default_width_preset || 1);
@@ -1551,6 +1586,7 @@ function init(cfg) {
   setChecked('behavior-workspace_edge_wrap', cfg.behavior.workspace_edge_wrap === true);
   setChecked('behavior-fullscreen_follows_focus', cfg.behavior.fullscreen_follows_focus !== false);
   setChecked('behavior-disable_snap_layouts', cfg.behavior.disable_snap_layouts !== false);
+  setChecked('behavior-cross_monitor_drag', cfg.behavior.cross_monitor_drag !== false);
   setChecked('behavior-swap_chain_ghost_animation', cfg.behavior.swap_chain_ghost_animation === true);
   setChecked('behavior-hide_offscreen_taskbar_buttons', cfg.behavior.hide_offscreen_taskbar_buttons !== false);
   setCb('cb-behavior-log_level', cfg.behavior.log_level);
@@ -2122,6 +2158,12 @@ function readConfig() {
       outer_gap_right: num('layout-outer_gap_right'),
       outer_gap_top: num('layout-outer_gap_top'),
       outer_gap_bottom: num('layout-outer_gap_bottom'),
+      default_floating_width: num('layout-default_floating_width'),
+      default_floating_height: num('layout-default_floating_height'),
+      default_scratchpad_width: num('layout-default_scratchpad_width'),
+      default_scratchpad_height: num('layout-default_scratchpad_height'),
+      remember_floating_sizes: checked('layout-remember_floating_sizes'),
+      remember_scratchpad_size: checked('layout-remember_scratchpad_size'),
       width_presets: widthPresets,
       height_presets: readPresets('height'),
       default_width_preset: defaultWidthPreset,
@@ -2149,8 +2191,10 @@ function readConfig() {
       workspace_edge_wrap: checked('behavior-workspace_edge_wrap'),
       fullscreen_follows_focus: checked('behavior-fullscreen_follows_focus'),
       disable_snap_layouts: checked('behavior-disable_snap_layouts'),
+      cross_monitor_drag: checked('behavior-cross_monitor_drag'),
       swap_chain_ghost_animation: checked('behavior-swap_chain_ghost_animation'),
       hide_offscreen_taskbar_buttons: checked('behavior-hide_offscreen_taskbar_buttons'),
+      check_for_updates: window._initConfig.behavior.check_for_updates,
       log_level: cbVal('cb-behavior-log_level'),
       tab_close_action: cbVal('cb-behavior-tab_close_action'),
       new_window_placement: cbVal('cb-behavior-new_window_placement')
@@ -2321,6 +2365,58 @@ mod tests {
         ));
         assert!(SETTINGS_HTML
             .contains("reduce_motion_on_battery: checked('animation-reduce_motion_on_battery')"));
+    }
+
+    #[test]
+    fn floating_and_scratchpad_sizes_are_wired_into_settings_config() {
+        for (field, default) in [
+            ("floating_width", 800),
+            ("floating_height", 600),
+            ("scratchpad_width", 900),
+            ("scratchpad_height", 600),
+        ] {
+            let id = format!("layout-default_{field}");
+            assert!(
+                SETTINGS_HTML.contains(&format!("<input type=\"number\" id=\"{id}\" min=\"1\">")),
+                "missing settings input {id}"
+            );
+            assert!(
+                SETTINGS_HTML.contains(&format!(
+                    "setVal('{id}', cfg.layout.default_{field} || {default});"
+                )),
+                "missing settings initialization for {field}"
+            );
+            assert!(
+                SETTINGS_HTML.contains(&format!("default_{field}: num('{id}')")),
+                "missing settings serialization for {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn session_size_memory_and_cross_monitor_drag_are_wired() {
+        for field in ["remember_floating_sizes", "remember_scratchpad_size"] {
+            let id = format!("layout-{field}");
+            assert!(SETTINGS_HTML.contains(&format!("id=\"{id}\"")));
+            assert!(SETTINGS_HTML.contains(&format!(
+                "setChecked('{id}', cfg.layout.{field} !== false);"
+            )));
+            assert!(SETTINGS_HTML.contains(&format!("{field}: checked('{id}')")));
+        }
+        assert!(SETTINGS_HTML.contains("id=\"behavior-cross_monitor_drag\""));
+        assert!(SETTINGS_HTML.contains(
+            "setChecked('behavior-cross_monitor_drag', cfg.behavior.cross_monitor_drag !== false);"
+        ));
+        assert!(
+            SETTINGS_HTML.contains("cross_monitor_drag: checked('behavior-cross_monitor_drag')")
+        );
+    }
+
+    #[test]
+    fn settings_save_preserves_hidden_update_check_preference() {
+        assert!(SETTINGS_HTML.contains("window._initConfig = cfg;"));
+        assert!(SETTINGS_HTML
+            .contains("check_for_updates: window._initConfig.behavior.check_for_updates"));
     }
 
     #[test]

@@ -36,7 +36,12 @@ impl Workspace {
         viewport: Rect,
         viewport_left: i32,
     ) -> Vec<WindowPlacement> {
-        let mut placements = Vec::new();
+        let mut placements = Vec::with_capacity(self.window_count() + self.floating_windows.len());
+        // Reuse per-column scratch buffers instead of allocating three Vecs
+        // for every column on every animation frame.
+        let mut visible_windows: Vec<(usize, WindowId)> = Vec::new();
+        let mut visible_weights: Vec<f64> = Vec::new();
+        let mut min_heights: Vec<i32> = Vec::new();
 
         // Defensively clamp gaps to >= 0 in case fields were set directly
         let gap = self.gap.max(0);
@@ -76,7 +81,10 @@ impl Workspace {
                         }
                         let share = ((column.width as f64 / flexible_total as f64) * excess as f64)
                             .round() as i32;
-                        let shrink = share.min(remaining).min(column.width - MIN_COLUMN_WIDTH).max(0);
+                        let shrink = share
+                            .min(remaining)
+                            .min(column.width - MIN_COLUMN_WIDTH)
+                            .max(0);
                         widths[col_idx] -= shrink;
                         remaining -= shrink;
                     }
@@ -89,6 +97,15 @@ impl Workspace {
         let mut current_x: i32 = 0;
 
         for (col_idx, column) in self.columns.iter().enumerate() {
+            // Fully minimized columns consume no strip geometry. Bail out
+            // before building any per-column scratch data.
+            if !self.is_column_active(column) {
+                continue;
+            }
+            visible_windows.clear();
+            visible_weights.clear();
+            min_heights.clear();
+
             let eff_width = effective_widths[col_idx];
 
             // Calculate column position in strip coordinates
@@ -127,41 +144,54 @@ impl Workspace {
             // the user. Animation frames continue to use this placement
             // logic so the position transitions atomically with the
             // visibility flip.
-            let col_screen_x = match visibility {
-                Visibility::OffScreenRight => natural_screen_x
-                    .max(viewport.x.saturating_add(viewport.width)),
-                Visibility::OffScreenLeft => natural_screen_x
-                    .min(viewport.x.saturating_sub(eff_width)),
+            let mut col_screen_x = match visibility {
+                Visibility::OffScreenRight => {
+                    natural_screen_x.max(viewport.x.saturating_add(viewport.width))
+                }
+                Visibility::OffScreenLeft => {
+                    natural_screen_x.min(viewport.x.saturating_sub(eff_width))
+                }
                 Visibility::Visible => natural_screen_x,
             };
+            // A focused column whose enforceable minimum consumes outer-gap
+            // space can still fit in the full work area. Sacrifice only the
+            // necessary horizontal padding rather than clipping either edge.
+            if visibility == Visibility::Visible
+                && col_idx == self.focused_column
+                && eff_width > vis_w
+                && eff_width <= viewport.width
+            {
+                let max_x = viewport
+                    .x
+                    .saturating_add(viewport.width)
+                    .saturating_sub(eff_width);
+                col_screen_x = col_screen_x.clamp(viewport.x, max_x);
+            }
 
             // Build the set of windows that occupy column geometry on this pass.
             // Vertical: all non-minimized windows split by height_weights.
             // Tabbed: only the active tab takes the full column rect; if it's
             // minimized, fall back to the first visible tab so the column
             // doesn't render empty.
-            let visible_windows: Vec<(usize, WindowId)> = match column.mode() {
-                crate::ColumnMode::Vertical => column
-                    .windows()
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, w)| !self.minimized_windows.contains(w))
-                    .map(|(i, &w)| (i, w))
-                    .collect(),
+            match column.mode() {
+                crate::ColumnMode::Vertical => visible_windows.extend(
+                    column
+                        .windows()
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, w)| !self.minimized_windows.contains(w))
+                        .map(|(i, &w)| (i, w)),
+                ),
                 crate::ColumnMode::Tabbed { .. } => {
                     // Shared picker: prefer active tab, fall back to first
                     // visible if active is minimized.
-                    column
+                    if let Some((i, &w)) = column
                         .effective_visible_tab(|w| self.minimized_windows.contains(&w))
-                        .and_then(|i| column.windows().get(i).map(|&w| (i, w)))
-                        .into_iter()
-                        .collect()
+                        .and_then(|i| column.windows().get(i).map(|w| (i, w)))
+                    {
+                        visible_windows.push((i, w));
+                    }
                 }
-            };
-
-            // Skip columns where all windows are minimized
-            if !self.is_column_active(column) {
-                continue;
             }
 
             // In Tabbed mode, every non-active non-minimized tab gets an
@@ -227,15 +257,21 @@ impl Workspace {
             // absorbs rounding remainder so the column stays flush with the
             // viewport — this also means if there are no flexible windows,
             // any leftover space simply flows into the last pinned window.
-            let visible_weights: Vec<f64> = if column.height_weights.len() == column.windows().len() {
-                visible_windows.iter().map(|(i, _)| column.height_weights[*i]).collect()
+            if column.height_weights.len() == column.windows().len() {
+                visible_weights.extend(
+                    visible_windows
+                        .iter()
+                        .map(|(i, _)| column.height_weights[*i]),
+                );
             } else {
-                vec![1.0; visible_windows.len()]
-            };
+                visible_weights.resize(visible_windows.len(), 1.0);
+            }
 
-            let min_heights: Vec<i32> = visible_windows.iter()
-                .map(|(_, wid)| self.window_min_heights.get(wid).copied().unwrap_or(0))
-                .collect();
+            min_heights.extend(
+                visible_windows
+                    .iter()
+                    .map(|(_, wid)| self.window_min_heights.get(wid).copied().unwrap_or(0)),
+            );
             let total_min: i32 = min_heights.iter().sum();
             let flex_height = (available_height - total_min).max(0);
 
@@ -253,6 +289,7 @@ impl Workspace {
             let has_flex = flex_weight_sum > 0.0;
 
             let mut current_y = viewport.y + outer_top + column_top_reserve;
+            let visible_placement_start = placements.len();
 
             for (win_idx, &(_, window_id)) in visible_windows.iter().enumerate() {
                 let is_last = win_idx == visible_windows.len() - 1;
@@ -287,6 +324,31 @@ impl Workspace {
                 });
 
                 current_y = current_y.saturating_add(height).saturating_add(gap);
+            }
+
+            // Minimum heights may consume the top/bottom outer padding while
+            // still fitting physically in the work area. Shift this column's
+            // complete visible stack as a unit when that exposes both edges;
+            // if the stack itself exceeds the viewport, no translation can do
+            // so and the application's combined minimums are impossible here.
+            let visible_slice = &mut placements[visible_placement_start..];
+            if let (Some(first), Some(last)) = (visible_slice.first(), visible_slice.last()) {
+                let stack_top = first.rect.y;
+                let stack_bottom = last.rect.bottom();
+                let stack_height = stack_bottom.saturating_sub(stack_top);
+                if stack_height <= viewport.height {
+                    let max_top = viewport
+                        .y
+                        .saturating_add(viewport.height)
+                        .saturating_sub(stack_height);
+                    let clamped_top = stack_top.clamp(viewport.y, max_top);
+                    let shift = clamped_top.saturating_sub(stack_top);
+                    if shift != 0 {
+                        for placement in visible_slice {
+                            placement.rect.y = placement.rect.y.saturating_add(shift);
+                        }
+                    }
+                }
             }
 
             current_x = current_x.saturating_add(eff_width).saturating_add(gap);

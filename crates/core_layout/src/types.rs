@@ -19,6 +19,28 @@ pub(crate) fn default_outer_gap_value() -> i32 {
 /// On Windows, this will typically be the HWND cast to u64.
 pub type WindowId = u64;
 
+/// Width and height for a floating window, without a screen position.
+///
+/// Floating sizes are kept separately from [`Rect`] so callers can restore a
+/// window on a different monitor without retaining stale absolute coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FloatingSize {
+    /// Width in pixels (logical or physical according to the caller).
+    pub width: i32,
+    /// Height in pixels (logical or physical according to the caller).
+    pub height: i32,
+}
+
+impl FloatingSize {
+    /// Create a floating size with dimensions clamped to at least one pixel.
+    pub fn new(width: i32, height: i32) -> Self {
+        Self {
+            width: width.max(1),
+            height: height.max(1),
+        }
+    }
+}
+
 /// Errors that can occur during layout operations.
 #[derive(Debug, Error)]
 pub enum LayoutError {
@@ -76,6 +98,51 @@ impl Rect {
     pub fn bottom(&self) -> i32 {
         self.y + self.height
     }
+
+    /// Return this rectangle wholly contained by `bounds`.
+    ///
+    /// An oversized axis is shrunk before its origin is clamped; otherwise no
+    /// position could expose both opposing edges at once. Bounds with a zero
+    /// extent still produce a one-pixel rectangle anchored at their origin.
+    pub fn clamped_inside(self, bounds: Rect) -> Rect {
+        let bounds_width = bounds.width.max(1);
+        let bounds_height = bounds.height.max(1);
+        let width = self.width.max(1).min(bounds_width);
+        let height = self.height.max(1).min(bounds_height);
+        let max_x = bounds.x.saturating_add(bounds_width).saturating_sub(width);
+        let max_y = bounds
+            .y
+            .saturating_add(bounds_height)
+            .saturating_sub(height);
+        Rect::new(
+            self.x.clamp(bounds.x, max_x),
+            self.y.clamp(bounds.y, max_y),
+            width,
+            height,
+        )
+    }
+}
+
+/// Center a requested floating size in a viewport, clamping it to the space
+/// left after reserving `margin` pixels in total on each axis.
+///
+/// The margin is deliberately a total rather than a per-edge value: callers
+/// preserve the existing 40px floating and 80px scratchpad compatibility
+/// margins while keeping the resulting rectangle inside the work area.
+pub fn centered_rect_for_size(viewport: Rect, requested_size: FloatingSize, margin: i32) -> Rect {
+    let margin = margin.max(0);
+    let max_width = viewport.width.saturating_sub(margin).max(1);
+    let max_height = viewport.height.saturating_sub(margin).max(1);
+    let width = requested_size.width.clamp(1, max_width);
+    let height = requested_size.height.clamp(1, max_height);
+    let x = viewport
+        .x
+        .saturating_add(viewport.width.saturating_sub(width) / 2);
+    let y = viewport
+        .y
+        .saturating_add(viewport.height.saturating_sub(height) / 2);
+
+    Rect::new(x, y, width, height)
 }
 
 /// Visibility state for layout computation.

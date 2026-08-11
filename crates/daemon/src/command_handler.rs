@@ -1,7 +1,7 @@
 //! IPC command handling for AppState.
 
 use crate::config::Config;
-use crate::state::{validate_set_width_fraction, AppState};
+use crate::state::{validate_set_width_fraction, AppState, FLOATING_TOTAL_MARGIN};
 use leopardwm_core_layout::{Rect, Workspace};
 use leopardwm_ipc::{IpcCommand, IpcResponse};
 use leopardwm_platform_win32::{
@@ -883,20 +883,44 @@ impl AppState {
 
     /// Handle `IpcCommand::ToggleFloating`.
     fn handle_toggle_floating(&mut self) -> IpcResponse {
-        let viewport = self.focused_viewport();
-        let prev_hwnd = self.previous_focused_hwnd;
-        if let Some(workspace) = self.focused_workspace_mut() {
-            // Check if the OS-foreground window is floating — unfloat it
-            let foreground_is_floating = prev_hwnd
-                .map(|hwnd| workspace.is_floating(hwnd))
-                .unwrap_or(false);
-            if foreground_is_floating {
-                let hwnd = prev_hwnd.unwrap();
-                if workspace.unfloat_window(hwnd) {
-                    self.disable_snap_for_window(hwnd);
-                    info!("Unfloated window {} back to tiling", hwnd);
-                }
-            } else if let Some(wid) = workspace.toggle_floating(viewport) {
+        let floating_hwnd = self.previous_focused_hwnd.filter(|hwnd| {
+            self.focused_workspace()
+                .is_some_and(|workspace| workspace.is_floating(*hwnd))
+        });
+
+        if let Some(hwnd) = floating_hwnd {
+            // Preserve the actual visible (or last stored) size before
+            // unfloat removes the `FloatingWindow` entry.
+            let _ = self.capture_floating_geometry(hwnd);
+            if self
+                .focused_workspace_mut()
+                .is_some_and(|workspace| workspace.unfloat_window(hwnd))
+            {
+                self.disable_snap_for_window(hwnd);
+                info!("Unfloated window {} back to tiling", hwnd);
+            }
+        } else if let Some(wid) = self
+            .focused_workspace()
+            .and_then(|workspace| workspace.focused_window())
+        {
+            let logical_size = if self.config.layout.remember_floating_sizes {
+                self.floating_size_history
+                    .get(&wid)
+                    .copied()
+                    .unwrap_or_else(|| self.default_floating_size())
+            } else {
+                self.default_floating_size()
+            };
+            let rect = self.centered_rect_for_logical_floating_size(
+                self.focused_monitor,
+                logical_size,
+                FLOATING_TOTAL_MARGIN,
+            );
+            if self
+                .focused_workspace_mut()
+                .and_then(|workspace| workspace.toggle_floating(rect))
+                .is_some()
+            {
                 self.restore_snap_for_window(wid);
                 info!("Toggled window {} to floating", wid);
             }
@@ -953,26 +977,12 @@ impl AppState {
             }
         }
 
-        // Cancel any in-progress drag: reinsert window if it was
-        // removed from source during live preview, then remove placeholders.
-        // Only reinsert if the window still exists.
-        if let Some(drag) = self.drag_state.take() {
-            if drag.removed_from_source
-                && drag.is_tiled
-                && leopardwm_platform_win32::is_valid_window(drag.hwnd)
-            {
-                if let Some(ws) = self
-                    .workspaces
-                    .get_mut(&drag.source_monitor)
-                    .and_then(|v| v.get_mut(drag.source_workspace_idx))
-                {
-                    let _ = ws.insert_window(drag.hwnd, None);
-                }
-            }
-            for ws_vec in self.workspaces.values_mut() {
-                for ws in ws_vec.iter_mut() {
-                    let _ = ws.remove_window(crate::state::DRAG_PLACEHOLDER_HWND);
-                }
+        // Cancel any in-progress drag before switching ownership. This
+        // restores both a detached plain-drag HWND and a Shift live reorder.
+        if let Some(drag_hwnd) = self.drag_state.as_ref().map(|drag| drag.hwnd) {
+            let restore_window = leopardwm_platform_win32::is_valid_window(drag_hwnd);
+            if let Some(aborted_hwnd) = self.abort_active_drag(restore_window) {
+                leopardwm_platform_win32::set_dwm_transitions_disabled(aborted_hwnd, false);
             }
         }
         self.pending_drag_hint = Some(crate::state::DragHintAction::Hide);

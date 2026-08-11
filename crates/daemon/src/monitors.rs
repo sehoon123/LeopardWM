@@ -65,11 +65,17 @@ impl AppState {
                         .get(&monitor_id)
                         .map(|m| m.scale_factor)
                         .unwrap_or(1.0);
-                    let viewport_width = self
+                    let work_area = self
                         .monitors
                         .get(&monitor_id)
-                        .map(|m| m.work_area.width)
-                        .unwrap_or(FALLBACK_VIEWPORT_WIDTH);
+                        .map(|m| m.work_area)
+                        .unwrap_or(Rect::new(
+                            0,
+                            0,
+                            FALLBACK_VIEWPORT_WIDTH,
+                            FALLBACK_WORK_AREA_HEIGHT,
+                        ));
+                    let viewport_width = work_area.width;
                     let params = ScaledLayoutParams::from_config(
                         &self.config.layout,
                         &self.config.appearance,
@@ -81,6 +87,7 @@ impl AppState {
                         let (old_ol, old_or, _, _) = workspace.outer_gaps();
                         params.apply_to(workspace);
                         workspace.rescale_column_widths(old_gap, old_ol, old_or, viewport_width);
+                        workspace.clamp_floating_to(work_area);
                     }
                 }
                 return;
@@ -204,7 +211,7 @@ impl AppState {
                         }
                     }
                     for fw in old_workspace.floating_windows() {
-                        floating_windows.push((fw.id, fw.rect));
+                        floating_windows.push((fw.id, fw.rect, fw.pinned));
                         if old_workspace.is_minimized(fw.id) {
                             minimized_ids.push(fw.id);
                         }
@@ -225,24 +232,21 @@ impl AppState {
                                 warn!("Failed to migrate tiled window {}: {}", window_id, e);
                             }
                         }
-                        for (wid, rect) in &floating_windows {
+                        for (wid, rect, pinned) in &floating_windows {
                             let translated = match (source_wa, target_wa) {
-                                (Some(src), Some(tgt)) => {
-                                    let dx = tgt.x - src.x;
-                                    let dy = tgt.y - src.y;
-                                    let max_x = (tgt.x + tgt.width - rect.width).max(tgt.x);
-                                    let max_y = (tgt.y + tgt.height - rect.height).max(tgt.y);
-                                    leopardwm_core_layout::Rect::new(
-                                        (rect.x + dx).clamp(tgt.x, max_x),
-                                        (rect.y + dy).clamp(tgt.y, max_y),
-                                        rect.width,
-                                        rect.height,
-                                    )
-                                }
+                                (Some(src), Some(tgt)) => Rect::new(
+                                    rect.x.saturating_add(tgt.x - src.x),
+                                    rect.y.saturating_add(tgt.y - src.y),
+                                    rect.width,
+                                    rect.height,
+                                )
+                                .clamped_inside(tgt),
                                 _ => *rect,
                             };
                             if let Err(e) = primary_ws.add_floating(*wid, translated) {
                                 warn!("Failed to migrate floating window {}: {}", wid, e);
+                            } else {
+                                primary_ws.set_floating_pinned(*wid, *pinned);
                             }
                         }
                         // Restore minimized state for migrated windows
@@ -283,11 +287,17 @@ impl AppState {
                 .get(&monitor_id)
                 .map(|m| m.scale_factor)
                 .unwrap_or(1.0);
-            let viewport_width = self
+            let work_area = self
                 .monitors
                 .get(&monitor_id)
-                .map(|m| m.work_area.width)
-                .unwrap_or(FALLBACK_VIEWPORT_WIDTH);
+                .map(|m| m.work_area)
+                .unwrap_or(Rect::new(
+                    0,
+                    0,
+                    FALLBACK_VIEWPORT_WIDTH,
+                    FALLBACK_WORK_AREA_HEIGHT,
+                ));
+            let viewport_width = work_area.width;
             let params = ScaledLayoutParams::from_config(
                 &self.config.layout,
                 &self.config.appearance,
@@ -300,6 +310,7 @@ impl AppState {
                 let (old_ol, old_or, _, _) = workspace.outer_gaps();
                 params.apply_to(workspace);
                 workspace.rescale_column_widths(old_gap, old_ol, old_or, viewport_width);
+                workspace.clamp_floating_to(work_area);
             }
         }
 
@@ -400,37 +411,34 @@ impl AppState {
 
         let is_floating = source_workspace.is_floating(window_id);
         if is_floating {
-            let rect = source_workspace
+            let floating = source_workspace
                 .floating_windows()
                 .iter()
-                .find(|f| f.id == window_id)
-                .map(|f| f.rect)
-                .unwrap_or(leopardwm_core_layout::Rect::new(0, 0, 800, 600));
+                .find(|floating| floating.id == window_id)
+                .cloned()
+                .ok_or_else(|| format!("Floating window {} missing from source", window_id))?;
+            let rect = floating.rect;
             // Translate floating coordinates from source to target monitor work area
             let translated_rect = match (
                 self.monitors.get(&source_monitor),
                 self.monitors.get(&target_monitor),
             ) {
-                (Some(src_mon), Some(tgt_mon)) => {
-                    let dx = tgt_mon.work_area.x - src_mon.work_area.x;
-                    let dy = tgt_mon.work_area.y - src_mon.work_area.y;
-                    let max_x = (tgt_mon.work_area.x + tgt_mon.work_area.width - rect.width)
-                        .max(tgt_mon.work_area.x);
-                    let max_y = (tgt_mon.work_area.y + tgt_mon.work_area.height - rect.height)
-                        .max(tgt_mon.work_area.y);
-                    leopardwm_core_layout::Rect::new(
-                        (rect.x + dx).clamp(tgt_mon.work_area.x, max_x),
-                        (rect.y + dy).clamp(tgt_mon.work_area.y, max_y),
-                        rect.width,
-                        rect.height,
-                    )
-                }
+                (Some(src_mon), Some(tgt_mon)) => Rect::new(
+                    rect.x
+                        .saturating_add(tgt_mon.work_area.x - src_mon.work_area.x),
+                    rect.y
+                        .saturating_add(tgt_mon.work_area.y - src_mon.work_area.y),
+                    rect.width,
+                    rect.height,
+                )
+                .clamped_inside(tgt_mon.work_area),
                 _ => rect,
             };
             source_workspace.remove_floating(window_id);
             target_workspace
                 .add_floating(window_id, translated_rect)
                 .map_err(|e| format!("Failed to add floating window to target: {}", e))?;
+            target_workspace.set_floating_pinned(window_id, floating.pinned);
         } else {
             source_workspace
                 .remove_window(window_id)

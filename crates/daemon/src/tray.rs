@@ -355,10 +355,18 @@ impl TrayManager {
             hotkey_mismatch,
             active_workspace,
         );
-        if let Ok(mut text) = self.shared.tooltip_text.lock() {
-            *text = tooltip;
+        let changed = self
+            .shared
+            .tooltip_text
+            .lock()
+            .map(|mut text| replace_if_changed(&mut text, tooltip))
+            .unwrap_or(false);
+        if !changed {
+            return;
         }
-        // Wake the message-loop thread to apply the new tooltip.
+        // Wake the message-loop thread only when the shell-visible text
+        // changed. Move/resize events call this frequently with identical
+        // state, so reposting would create needless tray-thread work.
         unsafe {
             win32_msg::PostThreadMessageW(
                 self.msg_thread_id,
@@ -805,6 +813,15 @@ fn map_menu_id_to_event(menu_id: &str) -> Option<TrayEvent> {
     }
 }
 
+fn replace_if_changed(current: &mut String, replacement: String) -> bool {
+    if *current == replacement {
+        false
+    } else {
+        *current = replacement;
+        true
+    }
+}
+
 /// Format the tray tooltip text (testable without requiring a real tray icon).
 pub fn format_tooltip_text(
     window_count: usize,
@@ -978,6 +995,14 @@ mod tests {
             Some(TrayEvent::SetCenteringJustInView)
         ));
         assert!(map_menu_id_to_event("unknown").is_none());
+    }
+
+    #[test]
+    fn test_replace_if_changed_skips_identical_tooltips() {
+        let mut current = "same".to_string();
+        assert!(!replace_if_changed(&mut current, "same".to_string()));
+        assert!(replace_if_changed(&mut current, "updated".to_string()));
+        assert_eq!(current, "updated");
     }
 
     #[test]

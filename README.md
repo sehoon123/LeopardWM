@@ -60,7 +60,7 @@ A few deliberate **non-features**, so you know what you're getting:
 - Global hotkeys with live config reload
 - Smooth scroll animations with layout transition effects (vsync-locked)
 - Touchpad gestures with configurable swipe actions
-- Drag-and-drop column reorder (Shift+drag to merge windows)
+- DPI-aware drag-and-drop across monitors — plain drag moves one window; hold Shift before drag start to move its whole column
 - **Tabbed columns** — toggle a column between vertical-stack and tab-strip mode (`Ctrl+Alt+T`); only the active tab fills the column rect, the rest sit in a clickable strip above
 - **Scratchpad** — stash the focused window out of the layout (`Ctrl+Alt+Shift+S`) and summon it back as a floating, centered overlay on demand (`Ctrl+Alt+S`); stash it again to release it back to tiling
 - **Sticky windows** — pin a window (`Ctrl+Alt+Y`) so it follows you across workspaces, keeping its current mode: a tiled window stays tiled (a column you can cycle to), a floating window stays a floating overlay
@@ -164,6 +164,38 @@ Most hotkeys use `Ctrl+Alt` as the base modifier. Layered pattern: base = focus,
 | `Win+Ctrl+Escape` | Emergency restore + panic-revert |
 
 > The scratchpad and sticky pins are session-scoped: they are keyed by window handle and reset when the daemon restarts.
+
+## Floating sizes and cross-monitor dragging
+
+LeopardWM treats floating geometry as monitor-local, DPI-aware state:
+
+- Ordinary floating windows default to `800 × 600` logical pixels; scratchpads default to `900 × 600`.
+- When size memory is enabled, only logical **width and height** are remembered for the current daemon session. Screen coordinates are never retained.
+- Ordinary floating and scratchpad histories are independent. Re-floating or summoning centers the remembered size on the focused monitor and clamps it to that monitor's work area.
+- Floating move/resize completion and monitor/work-area changes keep the visible frame inside the work area on all four sides. If an application enforces a minimum larger than the work area, exposing both opposing edges is physically impossible.
+
+Title-bar drag behavior:
+
+- **Plain drag:** move only the dragged window. Dropping over an existing column merges into it; dropping in empty space on another monitor creates a new column.
+- **Shift held before drag start:** move the complete source column, preserving its stack/tab composition.
+- The monitor under the pointer owns the drop. The destination monitor's active workspace, DPI scale, and work area are used; floating sticky/pinned state is preserved.
+- Turn off **Settings → Behavior → Cross-monitor window drag** to keep mouse drops on their source monitor. Keyboard monitor-move commands are unaffected.
+
+All user-facing controls are available in **Settings → Layout / Behavior** and in `config.toml`:
+
+```toml
+[layout]
+default_floating_width = 800
+default_floating_height = 600
+remember_floating_sizes = true
+
+default_scratchpad_width = 900
+default_scratchpad_height = 600
+remember_scratchpad_size = true
+
+[behavior]
+cross_monitor_drag = true
+```
 
 ## Tabbed columns
 

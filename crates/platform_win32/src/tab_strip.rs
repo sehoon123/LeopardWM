@@ -259,6 +259,40 @@ const TOOLTIP_FADE_INTERVAL_MS: u32 = 16;
 /// "Do not post the WM_QUIT message using PostMessage"), so we use a
 /// custom message and break the loop explicitly when it lands.
 const WM_QUIT_TAB_STRIP_THREAD: u32 = WM_USER + 4;
+/// Synchronously hides a strip on its owning UI thread. Serializing the hide
+/// with timer and input callbacks prevents an in-flight repaint from showing
+/// the layered window again after the daemon requested it hidden.
+const WM_HIDE_TAB_STRIP: u32 = WM_USER + 8;
+
+fn reset_hidden_interaction_state(state: &mut TabStripState) {
+    state.visible = false;
+    state.transition = None;
+    state.hovered_tab_idx = None;
+    state.hovered_close_idx = None;
+    state.mouse_tracking_armed = false;
+    state.tooltip_pending_tab = None;
+}
+
+fn strip_is_visible(hwnd: HWND) -> bool {
+    registry()
+        .states
+        .get(&(hwnd.0 as isize))
+        .is_some_and(|state| state.visible)
+}
+
+unsafe fn hide_tab_strip_on_ui_thread(hwnd: HWND) -> LRESULT {
+    let _ = KillTimer(Some(hwnd), HIGHLIGHT_ANIM_TIMER_ID);
+    let _ = KillTimer(Some(hwnd), TOOLTIP_DELAY_TIMER_ID);
+    {
+        let mut reg = registry();
+        if let Some(state) = reg.states.get_mut(&(hwnd.0 as isize)) {
+            reset_hidden_interaction_state(state);
+        }
+    }
+    hide_tooltip_popup(hwnd);
+    let _ = ShowWindow(hwnd, SW_HIDE);
+    LRESULT(0)
+}
 
 fn default_tab_strip_state() -> TabStripState {
     TabStripState {
@@ -679,11 +713,7 @@ impl TabStripOverlay {
     /// Hide the tab strip overlay.
     pub fn hide(&self) {
         unsafe {
-            let _ = ShowWindow(self.hwnd, SW_HIDE);
-        }
-        let mut reg = registry();
-        if let Some(state) = reg.states.get_mut(&(self.hwnd.0 as isize)) {
-            state.visible = false;
+            SendMessageW(self.hwnd, WM_HIDE_TAB_STRIP, None, None);
         }
     }
 
@@ -2825,6 +2855,19 @@ unsafe extern "system" fn tab_strip_wnd_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if msg == WM_HIDE_TAB_STRIP {
+        return hide_tab_strip_on_ui_thread(hwnd);
+    }
+    let requires_visible_strip = msg == WM_TIMER
+        || msg == WM_MOUSEMOVE
+        || msg == WM_MOUSELEAVE
+        || msg == WM_LBUTTONDOWN
+        || msg == WM_LBUTTONDBLCLK
+        || msg == WM_MBUTTONUP
+        || msg == WM_RBUTTONUP;
+    if requires_visible_strip && !strip_is_visible(hwnd) {
+        return LRESULT(0);
+    }
     // Defensive: prevent the strip from stealing activation focus when
     // clicked. Win32 may try to activate the popup if this isn't said
     // explicitly, even with WS_EX_NOACTIVATE in some edge cases.

@@ -8,9 +8,9 @@ impl AppState {
     /// Convert the config border color (hex RGB string) to BGR u32 for Win32.
     /// When high contrast mode is active, returns the system highlight color instead.
     /// Checks the live system setting so toggling high contrast takes effect
-    /// immediately without a config reload.
+    /// immediately when the cached flag is refreshed by theme/display events.
     pub(crate) fn border_color_bgr(&self) -> Option<u32> {
-        if leopardwm_platform_win32::is_high_contrast_enabled() {
+        if self.high_contrast {
             return Some(leopardwm_platform_win32::get_system_highlight_color_bgr());
         }
         hex_rgb_to_bgr(&self.config.appearance.active_border_color)
@@ -280,6 +280,44 @@ impl AppState {
             crate::config::TabCloseAction::Untab => leopardwm_platform_win32::TabCloseAction::Untab,
         };
 
+        // Snapshot monitor/workspace identity and prefill missing icons before
+        // the geometry walk borrows workspaces. Geometry is refreshed during
+        // animation, but cross-process WM_GETICON probes are cached until the
+        // low-frequency icon poll or a title/destroy event invalidates them.
+        let monitor_ids: Vec<isize> = self.workspaces.keys().copied().collect();
+        let mut tab_window_ids = Vec::new();
+        for &monitor in &monitor_ids {
+            let ws_idx = self.active_workspace_idx(monitor);
+            let Some(workspace) = self
+                .workspaces
+                .get(&monitor)
+                .and_then(|workspaces| workspaces.get(ws_idx))
+            else {
+                continue;
+            };
+            if workspace.is_fullscreen() {
+                continue;
+            }
+            for column in workspace
+                .columns()
+                .iter()
+                .filter(|column| column.is_tabbed())
+            {
+                tab_window_ids.extend(
+                    column
+                        .windows()
+                        .iter()
+                        .copied()
+                        .filter(|&hwnd| hwnd != crate::state::DRAG_PLACEHOLDER_HWND),
+                );
+            }
+        }
+        for hwnd in tab_window_ids {
+            self.tab_strip_icon_cache
+                .entry(hwnd)
+                .or_insert_with(|| leopardwm_platform_win32::get_window_icon(hwnd));
+        }
+
         // First pass: figure out the desired key set + per-key show args.
         struct StripShow {
             rect: leopardwm_core_layout::Rect,
@@ -290,10 +328,6 @@ impl AppState {
         let mut desired: std::collections::HashMap<(isize, usize, usize), StripShow> =
             std::collections::HashMap::new();
 
-        // Snapshot monitor + workspace identity into a vec so the
-        // subsequent column walk can borrow `self` (immutable) again
-        // without aliasing the iteration over `self.workspaces`.
-        let monitor_ids: Vec<isize> = self.workspaces.keys().copied().collect();
         for monitor in monitor_ids {
             let ws_idx = self.active_workspace_idx(monitor);
             let Some(ws_vec) = self.workspaces.get(&monitor) else {
@@ -343,7 +377,7 @@ impl AppState {
                             .cloned()
                             .or_else(|| self.lookup_window_info(w).map(|info| info.title))
                             .unwrap_or_default(),
-                        icon: leopardwm_platform_win32::get_window_icon(w),
+                        icon: self.tab_strip_icon_cache.get(&w).copied().flatten(),
                     })
                     .collect();
                 desired.insert(

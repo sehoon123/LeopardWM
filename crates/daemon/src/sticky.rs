@@ -8,6 +8,11 @@
 use tracing::{info, warn};
 
 use crate::state::AppState;
+use leopardwm_core_layout::{centered_rect_for_size, FloatingSize};
+
+const STICKY_FALLBACK_WIDTH: i32 = 900;
+const STICKY_FALLBACK_HEIGHT: i32 = 600;
+const STICKY_FALLBACK_TOTAL_MARGIN: i32 = 80;
 
 impl AppState {
     /// Toggle "sticky" for the OS-focused window. Pinning floats the window
@@ -152,7 +157,13 @@ impl AppState {
                         .find(|f| f.id == wid)
                         .map(|f| f.rect)
                 })
-                .unwrap_or_else(|| self.centered_float_rect());
+                .unwrap_or_else(|| {
+                    centered_rect_for_size(
+                        self.focused_viewport(),
+                        FloatingSize::new(STICKY_FALLBACK_WIDTH, STICKY_FALLBACK_HEIGHT),
+                        STICKY_FALLBACK_TOTAL_MARGIN,
+                    )
+                });
             // Add to the active workspace FIRST; only detach from the source
             // once that succeeds, so a failed move never loses the window.
             let added = self

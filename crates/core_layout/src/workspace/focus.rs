@@ -260,8 +260,11 @@ impl Workspace {
                     }
                 }
 
-                // If column is now empty, remove it
-                if column.is_empty() {
+                // If column is now empty, remove it. Its disappearance changes
+                // horizontal strip geometry, so an animation target calculated
+                // from the old strip must not restore an out-of-range offset.
+                let removed_column = column.is_empty();
+                if removed_column {
                     self.columns.remove(col_idx);
                     if self.columns.is_empty() {
                         // Workspace is now empty - reset all state
@@ -297,6 +300,9 @@ impl Workspace {
                     }
                 }
 
+                if removed_column {
+                    self.cancel_animation();
+                }
                 self.clamp_focus_indices();
 
                 debug_assert!(

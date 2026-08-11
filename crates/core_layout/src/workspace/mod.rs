@@ -311,6 +311,28 @@ impl Workspace {
         }
     }
 
+    /// Clamp every floating rectangle inside a monitor work area.
+    /// Returns whether any stored geometry changed.
+    pub fn clamp_floating_to(&mut self, bounds: Rect) -> bool {
+        let mut changed = false;
+        for floating in &mut self.floating_windows {
+            let clamped = floating.rect.clamped_inside(bounds);
+            if clamped != floating.rect {
+                floating.rect = clamped;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Get the current rectangle for a floating window.
+    pub fn floating_rect(&self, window_id: WindowId) -> Option<Rect> {
+        self.floating_windows
+            .iter()
+            .find(|floating| floating.id == window_id)
+            .map(|floating| floating.rect)
+    }
+
     /// Get all floating windows.
     pub fn floating_windows(&self) -> &[FloatingWindow] {
         &self.floating_windows
@@ -320,28 +342,25 @@ impl Workspace {
     ///
     /// Note: Negative gaps are treated as zero for calculation purposes.
     pub fn total_width(&self) -> i32 {
-        // Only count columns that have at least one non-minimized window
-        let active_columns: Vec<&Column> = self
-            .columns
-            .iter()
-            .filter(|c| self.is_column_active(c))
-            .collect();
+        // Count and sum active columns in one pass. This is called on every
+        // focus/scroll adjustment, so avoid allocating a temporary Vec.
+        let mut active_count = 0usize;
+        let mut column_widths = 0i32;
+        for column in &self.columns {
+            if self.is_column_active(column) {
+                active_count += 1;
+                column_widths = column_widths.saturating_add(column.width);
+            }
+        }
 
-        if active_columns.is_empty() {
+        if active_count == 0 {
             return 0;
         }
 
-        // Defensively clamp gaps to >= 0 in case fields were set directly
+        // Strip width = columns + inter-column gaps only. Outer gaps are
+        // viewport padding, not strip content.
         let gap = self.gap.max(0);
-
-        // Strip width = columns + inter-column gaps only.
-        // Outer gaps are viewport padding, not strip content.
-        let column_widths: i32 = active_columns
-            .iter()
-            .map(|c| c.width)
-            .fold(0i32, |acc, w| acc.saturating_add(w));
-        let gaps = gap.saturating_mul(active_columns.len().saturating_sub(1) as i32);
-
+        let gaps = gap.saturating_mul(active_count.saturating_sub(1) as i32);
         column_widths.saturating_add(gaps)
     }
 
@@ -412,13 +431,7 @@ impl Workspace {
 
     /// Set the gap at viewport edges in pixels.
     /// Values are clamped to >= 0.
-    pub fn set_outer_gaps(
-        &mut self,
-        left: i32,
-        right: i32,
-        top: i32,
-        bottom: i32,
-    ) {
+    pub fn set_outer_gaps(&mut self, left: i32, right: i32, top: i32, bottom: i32) {
         self.outer_gap_left = left.max(0);
         self.outer_gap_right = right.max(0);
         self.outer_gap_top = top.max(0);

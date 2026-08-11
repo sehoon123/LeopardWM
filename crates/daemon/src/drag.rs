@@ -1,20 +1,44 @@
 //! Drag-and-drop handling for AppState.
 
 use crate::state::{
-    AppState, DragHintAction, DragState, DropTarget, DRAG_PLACEHOLDER_HWND, FALLBACK_VIEWPORT_WIDTH,
+    AppState, DragHintAction, DragMode, DragState, DropTarget, DRAG_PLACEHOLDER_HWND,
+    FALLBACK_VIEWPORT_WIDTH,
 };
 use leopardwm_core_layout::{Rect, Visibility};
-use leopardwm_platform_win32::{find_monitor_for_rect, is_shift_key_pressed, MonitorId};
+use leopardwm_platform_win32::MonitorId;
 use tracing::{debug, info, warn};
 
 impl AppState {
     /// Remove the drag placeholder window from all workspaces on all monitors.
-    fn clear_drag_placeholder(&mut self) {
+    pub(crate) fn clear_drag_placeholder(&mut self) {
         for ws_vec in self.workspaces.values_mut() {
             for ws in ws_vec.iter_mut() {
                 let _ = ws.remove_window(DRAG_PLACEHOLDER_HWND);
             }
         }
+    }
+
+    /// Remove the live-preview placeholder from the one workspace named by
+    /// the previous drop target. Full-workspace cleanup remains the fallback
+    /// for the first tick and drag-end recovery, but steady 60 Hz hint updates
+    /// avoid scanning every monitor × workspace.
+    fn remove_previous_drag_placeholder(&mut self) {
+        let previous_target = self
+            .drag_state
+            .as_ref()
+            .and_then(|drag| drag.last_drop_target);
+        if let Some(target) = previous_target {
+            let workspace_idx = self.active_workspace_idx(target.monitor);
+            if let Some(workspace) = self
+                .workspaces
+                .get_mut(&target.monitor)
+                .and_then(|workspaces| workspaces.get_mut(workspace_idx))
+            {
+                let _ = workspace.remove_window(DRAG_PLACEHOLDER_HWND);
+                return;
+            }
+        }
+        self.clear_drag_placeholder();
     }
 
     /// Compute and show a drag hint overlay.
@@ -35,39 +59,40 @@ impl AppState {
         for strip in self.tab_strip_overlays.values() {
             strip.raise();
         }
-        let Some(win_info) = self.lookup_window_info(hwnd) else {
-            return;
-        };
-
-        // Use actual cursor position for more intuitive hit-testing —
-        // the window center lags behind the cursor for large windows.
-        let (cursor_x, cursor_y) =
-            leopardwm_platform_win32::get_cursor_pos().unwrap_or_else(|| {
+        // Use the cursor for both monitor and drop hit-testing. The prior path
+        // enumerated/cloned every monitor and fetched cross-process window
+        // metadata on each 60 Hz hint tick, then waited until the WINDOW CENTER
+        // crossed the seam. Cursor-first selection is cheaper and transfers as
+        // soon as the user's pointer enters the other monitor. Only query the
+        // window as a rare fallback when GetCursorPos fails.
+        let (cursor_x, cursor_y) = match leopardwm_platform_win32::get_cursor_pos() {
+            Some(point) => point,
+            None => {
+                let Some(win_info) = self.lookup_window_info(hwnd) else {
+                    return;
+                };
                 (
                     win_info.rect.x + win_info.rect.width / 2,
                     win_info.rect.y + win_info.rect.height / 2,
                 )
-            });
+            }
+        };
 
-        // Determine which monitor the dragged window is on.
-        let monitors: Vec<_> = self.monitors.values().cloned().collect();
-        let target_monitor_id = find_monitor_for_rect(&monitors, &win_info.rect)
-            .map(|m| m.id)
-            .unwrap_or(self.focused_monitor);
-
-        let shift_held = is_shift_key_pressed();
-
-        // Read drag state fields.
-        let (current_col, source_monitor, source_ws_idx) = match self.drag_state {
-            Some(ref d) => (
-                d.current_column_index,
-                d.source_monitor,
-                d.source_workspace_idx,
+        // Read the mode latched at MoveSizeStart together with source fields.
+        // Never re-sample Shift after a window-merge preview may have detached
+        // the HWND from its source column.
+        let (mode, current_col, source_monitor, source_ws_idx) = match self.drag_state {
+            Some(ref drag) => (
+                drag.mode,
+                drag.current_column_index,
+                drag.source_monitor,
+                drag.source_workspace_idx,
             ),
             None => return,
         };
+        let target_monitor_id = self.monitor_for_drag_point(cursor_x, cursor_y, source_monitor);
 
-        if shift_held {
+        if mode == DragMode::Column {
             // --- Shift+drag: column reorder mode ---
             // Only live-reorder on the source monitor; cross-monitor happens on drop.
             if target_monitor_id != source_monitor {
@@ -85,8 +110,9 @@ impl AppState {
             }
             let viewport = self.layout_viewport(target_monitor_id);
 
-            // Remove any existing placeholder before recomputing bounds.
-            self.clear_drag_placeholder();
+            // Remove the prior live-preview placeholder before recomputing
+            // bounds, touching only its recorded workspace on steady ticks.
+            self.remove_previous_drag_placeholder();
 
             let ws_idx = self.active_workspace_idx(target_monitor_id);
             let Some(workspace) = self
@@ -112,12 +138,46 @@ impl AppState {
                 .tab_strip_overlays
                 .values()
                 .find_map(|s| s.hit_test_screen(cursor_x, cursor_y));
-            let target_col = match strip_hit {
-                Some(hit) => hit.column_idx,
-                None => match compute_target_column_index(&column_bounds, cursor_x) {
-                    Some(idx) => idx,
-                    None => return,
-                },
+            let target_col = strip_hit
+                .map(|hit| hit.column_idx)
+                .or_else(|| compute_target_column_index(&column_bounds, cursor_x));
+
+            // A plain cross-monitor drag into an empty workspace or unused
+            // horizontal area creates a standalone column. Previously this
+            // returned without a target, so dropping onto an empty second
+            // monitor always snapped back. Keep the live preview lightweight:
+            // a vertical insertion line, with no structural mutation until
+            // drop.
+            let Some(target_col) = target_col else {
+                if target_monitor_id == source_monitor {
+                    return;
+                }
+                let insert_index = compute_insertion_index(&column_bounds, cursor_x);
+                let gap = workspace.gap();
+                let outer_left = workspace.outer_gaps().0.max(0);
+                let hint_x = if column_bounds.is_empty() {
+                    viewport.x.saturating_add(outer_left)
+                } else {
+                    compute_insertion_hint_x(&column_bounds, insert_index, gap)
+                };
+                let drop_target = DropTarget {
+                    monitor: target_monitor_id,
+                    insert_index,
+                    window_slot: None,
+                };
+                let unchanged = self
+                    .drag_state
+                    .as_ref()
+                    .is_some_and(|drag| drag.last_drop_target == Some(drop_target));
+                if let Some(ref mut drag) = self.drag_state {
+                    drag.last_drop_target = Some(drop_target);
+                }
+                if !unchanged {
+                    self.pending_drag_hint = Some(DragHintAction::ShowGhost {
+                        rect: Rect::new(hint_x - 2, viewport.y, 4, viewport.height),
+                    });
+                }
+                return;
             };
 
             // Determine if the dragged window is in the target column.
@@ -157,7 +217,6 @@ impl AppState {
             } else {
                 compute_window_slot(&col_rect, n_total, cursor_y)
             };
-            let _ = strip_hit;
 
             let drop_target = DropTarget {
                 monitor: target_monitor_id,
@@ -266,7 +325,12 @@ impl AppState {
             drag.last_drop_target = Some(drop_target);
         }
         let gap = workspace.gap();
-        let hint_x = compute_insertion_hint_x(&column_bounds, insert_index, gap);
+        let outer_left = workspace.outer_gaps().0.max(0);
+        let hint_x = if column_bounds.is_empty() {
+            viewport.x.saturating_add(outer_left)
+        } else {
+            compute_insertion_hint_x(&column_bounds, insert_index, gap)
+        };
         self.pending_drag_hint = Some(DragHintAction::ShowGhost {
             rect: Rect::new(hint_x - 2, viewport.y, 4, viewport.height),
         });
@@ -554,25 +618,25 @@ impl AppState {
     ) {
         let source_monitor = drag.source_monitor;
 
-        // Find target column and slot from cursor position.
+        // Find target column/slot from the cursor. On another monitor, empty
+        // space is a valid standalone-column destination rather than a cancel.
         if !self.monitors.contains_key(&target_monitor) {
-            self.snap_back_tiled(source_monitor, drag.source_workspace_idx);
+            self.cancel_tiled_drag(hwnd, drag);
             return;
         }
         let target_viewport = self.layout_viewport(target_monitor);
 
-        let (target_col_idx, window_slot) = {
+        let destination = {
             let ws_idx = self.active_workspace_idx(target_monitor);
             let Some(workspace) = self
                 .workspaces
                 .get(&target_monitor)
                 .and_then(|v| v.get(ws_idx))
             else {
-                self.snap_back_tiled(source_monitor, drag.source_workspace_idx);
+                self.cancel_tiled_drag(hwnd, drag);
                 return;
             };
             let column_bounds = column_bounds_from_placements(workspace, target_viewport);
-            // Use cursor position for intuitive drop targeting.
             let (cx, cy) = leopardwm_platform_win32::get_cursor_pos().unwrap_or_else(|| {
                 (
                     win_rect.x + win_rect.width / 2,
@@ -580,23 +644,18 @@ impl AppState {
                 )
             });
 
-            // If the drop lands on a visible tab strip, route to that
-            // tab's slot in the strip's owning column — overrides the
-            // column-based hit test below.
+            // If the drop lands on a visible tab strip, route to that strip's
+            // owning column. Otherwise merge only when directly over a column.
             let strip_hit = self
                 .tab_strip_overlays
                 .values()
                 .find_map(|s| s.hit_test_screen(cx, cy));
             if let Some(hit) = strip_hit {
-                (hit.column_idx, hit.tab_idx)
-            } else {
-                let col_idx = match compute_target_column_index(&column_bounds, cx) {
-                    Some(idx) => idx,
-                    None => {
-                        self.snap_back_tiled(source_monitor, drag.source_workspace_idx);
-                        return;
-                    }
-                };
+                WindowDropDestination::ExistingColumn {
+                    column: hit.column_idx,
+                    slot: hit.tab_idx,
+                }
+            } else if let Some(col_idx) = compute_target_column_index(&column_bounds, cx) {
                 let is_same_col = workspace.column(col_idx).is_some_and(|c| c.contains(hwnd));
                 let n_existing = workspace.column(col_idx).map(|c| c.len()).unwrap_or(0);
                 let n_total = if is_same_col {
@@ -606,10 +665,28 @@ impl AppState {
                 };
                 let col_rect = compute_column_rect(workspace, target_viewport, col_idx);
                 let slot = match col_rect {
-                    Some(ref r) if n_total > 0 => compute_window_slot(r, n_total, cy),
+                    Some(ref rect) if n_total > 0 => compute_window_slot(rect, n_total, cy),
                     _ => 0,
                 };
-                (col_idx, slot)
+                WindowDropDestination::ExistingColumn {
+                    column: col_idx,
+                    slot,
+                }
+            } else if target_monitor != source_monitor {
+                WindowDropDestination::NewColumn {
+                    index: compute_insertion_index(&column_bounds, cx),
+                }
+            } else {
+                self.cancel_tiled_drag(hwnd, drag);
+                return;
+            }
+        };
+
+        let (target_col_idx, window_slot) = match destination {
+            WindowDropDestination::ExistingColumn { column, slot } => (column, slot),
+            WindowDropDestination::NewColumn { index } => {
+                self.execute_cross_monitor_window_drop(hwnd, drag, target_monitor, index);
+                return;
             }
         };
 
@@ -640,7 +717,7 @@ impl AppState {
         // Single-window column dropped onto itself → snap back, nothing to merge.
         if let Some((src_col, src_len)) = src_col_info {
             if target_col_idx == src_col && src_len == 1 {
-                self.snap_back_tiled(source_monitor, drag.source_workspace_idx);
+                self.cancel_tiled_drag(hwnd, drag);
                 return;
             }
         }
@@ -653,7 +730,7 @@ impl AppState {
             .and_then(|v| v.get(tgt_check_idx))
             .is_none()
         {
-            self.snap_back_tiled(source_monitor, drag.source_workspace_idx);
+            self.cancel_tiled_drag(hwnd, drag);
             return;
         }
 
@@ -669,7 +746,7 @@ impl AppState {
             {
                 if let Err(e) = workspace.remove_window(hwnd) {
                     warn!("Failed to remove window {} for merge: {}", hwnd, e);
-                    self.snap_back_tiled(source_monitor, drag.source_workspace_idx);
+                    self.cancel_tiled_drag(hwnd, drag);
                     return;
                 }
             }
@@ -735,6 +812,21 @@ impl AppState {
                 debug!("Failed to focus merged window {}: {}", hwnd, e);
             }
             workspace.ensure_focused_visible_animated(target_viewport.width);
+        }
+
+        if target_monitor != source_monitor {
+            let source_viewport_width = self.viewport_width_for(source_monitor);
+            if let Some(source_ws) = self
+                .workspaces
+                .get_mut(&source_monitor)
+                .and_then(|v| v.get_mut(src_ws_idx))
+            {
+                source_ws.ensure_focused_visible_animated(source_viewport_width);
+            }
+            // The window may acquire different invisible-frame metrics after
+            // WM_DPICHANGED on the destination monitor. Invalidate both the
+            // global and animation-worker caches before the transition.
+            leopardwm_platform_win32::clear_inset_cache();
         }
 
         self.focused_monitor = target_monitor;
@@ -875,6 +967,17 @@ impl AppState {
                 ws.ensure_focused_visible_animated(vw);
             }
 
+            if target_monitor != source_monitor {
+                let source_viewport_width = self.viewport_width_for(source_monitor);
+                if let Some(source_ws) = self
+                    .workspaces
+                    .get_mut(&source_monitor)
+                    .and_then(|v| v.get_mut(src_ws_idx))
+                {
+                    source_ws.ensure_focused_visible_animated(source_viewport_width);
+                }
+                leopardwm_platform_win32::clear_inset_cache();
+            }
             self.focused_monitor = target_monitor;
 
             // Clear any in-progress transition so windows stay at their current positions.
@@ -895,6 +998,276 @@ impl AppState {
             self.clear_drag_placeholder();
             self.execute_window_merge(hwnd, drag, target_monitor, win_rect);
         }
+    }
+
+    /// Complete a plain drag into empty/unused space on another monitor by
+    /// moving only the dragged window into a new standalone column. Shift-drag
+    /// keeps its existing whole-column behavior below.
+    pub(crate) fn execute_cross_monitor_window_drop(
+        &mut self,
+        hwnd: u64,
+        drag: &DragState,
+        target_monitor: MonitorId,
+        insert_index: usize,
+    ) {
+        if target_monitor == drag.source_monitor {
+            self.cancel_tiled_drag(hwnd, drag);
+            return;
+        }
+
+        self.clear_drag_placeholder();
+        let source_monitor = drag.source_monitor;
+        let source_idx = drag.source_workspace_idx;
+        let target_idx = self.active_workspace_idx(target_monitor);
+        let target_viewport = self.layout_viewport(target_monitor);
+        let source_viewport_width = self.viewport_width_for(source_monitor);
+
+        let Some(mut source_workspace) = self
+            .workspaces
+            .get(&source_monitor)
+            .and_then(|v| v.get(source_idx))
+            .cloned()
+        else {
+            self.cancel_tiled_drag(hwnd, drag);
+            return;
+        };
+        let Some(mut target_workspace) = self
+            .workspaces
+            .get(&target_monitor)
+            .and_then(|v| v.get(target_idx))
+            .cloned()
+        else {
+            self.cancel_tiled_drag(hwnd, drag);
+            return;
+        };
+
+        // The live preview may already have detached the window from a
+        // multi-window source column. Otherwise remove it on the snapshot;
+        // failures leave the real state untouched.
+        if source_workspace.contains_window(hwnd) {
+            if let Err(error) = source_workspace.remove_window(hwnd) {
+                warn!(
+                    "Failed to detach window {} for cross-monitor drop: {}",
+                    hwnd, error
+                );
+                self.cancel_tiled_drag(hwnd, drag);
+                return;
+            }
+        } else if !drag.removed_from_source {
+            self.cancel_tiled_drag(hwnd, drag);
+            return;
+        }
+
+        let (outer_left, outer_right, _, _) = target_workspace.outer_gaps();
+        let fitting_width = target_viewport
+            .width
+            .saturating_sub(outer_left.max(0))
+            .saturating_sub(outer_right.max(0))
+            .max(100);
+        let carried_width = if drag.source_column_width > 0 {
+            self.scale_px_between_monitors(drag.source_column_width, source_monitor, target_monitor)
+        } else {
+            target_workspace.default_column_width()
+        };
+        let target_width = carried_width.min(fitting_width);
+        if let Err(error) =
+            target_workspace.insert_window_at_column(hwnd, Some(target_width), insert_index)
+        {
+            warn!(
+                "Failed to insert window {} on target monitor {}: {}",
+                hwnd, target_monitor, error
+            );
+            self.cancel_tiled_drag(hwnd, drag);
+            return;
+        }
+        source_workspace.ensure_focused_visible_animated(source_viewport_width);
+        target_workspace.ensure_focused_visible_animated(target_viewport.width);
+
+        let snapshot = self.snapshot_layout();
+        self.workspaces.get_mut(&source_monitor).unwrap()[source_idx] = source_workspace;
+        self.workspaces.get_mut(&target_monitor).unwrap()[target_idx] = target_workspace;
+        self.focused_monitor = target_monitor;
+        self.last_placed_layout_rects.remove(&hwnd);
+        leopardwm_platform_win32::clear_inset_cache();
+
+        info!(
+            "Cross-monitor window drop: {} from monitor {} to monitor {} as column {}",
+            hwnd, source_monitor, target_monitor, insert_index
+        );
+        self.start_layout_transition(snapshot);
+        if let Err(error) = self.apply_layout() {
+            warn!("Failed to apply cross-monitor window drop: {}", error);
+        }
+        self.sync_foreground_window();
+    }
+
+    /// Restore a window detached by live merge preview to its exact original
+    /// column/slot. Returns true when no restore was needed or it succeeded.
+    pub(crate) fn restore_detached_drag_window(&mut self, hwnd: u64, drag: &DragState) -> bool {
+        if !drag.removed_from_source {
+            return true;
+        }
+        self.workspaces
+            .get_mut(&drag.source_monitor)
+            .and_then(|v| v.get_mut(drag.source_workspace_idx))
+            .is_some_and(|workspace| {
+                if workspace.contains_window(hwnd) {
+                    return true;
+                }
+                let sibling_column = drag.source_sibling.and_then(|sibling| {
+                    workspace
+                        .find_window_location(sibling)
+                        .map(|(column, _)| column)
+                });
+                let result = if let Some(column) = sibling_column {
+                    workspace.insert_window_in_column_at(hwnd, column, drag.source_window_index)
+                } else {
+                    workspace.insert_window_at_column(
+                        hwnd,
+                        Some(drag.source_column_width),
+                        drag.source_column_index,
+                    )
+                };
+                result.is_ok() && workspace.focus_window(hwnd).is_ok()
+            })
+    }
+
+    /// Restore all source-side preview mutations. Plain mode may need the
+    /// detached HWND reinserted; column mode may need a live reorder reversed.
+    fn restore_drag_source_state(
+        &mut self,
+        hwnd: u64,
+        drag: &DragState,
+        restore_window: bool,
+    ) -> bool {
+        let window_restored = !restore_window || self.restore_detached_drag_window(hwnd, drag);
+        let order_restored = if drag.mode == DragMode::Column {
+            self.workspaces
+                .get_mut(&drag.source_monitor)
+                .and_then(|workspaces| workspaces.get_mut(drag.source_workspace_idx))
+                .is_some_and(|workspace| {
+                    let location = workspace
+                        .find_window_location(hwnd)
+                        .or_else(|| {
+                            drag.source_sibling
+                                .and_then(|sibling| workspace.find_window_location(sibling))
+                        })
+                        .map(|(column, _)| column);
+                    if let Some(column) = location {
+                        let original = drag
+                            .source_column_index
+                            .min(workspace.column_count().saturating_sub(1));
+                        workspace.reorder_column(column, original);
+                        true
+                    } else {
+                        false
+                    }
+                })
+        } else {
+            true
+        };
+        window_restored && order_restored
+    }
+
+    /// Abort the active drag without applying layout. Callers choose whether a
+    /// still-live detached HWND should be restored (real destruction passes
+    /// false), then decide when to reapply/re-enable DWM transitions.
+    pub(crate) fn abort_active_drag(&mut self, restore_window: bool) -> Option<u64> {
+        let drag = self.drag_state.take()?;
+        self.clear_drag_placeholder();
+        if drag.is_tiled && !self.restore_drag_source_state(drag.hwnd, &drag, restore_window) {
+            warn!(
+                "Failed to restore aborted drag {} on monitor {} workspace {}",
+                drag.hwnd, drag.source_monitor, drag.source_workspace_idx
+            );
+        }
+        self.pending_drag_hint = Some(DragHintAction::Hide);
+        Some(drag.hwnd)
+    }
+
+    /// Restore a window detached by live merge preview, then snap the source
+    /// workspace back. This closes a management-loss bug where moving out of a
+    /// valid target and releasing over empty space could leave the HWND in no
+    /// workspace at all.
+    pub(crate) fn cancel_tiled_drag(&mut self, hwnd: u64, drag: &DragState) {
+        self.clear_drag_placeholder();
+        if !self.restore_drag_source_state(hwnd, drag, true) {
+            warn!(
+                "Failed to restore cancelled drag {} to monitor {} workspace {}",
+                hwnd, drag.source_monitor, drag.source_workspace_idx
+            );
+        }
+        self.snap_back_tiled(drag.source_monitor, drag.source_workspace_idx);
+    }
+
+    /// Finish a floating-window drag. Cross-monitor drops transfer workspace
+    /// ownership transactionally; every drop clamps the visible frame to the
+    /// destination work area so no left/right/top/bottom edge remains outside.
+    pub(crate) fn finish_floating_drag(
+        &mut self,
+        hwnd: u64,
+        drag: &DragState,
+        target_monitor: MonitorId,
+        visible_rect: Rect,
+    ) -> bool {
+        let Some(target_work_area) = self.monitors.get(&target_monitor).map(|m| m.work_area) else {
+            return false;
+        };
+        let clamped_rect = clamp_rect_to_work_area(visible_rect, target_work_area);
+        let mut transferred = false;
+
+        if target_monitor != drag.source_monitor {
+            let source_idx = drag.source_workspace_idx;
+            let target_idx = self.active_workspace_idx(target_monitor);
+            let Some(mut source_workspace) = self
+                .workspaces
+                .get(&drag.source_monitor)
+                .and_then(|v| v.get(source_idx))
+                .cloned()
+            else {
+                return false;
+            };
+            let Some(floating) = source_workspace
+                .floating_windows()
+                .iter()
+                .find(|floating| floating.id == hwnd)
+                .cloned()
+            else {
+                return false;
+            };
+            let Some(mut target_workspace) = self
+                .workspaces
+                .get(&target_monitor)
+                .and_then(|v| v.get(target_idx))
+                .cloned()
+            else {
+                return false;
+            };
+
+            if !source_workspace.remove_floating(hwnd)
+                || target_workspace.add_floating(hwnd, clamped_rect).is_err()
+            {
+                return false;
+            }
+            target_workspace.set_floating_pinned(hwnd, floating.pinned);
+            self.workspaces.get_mut(&drag.source_monitor).unwrap()[source_idx] = source_workspace;
+            self.workspaces.get_mut(&target_monitor).unwrap()[target_idx] = target_workspace;
+            self.focused_monitor = target_monitor;
+            transferred = true;
+            leopardwm_platform_win32::clear_inset_cache();
+        }
+
+        let updated = self.update_floating_geometry(hwnd, clamped_rect);
+        if updated && (transferred || clamped_rect != visible_rect) {
+            self.last_placed_layout_rects.remove(&hwnd);
+            if let Err(error) = self.apply_layout() {
+                warn!(
+                    "Failed to clamp/re-home floating window {}: {}",
+                    hwnd, error
+                );
+            }
+        }
+        updated
     }
 
     /// Move a column to a different monitor after cross-monitor drag-drop.
@@ -920,14 +1293,14 @@ impl AppState {
         {
             Some(idx) => idx,
             None => {
-                self.snap_back_tiled(source_monitor, drag.source_workspace_idx);
+                self.cancel_tiled_drag(hwnd, drag);
                 return;
             }
         };
 
         // Compute target insertion index.
         if !self.monitors.contains_key(&target_monitor) {
-            self.snap_back_tiled(source_monitor, drag.source_workspace_idx);
+            self.cancel_tiled_drag(hwnd, drag);
             return;
         }
         let target_viewport = self.layout_viewport(target_monitor);
@@ -939,54 +1312,64 @@ impl AppState {
             .and_then(|v| v.get(tgt_idx))
             .map(|ws| column_bounds_from_placements(ws, target_viewport))
             .unwrap_or_default();
-        let win_center_x = win_rect.x + win_rect.width / 2;
-        let insert_idx = compute_insertion_index(&target_bounds, win_center_x);
+        let cursor_x = leopardwm_platform_win32::get_cursor_pos()
+            .map(|(x, _)| x)
+            .unwrap_or(win_rect.x + win_rect.width / 2);
+        let insert_idx = compute_insertion_index(&target_bounds, cursor_x);
 
-        // Collect minimized window IDs before removal (remove_column clears them
-        // from the source workspace's minimized set).
-        let minimized_in_col: Vec<u64> = self
+        // Build the transfer on cloned workspaces and commit only after the
+        // destination accepted the complete column. A duplicate/corrupt target
+        // must not lose the real source column.
+        let Some(mut source_workspace) = self
             .workspaces
             .get(&source_monitor)
-            .and_then(|v| v.get(src_idx))
-            .map(|ws| {
-                ws.columns()
-                    .get(col_idx)
-                    .map(|col| {
-                        col.windows()
-                            .iter()
-                            .copied()
-                            .filter(|wid| ws.is_minimized(*wid))
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            })
-            .unwrap_or_default();
-
-        // Verify target workspace exists before mutating source.
+            .and_then(|workspaces| workspaces.get(src_idx))
+            .cloned()
+        else {
+            self.cancel_tiled_drag(hwnd, drag);
+            return;
+        };
         let tgt_idx = self.active_workspace_idx(target_monitor);
-        if self
+        let Some(mut target_workspace) = self
             .workspaces
             .get(&target_monitor)
-            .and_then(|v| v.get(tgt_idx))
-            .is_none()
-        {
-            self.snap_back_tiled(source_monitor, drag.source_workspace_idx);
+            .and_then(|workspaces| workspaces.get(tgt_idx))
+            .cloned()
+        else {
+            self.cancel_tiled_drag(hwnd, drag);
             return;
-        }
-
-        // Remove column from source workspace.
-        let column = match self
-            .workspaces
-            .get_mut(&source_monitor)
-            .and_then(|v| v.get_mut(src_idx))
-            .and_then(|ws| ws.remove_column(col_idx))
-        {
-            Some(col) => col,
-            None => {
-                self.snap_back_tiled(source_monitor, drag.source_workspace_idx);
-                return;
-            }
         };
+        let minimized_in_col: Vec<u64> = source_workspace
+            .column(col_idx)
+            .map(|column| {
+                column
+                    .windows()
+                    .iter()
+                    .copied()
+                    .filter(|window| source_workspace.is_minimized(*window))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let Some(mut column) = source_workspace.remove_column(col_idx) else {
+            self.cancel_tiled_drag(hwnd, drag);
+            return;
+        };
+        let moved_windows: Vec<u64> = column.windows().to_vec();
+        let source_viewport_width = self.viewport_width_for(source_monitor);
+        source_workspace.ensure_focused_visible_animated(source_viewport_width);
+
+        // Preserve logical width across per-monitor DPI, then cap a column
+        // that cannot fit in the destination's visible strip so the focused
+        // frame does not arrive clipped on both horizontal edges.
+        let dpi_scaled_width =
+            self.scale_px_between_monitors(column.width(), source_monitor, target_monitor);
+        let (outer_left, outer_right, _, _) = target_workspace.outer_gaps();
+        let fitting_width = target_viewport
+            .width
+            .saturating_sub(outer_left.max(0))
+            .saturating_sub(outer_right.max(0))
+            .max(100);
+        column.set_width(dpi_scaled_width.min(fitting_width));
 
         debug!(
             "Cross-monitor drag: column with {} window(s) from monitor {} → monitor {} at index {}",
@@ -996,26 +1379,40 @@ impl AppState {
             insert_idx
         );
 
-        // Insert into target workspace and restore minimized state.
-        if let Some(target_ws) = self
-            .workspaces
-            .get_mut(&target_monitor)
-            .and_then(|v| v.get_mut(tgt_idx))
-        {
-            target_ws.insert_column_at(column, insert_idx);
-            for wid in &minimized_in_col {
-                target_ws.mark_minimized(*wid);
-            }
-            if let Err(e) = target_ws.focus_window(hwnd) {
-                debug!(
-                    "Failed to focus moved window after cross-monitor drag: {}",
-                    e
-                );
-            }
-            target_ws.ensure_focused_visible_animated(target_viewport.width);
+        let target_column_count = target_workspace.column_count();
+        target_workspace.insert_column_at(column, insert_idx);
+        if target_workspace.column_count() != target_column_count + 1 {
+            warn!(
+                "Cross-monitor column drop rejected by target monitor {}; source left unchanged",
+                target_monitor
+            );
+            self.cancel_tiled_drag(hwnd, drag);
+            return;
         }
+        for window in &minimized_in_col {
+            target_workspace.mark_minimized(*window);
+        }
+        if let Err(error) = target_workspace.focus_window(hwnd) {
+            warn!(
+                "Cross-monitor column drop could not focus {}: {}; source left unchanged",
+                hwnd, error
+            );
+            self.cancel_tiled_drag(hwnd, drag);
+            return;
+        }
+        debug_assert!(
+            moved_windows
+                .iter()
+                .all(|window| target_workspace.contains_window(*window)),
+            "accepted column must contain every transferred window"
+        );
+        target_workspace.ensure_focused_visible_animated(target_viewport.width);
 
+        self.workspaces.get_mut(&source_monitor).unwrap()[src_idx] = source_workspace;
+        self.workspaces.get_mut(&target_monitor).unwrap()[tgt_idx] = target_workspace;
         self.focused_monitor = target_monitor;
+        self.last_placed_layout_rects.remove(&hwnd);
+        leopardwm_platform_win32::clear_inset_cache();
 
         self.start_layout_transition(snapshot);
         if let Err(e) = self.apply_layout() {
@@ -1044,6 +1441,21 @@ impl AppState {
     }
 }
 
+/// Clamp a visible window rectangle wholly inside a monitor work area. If the
+/// window is larger than the work area, shrink that axis first; otherwise no
+/// position can make both opposing edges visible.
+pub(crate) fn clamp_rect_to_work_area(rect: Rect, work_area: Rect) -> Rect {
+    rect.clamped_inside(work_area)
+}
+
+/// Resolved plain-drag destination. A cross-monitor drop over an existing
+/// column merges into it; a drop into empty/unused target space creates a new
+/// standalone column at the insertion edge.
+enum WindowDropDestination {
+    ExistingColumn { column: usize, slot: usize },
+    NewColumn { index: usize },
+}
+
 /// Screen-space boundary of a single column.
 struct ColumnBound {
     column_index: usize,
@@ -1064,28 +1476,34 @@ fn column_bounds_from_placements(
     viewport: Rect,
 ) -> Vec<ColumnBound> {
     let placements = workspace.compute_placements_animated(viewport);
-    // Group placements by column_index and compute left/right per column,
-    // skipping off-screen (inactive-tab) placements.
-    let mut map: std::collections::HashMap<usize, (i32, i32)> = std::collections::HashMap::new();
-    for p in &placements {
-        if !matches!(p.visibility, leopardwm_core_layout::Visibility::Visible) {
+    // Placements are emitted in column order, with all windows from a column
+    // contiguous. Accumulate directly instead of building a HashMap and sorting
+    // it on every ~60 Hz drag-hint tick.
+    let mut bounds: Vec<ColumnBound> = Vec::with_capacity(workspace.column_count());
+    for placement in &placements {
+        if placement.column_index == usize::MAX
+            || !matches!(
+                placement.visibility,
+                leopardwm_core_layout::Visibility::Visible
+            )
+        {
             continue;
         }
-        let entry = map
-            .entry(p.column_index)
-            .or_insert((p.rect.x, p.rect.x + p.rect.width));
-        entry.0 = entry.0.min(p.rect.x);
-        entry.1 = entry.1.max(p.rect.x + p.rect.width);
+        let right = placement.rect.x.saturating_add(placement.rect.width);
+        if let Some(bound) = bounds
+            .last_mut()
+            .filter(|bound| bound.column_index == placement.column_index)
+        {
+            bound.screen_left = bound.screen_left.min(placement.rect.x);
+            bound.screen_right = bound.screen_right.max(right);
+        } else {
+            bounds.push(ColumnBound {
+                column_index: placement.column_index,
+                screen_left: placement.rect.x,
+                screen_right: right,
+            });
+        }
     }
-    let mut bounds: Vec<ColumnBound> = map
-        .into_iter()
-        .map(|(idx, (left, right))| ColumnBound {
-            column_index: idx,
-            screen_left: left,
-            screen_right: right,
-        })
-        .collect();
-    bounds.sort_by_key(|b| b.screen_left);
     bounds
 }
 
@@ -1177,4 +1595,24 @@ fn compute_window_slot(col_rect: &Rect, n_slots: usize, screen_y: i32) -> usize 
     }
     let slot = (relative_y / zone_height) as usize;
     slot.min(n_slots - 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use leopardwm_core_layout::Workspace;
+
+    #[test]
+    fn column_bounds_exclude_floating_sentinel_placements() {
+        let mut workspace = Workspace::with_gaps(10, 0);
+        workspace.insert_window(1, Some(600)).unwrap();
+        workspace
+            .add_floating(2, Rect::new(900, 100, 500, 400))
+            .unwrap();
+
+        let bounds = column_bounds_from_placements(&workspace, Rect::new(0, 0, 1920, 1040));
+
+        assert_eq!(bounds.len(), 1);
+        assert_eq!(bounds[0].column_index, 0);
+    }
 }

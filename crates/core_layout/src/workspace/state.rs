@@ -154,10 +154,13 @@ impl Workspace {
     // ========================================================================
 
     /// Toggle floating state for the focused window.
-    /// If the focused window is tiled, move it to floating with a centered rect.
-    /// If the focused window is floating, this is a no-op (floating windows are not focused via column focus).
+    ///
+    /// If the focused window is tiled, move it to floating at `rect`. Callers
+    /// compute that rectangle so monitor-specific sizing policy stays outside
+    /// the platform-agnostic layout engine. If the focused window is floating,
+    /// this is a no-op (floating windows are not focused via column focus).
     /// Returns the window ID that was toggled, if any.
-    pub fn toggle_floating(&mut self, viewport: Rect) -> Option<WindowId> {
+    pub fn toggle_floating(&mut self, rect: Rect) -> Option<WindowId> {
         let wid = self.focused_window()?;
 
         // Defensive guard: if the focused window is currently fullscreen, clear
@@ -182,13 +185,6 @@ impl Workspace {
         if let Some(origin) = origin {
             self.float_origin_column.insert(wid, origin);
         }
-
-        // Center a floating window of 800x600 or clamped to viewport
-        let float_w = 800.min(viewport.width - 40);
-        let float_h = 600.min(viewport.height - 40);
-        let float_x = viewport.x + (viewport.width - float_w) / 2;
-        let float_y = viewport.y + (viewport.height - float_h) / 2;
-        let rect = Rect::new(float_x, float_y, float_w, float_h);
 
         let _ = self.add_floating(wid, rect);
         Some(wid)

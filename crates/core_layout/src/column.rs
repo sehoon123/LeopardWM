@@ -192,7 +192,9 @@ impl Column {
             return;
         }
         let clamped = active_idx.min(self.windows.len() - 1);
-        self.mode = ColumnMode::Tabbed { active_idx: clamped };
+        self.mode = ColumnMode::Tabbed {
+            active_idx: clamped,
+        };
     }
 
     /// Switch this column back to Vertical mode.
@@ -208,7 +210,9 @@ impl Column {
         }
         if let ColumnMode::Tabbed { .. } = self.mode {
             let clamped = index.min(self.windows.len() - 1);
-            self.mode = ColumnMode::Tabbed { active_idx: clamped };
+            self.mode = ColumnMode::Tabbed {
+                active_idx: clamped,
+            };
         }
     }
 
@@ -266,7 +270,9 @@ impl Column {
     }
 
     /// Set a single window's height weight, distributing the remainder
-    /// equally among siblings. Each sibling keeps at least 5% weight.
+    /// equally among siblings. Each sibling keeps at least 5% weight when
+    /// that is mathematically possible; larger stacks use an equal-share
+    /// floor instead.
     pub fn set_height_weight(&mut self, index: usize, weight: f64) {
         let n = self.windows.len();
         if n <= 1 || index >= n {
@@ -275,10 +281,18 @@ impl Column {
         self.ensure_height_weights();
 
         let siblings = n - 1;
-        let min_sibling = 0.05;
-        // Clamp so siblings can each have at least min_sibling
-        let max_weight = 1.0 - (siblings as f64 * min_sibling);
-        let weight = weight.clamp(min_sibling, max_weight);
+        // A fixed 5% floor becomes impossible at 21+ windows and used to
+        // produce min > max here, which makes f64::clamp panic. Reduce the
+        // floor to an equal share for large stacks and defensively preserve
+        // ordered clamp bounds despite floating-point rounding.
+        let min_sibling = 0.05_f64.min(1.0 / n as f64);
+        let max_weight = (1.0 - siblings as f64 * min_sibling).max(min_sibling);
+        let requested = if weight.is_finite() {
+            weight
+        } else {
+            1.0 / n as f64
+        };
+        let weight = requested.clamp(min_sibling, max_weight);
 
         self.height_weights[index] = weight;
         let remainder = 1.0 - weight;
@@ -339,7 +353,9 @@ impl Column {
                 std::cmp::Ordering::Equal => active_idx.min(self.windows.len() - 1),
                 std::cmp::Ordering::Less => active_idx,
             };
-            self.mode = ColumnMode::Tabbed { active_idx: new_active };
+            self.mode = ColumnMode::Tabbed {
+                active_idx: new_active,
+            };
         }
         self.maintain_mode_invariant();
     }
@@ -354,7 +370,9 @@ impl Column {
             } else {
                 active_idx
             };
-            self.mode = ColumnMode::Tabbed { active_idx: new_active };
+            self.mode = ColumnMode::Tabbed {
+                active_idx: new_active,
+            };
         }
         self.maintain_mode_invariant();
     }
@@ -371,7 +389,9 @@ impl Column {
             } else {
                 active_idx
             };
-            self.mode = ColumnMode::Tabbed { active_idx: new_active };
+            self.mode = ColumnMode::Tabbed {
+                active_idx: new_active,
+            };
         }
         self.maintain_mode_invariant();
     }

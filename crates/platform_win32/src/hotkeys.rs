@@ -29,10 +29,16 @@ const WM_DISPLAYCHANGE: u32 = 0x007E;
 /// Window message for system-wide setting changes (work area, theme, etc.).
 const WM_SETTINGCHANGE: u32 = 0x001A;
 
+/// Window message indicating that theme resources changed.
+const WM_THEMECHANGED: u32 = 0x031A;
+
 /// `SystemParametersInfo` action signalling the desktop work area changed
 /// (wparam of `WM_SETTINGCHANGE`). Fired when the taskbar toggles between
 /// auto-hide and always-on, which resizes `rcWork` without a display change.
 const SPI_SETWORKAREA: usize = 0x002F;
+
+/// `SystemParametersInfo` action signalling high-contrast mode changed.
+const SPI_SETHIGHCONTRAST: usize = 0x0043;
 
 /// Window message for power state changes.
 const WM_POWERBROADCAST: u32 = 0x0218;
@@ -143,8 +149,9 @@ pub struct HotkeyEvent {
     pub id: HotkeyId,
 }
 
-/// Global sender for display change events forwarded to the window event
-/// channel. Registered once at startup (`set_display_change_sender`) and
+/// Global sender for display, work-area, and appearance events forwarded to
+/// the window event channel. Registered once at startup
+/// (`set_display_change_sender`) and
 /// deliberately NOT cleared when the system-event window is dropped: the window
 /// is recreated on every config reload, but the daemon's forwarding channel
 /// lives for the whole session. Clearing it on window drop silently stopped
@@ -248,9 +255,9 @@ impl Drop for SystemEventHandle {
     }
 }
 
-/// Register a sender for display change events.
+/// Register a sender for display, work-area, and appearance events.
 ///
-/// This allows the hotkey window to forward WM_DISPLAYCHANGE messages
+/// This allows the system-event window to forward relevant Windows messages
 /// to the window event channel. Call this before `register_system_events`.
 pub fn set_display_change_sender(sender: mpsc::Sender<WindowEvent>) -> Result<(), Win32Error> {
     let mut guard = DISPLAY_CHANGE_SENDER.lock().map_err(|_| {
@@ -357,14 +364,20 @@ pub fn register_system_events() -> Result<SystemEventHandle, Win32Error> {
                     &GUID_ACDC_POWER_SOURCE,
                     REGISTER_NOTIFICATION_FLAGS(0),
                 ) {
-                    tracing::warn!("Failed to register GUID_ACDC_POWER_SOURCE notification: {}", e);
+                    tracing::warn!(
+                        "Failed to register GUID_ACDC_POWER_SOURCE notification: {}",
+                        e
+                    );
                 }
                 if let Err(e) = RegisterPowerSettingNotification(
                     handle,
                     &GUID_POWER_SAVING_STATUS,
                     REGISTER_NOTIFICATION_FLAGS(0),
                 ) {
-                    tracing::warn!("Failed to register GUID_POWER_SAVING_STATUS notification: {}", e);
+                    tracing::warn!(
+                        "Failed to register GUID_POWER_SAVING_STATUS notification: {}",
+                        e
+                    );
                 }
                 tracing::debug!("Registered power setting notifications");
             }
@@ -491,10 +504,31 @@ fn sysevent_window_proc_inner(
             }
             windows::Win32::Foundation::LRESULT(0)
         }
+        WM_THEMECHANGED => {
+            let sender_guard = DISPLAY_CHANGE_SENDER
+                .lock()
+                .unwrap_or_else(recover_poisoned_mutex);
+            if let Some(sender) = sender_guard.as_ref() {
+                let _ = sender.send(WindowEvent::AppearanceChanged);
+            }
+            windows::Win32::Foundation::LRESULT(0)
+        }
+        WM_SETTINGCHANGE if wparam.0 == SPI_SETHIGHCONTRAST => {
+            let sender_guard = DISPLAY_CHANGE_SENDER
+                .lock()
+                .unwrap_or_else(recover_poisoned_mutex);
+            if let Some(sender) = sender_guard.as_ref() {
+                let _ = sender.send(WindowEvent::AppearanceChanged);
+            }
+            windows::Win32::Foundation::LRESULT(0)
+        }
         WM_POWERBROADCAST => {
             if wparam.0 == PBT_POWERSETTINGCHANGE {
                 let on_battery_or_saver = crate::system::is_on_battery_or_power_saver();
-                tracing::debug!("Power state changed: on_battery_or_saver={}", on_battery_or_saver);
+                tracing::debug!(
+                    "Power state changed: on_battery_or_saver={}",
+                    on_battery_or_saver
+                );
 
                 let sender_guard = POWER_STATE_SENDER
                     .lock()
@@ -758,7 +792,10 @@ mod tests {
             ..Default::default()
         };
         assert_ne!(Hotkey::stable_id(f13, 0x48), Hotkey::stable_id(f14, 0x48));
-        assert_ne!(Hotkey::stable_id(f13, 0x48), Hotkey::stable_id(ctrl_alt, 0x48));
+        assert_ne!(
+            Hotkey::stable_id(f13, 0x48),
+            Hotkey::stable_id(ctrl_alt, 0x48)
+        );
         // F13+H and a bare standard combo can't collide: same vk, different mods.
         assert_ne!(Hotkey::stable_id(f13, 0x48), Hotkey::stable_id(win, 0x48));
     }
@@ -929,6 +966,46 @@ mod tests {
     }
 
     #[test]
+    fn test_sysevent_window_proc_forwards_appearance_changes() {
+        let _guard = HOTKEY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex);
+
+        let (tx, rx) = mpsc::channel::<WindowEvent>();
+        set_display_change_sender(tx).unwrap();
+        let hwnd = HWND(std::ptr::null_mut());
+        let lparam = windows::Win32::Foundation::LPARAM(0);
+
+        let theme_result = sysevent_window_proc_inner(
+            hwnd,
+            WM_THEMECHANGED,
+            windows::Win32::Foundation::WPARAM(0),
+            lparam,
+        );
+        assert_eq!(theme_result.0, 0);
+        assert!(matches!(
+            rx.recv_timeout(std::time::Duration::from_millis(100)),
+            Ok(WindowEvent::AppearanceChanged)
+        ));
+
+        let contrast_result = sysevent_window_proc_inner(
+            hwnd,
+            WM_SETTINGCHANGE,
+            windows::Win32::Foundation::WPARAM(SPI_SETHIGHCONTRAST),
+            lparam,
+        );
+        assert_eq!(contrast_result.0, 0);
+        assert!(matches!(
+            rx.recv_timeout(std::time::Duration::from_millis(100)),
+            Ok(WindowEvent::AppearanceChanged)
+        ));
+
+        *DISPLAY_CHANGE_SENDER
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex) = None;
+    }
+
+    #[test]
     fn test_sysevent_handle_drop_does_not_block_when_quit_post_fails() {
         let _guard = HOTKEY_TEST_LOCK
             .lock()
@@ -1049,7 +1126,10 @@ mod tests {
 
         // Multiple F-key modifiers combine.
         let (mods, vk) = parse_hotkey_string("F13+F14+H").unwrap();
-        assert_eq!(mods.fn_mods, fn_mod_bit(0x7C).unwrap() | fn_mod_bit(0x7D).unwrap());
+        assert_eq!(
+            mods.fn_mods,
+            fn_mod_bit(0x7C).unwrap() | fn_mod_bit(0x7D).unwrap()
+        );
         assert_eq!(vk, super::vk::H);
 
         // F-key modifier mixes with standard modifiers.

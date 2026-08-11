@@ -40,6 +40,20 @@ outer_gap_right = {outer_gap}
 outer_gap_top = {outer_gap}
 outer_gap_bottom = {outer_gap}
 
+# Default manual floating-window size in logical pixels. The size is scaled
+# for the active monitor's DPI and clamped to its work area when shown.
+default_floating_width = 800
+default_floating_height = 600
+# Remember each ordinary floating window's resized logical size for this
+# daemon session. Position is never remembered; windows re-center when floated.
+remember_floating_sizes = true
+
+# Default scratchpad size in logical pixels. Remembered size and default size
+# stay independent from ordinary floating-window history.
+default_scratchpad_width = 900
+default_scratchpad_height = 600
+remember_scratchpad_size = true
+
 # Width presets (fractions of usable viewport width).
 width_presets = [0.333, 0.5, 0.667]
 
@@ -73,6 +87,11 @@ focus_follows_mouse = false
 
 # Disable Windows 11 Snap Layouts for tiled windows (also disables maximize button)
 # disable_snap_layouts = false
+
+# Allow title-bar drops onto another monitor. Plain drag transfers only the
+# dragged window; hold Shift before drag start to transfer its entire column.
+# Disable to keep every mouse drop on its source monitor.
+# cross_monitor_drag = true
 
 # Check GitHub Releases once a day for a newer version. One anonymous HTTPS GET to
 # api.github.com on startup + every 24h. Disable to skip entirely.
@@ -209,6 +228,13 @@ mod tests {
         }
         assert!(config.starts_with("# LeopardWM Configuration\n"));
         assert!(config.contains("gap = 10"));
+        assert!(config.contains("default_floating_width = 800"));
+        assert!(config.contains("default_floating_height = 600"));
+        assert!(config.contains("default_scratchpad_width = 900"));
+        assert!(config.contains("default_scratchpad_height = 600"));
+        assert!(config.contains("remember_floating_sizes = true"));
+        assert!(config.contains("remember_scratchpad_size = true"));
+        assert!(config.contains("# cross_monitor_drag = true"));
         assert!(config.contains("centering_mode = \"center\""));
         assert!(config.contains("\"Win+Ctrl+Escape\" = \"panic_revert\""));
     }

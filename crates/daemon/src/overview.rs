@@ -1595,16 +1595,20 @@ mod tests {
         add_windows(&mut state, 0, &[101, 102]);
         state.overview_icon_cache.insert(101, Some(0x1234));
         state.overview_icon_cache.insert(102, Some(0x5678));
+        state.tab_strip_icon_cache.insert(101, Some(0x1234));
+        state.tab_strip_icon_cache.insert(102, Some(0x5678));
 
-        // Hidden (window may live on, e.g. close-to-tray): icon kept —
+        // Hidden (window may live on, e.g. close-to-tray): icons kept —
         // the shared HICON stays valid while the window exists.
         state.handle_window_event(WindowEvent::Hidden(102));
         assert_eq!(state.overview_icon_cache.get(&102), Some(&Some(0x5678)));
+        assert_eq!(state.tab_strip_icon_cache.get(&102), Some(&Some(0x5678)));
 
         // Real destroy: the HICON dies with the window; a recycled HWND
-        // must re-probe.
+        // must re-probe in both UI paths.
         state.handle_window_event(WindowEvent::Destroyed(101));
         assert!(!state.overview_icon_cache.contains_key(&101));
+        assert!(!state.tab_strip_icon_cache.contains_key(&101));
     }
 
     #[test]

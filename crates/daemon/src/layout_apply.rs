@@ -9,6 +9,19 @@ use tracing::{debug, warn};
 
 const MAX_TIMEOUT_DIAGNOSTIC_CHARS: usize = 256;
 
+/// An exact-viewport minimum is safe to persist only when the requested origin
+/// was far enough from the work-area origin to distinguish a window that
+/// honored placement from app-owned fullscreen. Share this predicate between
+/// landing and animation propagation so their tolerance cannot drift.
+pub(crate) fn viewport_equality_is_proven(
+    position_matches: bool,
+    requested_origin: i32,
+    work_origin: i32,
+) -> bool {
+    position_matches
+        && requested_origin.abs_diff(work_origin) > leopardwm_platform_win32::EDGE_EPSILON_PX as u32
+}
+
 fn bounded_timeout_diagnostic(value: String) -> Option<String> {
     if value.is_empty() {
         return None;
@@ -34,6 +47,7 @@ type ApplyWorkerMsg = (
     Result<()>,
     Vec<leopardwm_platform_win32::WidthViolation>,
     Vec<leopardwm_platform_win32::HeightViolation>,
+    Vec<u64>,
 );
 
 /// Re-park any off-screen placement that would land on a NEIGHBOR monitor to an
@@ -57,11 +71,11 @@ fn park_offscreen_avoiding_neighbors(
         leopardwm_platform_win32::MonitorId,
         leopardwm_platform_win32::MonitorInfo,
     >,
+    monitor_rects: &[leopardwm_core_layout::Rect],
 ) {
     let Some(owner) = monitors.get(&owner_id).map(|m| m.rect) else {
         return;
     };
-    let monitor_rects: Vec<_> = monitors.values().map(|m| m.rect).collect();
     for p in placements.iter_mut() {
         if p.visibility == leopardwm_core_layout::Visibility::Visible {
             continue;
@@ -71,7 +85,7 @@ fn park_offscreen_avoiding_neighbors(
             .filter(|(id, _)| **id != owner_id)
             .any(|(_, m)| p.rect.intersects(&m.rect));
         if bleeds {
-            p.rect = offscreen_park_rect(p.rect, owner, &monitor_rects);
+            p.rect = offscreen_park_rect(p.rect, owner, monitor_rects);
         }
     }
 }
@@ -199,13 +213,19 @@ impl AppState {
             }
         }
         let mut all_placements = Vec::new();
+        let monitor_rects: Vec<_> = self.monitors.values().map(|monitor| monitor.rect).collect();
         for (monitor_id, ws_vec) in &self.workspaces {
             let idx = self.active_workspace_idx(*monitor_id);
             if let Some(workspace) = ws_vec.get(idx) {
                 if self.monitors.contains_key(monitor_id) {
                     let viewport = self.layout_viewport(*monitor_id);
                     let mut placements = workspace.compute_placements_animated(viewport);
-                    park_offscreen_avoiding_neighbors(&mut placements, *monitor_id, &self.monitors);
+                    park_offscreen_avoiding_neighbors(
+                        &mut placements,
+                        *monitor_id,
+                        &self.monitors,
+                        &monitor_rects,
+                    );
                     all_placements.extend(placements);
                 }
             }
@@ -346,6 +366,24 @@ impl AppState {
             }
         }
 
+        // Safety net for scroll invariant #4: a structural change that shrank
+        // the strip can leave the active workspace scrolled past its content,
+        // which renders as the leftmost column clipped off-screen with blank
+        // desktop at the right edge. Re-clamp each monitor's active workspace
+        // before placement so a stale over-scroll can't reach the screen.
+        let active_workspace = &self.active_workspace;
+        let monitors = &self.monitors;
+        for (monitor_id, ws_vec) in &mut self.workspaces {
+            let viewport_width = monitors
+                .get(monitor_id)
+                .map(|monitor| monitor.work_area.width)
+                .unwrap_or(FALLBACK_VIEWPORT_WIDTH);
+            let active_idx = active_workspace.get(monitor_id).copied().unwrap_or(0);
+            if let Some(workspace) = ws_vec.get_mut(active_idx) {
+                workspace.clamp_scroll_to_bounds(viewport_width);
+            }
+        }
+
         let mut all_placements = self.collect_apply_placements();
 
         // Interpolate layout transitions (structural changes like move/expel).
@@ -395,10 +433,18 @@ impl AppState {
         self.record_last_placed_rects(&all_placements);
 
         let timeout = self.layout_apply_timeout;
-        let (rx, worker_handle) = self.spawn_apply_worker(all_placements)?;
+        let (rx, worker_handle) = match self.spawn_apply_worker(all_placements) {
+            Ok(worker) => worker,
+            Err(error) => {
+                self.last_placed_layout_rects.clear();
+                self.moved_or_resized_suppression.clear();
+                self.applying_layout = false;
+                return Err(error);
+            }
+        };
 
         let result = match rx.recv_timeout(timeout) {
-            Ok((result, width_violations, height_violations)) => {
+            Ok((result, width_violations, height_violations, geometry_mismatches)) => {
                 let _ = worker_handle.join();
                 if result.is_err() {
                     self.moved_or_resized_suppression.clear();
@@ -408,17 +454,25 @@ impl AppState {
                 } else {
                     false
                 };
-                // If any constraint was added, run a single guarded re-apply
-                // so the corrected layout lands on the current frame instead
-                // of waiting for the next user-triggered event. The inner
-                // apply_layout manages its own applying_layout state; we just
-                // need to release our own first so the guard at the top of
-                // the recursive call can re-enter cleanly. If the inner call
-                // fails (e.g. its worker times out and pauses the daemon), we
-                // surface that error in place of the outer Ok — the outer
-                // placements may have already landed, but the daemon state
-                // needs to reflect that the corrective pass didn't complete.
-                if constraints_changed && !self.reapplying_after_violation {
+                let geometry_changed = result.is_ok() && !geometry_mismatches.is_empty();
+                // A geometry-only correction has the same desired layout
+                // rectangles, so evict just the mismatched HWNDs before the
+                // guarded re-apply; otherwise the fast-path would skip the
+                // SetWindowPos that needs to use freshly queried insets.
+                if geometry_changed {
+                    for hwnd in &geometry_mismatches {
+                        self.last_placed_layout_rects.remove(hwnd);
+                    }
+                    debug!(
+                        "Retrying {} tiled window(s) whose visible frame missed a requested edge",
+                        geometry_mismatches.len()
+                    );
+                }
+                // If a constraint was added or visible geometry missed an edge,
+                // run a single guarded re-apply so the corrected layout lands on
+                // the current frame instead of waiting for another user event.
+                // The guard prevents an uncooperative app from recursing forever.
+                if (constraints_changed || geometry_changed) && !self.reapplying_after_violation {
                     self.reapplying_after_violation = true;
                     self.applying_layout = false;
                     let reapply = self.apply_layout();
@@ -472,6 +526,13 @@ impl AppState {
                 ))
             }
         };
+        if result.is_err() {
+            // Desired rectangles are recorded before the worker runs so the
+            // normal success path can use the fast cache immediately. A
+            // failed or timed-out batch did not reliably apply them, so an
+            // identical next layout must retry instead of returning early.
+            self.last_placed_layout_rects.clear();
+        }
         self.applying_layout = false;
 
         // Reposition border to track the focused window after layout changes
@@ -485,6 +546,9 @@ impl AppState {
     /// Collect animated placements for every monitor's active workspace, with debug logging.
     fn collect_apply_placements(&self) -> Vec<leopardwm_core_layout::WindowPlacement> {
         let mut all_placements = Vec::new();
+        // Reuse one monitor-rect snapshot for every owner monitor in this
+        // batch instead of allocating it again per monitor.
+        let monitor_rects: Vec<_> = self.monitors.values().map(|monitor| monitor.rect).collect();
 
         for (monitor_id, ws_vec) in &self.workspaces {
             let idx = self.active_workspace_idx(*monitor_id);
@@ -493,7 +557,12 @@ impl AppState {
                     // Use animated placements to support smooth scrolling
                     let viewport = self.layout_viewport(*monitor_id);
                     let mut placements = workspace.compute_placements_animated(viewport);
-                    park_offscreen_avoiding_neighbors(&mut placements, *monitor_id, &self.monitors);
+                    park_offscreen_avoiding_neighbors(
+                        &mut placements,
+                        *monitor_id,
+                        &self.monitors,
+                        &monitor_rects,
+                    );
                     debug!(
                         "Monitor {}: {} placements for viewport {}x{} (animating: {}, scroll: {:.1}, minimized: {})",
                         monitor_id,
@@ -611,7 +680,7 @@ impl AppState {
                         || apply_epoch_ref.load(Ordering::SeqCst) != apply_epoch
                 };
                 if should_cancel() {
-                    let _ = tx.send((Ok(()), Vec::new(), Vec::new()));
+                    let _ = tx.send((Ok(()), Vec::new(), Vec::new(), Vec::new()));
                     return;
                 }
 
@@ -634,26 +703,36 @@ impl AppState {
                         );
                         #[cfg(test)]
                         late_worker_recovery_count.fetch_add(1, Ordering::SeqCst);
-                        let _ = tx.send((Ok(()), Vec::new(), Vec::new()));
+                        let _ = tx.send((Ok(()), Vec::new(), Vec::new(), Vec::new()));
                         return;
                     }
-                    let _ = tx.send((result, Vec::new(), Vec::new()));
+                    let _ = tx.send((result, Vec::new(), Vec::new(), Vec::new()));
                     return;
                 }
 
                 if should_cancel() {
-                    let _ = tx.send((Ok(()), Vec::new(), Vec::new()));
+                    let _ = tx.send((Ok(()), Vec::new(), Vec::new(), Vec::new()));
                     return;
                 }
-                let (result, width_violations, height_violations) =
+                let (result, width_violations, height_violations, geometry_mismatches) =
                     match leopardwm_platform_win32::apply_placements(
                         &all_placements,
                         &platform_config,
                         None,
                         post_animation_nudge,
                     ) {
-                        Ok(r) => (Ok(()), r.width_violations, r.height_violations),
-                        Err(e) => (Err(anyhow!(e.to_string())), Vec::new(), Vec::new()),
+                        Ok(r) => (
+                            Ok(()),
+                            r.width_violations,
+                            r.height_violations,
+                            r.geometry_mismatches,
+                        ),
+                        Err(e) => (
+                            Err(anyhow!(e.to_string())),
+                            Vec::new(),
+                            Vec::new(),
+                            Vec::new(),
+                        ),
                     };
                 if should_cancel() {
                     run_layout_apply_recovery_pass(
@@ -662,10 +741,15 @@ impl AppState {
                     );
                     #[cfg(test)]
                     late_worker_recovery_count.fetch_add(1, Ordering::SeqCst);
-                    let _ = tx.send((Ok(()), Vec::new(), Vec::new()));
+                    let _ = tx.send((Ok(()), Vec::new(), Vec::new(), Vec::new()));
                     return;
                 }
-                let _ = tx.send((result, width_violations, height_violations));
+                let _ = tx.send((
+                    result,
+                    width_violations,
+                    height_violations,
+                    geometry_mismatches,
+                ));
             });
 
         match spawn_result {
@@ -678,66 +762,115 @@ impl AppState {
     }
 
     /// Feed worker-reported size violations back to the layout engine; returns whether constraints changed.
-    fn propagate_size_violations(
+    pub(crate) fn propagate_size_violations(
         &mut self,
         width_violations: &[leopardwm_platform_win32::WidthViolation],
         height_violations: &[leopardwm_platform_win32::HeightViolation],
     ) -> bool {
-        // Skip violations where min_width/min_height >= viewport size —
-        // the window is temporarily fullscreen/maximized by the app
-        // itself, not genuinely enforcing a minimum that large.
+        // Values larger than the work area are physically impossible. At
+        // exact equality, accept only windows that honored a requested axis
+        // origin different from the work-area origin. Otherwise fullscreen and
+        // a real minimum are indistinguishable—and already fit without clipping.
         let mut constraints_changed = false;
-        if !width_violations.is_empty() {
-            for v in width_violations {
-                let vw = self
-                    .find_window_workspace(v.window_id)
-                    .map(|(mid, _)| self.viewport_width_for(mid))
-                    .unwrap_or(i32::MAX);
-                if v.min_width >= vw {
-                    debug!(
-                        "Ignoring viewport-sized width violation for window {} ({}px >= {}px viewport)",
-                        v.window_id, v.min_width, vw
-                    );
-                    continue;
-                }
-                for ws_vec in self.workspaces.values_mut() {
-                    for ws in ws_vec.iter_mut() {
-                        if ws.contains_window(v.window_id) {
-                            ws.set_window_min_width(v.window_id, v.min_width);
-                            constraints_changed = true;
-                        }
-                    }
+        let mut width_changed_workspaces = Vec::new();
+        for violation in width_violations {
+            let Some((monitor_id, workspace_idx)) = self.find_window_workspace(violation.window_id)
+            else {
+                continue;
+            };
+            let work_area = self.layout_viewport(monitor_id);
+            let viewport_width = work_area.width;
+            let equality_is_proven = viewport_equality_is_proven(
+                violation.position_matches,
+                violation.requested_left,
+                work_area.x,
+            );
+            if violation.min_width > viewport_width
+                || (violation.min_width == viewport_width && !equality_is_proven)
+            {
+                debug!(
+                    "Ignoring impossible/fullscreen-like width violation for window {} ({}px vs {}px viewport, position_matches={}, requested_left={}, work_left={})",
+                    violation.window_id,
+                    violation.min_width,
+                    viewport_width,
+                    violation.position_matches,
+                    violation.requested_left,
+                    work_area.x
+                );
+                continue;
+            }
+            let changed = self
+                .workspaces
+                .get_mut(&monitor_id)
+                .and_then(|workspaces| workspaces.get_mut(workspace_idx))
+                .is_some_and(|workspace| {
+                    workspace.set_window_min_width(violation.window_id, violation.min_width)
+                });
+            if changed {
+                constraints_changed = true;
+                let slot = (monitor_id, workspace_idx);
+                if !width_changed_workspaces.contains(&slot) {
+                    width_changed_workspaces.push(slot);
                 }
             }
-            for ws_vec in self.workspaces.values_mut() {
-                for ws in ws_vec.iter_mut() {
-                    if ws.apply_min_width_constraints() {
-                        constraints_changed = true;
+        }
+
+        // Fold only newly changed minimums into their stored column widths,
+        // then re-validate active-workspace scroll. This avoids rescanning all
+        // monitors × workspaces for every landing violation.
+        let dragging = self.drag_state.is_some();
+        for (monitor_id, workspace_idx) in width_changed_workspaces {
+            let viewport_width = self.viewport_width_for(monitor_id);
+            let active_idx = self.active_workspace_idx(monitor_id);
+            if let Some(workspace) = self
+                .workspaces
+                .get_mut(&monitor_id)
+                .and_then(|workspaces| workspaces.get_mut(workspace_idx))
+            {
+                if workspace.apply_min_width_constraints() {
+                    constraints_changed = true;
+                    if workspace_idx == active_idx && !dragging && !workspace.is_animating() {
+                        workspace.ensure_focused_visible(viewport_width);
                     }
                 }
             }
         }
-        if !height_violations.is_empty() {
-            for v in height_violations {
-                let vh = self
-                    .find_window_workspace(v.window_id)
-                    .and_then(|(mid, _)| self.monitors.get(&mid).map(|m| m.work_area.height))
-                    .unwrap_or(i32::MAX);
-                if v.min_height >= vh {
-                    debug!(
-                        "Ignoring viewport-sized height violation for window {} ({}px >= {}px viewport)",
-                        v.window_id, v.min_height, vh
-                    );
-                    continue;
-                }
-                for ws_vec in self.workspaces.values_mut() {
-                    for ws in ws_vec.iter_mut() {
-                        if ws.contains_window(v.window_id) {
-                            ws.set_window_min_height(v.window_id, v.min_height);
-                            constraints_changed = true;
-                        }
-                    }
-                }
+
+        for violation in height_violations {
+            let Some((monitor_id, workspace_idx)) = self.find_window_workspace(violation.window_id)
+            else {
+                continue;
+            };
+            let work_area = self.layout_viewport(monitor_id);
+            let viewport_height = work_area.height;
+            let equality_is_proven = viewport_equality_is_proven(
+                violation.position_matches,
+                violation.requested_top,
+                work_area.y,
+            );
+            if violation.min_height > viewport_height
+                || (violation.min_height == viewport_height && !equality_is_proven)
+            {
+                debug!(
+                    "Ignoring impossible/fullscreen-like height violation for window {} ({}px vs {}px viewport, position_matches={}, requested_top={}, work_top={})",
+                    violation.window_id,
+                    violation.min_height,
+                    viewport_height,
+                    violation.position_matches,
+                    violation.requested_top,
+                    work_area.y
+                );
+                continue;
+            }
+            if self
+                .workspaces
+                .get_mut(&monitor_id)
+                .and_then(|workspaces| workspaces.get_mut(workspace_idx))
+                .is_some_and(|workspace| {
+                    workspace.set_window_min_height(violation.window_id, violation.min_height)
+                })
+            {
+                constraints_changed = true;
             }
         }
         constraints_changed
@@ -913,7 +1046,8 @@ mod park_tests {
             placement(30, bleeding, Visibility::OffScreenRight),
         ];
 
-        park_offscreen_avoiding_neighbors(&mut placements, 1, &monitors);
+        let monitor_rects = [owner.rect, right.rect];
+        park_offscreen_avoiding_neighbors(&mut placements, 1, &monitors, &monitor_rects);
 
         assert_eq!(placements[0].rect, visible, "visible placement untouched");
         assert_eq!(
@@ -936,7 +1070,8 @@ mod park_tests {
         let orig = Rect::new(5300, 10, 400, 400);
         let mut placements = vec![placement(30, orig, Visibility::OffScreenRight)];
         // owner_id 1 isn't in the map -> early return, nothing changes.
-        park_offscreen_avoiding_neighbors(&mut placements, 1, &monitors);
+        let monitor_rects = [monitors[&2].rect];
+        park_offscreen_avoiding_neighbors(&mut placements, 1, &monitors, &monitor_rects);
         assert_eq!(placements[0].rect, orig);
     }
 }
