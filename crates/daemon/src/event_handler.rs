@@ -7,7 +7,8 @@ use crate::state::{
 };
 use leopardwm_core_layout::Rect;
 use leopardwm_platform_win32::{
-    enumerate_monitors, get_process_executable, is_shift_key_pressed, WindowEvent,
+    enumerate_monitors, get_process_executable, is_ctrl_alt_pressed, is_shift_key_pressed,
+    WindowEvent,
 };
 use tracing::{debug, info, warn};
 
@@ -52,6 +53,23 @@ pub(crate) fn fullscreen_focus_guard(
         return None;
     }
     fullscreen.filter(|&fs| fs != focused_hwnd)
+}
+
+/// Choose and latch one drag contract at MoveSizeStart. Shift retains priority
+/// over the Ctrl+Alt standalone-window override.
+pub(crate) fn select_drag_mode(
+    is_tiled: bool,
+    shift_pressed: bool,
+    ctrl_alt_pressed: bool,
+    drag_to_merge: bool,
+) -> crate::state::DragMode {
+    if is_tiled && shift_pressed {
+        crate::state::DragMode::Column
+    } else if is_tiled && (ctrl_alt_pressed || !drag_to_merge) {
+        crate::state::DragMode::WindowAsColumn
+    } else {
+        crate::state::DragMode::Window
+    }
 }
 
 /// True when `title` names `filename` as a whole token, i.e. the filename
@@ -1588,11 +1606,12 @@ impl AppState {
                     0,
                 )
             };
-        let mode = if is_tiled && is_shift_key_pressed() {
-            crate::state::DragMode::Column
-        } else {
-            crate::state::DragMode::Window
-        };
+        let mode = select_drag_mode(
+            is_tiled,
+            is_shift_key_pressed(),
+            is_ctrl_alt_pressed(),
+            self.config.behavior.drag_to_merge,
+        );
         self.drag_state = Some(DragState {
             hwnd,
             is_tiled,
@@ -1711,8 +1730,7 @@ impl AppState {
             win_info.rect.x + win_info.rect.width / 2,
             win_info.rect.y + win_info.rect.height / 2,
         ));
-        let target_monitor =
-            self.monitor_for_drag_point(cursor_x, cursor_y, drag.source_monitor);
+        let target_monitor = self.monitor_for_drag_point(cursor_x, cursor_y, drag.source_monitor);
 
         if drag.mode == crate::state::DragMode::Column {
             // Clean up placeholder (shouldn't exist in shift mode, but be safe).
@@ -1727,6 +1745,14 @@ impl AppState {
             } else {
                 self.execute_cross_monitor_drag(hwnd, &drag, target_monitor, &win_info.rect);
             }
+        } else if drag.mode == crate::state::DragMode::WindowAsColumn {
+            self.finish_standalone_window_drag(
+                hwnd,
+                &drag,
+                target_monitor,
+                cursor_x,
+                &win_info.rect,
+            );
         } else {
             // Default drop: swap placeholder with real window in-place.
             self.finalize_drag_merge(hwnd, &drag, target_monitor, &win_info.rect);

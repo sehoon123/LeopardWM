@@ -450,6 +450,12 @@ pub struct BehaviorConfig {
     #[serde(default = "default_true")]
     pub cross_monitor_drag: bool,
 
+    /// Allow a one-window drag dropped over an existing column to merge into
+    /// that column. Disable to keep every dragged window in its own column.
+    /// Ctrl+Alt held at drag start always disables merging for that drag.
+    #[serde(default = "default_true")]
+    pub drag_to_merge: bool,
+
     /// Whether to check GitHub Releases once a day for a newer version.
     /// Single anonymous HTTPS GET to api.github.com; no other telemetry.
     #[serde(default = "default_true")]
@@ -522,6 +528,7 @@ impl Default for BehaviorConfig {
             focus_follows_mouse_delay_ms: default_focus_delay(),
             disable_snap_layouts: true,
             cross_monitor_drag: true,
+            drag_to_merge: true,
             check_for_updates: true,
             tab_close_action: TabCloseAction::default(),
             swap_chain_ghost_animation: true,
@@ -1609,6 +1616,7 @@ mod tests {
         assert_eq!(config.layout.centering_mode, CenteringModeConfig::Center);
         assert!(config.behavior.focus_new_windows);
         assert!(config.behavior.cross_monitor_drag);
+        assert!(config.behavior.drag_to_merge);
         assert!(config.behavior.swap_chain_ghost_animation);
     }
 
@@ -1622,6 +1630,7 @@ mod tests {
 
             [behavior]
             cross_monitor_drag = false
+            drag_to_merge = false
             "#,
         )
         .unwrap();
@@ -1629,6 +1638,7 @@ mod tests {
         assert!(!config.layout.remember_floating_sizes);
         assert!(!config.layout.remember_scratchpad_size);
         assert!(!config.behavior.cross_monitor_drag);
+        assert!(!config.behavior.drag_to_merge);
     }
 
     #[test]
@@ -1655,6 +1665,7 @@ mod tests {
         assert!(config.layout.remember_floating_sizes); // default
         assert!(config.layout.remember_scratchpad_size); // default
         assert!(config.behavior.cross_monitor_drag); // default
+        assert!(config.behavior.drag_to_merge); // default
         assert_eq!(config.layout.width_presets, vec![0.333, 0.5, 0.667]); // default
     }
 

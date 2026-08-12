@@ -12,12 +12,15 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::info;
 
-/// Drag operation selected at MoveSizeStart. Latching prevents a modifier
-/// change at mouse-up from combining window-merge preview state with the
-/// whole-column drop path.
+/// Drag operation selected at MoveSizeStart. Latching prevents modifier
+/// changes at mouse-up from combining incompatible preview and drop paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DragMode {
+    /// Move one window and allow a drop over another column to merge into it.
     Window,
+    /// Move one window as its own standalone column; never merge/consume.
+    WindowAsColumn,
+    /// Move the complete source column.
     Column,
 }
 
@@ -27,8 +30,9 @@ pub(crate) struct DragState {
     pub(crate) hwnd: u64,
     /// Whether the dragged window is tiled (vs floating).
     pub(crate) is_tiled: bool,
-    /// Plain drag moves one window; Shift held at drag start moves its entire
-    /// column. The mode stays fixed for the lifetime of this drag.
+    /// Plain drag normally moves one window with merge enabled; Ctrl+Alt or
+    /// the no-merge setting moves it as a standalone column; Shift moves its
+    /// complete source column. The mode stays fixed for this drag.
     pub(crate) mode: DragMode,
     /// Source monitor at drag start.
     pub(crate) source_monitor: MonitorId,

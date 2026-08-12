@@ -176,10 +176,12 @@ LeopardWM treats floating geometry as monitor-local, DPI-aware state:
 
 Title-bar drag behavior:
 
-- **Plain drag:** move only the dragged window. Dropping over an existing column merges into it; dropping in empty space on another monitor creates a new column.
-- **Shift held before drag start:** move the complete source column, preserving its stack/tab composition.
+- **Plain drag:** move only the dragged window. Dropping over an existing column merges into it when **Allow drag to merge windows** is enabled; dropping in empty space on another monitor creates a new column.
+- **Ctrl+Alt held before drag start:** move only the dragged window as a standalone column, never merging/consuming it into another column.
+- **Shift held before drag start:** move the complete source column, preserving its stack/tab composition. Shift takes precedence over Ctrl+Alt.
+- The drag mode is latched at drag start; changing modifiers while dragging does not change the preview/drop behavior.
 - The monitor under the pointer owns the drop. The destination monitor's active workspace, DPI scale, and work area are used; floating sticky/pinned state is preserved.
-- Turn off **Settings → Behavior → Cross-monitor window drag** to keep mouse drops on their source monitor. Keyboard monitor-move commands are unaffected.
+- Turn off **Settings → Behavior → Allow drag to merge windows** to make standalone-column drag the default. Turn off **Cross-monitor window drag** to keep mouse drops on their source monitor. Keyboard monitor-move commands are unaffected.
 
 All user-facing controls are available in **Settings → Layout / Behavior** and in `config.toml`:
 
@@ -195,6 +197,7 @@ remember_scratchpad_size = true
 
 [behavior]
 cross_monitor_drag = true
+drag_to_merge = true
 ```
 
 ## Tabbed columns

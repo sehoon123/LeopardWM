@@ -1187,6 +1187,175 @@ fn test_cross_monitor_drag_setting_keeps_drop_on_source_when_disabled() {
 }
 
 #[test]
+fn test_drag_mode_latches_standalone_override_and_shift_priority() {
+    use crate::event_handler::select_drag_mode;
+
+    assert_eq!(select_drag_mode(true, false, false, true), DragMode::Window);
+    assert_eq!(
+        select_drag_mode(true, false, true, true),
+        DragMode::WindowAsColumn
+    );
+    assert_eq!(
+        select_drag_mode(true, false, false, false),
+        DragMode::WindowAsColumn
+    );
+    assert_eq!(select_drag_mode(true, true, true, false), DragMode::Column);
+    assert_eq!(
+        select_drag_mode(false, false, true, false),
+        DragMode::Window,
+        "floating drags are unaffected by tiled merge policy"
+    );
+}
+
+#[test]
+fn test_same_monitor_standalone_drag_splits_window_without_consuming() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.paused = true;
+    {
+        let workspace = &mut state.workspaces.get_mut(&1).unwrap()[0];
+        workspace.insert_window(100, Some(700)).unwrap();
+        workspace.insert_window_in_column(101, 0).unwrap();
+        workspace.insert_window(200, Some(500)).unwrap();
+    }
+    let drag = DragState {
+        hwnd: 100,
+        is_tiled: true,
+        mode: DragMode::WindowAsColumn,
+        source_monitor: 1,
+        source_workspace_idx: 0,
+        source_column_index: 0,
+        source_window_index: 0,
+        source_sibling: Some(101),
+        source_column_width: 700,
+        current_column_index: 0,
+        last_drop_target: None,
+        last_hint_update: None,
+        removed_from_source: false,
+    };
+
+    state.execute_same_monitor_standalone_window_drop(100, &drag, 2);
+
+    let workspace = &state.workspaces[&1][0];
+    assert_eq!(workspace.column_count(), 3);
+    assert_eq!(workspace.column(0).unwrap().windows(), &[101]);
+    assert_eq!(workspace.column(1).unwrap().windows(), &[200]);
+    assert_eq!(workspace.column(2).unwrap().windows(), &[100]);
+    assert_eq!(workspace.column(2).unwrap().width(), 700);
+    assert_eq!(workspace.focused_window(), Some(100));
+}
+
+#[test]
+fn test_same_monitor_standalone_drag_reorders_single_window_column() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.paused = true;
+    {
+        let workspace = &mut state.workspaces.get_mut(&1).unwrap()[0];
+        workspace.insert_window(100, Some(600)).unwrap();
+        workspace.insert_window(200, Some(500)).unwrap();
+        workspace.insert_window(300, Some(400)).unwrap();
+    }
+    let drag = DragState {
+        hwnd: 100,
+        is_tiled: true,
+        mode: DragMode::WindowAsColumn,
+        source_monitor: 1,
+        source_workspace_idx: 0,
+        source_column_index: 0,
+        source_window_index: 0,
+        source_sibling: None,
+        source_column_width: 600,
+        current_column_index: 0,
+        last_drop_target: None,
+        last_hint_update: None,
+        removed_from_source: false,
+    };
+
+    state.execute_same_monitor_standalone_window_drop(100, &drag, 3);
+
+    let workspace = &state.workspaces[&1][0];
+    assert_eq!(workspace.column_count(), 3);
+    assert_eq!(workspace.column(0).unwrap().windows(), &[200]);
+    assert_eq!(workspace.column(1).unwrap().windows(), &[300]);
+    assert_eq!(workspace.column(2).unwrap().windows(), &[100]);
+}
+
+#[test]
+fn test_cross_monitor_standalone_drag_never_merges_existing_column() {
+    let mut state = AppState::new_with_config(test_config(), two_monitors());
+    state.paused = true;
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(100, Some(600))
+        .unwrap();
+    state.workspaces.get_mut(&2).unwrap()[0]
+        .insert_window(200, Some(500))
+        .unwrap();
+    let drag = DragState {
+        hwnd: 100,
+        is_tiled: true,
+        mode: DragMode::WindowAsColumn,
+        source_monitor: 1,
+        source_workspace_idx: 0,
+        source_column_index: 0,
+        source_window_index: 0,
+        source_sibling: None,
+        source_column_width: 600,
+        current_column_index: 0,
+        last_drop_target: None,
+        last_hint_update: None,
+        removed_from_source: false,
+    };
+
+    state.finish_standalone_window_drag(100, &drag, 2, 2500, &Rect::new(2200, 100, 600, 800));
+
+    assert!(!state.workspaces[&1][0].contains_window(100));
+    let target = &state.workspaces[&2][0];
+    assert_eq!(target.column_count(), 2);
+    assert!(target
+        .columns()
+        .iter()
+        .any(|column| column.windows() == [100]));
+    assert!(target
+        .columns()
+        .iter()
+        .any(|column| column.windows() == [200]));
+}
+
+#[test]
+fn test_cross_monitor_standalone_rejection_keeps_source_unchanged() {
+    let mut state = AppState::new_with_config(test_config(), two_monitors());
+    state.paused = true;
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(100, Some(600))
+        .unwrap();
+    // Deliberately corrupt global ownership so destination insertion rejects
+    // the duplicate. The transactional path must not remove the real source.
+    state.workspaces.get_mut(&2).unwrap()[0]
+        .insert_window(100, Some(500))
+        .unwrap();
+    let drag = DragState {
+        hwnd: 100,
+        is_tiled: true,
+        mode: DragMode::WindowAsColumn,
+        source_monitor: 1,
+        source_workspace_idx: 0,
+        source_column_index: 0,
+        source_window_index: 0,
+        source_sibling: None,
+        source_column_width: 600,
+        current_column_index: 0,
+        last_drop_target: None,
+        last_hint_update: None,
+        removed_from_source: false,
+    };
+
+    state.execute_cross_monitor_window_drop(100, &drag, 2, 0);
+
+    assert!(state.workspaces[&1][0].contains_window(100));
+    assert!(state.workspaces[&2][0].contains_window(100));
+    assert_eq!(state.focused_monitor, 1);
+}
+
+#[test]
 fn test_clamp_rect_to_work_area_keeps_all_four_edges_visible() {
     let work_area = Rect::new(1920, 40, 1600, 900);
     let clamped =

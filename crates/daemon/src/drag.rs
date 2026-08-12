@@ -42,8 +42,9 @@ impl AppState {
     }
 
     /// Compute and show a drag hint overlay.
-    /// Default drag = move window between columns (merge mode).
-    /// Shift+drag = move entire column (reorder mode).
+    /// Default drag = move one window with merge enabled.
+    /// Ctrl+Alt/config override = move one window as a standalone column.
+    /// Shift+drag = move the complete column.
     pub(crate) fn update_drag_hint(&mut self, hwnd: u64) {
         // No drag ghost while tiling is paused.
         if self.paused {
@@ -100,6 +101,12 @@ impl AppState {
             } else {
                 self.shift_drag_reorder_hint(cursor_x, source_monitor, source_ws_idx, current_col);
             }
+        } else if mode == DragMode::WindowAsColumn {
+            // --- Ctrl+Alt/config override: standalone-window mode ---
+            // Never insert a vertical/tab placeholder. Show only the horizontal
+            // column insertion edge and perform the structural split/reorder on
+            // drop, so this mode cannot accidentally consume into a column.
+            self.standalone_window_drag_hint(cursor_x, target_monitor_id);
         } else {
             // --- Default drag: window merge mode with live preview ---
             // Source column keeps the dragged window (preserving its space).
@@ -294,6 +301,48 @@ impl AppState {
             // Show ghost at the target slot position (recompute from updated layout).
             self.show_merge_drop_ghost(hwnd, is_same_column, target_monitor_id, viewport);
         }
+    }
+
+    /// Show a standalone-window drop as a vertical insertion edge. This path
+    /// never mutates workspace structure during preview, so cancellation is a
+    /// no-op and drops cannot merge even while directly over another column.
+    fn standalone_window_drag_hint(&mut self, cursor_x: i32, target_monitor_id: MonitorId) {
+        if !self.monitors.contains_key(&target_monitor_id) {
+            return;
+        }
+        self.remove_previous_drag_placeholder();
+        let viewport = self.layout_viewport(target_monitor_id);
+        let ws_idx = self.active_workspace_idx(target_monitor_id);
+        let Some(workspace) = self
+            .workspaces
+            .get(&target_monitor_id)
+            .and_then(|workspaces| workspaces.get(ws_idx))
+        else {
+            return;
+        };
+        let column_bounds = column_bounds_from_placements(workspace, viewport);
+        let insert_index = compute_insertion_index(&column_bounds, cursor_x);
+        let drop_target = DropTarget {
+            monitor: target_monitor_id,
+            insert_index,
+            window_slot: None,
+        };
+        if let Some(ref mut drag) = self.drag_state {
+            if drag.last_drop_target == Some(drop_target) {
+                return;
+            }
+            drag.last_drop_target = Some(drop_target);
+        }
+        let gap = workspace.gap();
+        let outer_left = workspace.outer_gaps().0.max(0);
+        let hint_x = if column_bounds.is_empty() {
+            viewport.x.saturating_add(outer_left)
+        } else {
+            compute_insertion_hint_x(&column_bounds, insert_index, gap)
+        };
+        self.pending_drag_hint = Some(DragHintAction::ShowGhost {
+            rect: Rect::new(hint_x - 2, viewport.y, 4, viewport.height),
+        });
     }
 
     /// Show the column-reorder ghost at the insertion edge on a non-source monitor.
@@ -1000,9 +1049,132 @@ impl AppState {
         }
     }
 
-    /// Complete a plain drag into empty/unused space on another monitor by
-    /// moving only the dragged window into a new standalone column. Shift-drag
-    /// keeps its existing whole-column behavior below.
+    /// Finish a no-merge window drag at the pointer's horizontal insertion
+    /// edge. Same-monitor drops split/reorder one standalone column;
+    /// cross-monitor drops use the existing transactional transfer.
+    pub(crate) fn finish_standalone_window_drag(
+        &mut self,
+        hwnd: u64,
+        drag: &DragState,
+        target_monitor: MonitorId,
+        cursor_x: i32,
+        win_rect: &Rect,
+    ) {
+        self.clear_drag_placeholder();
+        if !self.monitors.contains_key(&target_monitor) {
+            self.cancel_tiled_drag(hwnd, drag);
+            return;
+        }
+        let target_idx = self.active_workspace_idx(target_monitor);
+        let target_viewport = self.layout_viewport(target_monitor);
+        let Some(target_workspace) = self
+            .workspaces
+            .get(&target_monitor)
+            .and_then(|workspaces| workspaces.get(target_idx))
+        else {
+            self.cancel_tiled_drag(hwnd, drag);
+            return;
+        };
+        let bounds = column_bounds_from_placements(target_workspace, target_viewport);
+        let pointer_x = if bounds.is_empty() {
+            win_rect.x.saturating_add(win_rect.width / 2)
+        } else {
+            cursor_x
+        };
+        let insert_index = compute_insertion_index(&bounds, pointer_x);
+
+        if target_monitor == drag.source_monitor {
+            self.execute_same_monitor_standalone_window_drop(hwnd, drag, insert_index);
+        } else {
+            self.execute_cross_monitor_window_drop(hwnd, drag, target_monitor, insert_index);
+        }
+    }
+
+    /// Move one window into its own column on the source monitor. The mutation
+    /// is prepared on a clone and committed only after remove+insert+focus all
+    /// succeed, so a bad insertion cannot orphan the HWND.
+    pub(crate) fn execute_same_monitor_standalone_window_drop(
+        &mut self,
+        hwnd: u64,
+        drag: &DragState,
+        insert_index: usize,
+    ) {
+        self.clear_drag_placeholder();
+        let monitor = drag.source_monitor;
+        let workspace_idx = drag.source_workspace_idx;
+        if self.active_workspace_idx(monitor) != workspace_idx || drag.removed_from_source {
+            self.cancel_tiled_drag(hwnd, drag);
+            return;
+        }
+        let viewport_width = self.viewport_width_for(monitor);
+        let Some(mut workspace) = self
+            .workspaces
+            .get(&monitor)
+            .and_then(|workspaces| workspaces.get(workspace_idx))
+            .cloned()
+        else {
+            self.cancel_tiled_drag(hwnd, drag);
+            return;
+        };
+        let Some((source_column, _)) = workspace.find_window_location(hwnd) else {
+            self.cancel_tiled_drag(hwnd, drag);
+            return;
+        };
+        let source_column_len = workspace
+            .column(source_column)
+            .map(|column| column.len())
+            .unwrap_or(0);
+        if source_column_len == 0 || workspace.remove_window(hwnd).is_err() {
+            self.cancel_tiled_drag(hwnd, drag);
+            return;
+        }
+
+        // Removing a single-window source column shifts every later insertion
+        // edge left. Multi-window sources remain in place and need no adjustment.
+        let adjusted_index = if source_column_len == 1 && source_column < insert_index {
+            insert_index - 1
+        } else {
+            insert_index
+        };
+        let width = (drag.source_column_width > 0).then_some(drag.source_column_width);
+        if let Err(error) = workspace.insert_window_at_column(hwnd, width, adjusted_index) {
+            warn!(
+                "Failed to insert standalone drag window {} at column {}: {}",
+                hwnd, adjusted_index, error
+            );
+            self.cancel_tiled_drag(hwnd, drag);
+            return;
+        }
+        workspace.ensure_focused_visible_animated(viewport_width);
+
+        let snapshot = self.snapshot_layout();
+        self.workspaces.get_mut(&monitor).unwrap()[workspace_idx] = workspace;
+        self.focused_monitor = monitor;
+        self.last_placed_layout_rects.remove(&hwnd);
+        info!(
+            "Standalone window drag: {} moved to column {} on monitor {}",
+            hwnd, adjusted_index, monitor
+        );
+        if self.focused_window_uses_sticky_compositor() {
+            if let Some(workspace) = self
+                .workspaces
+                .get_mut(&monitor)
+                .and_then(|workspaces| workspaces.get_mut(workspace_idx))
+            {
+                workspace.stop_animation();
+            }
+        } else {
+            self.start_layout_transition(snapshot);
+        }
+        if let Err(error) = self.apply_layout() {
+            warn!("Failed to apply standalone window drag: {}", error);
+        }
+        self.sync_foreground_window();
+    }
+
+    /// Complete a one-window drag into empty/unused space on another monitor
+    /// by creating a standalone column. Shift-drag retains its existing
+    /// whole-column behavior.
     pub(crate) fn execute_cross_monitor_window_drop(
         &mut self,
         hwnd: u64,
@@ -1094,7 +1266,17 @@ impl AppState {
             "Cross-monitor window drop: {} from monitor {} to monitor {} as column {}",
             hwnd, source_monitor, target_monitor, insert_index
         );
-        self.start_layout_transition(snapshot);
+        if self.focused_window_uses_sticky_compositor() {
+            if let Some(target_workspace) = self
+                .workspaces
+                .get_mut(&target_monitor)
+                .and_then(|workspaces| workspaces.get_mut(target_idx))
+            {
+                target_workspace.stop_animation();
+            }
+        } else {
+            self.start_layout_transition(snapshot);
+        }
         if let Err(error) = self.apply_layout() {
             warn!("Failed to apply cross-monitor window drop: {}", error);
         }

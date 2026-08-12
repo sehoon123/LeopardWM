@@ -93,6 +93,11 @@ focus_follows_mouse = false
 # Disable to keep every mouse drop on its source monitor.
 # cross_monitor_drag = true
 
+# Allow a dragged window dropped over an existing column to merge/consume into
+# that column. Disable to keep every dragged window as a standalone column.
+# Ctrl+Alt held before drag start temporarily disables merging for one drag.
+# drag_to_merge = true
+
 # Check GitHub Releases once a day for a newer version. One anonymous HTTPS GET to
 # api.github.com on startup + every 24h. Disable to skip entirely.
 # check_for_updates = false

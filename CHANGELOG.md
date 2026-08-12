@@ -6,6 +6,10 @@ All notable changes to LeopardWM will be documented in this file.
 
 ### Fixes
 
+- **Window drags can avoid consuming into another column.** Disable
+  `behavior.drag_to_merge` to keep every one-window drag as a standalone
+  column, or hold Ctrl+Alt before drag start for a one-drag override. Shift
+  remains the whole-column drag modifier and takes precedence.
 - **Direct watchdog launches no longer open a console window.** Release builds
   now run as a Windows GUI-subsystem process, so launching the watchdog
   directly (for example from a user-configured scheduled task) cannot expose a

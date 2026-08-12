@@ -1131,6 +1131,10 @@ input[type="range"]::-webkit-slider-thumb {
             <label class="toggle"><input type="checkbox" id="behavior-cross_monitor_drag"><span class="track"></span><span class="thumb"></span></label>
           </div>
           <div class="field">
+            <div class="field-info"><div class="field-label">Allow drag to merge windows</div><div class="field-desc">Drop over a column to consume into it. Turn off to keep dragged windows as standalone columns; Ctrl+Alt at drag start temporarily bypasses merging.</div></div>
+            <label class="toggle"><input type="checkbox" id="behavior-drag_to_merge"><span class="track"></span><span class="thumb"></span></label>
+          </div>
+          <div class="field">
             <div class="field-info"><div class="field-label">Smooth app animations (experimental)</div><div class="field-desc">Attempt DWM-thumbnail animation only when Windows permits the source window to be hidden. Unsupported external apps automatically use safe live placement.</div></div>
             <label class="toggle"><input type="checkbox" id="behavior-swap_chain_ghost_animation"><span class="track"></span><span class="thumb"></span></label>
           </div>
@@ -1587,6 +1591,7 @@ function init(cfg) {
   setChecked('behavior-fullscreen_follows_focus', cfg.behavior.fullscreen_follows_focus !== false);
   setChecked('behavior-disable_snap_layouts', cfg.behavior.disable_snap_layouts !== false);
   setChecked('behavior-cross_monitor_drag', cfg.behavior.cross_monitor_drag !== false);
+  setChecked('behavior-drag_to_merge', cfg.behavior.drag_to_merge !== false);
   setChecked('behavior-swap_chain_ghost_animation', cfg.behavior.swap_chain_ghost_animation === true);
   setChecked('behavior-hide_offscreen_taskbar_buttons', cfg.behavior.hide_offscreen_taskbar_buttons !== false);
   setCb('cb-behavior-log_level', cfg.behavior.log_level);
@@ -2192,6 +2197,7 @@ function readConfig() {
       fullscreen_follows_focus: checked('behavior-fullscreen_follows_focus'),
       disable_snap_layouts: checked('behavior-disable_snap_layouts'),
       cross_monitor_drag: checked('behavior-cross_monitor_drag'),
+      drag_to_merge: checked('behavior-drag_to_merge'),
       swap_chain_ghost_animation: checked('behavior-swap_chain_ghost_animation'),
       hide_offscreen_taskbar_buttons: checked('behavior-hide_offscreen_taskbar_buttons'),
       check_for_updates: window._initConfig.behavior.check_for_updates,
@@ -2394,7 +2400,7 @@ mod tests {
     }
 
     #[test]
-    fn session_size_memory_and_cross_monitor_drag_are_wired() {
+    fn session_size_memory_and_drag_behavior_are_wired() {
         for field in ["remember_floating_sizes", "remember_scratchpad_size"] {
             let id = format!("layout-{field}");
             assert!(SETTINGS_HTML.contains(&format!("id=\"{id}\"")));
@@ -2410,6 +2416,11 @@ mod tests {
         assert!(
             SETTINGS_HTML.contains("cross_monitor_drag: checked('behavior-cross_monitor_drag')")
         );
+        assert!(SETTINGS_HTML.contains("id=\"behavior-drag_to_merge\""));
+        assert!(SETTINGS_HTML.contains(
+            "setChecked('behavior-drag_to_merge', cfg.behavior.drag_to_merge !== false);"
+        ));
+        assert!(SETTINGS_HTML.contains("drag_to_merge: checked('behavior-drag_to_merge')"));
     }
 
     #[test]

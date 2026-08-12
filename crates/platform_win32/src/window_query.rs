@@ -4,7 +4,9 @@ use leopardwm_core_layout::{Rect, WindowId};
 use std::ffi::c_void;
 use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_SHIFT};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetAsyncKeyState, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_RCONTROL, VK_RSHIFT,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowLongW, GetWindowRect, IsIconic, IsWindow, IsWindowVisible, GWL_STYLE, WS_CAPTION,
     WS_MAXIMIZEBOX, WS_MINIMIZEBOX,
@@ -247,12 +249,23 @@ pub fn is_window_shell_cloaked(hwnd: WindowId) -> bool {
     crate::enumeration::is_window_cloaked(hwnd)
 }
 
-/// Check if the Shift key is currently held down.
-///
-/// Uses `GetKeyState` to poll the keyboard state. Returns `true`
-/// if the high bit is set (key is down).
+/// Check if either physical Shift key is currently held down. Async polling is
+/// required because MoveSizeStart arrives through a WinEvent callback rather
+/// than this daemon thread's keyboard message queue.
 pub fn is_shift_key_pressed() -> bool {
-    unsafe { GetKeyState(VK_SHIFT.0 as i32) < 0 }
+    unsafe { GetAsyncKeyState(VK_LSHIFT.0 as i32) < 0 || GetAsyncKeyState(VK_RSHIFT.0 as i32) < 0 }
+}
+
+/// Check whether a physical Ctrl key and Left Alt are both held. Right Alt is
+/// deliberately excluded because AltGr presents as Left Ctrl + Right Alt.
+/// Drag mode samples this only at MoveSizeStart, so releasing either key later
+/// cannot change the preview/drop contract halfway through.
+pub fn is_ctrl_alt_pressed() -> bool {
+    unsafe {
+        (GetAsyncKeyState(VK_LCONTROL.0 as i32) < 0
+            || GetAsyncKeyState(VK_RCONTROL.0 as i32) < 0)
+            && GetAsyncKeyState(VK_LMENU.0 as i32) < 0
+    }
 }
 
 /// Get the current mouse cursor position in screen coordinates.
