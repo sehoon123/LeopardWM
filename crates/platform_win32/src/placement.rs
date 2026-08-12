@@ -35,39 +35,44 @@ const DWMWA_TRANSITIONS_FORCEDISABLED: DWMWINDOWATTRIBUTE = DWMWINDOWATTRIBUTE(3
 /// and `GHOST_CLOAKED` — only callers that have already evaluated the
 /// OR-cloak invariant (or recovery paths that want to force-uncloak
 /// regardless) should call this directly.
-unsafe fn dwm_set_cloak(hwnd: HWND, cloaked: bool) {
+unsafe fn dwm_set_cloak(hwnd: HWND, cloaked: bool) -> bool {
     // NOTE: DWMWA_CLOAK only succeeds on windows owned by the calling
     // process; cloaking another process's window returns E_ACCESSDENIED
-    // (0x80070005). LeopardWM manages external windows, so this is a no-op
-    // for them and hiding relies on physically moving windows off-screen
-    // (see the off-screen sentinel positioning). Kept as belt-and-suspenders
-    // for the rare same-process window.
+    // (0x80070005). Callers that require an actually-hidden source (the DWM
+    // thumbnail animation) must check this result instead of treating logical
+    // set membership as proof that the external HWND was cloaked.
     let value = BOOL::from(cloaked);
-    let _ = DwmSetWindowAttribute(
+    DwmSetWindowAttribute(
         hwnd,
         DWMWA_CLOAK,
         &value as *const _ as _,
         std::mem::size_of::<BOOL>() as u32,
-    );
+    )
+    .is_ok()
 }
 
-/// OR-cloak helper. Applies the logical OR of `GLOBAL_CLOAKED` and
-/// `GHOST_CLOAKED` membership for `wid` to the underlying DWM cloak
-/// state. Callers mutate one of the two sets, then call this to commit
-/// the resulting effective state.
-///
-/// Validates that the HWND is still live (`IsWindow`) before calling
-/// `dwm_set_cloak`. `WindowId → HWND` is a raw cast (`lib.rs:89-93`),
-/// so without this guard we could cloak/uncloak a recycled HWND.
-pub fn apply_cloak_state(wid: WindowId) {
+/// Serialize logical cloak-set mutations with the physical DWM commit. The
+/// animation worker and daemon thread can otherwise race and leave DWM in the
+/// opposite state from the final logical OR.
+static CLOAK_COMMIT: Mutex<()> = Mutex::new(());
+
+fn lock_cloak_commit() -> std::sync::MutexGuard<'static, ()> {
+    CLOAK_COMMIT
+        .lock()
+        .unwrap_or_else(crate::recover_poisoned_mutex)
+}
+
+/// Apply the current logical OR without acquiring `CLOAK_COMMIT`.
+/// Callers must already hold the commit lock.
+fn apply_cloak_state_locked(wid: WindowId) -> bool {
     let should_cloak = ghost_cloaked_contains(wid) || global_cloaked_contains(wid);
     let Ok(hwnd) = window_id_to_hwnd(wid) else {
-        return;
+        return false;
     };
     if !unsafe { IsWindow(Some(hwnd)).as_bool() } {
-        return;
+        return false;
     }
-    unsafe { dwm_set_cloak(hwnd, should_cloak) };
+    unsafe { dwm_set_cloak(hwnd, should_cloak) }
 }
 
 fn global_cloaked_contains(wid: WindowId) -> bool {
@@ -94,35 +99,52 @@ fn ghost_cloaked_contains(wid: WindowId) -> bool {
     guard.as_ref().is_some_and(|set| set.contains(&wid))
 }
 
-/// Mark a window as cloaked by the ghost-animation system. Caller must
-/// follow with `apply_cloak_state(wid)` to commit the DWM state.
-pub fn mark_ghost_cloaked(wid: WindowId) {
-    let mut guard = lock_ghost_cloaked();
-    let set = guard.get_or_insert_with(HashSet::new);
-    set.insert(wid);
+/// Mark a source for ghost animation only when DWM physically cloaks it.
+/// External application HWNDs normally reject DWMWA_CLOAK with
+/// E_ACCESSDENIED; in that case roll back the logical mark so the caller can
+/// safely fall back to live placement instead of drawing a thumbnail over an
+/// uncloaked source.
+pub fn try_mark_ghost_cloaked(wid: WindowId) -> bool {
+    let _commit = lock_cloak_commit();
+    {
+        let mut guard = lock_ghost_cloaked();
+        guard.get_or_insert_with(HashSet::new).insert(wid);
+    }
+    if apply_cloak_state_locked(wid) {
+        true
+    } else {
+        {
+            let mut guard = lock_ghost_cloaked();
+            if let Some(ref mut set) = *guard {
+                set.remove(&wid);
+            }
+        }
+        let _ = apply_cloak_state_locked(wid);
+        false
+    }
 }
 
-/// Remove a window from the ghost-cloak set. Caller must follow with
-/// `apply_cloak_state(wid)` to commit the DWM state (which will uncloak
-/// the window unless it's still in `GLOBAL_CLOAKED`).
+/// Atomically remove a window from the ghost-cloak set and commit the new OR
+/// state (which uncloaks it unless normal placement still requires a cloak).
 pub fn unmark_ghost_cloaked(wid: WindowId) {
+    let _commit = lock_cloak_commit();
+    unmark_ghost_cloaked_locked(wid);
+    let _ = apply_cloak_state_locked(wid);
+}
+
+fn unmark_ghost_cloaked_locked(wid: WindowId) {
     let mut guard = lock_ghost_cloaked();
     if let Some(ref mut set) = *guard {
         set.remove(&wid);
     }
 }
 
-/// Drain the entire `GHOST_CLOAKED` set, returning the wids that were
-/// being held. Recovery paths (panic hook, abort_active_ghost_transition)
-/// use this to clear all ghost cloaks at once. Caller is responsible for
-/// calling `apply_cloak_state(wid)` (or `dwm_set_cloak` directly for
-/// force-uncloak) on each returned wid.
-pub fn drain_ghost_cloaked() -> Vec<WindowId> {
-    let mut guard = lock_ghost_cloaked();
-    match guard.as_mut() {
-        Some(set) => set.drain().collect(),
-        None => Vec::new(),
-    }
+/// Logical-only removal for a proven recycled/dead HWND. Serializes the set
+/// mutation but deliberately performs no DWM call on the potentially unrelated
+/// handle now occupying the same numeric value.
+pub fn forget_recycled_ghost_cloak(wid: WindowId) {
+    let _commit = lock_cloak_commit();
+    unmark_ghost_cloaked_locked(wid);
 }
 
 // ---------------------------------------------------------------------
@@ -175,12 +197,15 @@ fn lock_cloaked() -> std::sync::MutexGuard<'static, Option<HashSet<WindowId>>> {
 /// in the placement path will reposition or uncloak it, so a direct cloak
 /// is safe and stays put until the owner uncloaks it.
 pub fn dwm_cloak_window(window_id: WindowId) {
+    let _commit = lock_cloak_commit();
     {
         let mut guard = lock_direct_cloaked();
         guard.get_or_insert_with(HashSet::new).insert(window_id);
     }
     if let Ok(hwnd) = window_id_to_hwnd(window_id) {
-        unsafe { dwm_set_cloak(hwnd, true) };
+        unsafe {
+            let _ = dwm_set_cloak(hwnd, true);
+        }
     }
 }
 
@@ -191,6 +216,7 @@ pub fn dwm_cloak_window(window_id: WindowId) {
 /// Bypasses `apply_cloak_state`'s OR-check: the intent here is "force
 /// visible" regardless of why the window was originally cloaked.
 pub fn dwm_uncloak_window(window_id: WindowId) {
+    let _commit = lock_cloak_commit();
     {
         let mut guard = lock_cloaked();
         if let Some(ref mut set) = *guard {
@@ -217,6 +243,7 @@ pub fn dwm_uncloak_window(window_id: WindowId) {
 /// Force-uncloak every tracked window from both sets. Called during
 /// shutdown and panic recovery. Bypasses `apply_cloak_state`.
 pub fn dwm_uncloak_all() {
+    let _commit = lock_cloak_commit();
     let global_ids: Vec<WindowId> = {
         let mut guard = lock_cloaked();
         match guard.as_mut() {
@@ -266,6 +293,7 @@ pub fn is_placement_cloaked(window_id: WindowId) -> bool {
 /// becomes empty (e.g., switching to an empty workspace) so that windows
 /// from the previous call are not left permanently invisible.
 fn uncloak_all_tracked() {
+    let _commit = lock_cloak_commit();
     let ids: Vec<WindowId> = {
         let mut guard = lock_cloaked();
         match guard.as_mut() {
@@ -274,9 +302,7 @@ fn uncloak_all_tracked() {
         }
     };
     for wid in ids {
-        if let Ok(hwnd) = window_id_to_hwnd(wid) {
-            unsafe { dwm_set_cloak(hwnd, false) };
-        }
+        let _ = apply_cloak_state_locked(wid);
     }
 }
 
@@ -691,6 +717,7 @@ fn build_defer_entries(
 
 /// Uncloak entries becoming visible and drop them from the tracking set.
 fn uncloak_becoming_visible(entries: &[DeferEntry]) {
+    let _commit = lock_cloak_commit();
     let to_consider: Vec<WindowId> = {
         let mut cloaked = lock_cloaked();
         if let Some(ref mut set) = *cloaked {
@@ -704,7 +731,7 @@ fn uncloak_becoming_visible(entries: &[DeferEntry]) {
         }
     };
     for wid in to_consider {
-        apply_cloak_state(wid);
+        let _ = apply_cloak_state_locked(wid);
     }
 }
 
@@ -1074,6 +1101,7 @@ fn sync_cloak_state(
     placements: &[WindowPlacement],
     failed_window_ids: &HashSet<u64>,
 ) {
+    let _commit = lock_cloak_commit();
     let (to_cloak, to_uncloak): (Vec<WindowId>, Vec<WindowId>) = {
         let mut cloaked = lock_cloaked();
         let set = cloaked.get_or_insert_with(HashSet::new);
@@ -1100,10 +1128,10 @@ fn sync_cloak_state(
         (cloak, uncloak)
     };
     for wid in to_cloak {
-        apply_cloak_state(wid);
+        let _ = apply_cloak_state_locked(wid);
     }
     for wid in to_uncloak {
-        apply_cloak_state(wid);
+        let _ = apply_cloak_state_locked(wid);
     }
 }
 
@@ -1423,6 +1451,20 @@ mod tests {
     }
 
     #[test]
+    fn test_failed_physical_ghost_cloak_rolls_back_logical_mark() {
+        let invalid_window = 0;
+        {
+            let mut guard = lock_ghost_cloaked();
+            if let Some(ref mut set) = *guard {
+                set.remove(&invalid_window);
+            }
+        }
+
+        assert!(!try_mark_ghost_cloaked(invalid_window));
+        assert!(!ghost_cloaked_contains(invalid_window));
+    }
+
+    #[test]
     fn test_zero_sized_offscreen_marker_uses_global_sentinel() {
         let placement = WindowPlacement {
             window_id: 1,
@@ -1500,7 +1542,10 @@ mod tests {
         assert!(is_placement_cloaked(wid), "global only should give true");
 
         // Case 3: both sets → true.
-        mark_ghost_cloaked(wid);
+        {
+            let mut g = lock_ghost_cloaked();
+            g.get_or_insert_with(HashSet::new).insert(wid);
+        }
         assert!(is_placement_cloaked(wid), "both sets should give true");
 
         // Case 4: ghost only → true.
@@ -1513,7 +1558,12 @@ mod tests {
         assert!(is_placement_cloaked(wid), "ghost only should give true");
 
         // Case 5: neither → false again.
-        unmark_ghost_cloaked(wid);
+        {
+            let mut g = lock_ghost_cloaked();
+            if let Some(ref mut s) = *g {
+                s.remove(&wid);
+            }
+        }
         assert!(
             !is_placement_cloaked(wid),
             "neither again should give false"
@@ -1526,7 +1576,8 @@ mod tests {
             s.insert(wid);
         }
         if had_ghost_before {
-            mark_ghost_cloaked(wid);
+            let mut g = lock_ghost_cloaked();
+            g.get_or_insert_with(HashSet::new).insert(wid);
         }
     }
 }

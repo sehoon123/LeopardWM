@@ -460,10 +460,10 @@ pub struct BehaviorConfig {
     #[serde(default)]
     pub tab_close_action: TabCloseAction,
 
-    /// Use DWM thumbnails to animate Chromium / Electron / Mozilla /
-    /// Cascadia windows during layout transitions instead of per-frame
-    /// `SetWindowPos` on the live HWND. Eliminates the visible 1px
-    /// wobble and Chrome stutter during column scroll.
+    /// Use DWM thumbnails only when Windows permits the live source HWND to
+    /// be physically cloaked. External application windows commonly reject
+    /// cloaking, so this experimental path safely falls back to live placement
+    /// when enabled but unsupported.
     #[serde(default = "default_true")]
     pub swap_chain_ghost_animation: bool,
 
@@ -1609,6 +1609,7 @@ mod tests {
         assert_eq!(config.layout.centering_mode, CenteringModeConfig::Center);
         assert!(config.behavior.focus_new_windows);
         assert!(config.behavior.cross_monitor_drag);
+        assert!(config.behavior.swap_chain_ghost_animation);
     }
 
     #[test]

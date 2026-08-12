@@ -3791,14 +3791,43 @@ fn test_moved_or_resized_suppression_lookup_leaves_other_entries_untouched() {
 // =========================================================================
 
 fn make_test_window_info(hwnd: u64) -> leopardwm_platform_win32::WindowInfo {
+    make_test_window_info_with_class(hwnd, "TestWindowClass")
+}
+
+fn make_test_window_info_with_class(
+    hwnd: u64,
+    class_name: &str,
+) -> leopardwm_platform_win32::WindowInfo {
     leopardwm_platform_win32::WindowInfo {
         hwnd,
         title: format!("Test Window {}", hwnd),
-        class_name: "TestWindowClass".to_string(),
+        class_name: class_name.to_string(),
         process_id: 1000 + hwnd as u32,
         rect: Rect::new(100, 100, 800, 600),
         visible: true,
     }
+}
+
+#[test]
+fn test_sticky_compositor_focus_is_detected_for_safe_navigation() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state
+        .focused_workspace_mut()
+        .unwrap()
+        .insert_window(100, Some(800))
+        .unwrap();
+    state.injected_window_info.insert(
+        100,
+        make_test_window_info_with_class(100, "Chrome_WidgetWin_1"),
+    );
+
+    assert!(state.focused_window_uses_sticky_compositor());
+
+    state.injected_window_info.insert(
+        100,
+        make_test_window_info_with_class(100, "TestWindowClass"),
+    );
+    assert!(!state.focused_window_uses_sticky_compositor());
 }
 
 #[test]

@@ -2878,10 +2878,10 @@ async fn handle_animation_frame_applied(
                 if still_valid {
                     surviving.push(wid);
                 } else {
-                    leopardwm_platform_win32::unmark_ghost_cloaked(wid);
+                    leopardwm_platform_win32::forget_recycled_ghost_cloak(wid);
                     state.ghost_handles.remove(&wid);
-                    // Don't apply_cloak_state — we don't know
-                    // what HWND we'd be uncloaking.
+                    // Logical cleanup only: we do not know what HWND may now
+                    // occupy this recycled numeric handle.
                 }
             }
 
@@ -2889,7 +2889,6 @@ async fn handle_animation_frame_applied(
             // the synchronous SetWindowPos hits a visible HWND.
             for &wid in &surviving {
                 leopardwm_platform_win32::unmark_ghost_cloaked(wid);
-                leopardwm_platform_win32::apply_cloak_state(wid);
             }
 
             // Only this landing pass follows an async frame burst,

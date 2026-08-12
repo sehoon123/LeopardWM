@@ -54,12 +54,12 @@ pub use enumeration::{
 pub use elevation::{manage_block, window_manage_block, ManageBlock};
 pub use event_hooks::{install_event_hooks, EventHookHandle, WindowEvent};
 pub use placement::{
-    apply_placements, clear_inset_cache, drain_ghost_cloaked, dwm_cloak_window, dwm_uncloak_all,
-    dwm_uncloak_window, get_window_invisible_insets, is_placement_cloaked,
-    mark_ghost_cloaked, set_dwm_transitions_disabled, unmark_ghost_cloaked,
+    apply_placements, clear_inset_cache, dwm_cloak_window, dwm_uncloak_all,
+    dwm_uncloak_window, forget_recycled_ghost_cloak, get_window_invisible_insets,
+    is_placement_cloaked, set_dwm_transitions_disabled, try_mark_ghost_cloaked,
+    unmark_ghost_cloaked,
     ApplyPlacementsResult, HeightViolation, PlacementCache, WidthViolation, EDGE_EPSILON_PX,
 };
-pub use placement::apply_cloak_state;
 pub use placement::clear_suspected_oversize;
 pub use types::{MonitorId, MonitorInfo, PlatformConfig, Win32Error, WindowInfo};
 pub use focus::{

@@ -1131,7 +1131,7 @@ input[type="range"]::-webkit-slider-thumb {
             <label class="toggle"><input type="checkbox" id="behavior-cross_monitor_drag"><span class="track"></span><span class="thumb"></span></label>
           </div>
           <div class="field">
-            <div class="field-info"><div class="field-label">Smooth app animations (experimental)</div><div class="field-desc">Use DWM thumbnails to animate Chromium / Electron / Firefox / Terminal / .NET windows during column scrolls. Eliminates the 1px wobble and repaint stutter on Chrome, Slack, Discord, WinForms/WPF apps, etc.</div></div>
+            <div class="field-info"><div class="field-label">Smooth app animations (experimental)</div><div class="field-desc">Attempt DWM-thumbnail animation only when Windows permits the source window to be hidden. Unsupported external apps automatically use safe live placement.</div></div>
             <label class="toggle"><input type="checkbox" id="behavior-swap_chain_ghost_animation"><span class="track"></span><span class="thumb"></span></label>
           </div>
           <div class="field">

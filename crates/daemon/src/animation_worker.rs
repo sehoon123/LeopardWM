@@ -313,9 +313,8 @@ fn worker_loop(
                 }
 
                 // Apply window placements, skipping unchanged windows via cache.
-                // Animation frames are SWP_ASYNCWINDOWPOS so the sticky-compositor
-                // nudge inside `apply_placements` is a no-op; pass `false` to keep
-                // the call signature explicit.
+                // Animation frames are SWP_ASYNCWINDOWPOS so a hung application
+                // cannot block this persistent worker.
                 let (apply_result, width_violations, height_violations) =
                     match leopardwm_platform_win32::apply_placements(
                         &request.placements,

@@ -172,7 +172,6 @@ impl AppState {
         // window also in GLOBAL_CLOAKED (off-screen parked) stays cloaked.
         for wid in &wids {
             leopardwm_platform_win32::unmark_ghost_cloaked(*wid);
-            leopardwm_platform_win32::apply_cloak_state(*wid);
         }
 
         // Clear ghosted_wids on any still-live transition so
@@ -300,6 +299,16 @@ impl AppState {
             }
             match leopardwm_platform_win32::thumbnail::register(wid) {
                 Ok(handle) => {
+                    // A thumbnail is safe only when its live source is actually
+                    // hidden. External application HWNDs normally reject
+                    // DWMWA_CLOAK; fall back to live placement rather than
+                    // compositing a moving thumbnail over an uncloaked source.
+                    if !leopardwm_platform_win32::try_mark_ghost_cloaked(wid) {
+                        tracing::debug!(
+                            "ghost: physical cloak unavailable for {wid}; using live placement"
+                        );
+                        continue;
+                    }
                     let final_dest = leopardwm_platform_win32::thumbnail::screen_to_host_client(
                         target_rect,
                         host_origin,
@@ -307,8 +316,6 @@ impl AppState {
                     let entry =
                         crate::state::GhostEntry::new(handle.into_isize(), class, final_dest);
                     self.ghost_handles.insert(wid, entry);
-                    leopardwm_platform_win32::mark_ghost_cloaked(wid);
-                    leopardwm_platform_win32::apply_cloak_state(wid);
                     ghosted_wids.insert(wid);
                 }
                 Err(e) => {

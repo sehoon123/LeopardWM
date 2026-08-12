@@ -97,14 +97,10 @@ focus_follows_mouse = false
 # api.github.com on startup + every 24h. Disable to skip entirely.
 # check_for_updates = false
 
-# Animate Chromium / Electron / Mozilla / Cascadia / .NET windows via DWM
-# thumbnails instead of per-frame SetWindowPos during column scrolls. Eliminates
-# the 1px wobble and renderer stutter on apps that repaint poorly under
-# per-frame moves (Chrome, Edge, Slack, Discord, Beeper, Spotify, VS Code,
-# Firefox, Windows Terminal, and .NET Framework WinForms/WPF apps).
-# Default on since v0.1.18. Set to false to fall back to the legacy
-# per-frame SetWindowPos path.
-# swap_chain_ghost_animation = false
+# Experimental DWM-thumbnail animation. LeopardWM attempts the path only if
+# Windows confirms the source HWND was physically cloaked; unsupported external
+# applications automatically fall back to safe live placement.
+# swap_chain_ghost_animation = true
 
 # Where newly opened windows go: "new_column" (default, own column to the
 # right) or "in_column" (stacked into the focused column).

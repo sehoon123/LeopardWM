@@ -125,7 +125,20 @@ impl AppState {
         if let Some(workspace) = self.focused_workspace_mut() {
             f(workspace, viewport_width);
         }
-        if let Some(snapshot) = snapshot {
+        let focused_live_animation_is_unsafe = sync_focus
+            && self
+                .focused_workspace()
+                .is_some_and(|workspace| workspace.is_animating())
+            && self.focused_window_uses_sticky_compositor();
+        if focused_live_animation_is_unsafe {
+            // The focused HWND cannot use the thumbnail path, and rapid async
+            // SetWindowPos leaves Chromium/Firefox/Cascadia surfaces behind the
+            // window frame. Snap this navigation directly; the bounded sync
+            // apply worker below retains hung-window protection.
+            if let Some(workspace) = self.focused_workspace_mut() {
+                workspace.stop_animation();
+            }
+        } else if let Some(snapshot) = snapshot {
             self.start_layout_transition(snapshot);
         }
         if let Err(e) = self.apply_layout() {
@@ -138,6 +151,21 @@ impl AppState {
             self.sync_foreground_window();
         }
         IpcResponse::Ok
+    }
+
+    /// Whether the focused tiled window uses a compositor that cannot reliably
+    /// follow per-frame asynchronous SetWindowPos. Called only for commands that
+    /// already started a scroll animation; unknown classes keep the normal path.
+    pub(crate) fn focused_window_uses_sticky_compositor(&self) -> bool {
+        self.focused_workspace()
+            .and_then(|workspace| workspace.focused_visible_window())
+            .is_some_and(|hwnd| {
+                let class = self
+                    .lookup_window_info(hwnd)
+                    .map(|info| info.class_name)
+                    .unwrap_or_default();
+                leopardwm_platform_win32::thumbnail::is_ghost_animation_class_str(&class)
+            })
     }
 
     /// Exit fullscreen on the focused workspace if active, restoring the tiled
