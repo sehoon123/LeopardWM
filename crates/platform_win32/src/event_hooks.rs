@@ -332,12 +332,6 @@ fn win_event_callback_inner(
         normalize_to_root_window(hwnd)
     };
 
-    if should_filter_window_event_by_manageability(event)
-        && !should_emit_window_event_for(event, hwnd)
-    {
-        return;
-    }
-
     let window_id = hwnd.0 as WindowId;
 
     // Suppress LOCATIONCHANGE and SHOW events for windows currently cloaked
@@ -348,6 +342,16 @@ fn win_event_callback_inner(
     // events (minimize, close-to-tray) must reach the daemon.
     if matches!(event, EVENT_OBJECT_SHOW | EVENT_OBJECT_LOCATIONCHANGE)
         && crate::is_placement_cloaked(window_id)
+    {
+        return;
+    }
+
+    // Placement cloak/uncloak generates high-frequency LOCATIONCHANGE events.
+    // Check the daemon-owned registry before the manageability policy, which
+    // otherwise probes visibility, styles, DWM cloak state, title, and class
+    // only to discard the event immediately afterward.
+    if should_filter_window_event_by_manageability(event)
+        && !should_emit_window_event_for(event, hwnd)
     {
         return;
     }

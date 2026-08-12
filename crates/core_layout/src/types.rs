@@ -83,20 +83,29 @@ impl Rect {
 
     /// Check if this rectangle intersects with another.
     pub fn intersects(&self, other: &Rect) -> bool {
-        self.x < other.x + other.width
-            && self.x + self.width > other.x
-            && self.y < other.y + other.height
-            && self.y + self.height > other.y
+        let self_left = i64::from(self.x);
+        let self_top = i64::from(self.y);
+        let self_right = self_left + i64::from(self.width);
+        let self_bottom = self_top + i64::from(self.height);
+        let other_left = i64::from(other.x);
+        let other_top = i64::from(other.y);
+        let other_right = other_left + i64::from(other.width);
+        let other_bottom = other_top + i64::from(other.height);
+
+        self_left < other_right
+            && self_right > other_left
+            && self_top < other_bottom
+            && self_bottom > other_top
     }
 
     /// Get the right edge x-coordinate.
     pub fn right(&self) -> i32 {
-        self.x + self.width
+        self.x.saturating_add(self.width)
     }
 
     /// Get the bottom edge y-coordinate.
     pub fn bottom(&self) -> i32 {
-        self.y + self.height
+        self.y.saturating_add(self.height)
     }
 
     /// Return this rectangle wholly contained by `bounds`.
@@ -109,11 +118,15 @@ impl Rect {
         let bounds_height = bounds.height.max(1);
         let width = self.width.max(1).min(bounds_width);
         let height = self.height.max(1).min(bounds_height);
-        let max_x = bounds.x.saturating_add(bounds_width).saturating_sub(width);
+        // Subtract the contained size before adding the remaining travel.
+        // `(origin + bounds) - size` can saturate at i32::MAX first and then
+        // fall below `origin`, which would invert the subsequent clamp range.
+        let max_x = bounds
+            .x
+            .saturating_add(bounds_width.saturating_sub(width));
         let max_y = bounds
             .y
-            .saturating_add(bounds_height)
-            .saturating_sub(height);
+            .saturating_add(bounds_height.saturating_sub(height));
         Rect::new(
             self.x.clamp(bounds.x, max_x),
             self.y.clamp(bounds.y, max_y),

@@ -22,6 +22,18 @@ pub(crate) fn viewport_equality_is_proven(
         && requested_origin.abs_diff(work_origin) > leopardwm_platform_win32::EDGE_EPSILON_PX as u32
 }
 
+/// Whether an unchanged desired layout may bypass the synchronous placement
+/// worker. A completed animation must always perform one exact landing pass:
+/// that pass drains `post_animation_nudge_pending`, repairs sticky compositor
+/// surfaces, and verifies all four DWM edges.
+pub(crate) fn can_skip_unchanged_layout(
+    placements_unchanged: bool,
+    bypass_fast_path: bool,
+    post_animation_landing_pending: bool,
+) -> bool {
+    placements_unchanged && !bypass_fast_path && !post_animation_landing_pending
+}
+
 fn bounded_timeout_diagnostic(value: String) -> Option<String> {
     if value.is_empty() {
         return None;
@@ -154,11 +166,14 @@ impl AppState {
     /// Returns true when a moved/resized event should be ignored due to recent apply_layout().
     pub(crate) fn should_suppress_moved_or_resized(&mut self, hwnd: u64) -> bool {
         let now = std::time::Instant::now();
-        self.moved_or_resized_suppression
-            .retain(|_, deadline| *deadline > now);
-        self.moved_or_resized_suppression
-            .get(&hwnd)
-            .is_some_and(|deadline| *deadline > now)
+        match self.moved_or_resized_suppression.get(&hwnd).copied() {
+            Some(deadline) if deadline > now => true,
+            Some(_) => {
+                self.moved_or_resized_suppression.remove(&hwnd);
+                false
+            }
+            None => false,
+        }
     }
 
     /// Join any finished timed-out apply workers so the pending list does not grow indefinitely.
@@ -418,9 +433,16 @@ impl AppState {
         let bypass_fast_path = self.injected_apply_placements_behavior.is_some();
         #[cfg(not(test))]
         let bypass_fast_path = false;
-        if placements_unchanged && !bypass_fast_path {
+        if can_skip_unchanged_layout(
+            placements_unchanged,
+            bypass_fast_path,
+            self.post_animation_nudge_pending,
+        ) {
             self.applying_layout = false;
             return Ok(());
+        }
+        if placements_unchanged && self.post_animation_nudge_pending {
+            debug!("Forcing exact landing for unchanged post-animation placements");
         }
 
         let timeout_candidate_ids: Vec<u64> = all_placements
@@ -660,16 +682,25 @@ impl AppState {
         let apply_epoch_ref = self.apply_epoch.clone();
         let apply_epoch = apply_epoch_ref.fetch_add(1, Ordering::SeqCst) + 1;
         let apply_window_ids: Vec<u64> = all_placements.iter().map(|p| p.window_id).collect();
-        // Drain the post-animation nudge flag so only the landing pass after
-        // an actual scroll / transition fires the (w-1 → w) sticky-compositor
-        // nudge. Routine applies skip it, which kills the visible Zen / Slack
-        // / Cascadia 1 px wobble that used to fire on every focus shift,
-        // drag, or window event.
-        let post_animation_nudge = std::mem::take(&mut self.post_animation_nudge_pending);
+        // Only the landing pass after an actual scroll / transition fires the
+        // (w-1 → w) sticky-compositor nudge. Routine applies skip it, which
+        // avoids a visible 1 px wobble on every focus shift, drag, or window
+        // event. Consume the flag only after creating the worker successfully;
+        // a spawn failure must leave the required landing armed for retry.
+        let post_animation_nudge = self.post_animation_nudge_pending;
         #[cfg(test)]
         let injected_behavior = self.injected_apply_placements_behavior;
         #[cfg(test)]
         let late_worker_recovery_count = self.late_worker_recovery_count.clone();
+
+        #[cfg(test)]
+        if matches!(
+            injected_behavior,
+            Some(TestApplyPlacementsBehavior::FailWorkerSpawn)
+        ) {
+            self.applying_layout = false;
+            return Err(anyhow!("injected apply worker spawn failure"));
+        }
 
         let (tx, rx) = std::sync::mpsc::channel::<ApplyWorkerMsg>();
         let spawn_result = std::thread::Builder::new()
@@ -695,6 +726,9 @@ impl AppState {
                             std::thread::sleep(delay);
                             Err(anyhow!("injected apply_placements failure"))
                         }
+                        TestApplyPlacementsBehavior::FailWorkerSpawn => unreachable!(
+                            "spawn-failure injection returns before creating the worker"
+                        ),
                     };
                     if should_cancel() {
                         run_layout_apply_recovery_pass(
@@ -753,7 +787,10 @@ impl AppState {
             });
 
         match spawn_result {
-            Ok(handle) => Ok((rx, handle)),
+            Ok(handle) => {
+                self.post_animation_nudge_pending = false;
+                Ok((rx, handle))
+            }
             Err(e) => {
                 self.applying_layout = false;
                 Err(anyhow!("Failed to spawn layout worker thread: {}", e))

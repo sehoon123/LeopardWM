@@ -167,6 +167,7 @@ pub(crate) const EDIT_CONFIG_PULL_TTL: Duration = Duration::from_secs(10);
 pub(crate) enum TestApplyPlacementsBehavior {
     SleepAndSucceed(Duration),
     SleepAndFail(Duration),
+    FailWorkerSpawn,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

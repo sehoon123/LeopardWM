@@ -1586,6 +1586,108 @@ fn test_floating_cross_monitor_drop_records_target_dpi_logical_size() {
 }
 
 #[test]
+fn test_reconcile_handle_change_rekeys_monitor_owned_state() {
+    let mut state = AppState::new_with_config(test_config(), two_monitors());
+    state.workspaces.get_mut(&2).unwrap()[0]
+        .add_floating(200, Rect::new(2000, 100, 600, 400))
+        .unwrap();
+    state.floating_focus.insert((2, 0), 200);
+    state.move_origins.insert(
+        300,
+        MoveOrigin {
+            monitor: 2,
+            ws_idx: 0,
+            column: 0,
+            sibling: None,
+        },
+    );
+    state.pending_tab_focus = Some(PendingTabFocus {
+        monitor: 2,
+        workspace_idx: 0,
+        column_idx: 0,
+        tab_idx: 0,
+        set_at: std::time::Instant::now(),
+    });
+
+    let mut remapped = two_monitors();
+    remapped[1].id = 99;
+    state.reconcile_monitors(remapped);
+
+    assert!(state.workspaces.contains_key(&99));
+    assert!(!state.workspaces.contains_key(&2));
+    assert_eq!(state.floating_focus.get(&(99, 0)), Some(&200));
+    assert!(!state.floating_focus.contains_key(&(2, 0)));
+    assert_eq!(state.move_origins[&300].monitor, 99);
+    assert_eq!(state.pending_tab_focus.unwrap().monitor, 99);
+
+    state.focused_monitor = 99;
+    assert_eq!(
+        state.handle_command(IpcCommand::SwitchWorkspace { index: 2 }),
+        IpcResponse::Ok
+    );
+    assert_eq!(
+        state.handle_command(IpcCommand::SwitchWorkspace { index: 1 }),
+        IpcResponse::Ok
+    );
+    assert_eq!(state.previous_focused_hwnd, Some(200));
+}
+
+#[test]
+fn test_reconcile_handle_reuse_does_not_transfer_layout_to_new_device() {
+    let mut state = AppState::new_with_config(test_config(), two_monitors());
+    state.workspaces.get_mut(&2).unwrap()[0]
+        .insert_window(200, Some(650))
+        .unwrap();
+
+    let mut changed = two_monitors();
+    changed[1].id = 3; // DISPLAY2 survives under a new HMONITOR.
+    changed.push(MonitorInfo {
+        id: 2, // Its old HMONITOR is immediately reused by DISPLAY3.
+        rect: Rect::new(3840, 0, 1920, 1080),
+        work_area: Rect::new(3840, 0, 1920, 1040),
+        is_primary: false,
+        device_name: "DISPLAY3".to_string(),
+        scale_factor: 1.0,
+    });
+
+    state.reconcile_monitors(changed);
+
+    assert!(state.workspaces[&3][0].contains_window(200));
+    let col = state.workspaces[&3][0].find_window_location(200).unwrap().0;
+    assert_eq!(state.workspaces[&3][0].column(col).unwrap().width(), 650);
+    assert_eq!(
+        state.workspaces[&2][0].window_count(),
+        0,
+        "new DISPLAY3 must start fresh rather than inherit DISPLAY2's layout"
+    );
+}
+
+#[test]
+fn test_reconcile_swapped_handles_preserve_physical_monitor_ownership() {
+    let mut state = AppState::new_with_config(test_config(), two_monitors());
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(100, None)
+        .unwrap();
+    state.workspaces.get_mut(&2).unwrap()[0]
+        .insert_window(200, None)
+        .unwrap();
+
+    let mut swapped = two_monitors();
+    swapped[0].id = 2;
+    swapped[1].id = 1;
+    state.reconcile_monitors(swapped);
+
+    assert!(
+        state.workspaces[&2][0].contains_window(100),
+        "DISPLAY1 layout follows its stable device name"
+    );
+    assert!(
+        state.workspaces[&1][0].contains_window(200),
+        "DISPLAY2 layout follows its stable device name"
+    );
+}
+
+#[test]
 fn test_reconcile_no_change() {
     let mut state = AppState::new_with_config(test_config(), test_monitors());
     let monitors_before = state.workspaces.len();
@@ -2361,6 +2463,47 @@ fn test_restore_clears_minimized() {
     assert!(ws.mark_restored(100));
     assert!(!ws.is_minimized(100));
     assert_eq!(ws.minimized_count(), 0);
+}
+
+#[test]
+fn test_restore_event_invalidates_desired_rect_cache() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    let ws = state.focused_workspace_mut().unwrap();
+    ws.insert_window(100, Some(800)).unwrap();
+    ws.mark_minimized(100);
+    state
+        .last_placed_layout_rects
+        .insert(100, Rect::new(10, 10, 800, 600));
+
+    state.handle_window_event(WindowEvent::Restored(100));
+
+    assert!(!state.last_placed_layout_rects.contains_key(&100));
+}
+
+#[test]
+fn test_post_animation_landing_cannot_take_unchanged_fast_path() {
+    use crate::layout_apply::can_skip_unchanged_layout;
+
+    assert!(can_skip_unchanged_layout(true, false, false));
+    assert!(!can_skip_unchanged_layout(true, false, true));
+    assert!(!can_skip_unchanged_layout(false, false, false));
+    assert!(!can_skip_unchanged_layout(true, true, false));
+}
+
+#[test]
+fn test_failed_apply_worker_spawn_preserves_post_animation_landing() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.paused = false;
+    state
+        .focused_workspace_mut()
+        .unwrap()
+        .insert_window(100, Some(800))
+        .unwrap();
+    state.post_animation_nudge_pending = true;
+    state.injected_apply_placements_behavior = Some(TestApplyPlacementsBehavior::FailWorkerSpawn);
+
+    assert!(state.apply_layout().is_err());
+    assert!(state.post_animation_nudge_pending);
 }
 
 #[test]
@@ -3620,6 +3763,27 @@ fn test_moved_or_resized_suppression_window_tracking() {
         !state.should_suppress_moved_or_resized(200),
         "expired suppression entries should be ignored"
     );
+    assert!(
+        !state.moved_or_resized_suppression.contains_key(&200),
+        "the expired entry is removed on its own lookup"
+    );
+}
+
+#[test]
+fn test_moved_or_resized_suppression_lookup_leaves_other_entries_untouched() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state
+        .moved_or_resized_suppression
+        .insert(100, std::time::Instant::now() - Duration::from_millis(1));
+    state
+        .moved_or_resized_suppression
+        .insert(200, std::time::Instant::now() + Duration::from_secs(1));
+
+    assert!(!state.should_suppress_moved_or_resized(100));
+    assert!(
+        state.moved_or_resized_suppression.contains_key(&200),
+        "a hot LOCATIONCHANGE lookup must not scan and mutate unrelated entries"
+    );
 }
 
 // =========================================================================
@@ -4691,6 +4855,32 @@ fn test_scratchpad_toggle_summons_then_hides() {
 }
 
 #[test]
+fn test_external_hidden_event_marks_shown_scratchpad_hidden() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state
+        .focused_workspace_mut()
+        .unwrap()
+        .insert_window(100, Some(800))
+        .unwrap();
+    state.scratchpad_stash();
+    state.scratchpad_toggle();
+    assert!(state.scratchpad.unwrap().shown);
+
+    state.handle_window_event(WindowEvent::Hidden(100));
+
+    assert!(
+        state.scratchpad.is_some(),
+        "designation survives external hide"
+    );
+    assert!(!state.scratchpad.unwrap().shown);
+    assert!(!state.focused_workspace().unwrap().contains_window(100));
+
+    state.scratchpad_toggle();
+    assert!(state.scratchpad.unwrap().shown);
+    assert!(state.focused_workspace().unwrap().is_floating(100));
+}
+
+#[test]
 fn test_scratchpad_first_summon_uses_configured_dpi_scaled_size() {
     let mut config = test_config();
     config.layout.default_scratchpad_width = 600;
@@ -5730,18 +5920,29 @@ fn test_restore_structure_prunes_dead_windows() {
 }
 
 #[test]
-fn test_restore_structure_clamps_workspace_index() {
+fn test_restore_structure_rejects_out_of_range_workspace_index() {
     let mut state = structure_restore_state();
-    let mut ws = leopardwm_core_layout::Workspace::default();
-    ws.insert_window(999, None).unwrap();
+    let mut valid = leopardwm_core_layout::Workspace::default();
+    valid.insert_window(888, None).unwrap();
+    valid.set_scroll_offset(88.0);
+    let mut invalid = leopardwm_core_layout::Workspace::default();
+    invalid.insert_window(999, None).unwrap();
+    invalid.set_scroll_offset(123.0);
     let snapshot = crate::state::StateSnapshot {
         saved_at: "0".to_string(),
-        workspaces: vec![crate::state::WorkspaceSnapshot {
-            monitor_device_name: "DISPLAY2".to_string(),
-            // Out-of-range index (user-writable JSON) must clamp to 8.
-            workspace_index: 42,
-            workspace: ws,
-        }],
+        workspaces: vec![
+            crate::state::WorkspaceSnapshot {
+                monitor_device_name: "DISPLAY2".to_string(),
+                workspace_index: 8,
+                workspace: valid,
+            },
+            crate::state::WorkspaceSnapshot {
+                monitor_device_name: "DISPLAY2".to_string(),
+                // User-writable garbage must not alias onto valid workspace 9.
+                workspace_index: 42,
+                workspace: invalid,
+            },
+        ],
         focused_monitor_name: "DISPLAY1".to_string(),
         active_workspace: std::collections::HashMap::new(),
         tab_title_overrides: std::collections::HashMap::new(),
@@ -5755,10 +5956,18 @@ fn test_restore_structure_clamps_workspace_index() {
         .find(|(_, m)| m.device_name == "DISPLAY2")
         .map(|(&id, _)| id)
         .unwrap();
-    assert!(restored.contains(&(display2_id, 8)), "index clamped to 8");
+    assert!(restored.contains(&(display2_id, 8)));
     let ws_vec = state.workspaces.get(&display2_id).unwrap();
-    assert_eq!(ws_vec.len(), 9, "vec extended to 0..=8, no further");
-    assert!(ws_vec[8].contains_window(999));
+    assert_eq!(ws_vec.len(), 9, "invalid index cannot extend the vec");
+    assert!(ws_vec[8].contains_window(888));
+    assert!(!ws_vec[8].contains_window(999));
+
+    // The post-enumeration pass must reject the same invalid entry instead of
+    // overwriting the valid workspace's saved scroll offset.
+    state.restore_state(&snapshot);
+    let ws_vec = state.workspaces.get(&display2_id).unwrap();
+    assert_eq!(ws_vec.len(), 9);
+    assert_eq!(ws_vec[8].scroll_offset(), 88.0);
 }
 
 #[test]
@@ -6098,4 +6307,7 @@ fn test_layout_viewport_unknown_monitor_falls_back() {
     assert_eq!(vp.x, 0);
     assert_eq!(vp.y, 0);
     assert!(
-        vp.width >                                                                       
+        vp.width > 0 && vp.height > 0,
+        "fallback viewport is non-empty"
+    );
+}

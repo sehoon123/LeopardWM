@@ -177,12 +177,16 @@ impl AppState {
     }
 
     fn corner_radius_for_window(&self, hwnd: u64) -> f32 {
-        let info = leopardwm_platform_win32::get_window_info(hwnd);
-
-        // 1. User-rule override always wins.
-        if let Some(ref info) = info {
-            let any_corner_overrides = self.compiled_rules.iter().any(|r| r.corner_style.is_some());
-            if any_corner_overrides {
+        // A corner override needs title/class/executable matching, but the
+        // usual path does not. Avoid synchronous cross-process window-info
+        // probing on every border animation frame when no configured rule can
+        // affect this result.
+        if self
+            .compiled_rules
+            .iter()
+            .any(|rule| rule.corner_style.is_some())
+        {
+            if let Some(info) = leopardwm_platform_win32::get_window_info(hwnd) {
                 let exe = get_process_executable(info.process_id).unwrap_or_default();
                 for rule in &self.compiled_rules {
                     if rule.matches(&info.class_name, &info.title, &exe) {

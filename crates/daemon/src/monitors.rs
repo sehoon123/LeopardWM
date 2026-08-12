@@ -8,6 +8,53 @@ use std::collections::{HashMap, HashSet};
 use tracing::{info, warn};
 
 impl AppState {
+    /// Re-key state that stores volatile HMONITOR values without changing its
+    /// physical-monitor ownership. Rebuild map keys from a single snapshot so
+    /// two handles that happen to swap values cannot overwrite each other's
+    /// workspace or floating-focus entry during a sequential move.
+    fn rekey_monitor_state(&mut self, remap: &HashMap<MonitorId, MonitorId>) {
+        let remap_id = |monitor_id| remap.get(&monitor_id).copied().unwrap_or(monitor_id);
+
+        self.monitors = std::mem::take(&mut self.monitors)
+            .into_iter()
+            .map(|(monitor_id, mut monitor)| {
+                let monitor_id = remap_id(monitor_id);
+                monitor.id = monitor_id;
+                (monitor_id, monitor)
+            })
+            .collect();
+        self.workspaces = std::mem::take(&mut self.workspaces)
+            .into_iter()
+            .map(|(monitor_id, workspaces)| (remap_id(monitor_id), workspaces))
+            .collect();
+        self.active_workspace = std::mem::take(&mut self.active_workspace)
+            .into_iter()
+            .map(|(monitor_id, workspace_idx)| (remap_id(monitor_id), workspace_idx))
+            .collect();
+        self.floating_focus = std::mem::take(&mut self.floating_focus)
+            .into_iter()
+            .map(|((monitor_id, workspace_idx), hwnd)| {
+                ((remap_id(monitor_id), workspace_idx), hwnd)
+            })
+            .collect();
+        self.focused_monitor = remap_id(self.focused_monitor);
+
+        for origin in self.move_origins.values_mut() {
+            origin.monitor = remap_id(origin.monitor);
+        }
+        if let Some(pending) = self.pending_tab_focus.as_mut() {
+            if pending.is_fresh() {
+                pending.monitor = remap_id(pending.monitor);
+            }
+        }
+        if let Some(drag) = self.drag_state.as_mut() {
+            drag.source_monitor = remap_id(drag.source_monitor);
+            if let Some(target) = drag.last_drop_target.as_mut() {
+                target.monitor = remap_id(target.monitor);
+            }
+        }
+    }
+
     /// Reconcile workspaces after monitor configuration change.
     ///
     /// This handles:
@@ -15,83 +62,84 @@ impl AppState {
     /// - Adding workspaces for newly connected monitors
     pub(crate) fn reconcile_monitors(&mut self, new_monitors: Vec<MonitorInfo>) {
         let new_ids: HashSet<MonitorId> = new_monitors.iter().map(|m| m.id).collect();
+        let new_id_by_name: HashMap<&str, MonitorId> = new_monitors
+            .iter()
+            .map(|monitor| (monitor.device_name.as_str(), monitor.id))
+            .collect();
+
+        // HMONITOR values are volatile and can be swapped or immediately reused
+        // for a different device. Align surviving devices by stable name first.
+        // If a disconnected device still occupies an ID now used by another
+        // device, move its old state to a temporary key so the normal removal
+        // path can still migrate/stash it without colliding with the survivor.
+        let mut used_ids: HashSet<MonitorId> = self.monitors.keys().copied().collect();
+        used_ids.extend(new_ids.iter().copied());
+        let mut temporary_id = MonitorId::MIN;
+        let mut remap = HashMap::new();
+        for monitor in self.monitors.values() {
+            if let Some(&new_id) = new_id_by_name.get(monitor.device_name.as_str()) {
+                if monitor.id != new_id {
+                    remap.insert(monitor.id, new_id);
+                }
+            } else if new_ids.contains(&monitor.id) {
+                while used_ids.contains(&temporary_id) {
+                    temporary_id = temporary_id.saturating_add(1);
+                }
+                remap.insert(monitor.id, temporary_id);
+                used_ids.insert(temporary_id);
+                temporary_id = temporary_id.saturating_add(1);
+            }
+        }
+        if !remap.is_empty() {
+            info!(
+                "Re-keying state for {} monitor handle(s) by stable device name",
+                remap.len()
+            );
+            self.rekey_monitor_state(&remap);
+        }
         let old_ids: HashSet<MonitorId> = self.monitors.keys().copied().collect();
 
-        // Detect HMONITOR handle changes without physical topology change
-        // (e.g., contrast theme switch). Match old→new by device_name and
-        // re-key workspace data instead of destroying and recreating it.
-        if new_ids != old_ids && new_monitors.len() == self.monitors.len() {
-            let old_by_name: HashMap<&str, MonitorId> = self
+        // With every surviving device already aligned to its current handle, an
+        // unchanged device-name set needs only metric/DPI refresh and refitting.
+        let same_physical_topology = new_monitors.len() == self.monitors.len()
+            && self
                 .monitors
                 .values()
-                .map(|m| (m.device_name.as_str(), m.id))
-                .collect();
-            let new_by_name: HashMap<&str, MonitorId> = new_monitors
-                .iter()
-                .map(|m| (m.device_name.as_str(), m.id))
-                .collect();
-
-            // If every device_name from the old set has a match in the new set,
-            // this is a handle change, not a topology change.
-            let remap: HashMap<MonitorId, MonitorId> = old_by_name
-                .iter()
-                .filter_map(|(name, &old_id)| new_by_name.get(name).map(|&new_id| (old_id, new_id)))
-                .collect();
-
-            if remap.len() == self.monitors.len() {
-                info!(
-                    "Monitor handles changed without topology change — re-keying {} workspace(s)",
-                    remap.len()
+                .all(|monitor| new_id_by_name.contains_key(monitor.device_name.as_str()));
+        if same_physical_topology {
+            self.monitors = new_monitors.into_iter().map(|m| (m.id, m)).collect();
+            for (&monitor_id, ws_vec) in self.workspaces.iter_mut() {
+                let scale = self
+                    .monitors
+                    .get(&monitor_id)
+                    .map(|m| m.scale_factor)
+                    .unwrap_or(1.0);
+                let work_area = self
+                    .monitors
+                    .get(&monitor_id)
+                    .map(|m| m.work_area)
+                    .unwrap_or(Rect::new(
+                        0,
+                        0,
+                        FALLBACK_VIEWPORT_WIDTH,
+                        FALLBACK_WORK_AREA_HEIGHT,
+                    ));
+                let viewport_width = work_area.width;
+                let params = ScaledLayoutParams::from_config(
+                    &self.config.layout,
+                    &self.config.appearance,
+                    scale,
+                    viewport_width,
                 );
-                for (&old_id, &new_id) in &remap {
-                    if old_id != new_id {
-                        if let Some(ws) = self.workspaces.remove(&old_id) {
-                            self.workspaces.insert(new_id, ws);
-                        }
-                        if let Some(idx) = self.active_workspace.remove(&old_id) {
-                            self.active_workspace.insert(new_id, idx);
-                        }
-                        if self.focused_monitor == old_id {
-                            self.focused_monitor = new_id;
-                        }
-                    }
+                for workspace in ws_vec.iter_mut() {
+                    let old_gap = workspace.gap();
+                    let (old_ol, old_or, _, _) = workspace.outer_gaps();
+                    params.apply_to(workspace);
+                    workspace.rescale_column_widths(old_gap, old_ol, old_or, viewport_width);
+                    workspace.clamp_floating_to(work_area);
                 }
-                // Update monitor info — no migration needed
-                self.monitors = new_monitors.into_iter().map(|m| (m.id, m)).collect();
-                // Re-apply scaled gaps in case DPI or work area changed
-                for (&monitor_id, ws_vec) in self.workspaces.iter_mut() {
-                    let scale = self
-                        .monitors
-                        .get(&monitor_id)
-                        .map(|m| m.scale_factor)
-                        .unwrap_or(1.0);
-                    let work_area = self
-                        .monitors
-                        .get(&monitor_id)
-                        .map(|m| m.work_area)
-                        .unwrap_or(Rect::new(
-                            0,
-                            0,
-                            FALLBACK_VIEWPORT_WIDTH,
-                            FALLBACK_WORK_AREA_HEIGHT,
-                        ));
-                    let viewport_width = work_area.width;
-                    let params = ScaledLayoutParams::from_config(
-                        &self.config.layout,
-                        &self.config.appearance,
-                        scale,
-                        viewport_width,
-                    );
-                    for workspace in ws_vec.iter_mut() {
-                        let old_gap = workspace.gap();
-                        let (old_ol, old_or, _, _) = workspace.outer_gaps();
-                        params.apply_to(workspace);
-                        workspace.rescale_column_widths(old_gap, old_ol, old_or, viewport_width);
-                        workspace.clamp_floating_to(work_area);
-                    }
-                }
-                return;
             }
+            return;
         }
 
         // Find primary monitor in new config (or first available)
@@ -132,35 +180,6 @@ impl AppState {
                     self.workspaces.insert(monitor.id, stashed_ws);
                     self.active_workspace.insert(monitor.id, clamped);
                     continue;
-                }
-                // Same-pass handle change: the same physical monitor (matched by
-                // device_name) is being removed elsewhere in this reconcile with a
-                // different HMONITOR. Adopt its live layout directly instead of
-                // recreating it, generalizing the count-unchanged re-key branch to
-                // the count-changed case (e.g. a dock event that also adds a
-                // monitor). The removed loop then finds nothing to migrate for it.
-                let adopt_from = old_ids.iter().copied().find(|&oid| {
-                    !new_ids.contains(&oid)
-                        && self
-                            .monitors
-                            .get(&oid)
-                            .is_some_and(|m| m.device_name == monitor.device_name)
-                });
-                if let Some(old_id) = adopt_from {
-                    if let Some(ws) = self.workspaces.remove(&old_id) {
-                        let idx = self.active_workspace.remove(&old_id).unwrap_or(0);
-                        let clamped = idx.min(ws.len().saturating_sub(1));
-                        if self.focused_monitor == old_id {
-                            self.focused_monitor = monitor.id;
-                        }
-                        info!(
-                            "Adopted live layout from monitor {} to {} ({}) across a handle change",
-                            old_id, monitor.id, monitor.device_name
-                        );
-                        self.workspaces.insert(monitor.id, ws);
-                        self.active_workspace.insert(monitor.id, clamped);
-                        continue;
-                    }
                 }
                 let params = ScaledLayoutParams::from_config(
                     &self.config.layout,

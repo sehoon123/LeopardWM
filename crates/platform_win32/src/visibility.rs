@@ -4,14 +4,14 @@ use crate::enumeration::{collect_all_top_level_window_ids, get_primary_monitor};
 use crate::placement::apply_placements;
 use crate::types::{PlatformConfig, Win32Error};
 use crate::window_style::reset_window_border_color;
-use crate::{combine_operation_failures, is_benign_side_effect_error, window_id_to_hwnd};
 use crate::MOVE_OFFSCREEN_SENTINEL_COORD;
+use crate::{combine_operation_failures, is_benign_side_effect_error, window_id_to_hwnd};
 use leopardwm_core_layout::{Rect, Visibility, WindowId, WindowPlacement};
 use std::ffi::c_void;
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowRect, IsIconic, IsWindow, SetWindowPos, ShowWindow, HWND_TOP, SWP_NOACTIVATE,
-    SWP_NOSIZE, SWP_NOZORDER, SW_RESTORE,
+    SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_RESTORE,
 };
 
 // ============================================================================
@@ -51,9 +51,15 @@ pub fn move_window_offscreen(window_id: WindowId) -> Result<(), Win32Error> {
     Ok(())
 }
 
-/// Synchronously move and resize a window to `rect` AND raise it to the
-/// top of the normal (non-topmost) window band. No activation, no async.
+fn position_window_flags() -> windows::Win32::UI::WindowsAndMessaging::SET_WINDOW_POS_FLAGS {
+    SWP_NOACTIVATE | SWP_SHOWWINDOW
+}
+
+/// Synchronously show, move, and resize a window to `rect`, then raise it to
+/// the top of the normal (non-topmost) window band. No activation, no async.
 ///
+/// `SWP_SHOWWINDOW` matters when the application itself hid a shown scratchpad:
+/// uncloaking and positioning alone do not clear the HWND's hidden state.
 /// Raising matters for a freshly-summoned scratchpad: the focus border
 /// tracks the window at its own z-level, so the window must be above the
 /// previously-focused window for the border to be visible. The move is
@@ -69,7 +75,7 @@ pub fn position_window(window_id: WindowId, rect: Rect) -> Result<(), Win32Error
             rect.y,
             rect.width,
             rect.height,
-            SWP_NOACTIVATE,
+            position_window_flags(),
         )
         .map_err(|e| {
             Win32Error::SetPositionFailed(format!("Failed to position window {}: {}", window_id, e))
@@ -360,6 +366,13 @@ pub fn cascade_windows(window_ids: &[WindowId]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_position_window_flags_show_without_activation() {
+        let flags = position_window_flags();
+        assert_ne!(flags.0 & SWP_SHOWWINDOW.0, 0);
+        assert_ne!(flags.0 & SWP_NOACTIVATE.0, 0);
+    }
 
     #[test]
     fn test_is_benign_side_effect_error_only_for_nonzero_not_found() {

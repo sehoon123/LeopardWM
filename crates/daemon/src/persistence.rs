@@ -8,6 +8,10 @@ use leopardwm_platform_win32::MonitorId;
 use std::collections::{HashMap, HashSet};
 use tracing::{debug, info, warn};
 
+/// Persisted workspace indices are user-writable JSON but the public command
+/// surface exposes exactly workspaces 1 through 9 (zero-based 0 through 8).
+const MAX_SAVED_WORKSPACE_INDEX: usize = 8;
+
 impl AppState {
     /// Save current workspace state to disk.
     pub(crate) fn save_state(&self) -> Result<()> {
@@ -279,10 +283,19 @@ impl AppState {
                 continue;
             };
 
-            // Clamp to the 1-9 workspace range (0-based 0..=8). The snapshot is
-            // user-writable JSON, so a garbage index must not drive the vec to
-            // pathological length on startup.
-            let ws_idx = ws_snapshot.workspace_index.min(8);
+            // Snapshots are user-writable JSON. Reject an out-of-contract
+            // index instead of aliasing it onto workspace 9, where it could
+            // overwrite a legitimate saved workspace.
+            if ws_snapshot.workspace_index > MAX_SAVED_WORKSPACE_INDEX {
+                warn!(
+                    "Skipping saved workspace {} for monitor '{}': valid range is 0..={}",
+                    ws_snapshot.workspace_index,
+                    ws_snapshot.monitor_device_name,
+                    MAX_SAVED_WORKSPACE_INDEX
+                );
+                continue;
+            }
+            let ws_idx = ws_snapshot.workspace_index;
 
             // Clone the saved workspace and drop windows that should not be
             // restored (closed while the daemon was down, or now unmanageable).
@@ -388,6 +401,15 @@ impl AppState {
                 .map(|(&id, _)| id);
 
             if let Some(id) = monitor_id {
+                if ws_snapshot.workspace_index > MAX_SAVED_WORKSPACE_INDEX {
+                    warn!(
+                        "Skipping saved workspace state {} for monitor '{}': valid range is 0..={}",
+                        ws_snapshot.workspace_index,
+                        ws_snapshot.monitor_device_name,
+                        MAX_SAVED_WORKSPACE_INDEX
+                    );
+                    continue;
+                }
                 let ws_idx = ws_snapshot.workspace_index;
                 if let Some(ws_vec) = self.workspaces.get_mut(&id) {
                     // Extend the vec with empty workspaces if needed

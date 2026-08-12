@@ -733,6 +733,20 @@ impl AppState {
             return;
         }
 
+        // A shown scratchpad can be hidden by its application (for example a
+        // minimize-to-tray action). Keep its designation and remembered size,
+        // but mirror the physical hide before workspace removal so the next
+        // toggle summons it instead of trying to hide it again.
+        if is_hidden_event
+            && self
+                .scratchpad
+                .is_some_and(|scratchpad| scratchpad.window_id == hwnd && scratchpad.shown)
+        {
+            if let Some(scratchpad) = self.scratchpad.as_mut() {
+                scratchpad.shown = false;
+            }
+        }
+
         // A real destruction may be the final event for an active drag. Clear
         // its sentinel and state now; never restore the dead HWND. Column mode
         // still restores the surviving column's pre-drag order.
@@ -1466,6 +1480,10 @@ impl AppState {
     /// Handle a window-restored event.
     fn on_window_restored(&mut self, hwnd: u64) {
         if let Some((monitor_id, ws_idx)) = self.find_window_workspace(hwnd) {
+            // Minimize/restore changes the HWND outside our placement pipeline.
+            // Never let the desired-rect cache suppress the first exact landing
+            // after restore, even when the logical slot itself did not change.
+            self.last_placed_layout_rects.remove(&hwnd);
             let viewport_width = self.viewport_width_for(monitor_id);
             let snapshot = self.snapshot_layout();
             let mut should_sync_foreground = false;

@@ -699,6 +699,25 @@ mod tests {
         assert!(!r3.intersects(&r1));
     }
 
+    #[test]
+    fn test_rect_edges_and_intersection_saturate_at_i32_max() {
+        let wide = Rect::new(i32::MAX - 5, i32::MAX - 5, 10, 10);
+        let overlapping = Rect::new(i32::MAX - 2, i32::MAX - 2, 1, 1);
+
+        assert!(wide.intersects(&overlapping));
+        assert!(overlapping.intersects(&wide));
+        assert_eq!(wide.right(), i32::MAX);
+        assert_eq!(wide.bottom(), i32::MAX);
+    }
+
+    #[test]
+    fn test_rect_clamped_inside_handles_max_coordinate_bounds() {
+        let bounds = Rect::new(i32::MAX, i32::MAX, 100, 100);
+        let clamped = Rect::new(i32::MIN, i32::MIN, 50, 60).clamped_inside(bounds);
+
+        assert_eq!(clamped, Rect::new(i32::MAX, i32::MAX, 50, 60));
+    }
+
     // ====== Tests added from code review ======
 
     #[test]

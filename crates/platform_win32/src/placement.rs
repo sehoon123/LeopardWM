@@ -573,6 +573,25 @@ pub fn apply_placements(
     })
 }
 
+/// Resolve the top-left position used for an off-screen placement.
+///
+/// Inactive tabs intentionally use a zero-area layout marker. Because their
+/// `SWP_NOSIZE` application retains the real HWND dimensions, parking such a
+/// marker merely one viewport left can still leave a wide window visible.
+/// Send those markers to the global sentinel while preserving ordinary strip
+/// off-screen positions for scrolling columns.
+fn offscreen_position(placement: &WindowPlacement, inset_l: i32, inset_t: i32) -> (i32, i32) {
+    if placement.rect.width == 0 && placement.rect.height == 0 {
+        let sentinel = crate::MOVE_OFFSCREEN_SENTINEL_COORD;
+        (sentinel, sentinel)
+    } else {
+        (
+            placement.rect.x.saturating_sub(inset_l),
+            placement.rect.y.saturating_sub(inset_t),
+        )
+    }
+}
+
 /// Build the defer-entry list for all placements, skipping cache-unchanged windows.
 fn build_defer_entries(
     placements: &[WindowPlacement],
@@ -649,11 +668,12 @@ fn build_defer_entries(
             // Off-screen: SWP_NOSIZE keeps current size (no resize side-effects).
             // w stores estimated frame width for clamping only — SetWindowPos
             // ignores it due to SWP_NOSIZE.
+            let (x, y) = offscreen_position(placement, inset_l, inset_t);
             entries.push(DeferEntry {
                 hwnd,
                 window_id: placement.window_id,
-                x: placement.rect.x - inset_l,
-                y: placement.rect.y - inset_t,
+                x,
+                y,
                 w: frame_w,
                 h: 0,
                 layout_rect: placement.rect,
@@ -1400,6 +1420,31 @@ mod tests {
         let config = PlatformConfig::default();
         let result = apply_placements(&[], &config, None, false);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_zero_sized_offscreen_marker_uses_global_sentinel() {
+        let placement = WindowPlacement {
+            window_id: 1,
+            rect: Rect::new(0, 0, 0, 0),
+            visibility: Visibility::OffScreenLeft,
+            column_index: 0,
+        };
+        assert_eq!(
+            offscreen_position(&placement, 8, 8),
+            (
+                crate::MOVE_OFFSCREEN_SENTINEL_COORD,
+                crate::MOVE_OFFSCREEN_SENTINEL_COORD,
+            )
+        );
+
+        let ordinary = WindowPlacement {
+            window_id: 2,
+            rect: Rect::new(-100, 50, 800, 600),
+            visibility: Visibility::OffScreenLeft,
+            column_index: 0,
+        };
+        assert_eq!(offscreen_position(&ordinary, 8, 6), (-108, 44));
     }
 
     #[test]
