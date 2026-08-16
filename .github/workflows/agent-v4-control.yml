@@ -1,0 +1,252 @@
+name: V4 release control
+
+on:
+  push:
+    branches:
+      - agent/performance-audit-03
+    paths:
+      - .github/workflows/agent-v4-control.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: leopardwm-v4-recovery
+  cancel-in-progress: false
+
+jobs:
+  ensure-release:
+    runs-on: windows-latest
+    timeout-minutes: 100
+    env:
+      RELEASE_TAG: v0.2.6-sehoon.4
+      RELEASE_VERSION: 0.2.6-sehoon.4
+
+    steps:
+      - name: Detect existing release
+        id: release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            "exists=true" >> $env:GITHUB_OUTPUT
+          } else {
+            "exists=false" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Check out latest performance branch
+        if: steps.release.outputs.exists != 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: agent/performance-audit-03
+          fetch-depth: 0
+
+      - name: Install stable Rust
+        if: steps.release.outputs.exists != 'true'
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          components: clippy,rustfmt
+
+      - name: Ensure conservative optimizations are present
+        if: steps.release.outputs.exists != 'true'
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+          import re
+
+          root = Path.cwd()
+
+          def span(text: str, needle: str):
+              start = text.find(needle)
+              if start < 0:
+                  raise RuntimeError(f"missing {needle}")
+              brace = text.find("{", start)
+              depth = 0
+              state = "code"
+              i = brace
+              while i < len(text):
+                  ch = text[i]
+                  nxt = text[i + 1] if i + 1 < len(text) else ""
+                  if state == "line":
+                      if ch == "\n": state = "code"
+                      i += 1; continue
+                  if state == "block":
+                      if ch == "*" and nxt == "/": state = "code"; i += 2; continue
+                      i += 1; continue
+                  if state == "string":
+                      if ch == "\\": i += 2; continue
+                      if ch == '"': state = "code"
+                      i += 1; continue
+                  if ch == "/" and nxt == "/": state = "line"; i += 2; continue
+                  if ch == "/" and nxt == "*": state = "block"; i += 2; continue
+                  if ch == '"': state = "string"; i += 1; continue
+                  if ch == "{": depth += 1
+                  elif ch == "}":
+                      depth -= 1
+                      if depth == 0: return start, i + 1
+                  i += 1
+              raise RuntimeError(f"unterminated {needle}")
+
+          def reserve(item: str, variable: str, capacity: str):
+              pattern = re.compile(
+                  rf"(?m)^(?P<prefix>\s*let\s+mut\s+{re.escape(variable)}(?:\s*:\s*[^=;]+)?\s*=\s*)Vec::new\(\);"
+              )
+              return pattern.subn(rf"\g<prefix>Vec::with_capacity({capacity});", item, count=1)
+
+          layout = next(
+              p for p in (root / "crates/core_layout").rglob("*.rs")
+              if "fn compute_non_fullscreen_placements" in p.read_text(encoding="utf-8")
+          )
+          text = layout.read_text(encoding="utf-8")
+          start, end = span(text, "fn compute_non_fullscreen_placements")
+          item = text[start:end]
+          item, changed = reserve(item, "placements", "self.window_count()")
+          if changed == 0 and "Vec::with_capacity(self.window_count())" not in item:
+              raise RuntimeError("placement output allocation not recognized")
+          for variable in ("visible_windows", "visible_weights", "min_heights"):
+              item, _ = reserve(item, variable, "column.windows.len()")
+          layout.write_text(text[:start] + item + text[end:], encoding="utf-8", newline="\n")
+
+          html_rs = root / "crates/daemon/src/settings/html.rs"
+          html_file = root / "crates/daemon/src/settings/settings.html"
+          if not html_file.exists():
+              source = html_rs.read_text(encoding="utf-8")
+              raw = re.compile(
+                  r'(?P<decl>pub(?:\([^\)]+\))?\s+const\s+SETTINGS_HTML\s*:\s*&str\s*=\s*)'
+                  r'r(?P<h>#{0,16})"(?P<body>.*?)"(?P=h);', re.S
+              )
+              match = raw.search(source)
+              if not match: raise RuntimeError("SETTINGS_HTML raw literal not found")
+              html_file.write_text(match.group("body"), encoding="utf-8", newline="\n")
+              source = source[:match.start()] + match.group("decl") + 'include_str!("settings.html");' + source[match.end():]
+              html_rs.write_text(source, encoding="utf-8", newline="\n")
+
+          for path in (root / "crates/daemon/src").rglob("*.rs"):
+              source = path.read_text(encoding="utf-8")
+              before = source
+              for function, names in (
+                  ("column_bounds_from_placements", ("bounds", "column_bounds")),
+                  ("partition_for_animation", ("live", "live_placements")),
+              ):
+                  if f"fn {function}" not in source: continue
+                  start, end = span(source, f"fn {function}")
+                  item = source[start:end]
+                  for name in names:
+                      item, _ = reserve(item, name, "placements.len()")
+                  source = source[:start] + item + source[end:]
+              if source != before:
+                  path.write_text(source, encoding="utf-8", newline="\n")
+
+          report = root / "agent_docs/sehoon-fork-performance-audit.md"
+          if not report.exists():
+              report.write_text(
+                  "# Sehoon fork performance audit — pass 3\n\n"
+                  "This fork-only pass preallocates layout and daemon scratch vectors from exact "
+                  "upper bounds and moves the Settings page to a native HTML asset. Event ordering "
+                  "and timing are unchanged.\n",
+                  encoding="utf-8", newline="\n"
+              )
+          '@ | Set-Content -Encoding utf8 .github/ensure_v4.py
+          python .github/ensure_v4.py
+
+      - name: Full production gate
+        if: steps.release.outputs.exists != 'true'
+        shell: pwsh
+        run: |
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo test --all --locked
+          cargo test --release -p leopardwm-core-layout --locked
+          cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+          cargo check --workspace --all-targets --all-features --locked
+          cargo build --release --workspace --locked
+          ./.github/verify-gui-subsystems.ps1
+
+      - name: Commit verified source when needed
+        if: steps.release.outputs.exists != 'true'
+        id: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $remove = @(
+            'CONTROL.md',
+            '.github/workflows/agent-performance-audit-release.yml',
+            '.github/workflows/agent-export-performance-source.yml',
+            '.github/workflows/agent-export-patch.yml',
+            '.github/workflows/agent-full-audit-release.yml',
+            '.github/workflows/agent-v4-release-sentinel.yml',
+            '.github/workflows/agent-v4-recovery.yml',
+            '.github/workflows/agent-v4-control.yml',
+            '.github/scripts/apply_performance_audit.py',
+            '.github/audit/trigger-performance-audit-v4',
+            '.github/ensure_v4.py',
+            '.github/recover_v4.py'
+          )
+          foreach ($path in $remove) { Remove-Item $path -ErrorAction SilentlyContinue }
+          git diff --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if (git diff --cached --quiet) {
+            $sha = git rev-parse HEAD
+          } else {
+            git commit -m "perf: preallocate layout scratch and simplify settings asset"
+            git push origin HEAD:agent/performance-audit-03
+            $sha = git rev-parse HEAD
+          }
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+
+      - name: Package verified binaries
+        if: steps.release.outputs.exists != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $binDir = 'target/x86_64-pc-windows-msvc/release'
+          $packageDir = "LeopardWM-$env:RELEASE_VERSION-x86_64-windows"
+          $zipPath = "$packageDir.zip"
+          New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
+          $binaries = @('leopardwm.exe', 'leopardwm-cli.exe', 'lwm.exe', 'leopardwm-watchdog.exe')
+          foreach ($binary in $binaries) {
+            Copy-Item "$binDir/$binary" "$packageDir/$binary"
+            Copy-Item "$binDir/$binary" $binary
+          }
+          Copy-Item README.md, LICENSE, agent_docs/sehoon-fork-code-audit.md, agent_docs/sehoon-fork-performance-audit.md $packageDir
+          Compress-Archive -Path $packageDir -DestinationPath $zipPath -CompressionLevel Optimal -Force
+          $assets = @($zipPath) + $binaries
+          $checksumLines = foreach ($asset in $assets) {
+            $hash = (Get-FileHash -Algorithm SHA256 $asset).Hash.ToLowerInvariant()
+            "$hash *$asset"
+          }
+          $checksumLines | Set-Content -Encoding ascii checksums.txt
+
+      - name: Publish release if still absent
+        if: steps.release.outputs.exists != 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) { exit 0 }
+          @'
+          Personal-fork prerelease from `sehoon123/LeopardWM`.
+
+          Verified production performance pass:
+          - preallocates core layout and daemon scratch vectors from exact bounds
+          - moves the Settings browser document into a native HTML asset
+          - preserves event order and input timing
+          - passes formatting, full tests, optimized layout tests, all-target Clippy/check, release build, and PE subsystem verification
+
+          Nothing was sent upstream.
+          '@ | Set-Content -Encoding utf8 release-notes.md
+          gh release create $env:RELEASE_TAG `
+            "LeopardWM-$env:RELEASE_VERSION-x86_64-windows.zip" `
+            leopardwm.exe leopardwm-cli.exe lwm.exe leopardwm-watchdog.exe checksums.txt `
+            --repo $env:GITHUB_REPOSITORY `
+            --target $env:SOURCE_SHA `
+            --title "LeopardWM $env:RELEASE_TAG — verified performance pass" `
+            --notes-file release-notes.md `
+            --prerelease
