@@ -1,0 +1,161 @@
+name: Full repository audit and scratchpad release
+
+on:
+  push:
+    branches:
+      - agent/full-audit-scratchpad-02
+    paths:
+      - .github/workflows/agent-full-audit-release.yml
+
+permissions:
+  contents: write
+
+jobs:
+  validate-build-release:
+    runs-on: windows-latest
+    env:
+      RELEASE_TAG: v0.2.6-sehoon.3
+      RELEASE_VERSION: 0.2.6-sehoon.3
+
+    steps:
+      - name: Check out audit branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: agent/full-audit-scratchpad-02
+          fetch-depth: 0
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7
+
+      - name: Decode and apply reviewed full-audit patch
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $encoded = (Get-Content .github/audit/full-audit.patch.gz.b64 -Raw).Trim()
+          [IO.File]::WriteAllBytes('full-audit.patch.gz', [Convert]::FromBase64String($encoded))
+          $input = [IO.File]::OpenRead('full-audit.patch.gz')
+          $output = [IO.File]::Create('full-audit.patch')
+          $gzip = [IO.Compression.GzipStream]::new(
+            $input,
+            [IO.Compression.CompressionMode]::Decompress
+          )
+          try {
+            $gzip.CopyTo($output)
+          } finally {
+            $gzip.Dispose()
+            $output.Dispose()
+            $input.Dispose()
+          }
+          git apply --check full-audit.patch
+          git apply full-audit.patch
+          Remove-Item full-audit.patch, full-audit.patch.gz
+
+      - name: Format source
+        run: cargo fmt --all
+
+      - name: Verify formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run complete test suite
+        run: cargo test --all --locked
+
+      - name: Run Clippy with warnings denied
+        run: cargo clippy --all --locked -- -D warnings
+
+      - name: Build optimized Windows binaries
+        run: cargo build --release --locked
+
+      - name: Verify GUI executable subsystems
+        shell: pwsh
+        run: ./.github/verify-gui-subsystems.ps1
+
+      - name: Commit only verified source changes
+        id: source_commit
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Remove-Item .github/audit/full-audit.patch.gz.b64
+          Remove-Item .github/workflows/agent-full-audit-release.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "fix: stabilize scratchpad geometry and harden runtime invariants"
+          git push origin HEAD:agent/full-audit-scratchpad-02
+          "sha=$(git rev-parse HEAD)" >> $env:GITHUB_OUTPUT
+
+      - name: Package binaries and checksums
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $binDir = 'target/x86_64-pc-windows-msvc/release'
+          $packageDir = "LeopardWM-$env:RELEASE_VERSION-x86_64-windows"
+          $zipPath = "$packageDir.zip"
+          New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
+          $binaries = @(
+            'leopardwm.exe',
+            'leopardwm-cli.exe',
+            'lwm.exe',
+            'leopardwm-watchdog.exe'
+          )
+          foreach ($binary in $binaries) {
+            Copy-Item "$binDir/$binary" "$packageDir/$binary"
+            Copy-Item "$binDir/$binary" $binary
+          }
+          Copy-Item README.md, LICENSE $packageDir
+          Compress-Archive -Path $packageDir -DestinationPath $zipPath -CompressionLevel Optimal -Force
+          $assets = @($zipPath) + $binaries
+          $checksumLines = foreach ($asset in $assets) {
+            $hash = (Get-FileHash -Algorithm SHA256 $asset).Hash.ToLowerInvariant()
+            "$hash *$asset"
+          }
+          $checksumLines | Set-Content -Encoding ascii checksums.txt
+          Get-Content checksums.txt
+
+      - name: Write release notes
+        shell: pwsh
+        run: |
+          @'
+          Personal-fork prerelease from `sehoon123/LeopardWM`.
+
+          Full audit pass and scratchpad stability fixes:
+          - prevents rapid scratchpad hide/show from learning stale, progressively smaller DWM frame bounds
+          - separates passive compositor observations from explicit user move/resize commits
+          - clears recycled-HWND state after destruction and hardens geometry overflow handling
+          - makes forwarding threads terminate when their Tokio destination closes
+          - fixes Win32 message loops that could dispatch `GetMessageW` error results
+          - validates DIB dimensions before allocation/raw-slice construction and tightens GDI cleanup
+          - hardens border, overlay, snapshot, overview, dialog, tab-strip, and thumbnail lifecycles
+          - repairs malformed persisted layout invariants before restoring workspace state
+          - hardens layout, monitor, drag, transition, placement, and interpolation arithmetic
+          - fixes a divide-by-zero path when dragging over a column whose windows are all minimized
+          - removes duplicate CLI compilation/test execution by sharing the implementation through a library
+          - retains the Settings resize and lifecycle fixes from the previous personal-fork build
+
+          Validation completed before packaging:
+          - `cargo fmt --all -- --check`
+          - `cargo test --all --locked`
+          - `cargo clippy --all --locked -- -D warnings`
+          - `cargo build --release --locked`
+          - GUI subsystem verification
+
+          This release exists only in the user fork. Nothing was sent to the upstream repository.
+          '@ | Set-Content -Encoding utf8 release-notes.md
+
+      - name: Publish tested binaries to this fork
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.source_commit.outputs.sha }}
+        run: |
+          gh release create $env:RELEASE_TAG `
+            "LeopardWM-$env:RELEASE_VERSION-x86_64-windows.zip" `
+            leopardwm.exe `
+            leopardwm-cli.exe `
+            lwm.exe `
+            leopardwm-watchdog.exe `
+            checksums.txt `
+            --repo $env:GITHUB_REPOSITORY `
+            --target $env:SOURCE_SHA `
+            --title "LeopardWM $env:RELEASE_TAG — full audit and scratchpad stability" `
+            --notes-file release-notes.md `
+            --prerelease
