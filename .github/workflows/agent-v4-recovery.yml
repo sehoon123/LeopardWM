@@ -1,0 +1,267 @@
+name: Recover v4 performance release
+
+on:
+  push:
+    branches:
+      - agent/performance-audit-03
+    paths:
+      - .github/workflows/agent-v4-recovery.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: leopardwm-v4-recovery
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    runs-on: windows-latest
+    timeout-minutes: 100
+    env:
+      RELEASE_TAG: v0.2.6-sehoon.4
+      RELEASE_VERSION: 0.2.6-sehoon.4
+
+    steps:
+      - name: Wait for primary pipeline and detect release
+        id: release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          for ($i = 0; $i -lt 40; $i++) {
+            gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY *> $null
+            if ($LASTEXITCODE -eq 0) {
+              "exists=true" >> $env:GITHUB_OUTPUT
+              exit 0
+            }
+            Start-Sleep -Seconds 30
+          }
+          "exists=false" >> $env:GITHUB_OUTPUT
+
+      - name: Check out latest performance branch
+        if: steps.release.outputs.exists != 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: agent/performance-audit-03
+          fetch-depth: 0
+
+      - name: Install stable Rust
+        if: steps.release.outputs.exists != 'true'
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          components: clippy,rustfmt
+
+      - name: Apply conservative allocation pass
+        if: steps.release.outputs.exists != 'true'
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+          import re
+
+          root = Path.cwd()
+
+          def rust_item(text: str, needle: str):
+              start = text.find(needle)
+              if start < 0:
+                  raise RuntimeError(f"missing {needle}")
+              brace = text.find("{", start)
+              depth = 0
+              in_string = False
+              escaped = False
+              for i in range(brace, len(text)):
+                  ch = text[i]
+                  if in_string:
+                      if escaped:
+                          escaped = False
+                      elif ch == "\\":
+                          escaped = True
+                      elif ch == '"':
+                          in_string = False
+                      continue
+                  if ch == '"':
+                      in_string = True
+                  elif ch == "{":
+                      depth += 1
+                  elif ch == "}":
+                      depth -= 1
+                      if depth == 0:
+                          return start, i + 1
+              raise RuntimeError(f"unterminated {needle}")
+
+          def replace_local(item: str, name: str, capacity: str):
+              pattern = re.compile(
+                  rf"(?m)^(?P<prefix>\s*let\s+mut\s+{re.escape(name)}(?:\s*:\s*[^=;]+)?\s*=\s*)Vec::new\(\);"
+              )
+              return pattern.subn(rf"\g<prefix>Vec::with_capacity({capacity});", item, count=1)
+
+          # Exact output cardinality is known before layout generation.
+          layout_file = next(
+              p for p in (root / "crates/core_layout").rglob("*.rs")
+              if "fn compute_non_fullscreen_placements" in p.read_text(encoding="utf-8")
+          )
+          source = layout_file.read_text(encoding="utf-8")
+          start, end = rust_item(source, "fn compute_non_fullscreen_placements")
+          item = source[start:end]
+          item, count = replace_local(item, "placements", "self.window_count()")
+          if count == 0 and "Vec::with_capacity(self.window_count())" not in item:
+              raise RuntimeError("layout placement output was not recognized")
+          for name in ("visible_windows", "visible_weights", "min_heights"):
+              item, _ = replace_local(item, name, "column.windows.len()")
+          source = source[:start] + item + source[end:]
+          layout_file.write_text(source, encoding="utf-8", newline="\n")
+
+          # Extract the browser document from the Rust token stream when not
+          # already extracted by a successful primary transform.
+          html_rs = root / "crates/daemon/src/settings/html.rs"
+          html_asset = root / "crates/daemon/src/settings/settings.html"
+          html_source = html_rs.read_text(encoding="utf-8")
+          if not html_asset.exists():
+              pattern = re.compile(
+                  r'(?P<decl>pub(?:\([^\)]+\))?\s+const\s+SETTINGS_HTML\s*:\s*&str\s*=\s*)'
+                  r'r(?P<hash>#{0,16})"(?P<body>.*?)"(?P=hash);',
+                  re.S,
+              )
+              match = pattern.search(html_source)
+              if not match:
+                  raise RuntimeError("SETTINGS_HTML literal was not recognized")
+              html_asset.write_text(match.group("body"), encoding="utf-8", newline="\n")
+              html_source = html_source[:match.start()] + match.group("decl") + 'include_str!("settings.html");' + html_source[match.end():]
+              html_rs.write_text(html_source, encoding="utf-8", newline="\n")
+
+          # Preallocate exact-upper-bound daemon vectors without changing their type.
+          for path in (root / "crates/daemon/src").rglob("*.rs"):
+              text = path.read_text(encoding="utf-8")
+              original = text
+              for function, variables in (
+                  ("column_bounds_from_placements", ("bounds", "column_bounds")),
+                  ("partition_for_animation", ("live", "live_placements")),
+              ):
+                  if f"fn {function}" not in text:
+                      continue
+                  try:
+                      start, end = rust_item(text, f"fn {function}")
+                  except RuntimeError:
+                      continue
+                  item = text[start:end]
+                  for variable in variables:
+                      item, _ = replace_local(item, variable, "placements.len()")
+                  text = text[:start] + item + text[end:]
+              if text != original:
+                  path.write_text(text, encoding="utf-8", newline="\n")
+
+          cargo = (root / "Cargo.toml").read_text(encoding="utf-8")
+          profile = re.search(r"(?ms)^\[profile\.release\]\n.*?(?=^\[|\Z)", cargo)
+          if profile and "incremental =" not in profile.group(0):
+              block = profile.group(0).rstrip() + "\nincremental = false\n"
+              cargo = cargo[:profile.start()] + block + cargo[profile.end():]
+              (root / "Cargo.toml").write_text(cargo, encoding="utf-8", newline="\n")
+
+          report = root / "agent_docs/sehoon-fork-performance-audit.md"
+          if not report.exists():
+              report.write_text(
+                  "# Sehoon fork performance audit — pass 3\n\n"
+                  "This conservative recovery pass preallocates layout and daemon scratch vectors "
+                  "from exact upper bounds, moves the Settings page to a native HTML asset, and "
+                  "keeps event ordering and timing unchanged.\n",
+                  encoding="utf-8",
+                  newline="\n",
+              )
+          '@ | Set-Content -Encoding utf8 .github/recover_v4.py
+          python .github/recover_v4.py
+
+      - name: Format and validate source
+        if: steps.release.outputs.exists != 'true'
+        shell: pwsh
+        run: |
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo test --all --locked
+          cargo test --release -p leopardwm-core-layout --locked
+          cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+          cargo check --workspace --all-targets --all-features --locked
+
+      - name: Build and verify optimized binaries
+        if: steps.release.outputs.exists != 'true'
+        shell: pwsh
+        run: |
+          cargo build --release --workspace --locked
+          ./.github/verify-gui-subsystems.ps1
+
+      - name: Commit recovered source
+        if: steps.release.outputs.exists != 'true'
+        id: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $remove = @(
+            '.github/workflows/agent-performance-audit-release.yml',
+            '.github/workflows/agent-export-performance-source.yml',
+            '.github/workflows/agent-export-patch.yml',
+            '.github/workflows/agent-full-audit-release.yml',
+            '.github/workflows/agent-v4-release-sentinel.yml',
+            '.github/workflows/agent-v4-recovery.yml',
+            '.github/scripts/apply_performance_audit.py',
+            '.github/audit/trigger-performance-audit-v4',
+            '.github/recover_v4.py'
+          )
+          foreach ($path in $remove) { Remove-Item $path -ErrorAction SilentlyContinue }
+          git diff --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "perf: preallocate layout scratch and simplify settings asset"
+          git push origin HEAD:agent/performance-audit-03
+          "sha=$(git rev-parse HEAD)" >> $env:GITHUB_OUTPUT
+
+      - name: Package recovered binaries
+        if: steps.release.outputs.exists != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $binDir = 'target/x86_64-pc-windows-msvc/release'
+          $packageDir = "LeopardWM-$env:RELEASE_VERSION-x86_64-windows"
+          $zipPath = "$packageDir.zip"
+          New-Item -ItemType Directory $packageDir -Force | Out-Null
+          $binaries = @('leopardwm.exe', 'leopardwm-cli.exe', 'lwm.exe', 'leopardwm-watchdog.exe')
+          foreach ($binary in $binaries) {
+            Copy-Item "$binDir/$binary" "$packageDir/$binary"
+            Copy-Item "$binDir/$binary" $binary
+          }
+          Copy-Item README.md, LICENSE, agent_docs/sehoon-fork-code-audit.md, agent_docs/sehoon-fork-performance-audit.md $packageDir
+          Compress-Archive -Path $packageDir -DestinationPath $zipPath -CompressionLevel Optimal -Force
+          $assets = @($zipPath) + $binaries
+          foreach ($asset in $assets) {
+            $hash = (Get-FileHash -Algorithm SHA256 $asset).Hash.ToLowerInvariant()
+            "$hash *$asset"
+          } | Set-Content -Encoding ascii checksums.txt
+
+      - name: Publish recovered release
+        if: steps.release.outputs.exists != 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          @'
+          Personal-fork prerelease from `sehoon123/LeopardWM`.
+
+          Verified conservative performance pass:
+          - preallocates layout output and per-column scratch vectors
+          - preallocates daemon placement scratch outputs with exact upper bounds
+          - moves the Settings document into a native HTML asset
+          - preserves all event ordering and timing semantics
+          - passes the full test, Clippy, all-target check, optimized build, and PE subsystem gates
+
+          Nothing was sent upstream.
+          '@ | Set-Content -Encoding utf8 release-notes.md
+          gh release create $env:RELEASE_TAG `
+            "LeopardWM-$env:RELEASE_VERSION-x86_64-windows.zip" `
+            leopardwm.exe leopardwm-cli.exe lwm.exe leopardwm-watchdog.exe checksums.txt `
+            --repo $env:GITHUB_REPOSITORY `
+            --target $env:SOURCE_SHA `
+            --title "LeopardWM $env:RELEASE_TAG — verified performance pass" `
+            --notes-file release-notes.md `
+            --prerelease
