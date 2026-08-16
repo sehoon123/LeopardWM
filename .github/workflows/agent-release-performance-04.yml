@@ -1,0 +1,284 @@
+name: Validate and publish performance audit 04
+
+on:
+  push:
+    branches:
+      - agent/performance-audit-03
+    paths:
+      - .github/workflows/agent-release-performance-04.yml
+
+permissions:
+  contents: write
+
+env:
+  RELEASE_TAG: v0.2.6-sehoon.4
+  RELEASE_VERSION: 0.2.6-sehoon.4
+  BASELINE_TAG: v0.2.6-sehoon.3
+
+jobs:
+  validate-package-release:
+    runs-on: windows-2025
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out exact performance branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: agent/performance-audit-03
+          fetch-depth: 0
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          components: clippy,rustfmt
+
+      - name: Reject an accidental overwrite
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            throw "Release $env:RELEASE_TAG already exists"
+          }
+          $global:LASTEXITCODE = 0
+
+      - name: Verify production-oriented source invariants
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $required = @(
+            'crates/cli/src/lib.rs',
+            'crates/cli/src/bin/lwm.rs',
+            'crates/daemon/src/settings/settings.html'
+          )
+          foreach ($path in $required) {
+            if (-not (Test-Path $path)) { throw "Missing optimized source asset: $path" }
+          }
+
+          $cliCargo = Get-Content -Raw -Encoding utf8 crates/cli/Cargo.toml
+          if ($cliCargo -match '(?ms)name\s*=\s*"lwm".*?path\s*=\s*"src/main.rs"') {
+            throw 'lwm still points at the primary binary source; duplicate compilation remains'
+          }
+
+          $settingsRust = Get-Content -Raw -Encoding utf8 crates/daemon/src/settings/html.rs
+          if (-not $settingsRust.Contains('include_str!("settings.html")')) {
+            throw 'Settings document is still compiled as a giant Rust raw literal'
+          }
+
+          $layoutSources = Get-ChildItem crates/core_layout/src -Recurse -Filter *.rs |
+            ForEach-Object { Get-Content -Raw -Encoding utf8 $_.FullName }
+          $layoutText = $layoutSources -join "`n"
+          if (-not $layoutText.Contains('Vec::with_capacity(self.window_count())')) {
+            throw 'Placement output does not reserve its known final capacity'
+          }
+          if (-not $layoutText.Contains('SmallVec')) {
+            throw 'Common per-column scratch storage is not inline-backed'
+          }
+
+      - name: Verify formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run complete locked debug test suite
+        run: cargo test --workspace --all-targets --locked
+
+      - name: Run Clippy for every target with warnings denied
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Check every Cargo target
+        run: cargo check --workspace --all-targets --locked
+
+      - name: Exercise optimized code in release mode
+        run: cargo test --workspace --lib --bins --release --locked
+
+      - name: Build optimized Windows binaries
+        run: cargo build --workspace --release --locked
+
+      - name: Verify GUI executable subsystems
+        shell: pwsh
+        run: ./.github/verify-gui-subsystems.ps1
+
+      - name: Stress deterministic layout and scratchpad regressions
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          1..20 | ForEach-Object {
+            cargo test -p leopardwm-core-layout --release --locked --quiet
+            if ($LASTEXITCODE -ne 0) { throw "core-layout stress pass $_ failed" }
+            cargo test -p leopardwm-daemon --bin leopardwm --release --locked --quiet scratchpad
+            if ($LASTEXITCODE -ne 0) { throw "scratchpad stress pass $_ failed" }
+            cargo test -p leopardwm-daemon --bin leopardwm --release --locked --quiet floating
+            if ($LASTEXITCODE -ne 0) { throw "floating stress pass $_ failed" }
+          }
+
+      - name: Generate auditable performance report
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $baseline = git rev-list -n 1 $env:BASELINE_TAG
+          if (-not $baseline) { throw "Cannot resolve baseline $env:BASELINE_TAG" }
+          $shortStat = git diff --shortstat "$baseline...HEAD"
+          $nameStatus = git diff --name-status "$baseline...HEAD"
+          $report = @"
+          # LeopardWM fork performance audit — $env:RELEASE_TAG
+
+          Baseline: `$env:BASELINE_TAG` (`$baseline`)
+
+          ## Engineering changes
+
+          - The CLI implementation and tests live in one library target; `leopardwm-cli` and `lwm` are thin wrappers. This removes duplicate compilation, duplicate unit-test execution, and Cargo's duplicate-target warning.
+          - The Settings document is a native HTML asset loaded through `include_str!`, rather than a 100+ KB Rust raw literal. Rust source parsing and maintenance complexity are reduced without introducing runtime I/O.
+          - Placement output reserves its known final capacity. Per-column scratch arrays use inline-backed `SmallVec` storage for the common case, avoiding heap traffic for ordinary window stacks while preserving spill behavior for large stacks.
+          - Hot collection paths use capacity hints where cardinality is already known or cheaply available. These changes reduce allocator churn without changing public configuration or IPC semantics.
+          - The preceding floating and scratchpad geometry fixes remain intact; optimized and debug builds execute the same transition semantics.
+
+          ## Validation gate
+
+          - `cargo fmt --all -- --check`
+          - `cargo test --workspace --all-targets --locked`
+          - `cargo clippy --workspace --all-targets --locked -- -D warnings`
+          - `cargo check --workspace --all-targets --locked`
+          - `cargo test --workspace --lib --bins --release --locked`
+          - `cargo build --workspace --release --locked`
+          - Windows GUI subsystem verification
+          - 20 release-mode stress passes for core layout, scratchpad, and floating regression groups
+
+          ## Scope and evidence
+
+          Diff summary: $shortStat
+
+          Allocation improvements above are structural guarantees visible in the source. No wall-clock percentage is claimed without a controlled ETW/allocator benchmark on representative customer hardware.
+
+          ## Changed paths from baseline
+
+          ```text
+          $nameStatus
+          ```
+          "@
+          New-Item -ItemType Directory -Path agent_docs -Force | Out-Null
+          [System.IO.File]::WriteAllText(
+            'agent_docs/performance-audit-v0.2.6-sehoon.4.md',
+            $report,
+            [System.Text.UTF8Encoding]::new($false)
+          )
+
+      - name: Remove transient audit controls and commit clean verified source
+        id: source_commit
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $transient = @(
+            '.github/workflows/agent-release-performance-04.yml',
+            '.github/workflows/agent-export-perf-source.yml',
+            '.github/audit/performance-pass.patch.gz.b64',
+            'agent_docs/README.tmp',
+            'agent_docs/control-note.tmp'
+          )
+          foreach ($path in $transient) {
+            Remove-Item $path -Force -ErrorAction SilentlyContinue
+          }
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if (git diff --cached --quiet) {
+            throw 'No clean source commit was produced'
+          }
+          git commit -m "perf: consolidate hot paths and productionize fork build"
+          git push origin HEAD:agent/performance-audit-03
+          "sha=$(git rev-parse HEAD)" >> $env:GITHUB_OUTPUT
+
+      - name: Package binaries and checksums
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $binDir = 'target/x86_64-pc-windows-msvc/release'
+          if (-not (Test-Path $binDir)) { $binDir = 'target/release' }
+          $packageDir = "LeopardWM-$env:RELEASE_VERSION-x86_64-windows"
+          $zipPath = "$packageDir.zip"
+          New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
+
+          $binaries = @('leopardwm.exe', 'leopardwm-cli.exe', 'lwm.exe', 'leopardwm-watchdog.exe')
+          foreach ($binary in $binaries) {
+            $source = Join-Path $binDir $binary
+            if (-not (Test-Path $source)) { throw "Missing release binary: $source" }
+            Copy-Item $source (Join-Path $packageDir $binary)
+            Copy-Item $source $binary
+          }
+
+          Copy-Item README.md, LICENSE, agent_docs/performance-audit-v0.2.6-sehoon.4.md $packageDir
+          Compress-Archive -Path $packageDir -DestinationPath $zipPath -CompressionLevel Optimal -Force
+
+          $assets = @($zipPath) + $binaries
+          $checksums = foreach ($asset in $assets) {
+            $hash = (Get-FileHash -Algorithm SHA256 $asset).Hash.ToLowerInvariant()
+            "$hash *$asset"
+          }
+          $checksums | Set-Content -Encoding ascii checksums.txt
+          Get-Content checksums.txt
+
+      - name: Publish tested binaries to this fork
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.source_commit.outputs.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          @'
+          Personal-fork prerelease from `sehoon123/LeopardWM`.
+
+          Performance and production-quality pass:
+          - consolidates the two CLI executables onto one shared implementation
+          - removes duplicate CLI compilation and duplicate unit-test execution
+          - moves the embedded Settings document to a maintainable `include_str!` asset
+          - reduces allocator pressure in placement and collection hot paths
+          - keeps ordinary per-column layout scratch data inline with `SmallVec`
+          - retains the settings-resize and floating/scratchpad stability fixes from prior fork releases
+          - includes a source-level audit report and complete checksums
+
+          Release publication is gated by debug and release tests, all-target Clippy, all-target checking, release build, GUI subsystem verification, and repeated release-mode regression stress.
+
+          No change was sent to the upstream repository.
+          '@ | Set-Content -Encoding utf8 release-notes.md
+
+          gh release create $env:RELEASE_TAG `
+            "LeopardWM-$env:RELEASE_VERSION-x86_64-windows.zip" `
+            leopardwm.exe `
+            leopardwm-cli.exe `
+            lwm.exe `
+            leopardwm-watchdog.exe `
+            checksums.txt `
+            agent_docs/performance-audit-v0.2.6-sehoon.4.md `
+            --repo $env:GITHUB_REPOSITORY `
+            --target $env:SOURCE_SHA `
+            --title "LeopardWM $env:RELEASE_TAG — performance and production-quality pass" `
+            --notes-file release-notes.md `
+            --prerelease
+
+      - name: Verify published release target and assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.source_commit.outputs.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $release = gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$env:RELEASE_TAG" | ConvertFrom-Json
+          if ($release.target_commitish -ne $env:SOURCE_SHA) {
+            throw "Release target mismatch: $($release.target_commitish) != $env:SOURCE_SHA"
+          }
+          $required = @(
+            "LeopardWM-$env:RELEASE_VERSION-x86_64-windows.zip",
+            'leopardwm.exe',
+            'leopardwm-cli.exe',
+            'lwm.exe',
+            'leopardwm-watchdog.exe',
+            'checksums.txt',
+            'performance-audit-v0.2.6-sehoon.4.md'
+          )
+          $names = @($release.assets | ForEach-Object name)
+          foreach ($name in $required) {
+            if ($names -notcontains $name) { throw "Missing release asset: $name" }
+          }
+          Write-Host "Verified $env:RELEASE_TAG at $env:SOURCE_SHA with $($names.Count) assets"
