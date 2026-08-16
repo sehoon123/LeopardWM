@@ -2623,6 +2623,18 @@ mod tests {
     }
 
     #[test]
+    fn test_unfloat_restores_original_column_width() {
+        let mut ws = Workspace::new();
+        let rect = Rect::new(560, 240, 800, 600);
+
+        ws.insert_window(1, Some(733)).unwrap();
+        assert_eq!(ws.toggle_floating(rect), Some(1));
+        assert!(ws.unfloat_window(1));
+
+        assert_eq!(ws.columns()[0].width(), 733);
+    }
+
+    #[test]
     fn test_toggle_floating_empty_workspace() {
         let mut ws = Workspace::new();
         let wid = ws.toggle_floating(Rect::new(0, 0, 800, 600));

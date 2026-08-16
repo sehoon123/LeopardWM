@@ -78,6 +78,24 @@ impl ScaledLayoutParams {
     }
 }
 
+/// Small DWM frame-bound differences are compositor/inset noise, not a user resize.
+///
+/// `DWMWA_EXTENDED_FRAME_BOUNDS` can lag a SetWindowPos by one compositor frame and
+/// can briefly alternate between the visible frame and the underlying chrome frame.
+/// Re-learning those few pixels on every float/unfloat cycle causes cumulative shrink.
+const FLOATING_CAPTURE_SIZE_EPSILON_PX: u32 = 32;
+
+fn stabilize_floating_capture(stored: Rect, observed: Rect) -> Rect {
+    let near_stored_size = stored.width.abs_diff(observed.width)
+        <= FLOATING_CAPTURE_SIZE_EPSILON_PX
+        && stored.height.abs_diff(observed.height) <= FLOATING_CAPTURE_SIZE_EPSILON_PX;
+    if near_stored_size {
+        Rect::new(observed.x, observed.y, stored.width, stored.height)
+    } else {
+        observed
+    }
+}
+
 impl AppState {
     /// Look up window info for a given window handle.
     ///
@@ -257,7 +275,9 @@ impl AppState {
     pub(crate) fn capture_floating_geometry(&mut self, hwnd: u64) -> Option<Rect> {
         let stored_rect = self.floating_rect_for_window(hwnd)?;
         #[cfg(not(test))]
-        let rect = leopardwm_platform_win32::get_window_visible_rect(hwnd).unwrap_or(stored_rect);
+        let rect = leopardwm_platform_win32::get_window_visible_rect(hwnd)
+            .map(|observed| stabilize_floating_capture(stored_rect, observed))
+            .unwrap_or(stored_rect);
         #[cfg(test)]
         let rect = stored_rect;
 
@@ -721,5 +741,29 @@ impl AppState {
             self.sync_foreground_window();
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod floating_capture_tests {
+    use super::*;
+
+    #[test]
+    fn small_dwm_frame_drift_keeps_the_stored_size() {
+        let stored = Rect::new(100, 100, 800, 600);
+        let observed = Rect::new(101, 102, 786, 593);
+
+        assert_eq!(
+            stabilize_floating_capture(stored, observed),
+            Rect::new(101, 102, 800, 600)
+        );
+    }
+
+    #[test]
+    fn a_real_resize_larger_than_the_drift_budget_is_learned() {
+        let stored = Rect::new(100, 100, 800, 600);
+        let observed = Rect::new(120, 130, 1200, 850);
+
+        assert_eq!(stabilize_floating_capture(stored, observed), observed);
     }
 }

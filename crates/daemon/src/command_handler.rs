@@ -917,9 +917,13 @@ impl AppState {
         });
 
         if let Some(hwnd) = floating_hwnd {
-            // Preserve the actual visible (or last stored) size before
-            // unfloat removes the `FloatingWindow` entry.
-            let _ = self.capture_floating_geometry(hwnd);
+            // The managed rect is the last user-confirmed/requested floating
+            // geometry. DWM extended frame bounds can lag a rapid
+            // SetWindowPos/toggle, so querying DWM here would re-learn a
+            // stale, slightly smaller size on every cycle.
+            if let Some(rect) = self.floating_rect_for_window(hwnd) {
+                let _ = self.update_floating_geometry(hwnd, rect);
+            }
             if self
                 .focused_workspace_mut()
                 .is_some_and(|workspace| workspace.unfloat_window(hwnd))

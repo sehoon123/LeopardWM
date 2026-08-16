@@ -56,41 +56,44 @@ impl Workspace {
         // Pre-compute effective column widths respecting window min-widths.
         // If a column contains a window with a known minimum width larger than
         // the allocated column width, widen it and shrink flexible columns.
-        let effective_widths: Vec<i32> = {
+        // The common case has no learned minimum-width constraints. Keep
+        // that path allocation-free; only materialize an adjusted-width vector
+        // when at least one constraint can actually change a column.
+        let effective_widths = if self.window_min_widths.is_empty() {
+            None
+        } else {
             let mut widths: Vec<i32> = self.columns.iter().map(|c| c.width).collect();
-            if !self.window_min_widths.is_empty() {
-                let mut excess = 0i32;
-                let mut flexible_total = 0i32;
-                for (col_idx, column) in self.columns.iter().enumerate() {
-                    if !self.is_column_active(column) {
-                        continue;
-                    }
-                    let min_w = self.column_effective_min_width(column);
-                    if min_w > column.width {
-                        excess += min_w - column.width;
-                        widths[col_idx] = min_w;
-                    } else {
-                        flexible_total += column.width;
-                    }
+            let mut excess = 0i32;
+            let mut flexible_total = 0i32;
+            for (col_idx, column) in self.columns.iter().enumerate() {
+                if !self.is_column_active(column) {
+                    continue;
                 }
-                if excess > 0 && flexible_total > 0 {
-                    let mut remaining = excess;
-                    for (col_idx, column) in self.columns.iter().enumerate() {
-                        if !self.is_column_active(column) || widths[col_idx] != column.width {
-                            continue;
-                        }
-                        let share = ((column.width as f64 / flexible_total as f64) * excess as f64)
-                            .round() as i32;
-                        let shrink = share
-                            .min(remaining)
-                            .min(column.width - MIN_COLUMN_WIDTH)
-                            .max(0);
-                        widths[col_idx] -= shrink;
-                        remaining -= shrink;
-                    }
+                let min_w = self.column_effective_min_width(column);
+                if min_w > column.width {
+                    excess += min_w - column.width;
+                    widths[col_idx] = min_w;
+                } else {
+                    flexible_total += column.width;
                 }
             }
-            widths
+            if excess > 0 && flexible_total > 0 {
+                let mut remaining = excess;
+                for (col_idx, column) in self.columns.iter().enumerate() {
+                    if !self.is_column_active(column) || widths[col_idx] != column.width {
+                        continue;
+                    }
+                    let share = ((column.width as f64 / flexible_total as f64) * excess as f64)
+                        .round() as i32;
+                    let shrink = share
+                        .min(remaining)
+                        .min(column.width - MIN_COLUMN_WIDTH)
+                        .max(0);
+                    widths[col_idx] -= shrink;
+                    remaining -= shrink;
+                }
+            }
+            Some(widths)
         };
 
         // Strip starts at 0 — outer gaps are viewport padding
@@ -106,7 +109,9 @@ impl Workspace {
             visible_weights.clear();
             min_heights.clear();
 
-            let eff_width = effective_widths[col_idx];
+            let eff_width = effective_widths
+                .as_ref()
+                .map_or(column.width, |widths| widths[col_idx]);
 
             // Calculate column position in strip coordinates
             let col_strip_x = current_x;
