@@ -31,6 +31,26 @@ jobs:
       - name: Apply repository-wide audit fixes
         run: python .github/scripts/apply_full_audit_phase2.py
 
+      - name: Repair generated Settings ownership and imports
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $path = 'crates/daemon/src/settings/win32.rs'
+          $text = Get-Content -Raw -Encoding utf8 $path
+          $oldImport = 'use wry::{WebContext, WebViewBuilderExtWindows as _};'
+          $newImport = 'use wry::WebContext;'
+          if (-not $text.Contains($oldImport)) {
+            throw "Expected obsolete Wry extension import was not found"
+          }
+          $text = $text.Replace($oldImport, $newImport)
+          $oldHtml = '.with_html(&settings_html)'
+          $newHtml = '.with_html(settings_html.as_str())'
+          if (-not $text.Contains($oldHtml)) {
+            throw "Expected cached Settings HTML call was not found"
+          }
+          $text = $text.Replace($oldHtml, $newHtml)
+          [System.IO.File]::WriteAllText($path, $text, [System.Text.UTF8Encoding]::new($false))
+
       - name: Format source
         run: cargo fmt --all
 
