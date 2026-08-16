@@ -1,0 +1,232 @@
+name: Verify or recover performance release 04
+
+on:
+  push:
+    branches:
+      - agent/performance-audit-03
+    paths:
+      - .github/workflows/agent-release-recovery-04.yml
+
+permissions:
+  contents: write
+
+env:
+  RELEASE_TAG: v0.2.6-sehoon.4
+  RELEASE_VERSION: 0.2.6-sehoon.4
+
+jobs:
+  verify-or-recover:
+    runs-on: windows-2025
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out fork branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: agent/performance-audit-03
+          fetch-depth: 0
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          components: clippy,rustfmt
+
+      - name: Detect already-published release
+        id: release_state
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            'exists=true' >> $env:GITHUB_OUTPUT
+          } else {
+            'exists=false' >> $env:GITHUB_OUTPUT
+            $global:LASTEXITCODE = 0
+          }
+
+      - name: Verify formatting
+        if: steps.release_state.outputs.exists != 'true'
+        run: cargo fmt --all -- --check
+
+      - name: Run all-target locked tests
+        if: steps.release_state.outputs.exists != 'true'
+        run: cargo test --workspace --all-targets --locked
+
+      - name: Run all-target Clippy with warnings denied
+        if: steps.release_state.outputs.exists != 'true'
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Check every target
+        if: steps.release_state.outputs.exists != 'true'
+        run: cargo check --workspace --all-targets --locked
+
+      - name: Run optimized binary and library tests
+        if: steps.release_state.outputs.exists != 'true'
+        run: cargo test --workspace --lib --bins --release --locked
+
+      - name: Build release binaries
+        if: steps.release_state.outputs.exists != 'true'
+        run: cargo build --workspace --release --locked
+
+      - name: Verify GUI PE subsystems
+        if: steps.release_state.outputs.exists != 'true'
+        shell: pwsh
+        run: ./.github/verify-gui-subsystems.ps1
+
+      - name: Stress layout and scratchpad transitions
+        if: steps.release_state.outputs.exists != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          1..10 | ForEach-Object {
+            cargo test -p leopardwm-core-layout --release --locked --quiet
+            if ($LASTEXITCODE -ne 0) { throw "core layout pass $_ failed" }
+            cargo test -p leopardwm-daemon --bin leopardwm --release --locked --quiet scratchpad
+            if ($LASTEXITCODE -ne 0) { throw "scratchpad pass $_ failed" }
+            cargo test -p leopardwm-daemon --bin leopardwm --release --locked --quiet floating
+            if ($LASTEXITCODE -ne 0) { throw "floating pass $_ failed" }
+          }
+
+      - name: Ensure performance audit report exists
+        if: steps.release_state.outputs.exists != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $path = 'agent_docs/performance-audit-v0.2.6-sehoon.4.md'
+          if (-not (Test-Path $path)) {
+            New-Item -ItemType Directory -Path agent_docs -Force | Out-Null
+            $lines = @(
+              '# LeopardWM fork performance audit — v0.2.6-sehoon.4',
+              '',
+              'Baseline: v0.2.6-sehoon.3',
+              '',
+              '## Changes',
+              '',
+              '- Consolidated the two CLI executables onto one library implementation with thin binary wrappers.',
+              '- Moved the embedded Settings page to an include_str! asset, preserving zero runtime I/O while simplifying compilation.',
+              '- Added exact capacity reservations to placement output and known-cardinality collection paths.',
+              '- Used inline-backed SmallVec scratch storage for common per-column layout cases.',
+              '- Retained the floating, scratchpad, Settings-resize, DPI, and lifecycle fixes from prior fork releases.',
+              '',
+              '## Release gate',
+              '',
+              '- Debug all-target tests',
+              '- Release-mode library and binary tests',
+              '- Clippy for all targets with warnings denied',
+              '- Workspace all-target check',
+              '- Optimized Windows build and GUI subsystem verification',
+              '- Repeated release-mode layout, scratchpad, and floating stress tests',
+              '',
+              'The allocation reductions are source-level structural improvements. No synthetic wall-clock percentage is claimed without controlled ETW and allocator traces on representative hardware.'
+            )
+            [System.IO.File]::WriteAllLines($path, $lines, [System.Text.UTF8Encoding]::new($false))
+          }
+
+      - name: Commit clean source tree
+        id: clean_commit
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $transient = @(
+            '.github/workflows/agent-release-recovery-04.yml',
+            '.github/workflows/agent-release-performance-04.yml',
+            '.github/workflows/agent-export-perf-source.yml',
+            '.github/audit/performance-pass.patch.gz.b64',
+            'agent_docs/README.tmp',
+            'agent_docs/control-note.tmp'
+          )
+          foreach ($path in $transient) {
+            Remove-Item $path -Force -ErrorAction SilentlyContinue
+          }
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if (-not (git diff --cached --quiet)) {
+            git commit -m "chore: finalize clean performance release tree"
+            git push origin HEAD:agent/performance-audit-03
+          }
+          "sha=$(git rev-parse HEAD)" >> $env:GITHUB_OUTPUT
+
+      - name: Package release when recovery is required
+        if: steps.release_state.outputs.exists != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $binDir = 'target/x86_64-pc-windows-msvc/release'
+          if (-not (Test-Path $binDir)) { $binDir = 'target/release' }
+          $packageDir = "LeopardWM-$env:RELEASE_VERSION-x86_64-windows"
+          $zipPath = "$packageDir.zip"
+          New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
+          $binaries = @('leopardwm.exe', 'leopardwm-cli.exe', 'lwm.exe', 'leopardwm-watchdog.exe')
+          foreach ($binary in $binaries) {
+            $source = Join-Path $binDir $binary
+            if (-not (Test-Path $source)) { throw "Missing binary: $source" }
+            Copy-Item $source (Join-Path $packageDir $binary)
+            Copy-Item $source $binary
+          }
+          Copy-Item README.md, LICENSE, agent_docs/performance-audit-v0.2.6-sehoon.4.md $packageDir
+          Compress-Archive -Path $packageDir -DestinationPath $zipPath -CompressionLevel Optimal -Force
+          $assets = @($zipPath) + $binaries
+          $checksums = foreach ($asset in $assets) {
+            $hash = (Get-FileHash -Algorithm SHA256 $asset).Hash.ToLowerInvariant()
+            "$hash *$asset"
+          }
+          $checksums | Set-Content -Encoding ascii checksums.txt
+
+      - name: Publish recovered release
+        if: steps.release_state.outputs.exists != 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.clean_commit.outputs.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -ne 0) {
+            $global:LASTEXITCODE = 0
+            @'
+          Personal-fork prerelease from `sehoon123/LeopardWM`.
+
+          This build consolidates duplicated CLI targets, reduces hot-path allocator traffic, extracts the embedded Settings asset without runtime I/O, and retains the previous floating/scratchpad stability fixes. Publication is gated by debug and release tests, all-target Clippy/checking, release build, GUI subsystem validation, and repeated release-mode regression stress.
+
+          No change was sent upstream.
+          '@ | Set-Content -Encoding utf8 release-notes.md
+            gh release create $env:RELEASE_TAG `
+              "LeopardWM-$env:RELEASE_VERSION-x86_64-windows.zip" `
+              leopardwm.exe `
+              leopardwm-cli.exe `
+              lwm.exe `
+              leopardwm-watchdog.exe `
+              checksums.txt `
+              agent_docs/performance-audit-v0.2.6-sehoon.4.md `
+              --repo $env:GITHUB_REPOSITORY `
+              --target $env:SOURCE_SHA `
+              --title "LeopardWM $env:RELEASE_TAG — performance and production-quality pass" `
+              --notes-file release-notes.md `
+              --prerelease
+          }
+
+      - name: Verify final release through GitHub API
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $release = gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$env:RELEASE_TAG" | ConvertFrom-Json
+          $required = @(
+            "LeopardWM-$env:RELEASE_VERSION-x86_64-windows.zip",
+            'leopardwm.exe',
+            'leopardwm-cli.exe',
+            'lwm.exe',
+            'leopardwm-watchdog.exe',
+            'checksums.txt',
+            'performance-audit-v0.2.6-sehoon.4.md'
+          )
+          $assetNames = @($release.assets | ForEach-Object name)
+          foreach ($name in $required) {
+            if ($assetNames -notcontains $name) { throw "Missing asset: $name" }
+          }
+          if ($release.draft) { throw 'Release is still a draft' }
+          Write-Host "Verified $env:RELEASE_TAG with $($assetNames.Count) assets; target=$($release.target_commitish)"
