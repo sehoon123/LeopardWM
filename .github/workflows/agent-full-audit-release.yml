@@ -1,4 +1,5 @@
 name: Full repository audit and scratchpad release
+# Registration bump for this branch-local one-shot workflow.
 
 on:
   push:
