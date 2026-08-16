@@ -1,0 +1,142 @@
+name: Full audit phase 2 runner
+
+on:
+  push:
+    branches:
+      - agent/full-audit-scratchpad-02
+    paths:
+      - .github/workflows/agent-full-audit-phase2-run.yml
+      - .github/audit/trigger-full-audit-phase2
+
+permissions:
+  contents: write
+
+jobs:
+  patch-test-build-release:
+    runs-on: windows-latest
+    env:
+      RELEASE_TAG: v0.2.6-sehoon.3
+      RELEASE_VERSION: 0.2.6-sehoon.3
+
+    steps:
+      - name: Check out audit branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: agent/full-audit-scratchpad-02
+          fetch-depth: 0
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+
+      - name: Apply repository-wide audit fixes
+        run: python .github/scripts/apply_full_audit_phase2.py
+
+      - name: Format source
+        run: cargo fmt --all
+
+      - name: Verify formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run full locked test suite
+        run: cargo test --all --locked
+
+      - name: Run Clippy with warnings denied
+        run: cargo clippy --all --locked -- -D warnings
+
+      - name: Check every Cargo target
+        run: cargo check --workspace --all-targets --locked
+
+      - name: Build optimized Windows binaries
+        run: cargo build --release --locked
+
+      - name: Verify GUI executable subsystems
+        shell: pwsh
+        run: ./.github/verify-gui-subsystems.ps1
+
+      - name: Remove one-shot automation and commit verified source
+        id: source_commit
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Remove-Item .github/workflows/agent-full-audit-phase2.yml -ErrorAction SilentlyContinue
+          Remove-Item .github/workflows/agent-full-audit-phase2-run.yml -ErrorAction SilentlyContinue
+          Remove-Item .github/workflows/agent-export-source.yml -ErrorAction SilentlyContinue
+          Remove-Item .github/scripts/apply_full_audit_phase2.py -ErrorAction SilentlyContinue
+          Remove-Item .github/audit/trigger-full-audit-phase2 -ErrorAction SilentlyContinue
+          Remove-Item .github/audit/full-audit.patch.gz.b64 -ErrorAction SilentlyContinue
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "fix: stabilize scratchpad transitions and complete audit pass"
+          git push origin HEAD:agent/full-audit-scratchpad-02
+          "sha=$(git rev-parse HEAD)" >> $env:GITHUB_OUTPUT
+
+      - name: Package binaries and checksums
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $binDir = 'target/x86_64-pc-windows-msvc/release'
+          $packageDir = "LeopardWM-$env:RELEASE_VERSION-x86_64-windows"
+          $zipPath = "$packageDir.zip"
+          New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
+          $binaries = @('leopardwm.exe', 'leopardwm-cli.exe', 'lwm.exe', 'leopardwm-watchdog.exe')
+          foreach ($binary in $binaries) {
+            Copy-Item "$binDir/$binary" "$packageDir/$binary"
+            Copy-Item "$binDir/$binary" $binary
+          }
+          Copy-Item README.md, LICENSE, agent_docs/sehoon-fork-code-audit.md $packageDir
+          Compress-Archive -Path $packageDir -DestinationPath $zipPath -CompressionLevel Optimal -Force
+          $assets = @($zipPath) + $binaries
+          $checksumLines = foreach ($asset in $assets) {
+            $hash = (Get-FileHash -Algorithm SHA256 $asset).Hash.ToLowerInvariant()
+            "$hash *$asset"
+          }
+          $checksumLines | Set-Content -Encoding ascii checksums.txt
+          Get-Content checksums.txt
+
+      - name: Write release notes
+        shell: pwsh
+        run: |
+          @'
+          Personal-fork prerelease from `sehoon123/LeopardWM`.
+
+          Full audit pass 2:
+          - fixes cumulative scratchpad shrink during rapid Ctrl+Alt+S hide/show cycles
+          - makes managed geometry the sole source for state-transition snapshots
+          - removes the production/test split that hid DWM timing regressions
+          - adds repeated-snapshot regression coverage
+          - hardens Settings section navigation and rejected-hotkey message staging
+          - restores WebView2 SmartScreen protection
+          - caches static Settings HTML and hotkey-catalog serialization
+          - stops rerunning the same CLI unit tests for the `lwm` alias target
+          - includes a repository-wide source inventory and prioritized audit backlog
+
+          Validation completed before packaging:
+          - `cargo fmt --all -- --check`
+          - `cargo test --all --locked`
+          - `cargo clippy --all --locked -- -D warnings`
+          - `cargo check --workspace --all-targets --locked`
+          - `cargo build --release --locked`
+          - GUI subsystem verification
+
+          This release exists only in the user fork. Nothing was sent upstream.
+          '@ | Set-Content -Encoding utf8 release-notes.md
+
+      - name: Publish tested binaries to this fork
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.source_commit.outputs.sha }}
+        run: |
+          gh release create $env:RELEASE_TAG `
+            "LeopardWM-$env:RELEASE_VERSION-x86_64-windows.zip" `
+            leopardwm.exe `
+            leopardwm-cli.exe `
+            lwm.exe `
+            leopardwm-watchdog.exe `
+            checksums.txt `
+            --repo $env:GITHUB_REPOSITORY `
+            --target $env:SOURCE_SHA `
+            --title "LeopardWM $env:RELEASE_TAG — full audit pass 2" `
+            --notes-file release-notes.md `
+            --prerelease
