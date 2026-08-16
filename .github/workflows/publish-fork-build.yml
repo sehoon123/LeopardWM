@@ -1,0 +1,113 @@
+name: Publish fork build
+
+on:
+  push:
+    branches:
+      - agent/fix-floating-size-drift
+    paths:
+      - .github/workflows/publish-fork-build.yml
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    if: github.event.head_commit.message == 'chore: publish fork build v0.2.6-sehoon.1'
+    runs-on: windows-latest
+    env:
+      TAG: v0.2.6-sehoon.1
+      VERSION: 0.2.6-sehoon.1
+      SOURCE_SHA: 9e38c9cad2f672d90c9f6babf77f0d0969c348be
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Check out verified source commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+
+      - name: Build release binaries
+        run: cargo build --release --locked
+
+      - name: Verify GUI executable subsystems
+        shell: pwsh
+        run: ./.github/verify-gui-subsystems.ps1
+
+      - name: Run tests
+        run: cargo test --all --locked
+
+      - name: Run Clippy
+        run: cargo clippy --all --locked -- -D warnings
+
+      - name: Package binaries and checksums
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $binDir = 'target/x86_64-pc-windows-msvc/release'
+          $packageDir = "LeopardWM-$env:VERSION-x86_64-windows"
+          $zipPath = "$packageDir.zip"
+
+          New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
+          $binaries = @(
+            'leopardwm.exe',
+            'leopardwm-cli.exe',
+            'lwm.exe',
+            'leopardwm-watchdog.exe'
+          )
+
+          foreach ($binary in $binaries) {
+            Copy-Item "$binDir/$binary" "$packageDir/$binary"
+            Copy-Item "$binDir/$binary" $binary
+          }
+          Copy-Item README.md, LICENSE $packageDir
+
+          Compress-Archive -Path $packageDir -DestinationPath $zipPath -CompressionLevel Optimal -Force
+
+          $assets = @($zipPath) + $binaries
+          $checksumLines = foreach ($asset in $assets) {
+            $hash = (Get-FileHash -Algorithm SHA256 $asset).Hash.ToLowerInvariant()
+            "$hash *$asset"
+          }
+          $checksumLines | Set-Content -Encoding ascii checksums.txt
+          Get-Content checksums.txt
+
+      - name: Write release notes
+        shell: pwsh
+        run: |
+          @'
+          Fork-only Windows build from `sehoon123/LeopardWM`.
+
+          Included changes:
+          - stabilizes repeated float/unfloat sizing by avoiding stale DWM frame re-learning
+          - preserves the original tiled column width across a floating round-trip
+          - filters small compositor-frame drift during floating geometry capture
+          - removes an unnecessary layout allocation when no minimum-width constraints exist
+
+          Validation:
+          - `cargo build --release --locked`
+          - GUI subsystem verification
+          - `cargo test --all --locked`
+          - `cargo clippy --all --locked -- -D warnings`
+
+          This is a personal fork prerelease and is not published to the upstream repository.
+          '@ | Set-Content -Encoding utf8 release-notes.md
+
+      - name: Publish release to this fork
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          gh release create $env:TAG `
+            "LeopardWM-$env:VERSION-x86_64-windows.zip" `
+            leopardwm.exe `
+            leopardwm-cli.exe `
+            lwm.exe `
+            leopardwm-watchdog.exe `
+            checksums.txt `
+            --repo $env:GITHUB_REPOSITORY `
+            --target $env:SOURCE_SHA `
+            --title "LeopardWM $env:TAG — sehoon fork build" `
+            --notes-file release-notes.md `
+            --prerelease
