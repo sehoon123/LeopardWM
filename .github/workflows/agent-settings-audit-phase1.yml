@@ -1,4 +1,5 @@
 name: Settings audit phase 1
+# Registration bump: GitHub records new branch-only workflows on their first update.
 
 on:
   push:
