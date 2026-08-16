@@ -1,4 +1,5 @@
 name: Export source for full audit
+# Registration bump for a branch-local one-shot workflow.
 
 on:
   push:
