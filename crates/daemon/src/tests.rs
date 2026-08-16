@@ -2202,7 +2202,7 @@ fn test_toggle_floating_roundtrip() {
 }
 
 #[test]
-fn test_capture_floating_geometry_rejects_tiled_window() {
+fn test_snapshot_managed_floating_geometry_rejects_tiled_window() {
     let mut state = AppState::new_with_config(test_config(), test_monitors());
     state
         .focused_workspace_mut()
@@ -2211,7 +2211,7 @@ fn test_capture_floating_geometry_rejects_tiled_window() {
         .unwrap();
 
     assert!(!state.update_floating_geometry(100, Rect::new(50, 50, 1200, 800)));
-    assert_eq!(state.capture_floating_geometry(100), None);
+    assert_eq!(state.snapshot_managed_floating_geometry(100), None);
     assert!(
         !state.floating_size_history.contains_key(&100),
         "tiled geometry must not seed floating-size history"
@@ -2219,7 +2219,7 @@ fn test_capture_floating_geometry_rejects_tiled_window() {
 }
 
 #[test]
-fn test_capture_floating_geometry_keeps_managed_float() {
+fn test_snapshot_managed_floating_geometry_keeps_managed_float() {
     let mut state = AppState::new_with_config(test_config(), test_monitors());
     let rect = Rect::new(100, 100, 1200, 800);
     state
@@ -2228,7 +2228,26 @@ fn test_capture_floating_geometry_keeps_managed_float() {
         .add_floating(100, rect)
         .unwrap();
 
-    assert_eq!(state.capture_floating_geometry(100), Some(rect));
+    assert_eq!(state.snapshot_managed_floating_geometry(100), Some(rect));
+    assert_eq!(
+        state.floating_size_history.get(&100),
+        Some(&FloatingSize::new(1200, 800))
+    );
+}
+
+#[test]
+fn test_repeated_managed_geometry_snapshot_is_idempotent() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    let rect = Rect::new(100, 100, 1200, 800);
+    state
+        .focused_workspace_mut()
+        .unwrap()
+        .add_floating(100, rect)
+        .unwrap();
+
+    for _ in 0..128 {
+        assert_eq!(state.snapshot_managed_floating_geometry(100), Some(rect));
+    }
     assert_eq!(
         state.floating_size_history.get(&100),
         Some(&FloatingSize::new(1200, 800))

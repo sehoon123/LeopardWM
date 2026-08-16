@@ -72,7 +72,7 @@ impl AppState {
         // reattaching the window.
         if let Some(sp) = self.scratchpad {
             if sp.window_id == wid {
-                let _ = self.capture_floating_geometry(wid);
+                let _ = self.snapshot_managed_floating_geometry(wid);
                 self.scratchpad = None;
                 self.release_to_tiling(wid, sp.origin_column, sp.origin_sibling);
                 // Keep focus on the returned window — it was focused while
@@ -104,7 +104,7 @@ impl AppState {
         // while its designation still owns its size, then clear the
         // designation before reattaching it.
         if let Some(prev) = self.scratchpad {
-            let _ = self.capture_floating_geometry(prev.window_id);
+            let _ = self.snapshot_managed_floating_geometry(prev.window_id);
             self.scratchpad = None;
             self.release_to_tiling(prev.window_id, prev.origin_column, prev.origin_sibling);
         }
@@ -113,7 +113,7 @@ impl AppState {
         // a scratchpad. Tiled windows start with no size memory and use the
         // configured scratchpad default on their first summon.
         let last_size = if self.config.layout.remember_scratchpad_size {
-            self.capture_floating_geometry(wid)
+            self.snapshot_managed_floating_geometry(wid)
                 .map(|rect| self.logical_floating_size_for_rect(rect))
         } else {
             None
@@ -200,7 +200,7 @@ impl AppState {
     /// panic / `emergency-uncloak` drains the direct-cloak set and
     /// re-homes any off-screen window.
     fn hide_window_to_holding(&mut self, wid: u64) {
-        let _ = self.capture_floating_geometry(wid);
+        let _ = self.snapshot_managed_floating_geometry(wid);
         self.detach_window_from_workspace(wid);
         leopardwm_platform_win32::dwm_cloak_window(wid);
         let _ = leopardwm_platform_win32::move_window_offscreen(wid);

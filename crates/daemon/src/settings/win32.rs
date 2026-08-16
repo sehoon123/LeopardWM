@@ -7,7 +7,7 @@
 //! with `window.ipc.postMessage`.
 
 use std::sync::mpsc;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::Result;
 use tracing::{info, warn};
@@ -27,7 +27,7 @@ use raw_window_handle::{
     HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle, Win32WindowHandle,
     WindowsDisplayHandle,
 };
-use wry::{WebContext, WebViewBuilderExtWindows as _};
+use wry::WebContext;
 
 use crate::config::Config;
 
@@ -65,22 +65,34 @@ const WM_SETTINGS_ACTIVATE: u32 = WM_APP + 2;
 static SETTINGS_THREAD: Mutex<Option<u32>> = Mutex::new(None);
 /// Latest rejected-bind list as a JSON array, staged for the next push.
 static PENDING_FAILED_BINDS: Mutex<Option<String>> = Mutex::new(None);
+/// Rendered static settings resources are shared across opens.
+static SETTINGS_HTML_RENDERED: OnceLock<String> = OnceLock::new();
+static SETTINGS_HOTKEY_CATALOG_JSON: OnceLock<String> = OnceLock::new();
 
 /// Push an updated rejected-hotkey list to the open settings window, if one is
 /// open. Safe to call from any thread and no-ops when no window is open; the
 /// `evaluate_script` itself runs on the window's own thread via its message loop.
 pub fn push_failed_binds(failed_binds: &[String]) {
     let thread_id = match SETTINGS_THREAD.lock() {
-        Ok(g) => *g,
+        Ok(guard) => *guard,
         Err(_) => return,
     };
     let Some(thread_id) = thread_id else { return };
     let json = serde_json::to_string(failed_binds).unwrap_or_else(|_| "[]".to_string());
-    if let Ok(mut pending) = PENDING_FAILED_BINDS.lock() {
-        *pending = Some(json);
-    }
-    unsafe {
-        let _ = PostThreadMessageW(thread_id, WM_SETTINGS_PUSH_BINDS, WPARAM(0), LPARAM(0));
+    let Ok(mut pending) = PENDING_FAILED_BINDS.lock() else {
+        return;
+    };
+
+    // Keep the staging mutex held until the thread message has been accepted.
+    // The window thread takes the same mutex before consuming the payload, so it
+    // can never observe a message without its matching data. A failed post does
+    // not leave stale data for a later settings-window lifetime.
+    *pending = Some(json);
+    let posted = unsafe {
+        PostThreadMessageW(thread_id, WM_SETTINGS_PUSH_BINDS, WPARAM(0), LPARAM(0)).is_ok()
+    };
+    if !posted {
+        *pending = None;
     }
 }
 
@@ -172,6 +184,13 @@ unsafe fn outer_size_for_client(client_width: i32, client_height: i32, dpi: u32)
     (
         rect.right.saturating_sub(rect.left).max(1),
         rect.bottom.saturating_sub(rect.top).max(1),
+    )
+}
+
+fn initial_section_script(section: &str) -> String {
+    let section_json = serde_json::to_string(section).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        "(function(section){{var items=document.querySelectorAll('.nav-item[data-section]');for(var i=0;i<items.length;i++){{if(items[i].dataset.section===section){{items[i].click();break;}}}}}})({section_json});"
     )
 }
 
@@ -296,8 +315,10 @@ pub fn run_settings_window(
         };
         // The settings UI derives its hotkey-list labels, order, and
         // reset-to-defaults from this single catalog (see ipc::hotkeys).
-        let catalog_json = serde_json::to_string(&leopardwm_ipc::hotkeys::hotkey_catalog())
-            .unwrap_or_else(|_| "[]".to_string());
+        let catalog_json = SETTINGS_HOTKEY_CATALOG_JSON.get_or_init(|| {
+            serde_json::to_string(&leopardwm_ipc::hotkeys::hotkey_catalog())
+                .unwrap_or_else(|_| "[]".to_string())
+        });
         let failed_binds_json =
             serde_json::to_string(&failed_binds).unwrap_or_else(|_| "[]".to_string());
 
@@ -305,9 +326,10 @@ pub fn run_settings_window(
         // moved into the IPC handler closure below.
         let close_tx = event_tx.clone();
 
-        let settings_html = SETTINGS_HTML.replace("{VERSION}", env!("CARGO_PKG_VERSION"));
+        let settings_html = SETTINGS_HTML_RENDERED
+            .get_or_init(|| SETTINGS_HTML.replace("{VERSION}", env!("CARGO_PKG_VERSION")));
         let webview_result = wry::WebViewBuilder::new_with_web_context(&mut web_context)
-            .with_html(&settings_html)
+            .with_html(settings_html.as_str())
             .with_initialization_script(format!(
                 "window._initConfig = {}; window._hotkeyCatalog = {}; window._failedHotkeys = {};",
                 config_json, catalog_json, failed_binds_json
@@ -317,7 +339,6 @@ pub fn run_settings_window(
             })
             .with_transparent(true)
             .with_background_color((0, 0, 0, 0))
-            .with_additional_browser_args("--disable-features=msSmartScreenProtection")
             .build(&win_handle);
         let webview = match webview_result {
             Ok(webview) => webview,
@@ -345,13 +366,11 @@ pub fn run_settings_window(
         let init_js = "init(window._initConfig)".to_string();
         let _ = webview.evaluate_script(&init_js);
 
-        // Navigate to initial section if requested
+        // Navigate without interpolating the section into a CSS selector. The
+        // current callers use internal constants, but JSON quoting keeps this
+        // boundary safe and a missing section now degrades to a no-op.
         if let Some(section) = initial_section {
-            let nav_js = format!(
-                "document.querySelector('.nav-item[data-section=\"{}\"]').click()",
-                section
-            );
-            let _ = webview.evaluate_script(&nav_js);
+            let _ = webview.evaluate_script(&initial_section_script(section));
         }
 
         // Show the window
@@ -673,6 +692,17 @@ mod tests {
         assert_eq!(scale_logical_px(100, 120), 125);
         assert_eq!(scale_logical_px(100, 144), 150);
         assert_eq!(scale_logical_px(100, 192), 200);
+    }
+
+    #[test]
+    fn initial_section_script_json_quotes_the_section() {
+        let section = "layout\");window.__leopardwm_injected=true;//";
+        let encoded = serde_json::to_string(section).unwrap();
+        let script = initial_section_script(section);
+
+        assert!(script.ends_with(&format!("({encoded});")));
+        assert!(script.contains("dataset.section===section"));
+        assert!(!script.contains("data-section=\\\"{}\\\""));
     }
 
     #[test]

@@ -16,6 +16,8 @@ path = "src/main.rs"
 [[bin]]
 name = "lwm"
 path = "src/main.rs"
+test = false
+bench = false
 
 [dependencies]
 leopardwm-ipc = { path = "../ipc" }

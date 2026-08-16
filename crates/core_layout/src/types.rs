@@ -121,9 +121,7 @@ impl Rect {
         // Subtract the contained size before adding the remaining travel.
         // `(origin + bounds) - size` can saturate at i32::MAX first and then
         // fall below `origin`, which would invert the subsequent clamp range.
-        let max_x = bounds
-            .x
-            .saturating_add(bounds_width.saturating_sub(width));
+        let max_x = bounds.x.saturating_add(bounds_width.saturating_sub(width));
         let max_y = bounds
             .y
             .saturating_add(bounds_height.saturating_sub(height));

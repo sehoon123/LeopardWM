@@ -520,8 +520,8 @@ pub fn apply_placements(
     // authoritatively.
     let (width_violations, height_violations, geometry_mismatches) =
         if async_flag == SET_WINDOW_POS_FLAGS(0) {
-        detect_size_violations(&entries, &failed_window_ids, &mut cache)
-    } else {
+            detect_size_violations(&entries, &failed_window_ids, &mut cache)
+        } else {
             (Vec::new(), Vec::new(), Vec::new())
         }; // end: skip landing verification during async frames
 
@@ -536,9 +536,9 @@ pub fn apply_placements(
         // Update entries for windows that were actually positioned
         let positioned: std::collections::HashSet<u64> = entries
             .iter()
-                .filter(|e| !failed_window_ids.contains(&e.window_id))
-                .map(|e| e.window_id)
-                .collect();
+            .filter(|e| !failed_window_ids.contains(&e.window_id))
+            .map(|e| e.window_id)
+            .collect();
         for p in placements {
             if positioned.contains(&p.window_id) {
                 cache.positions.insert(p.window_id, (p.rect, p.visibility));
@@ -746,30 +746,30 @@ fn position_entries(entries: &[DeferEntry]) -> (u32, HashSet<u64>) {
     if !entries.is_empty() {
         unsafe {
             match BeginDeferWindowPos(entries.len() as i32) {
-            Err(_) => {
-                // Fallback: apply individually if batching fails
-                for entry in entries {
-                    if SetWindowPos(
+                Err(_) => {
+                    // Fallback: apply individually if batching fails
+                    for entry in entries {
+                        if SetWindowPos(
                             entry.hwnd,
                             None,
                             entry.x,
                             entry.y,
                             entry.w,
                             entry.h,
-                        entry.flags,
+                            entry.flags,
                         )
                         .is_err()
                         {
-                        failed_window_ids.insert(entry.window_id);
+                            failed_window_ids.insert(entry.window_id);
+                        }
                     }
+                    applied = (entries.len() - failed_window_ids.len()) as u32;
                 }
-                applied = (entries.len() - failed_window_ids.len()) as u32;
-            }
-            Ok(initial_hdwp) => {
-                let mut hdwp = initial_hdwp;
-                let mut batch_ok = true;
-                for entry in entries {
-                    match DeferWindowPos(
+                Ok(initial_hdwp) => {
+                    let mut hdwp = initial_hdwp;
+                    let mut batch_ok = true;
+                    for entry in entries {
+                        match DeferWindowPos(
                             hdwp,
                             entry.hwnd,
                             None,
@@ -777,58 +777,58 @@ fn position_entries(entries: &[DeferEntry]) -> (u32, HashSet<u64>) {
                             entry.y,
                             entry.w,
                             entry.h,
-                        entry.flags,
-                    ) {
-                        Ok(new_hdwp) => hdwp = new_hdwp,
-                        Err(_) => {
-                            batch_ok = false;
-                            break;
+                            entry.flags,
+                        ) {
+                            Ok(new_hdwp) => hdwp = new_hdwp,
+                            Err(_) => {
+                                batch_ok = false;
+                                break;
+                            }
                         }
                     }
-                }
-                if batch_ok {
-                    if EndDeferWindowPos(hdwp).is_err() {
-                        // EndDeferWindowPos failed — fall back to individual calls
-                        for entry in entries {
-                            if SetWindowPos(
+                    if batch_ok {
+                        if EndDeferWindowPos(hdwp).is_err() {
+                            // EndDeferWindowPos failed — fall back to individual calls
+                            for entry in entries {
+                                if SetWindowPos(
                                     entry.hwnd,
                                     None,
                                     entry.x,
                                     entry.y,
                                     entry.w,
                                     entry.h,
-                                entry.flags,
+                                    entry.flags,
                                 )
                                 .is_err()
                                 {
-                                failed_window_ids.insert(entry.window_id);
+                                    failed_window_ids.insert(entry.window_id);
+                                }
                             }
+                            applied = (entries.len() - failed_window_ids.len()) as u32;
+                        } else {
+                            applied = entries.len() as u32;
                         }
-                        applied = (entries.len() - failed_window_ids.len()) as u32;
                     } else {
-                        applied = entries.len() as u32;
-                    }
-                } else {
-                    // DeferWindowPos failed — HDWP is already freed by Win32.
-                    // Fall back to individual SetWindowPos calls.
-                    for entry in entries {
-                        if SetWindowPos(
+                        // DeferWindowPos failed — HDWP is already freed by Win32.
+                        // Fall back to individual SetWindowPos calls.
+                        for entry in entries {
+                            if SetWindowPos(
                                 entry.hwnd,
                                 None,
                                 entry.x,
                                 entry.y,
                                 entry.w,
                                 entry.h,
-                            entry.flags,
+                                entry.flags,
                             )
                             .is_err()
                             {
-                            failed_window_ids.insert(entry.window_id);
+                                failed_window_ids.insert(entry.window_id);
+                            }
                         }
+                        applied = (entries.len() - failed_window_ids.len()) as u32;
                     }
-                    applied = (entries.len() - failed_window_ids.len()) as u32;
                 }
-            }
             }
         }
     }
@@ -1139,8 +1139,8 @@ fn sync_cloak_state(
 /// fails to rebuild after rapid async SetWindowPos during animation. A real
 /// size delta must reach the window for the render target to re-sync.
 const STICKY_COMPOSITOR_CLASSES: &[&str] = &[
-    "Chrome_WidgetWin_1",           // Electron / Chromium (Slack, Beeper, Spotify, TradingView)
-    "MozillaWindowClass",           // Firefox / Zen
+    "Chrome_WidgetWin_1", // Electron / Chromium (Slack, Beeper, Spotify, TradingView)
+    "MozillaWindowClass", // Firefox / Zen
     "CASCADIA_HOSTING_WINDOW_CLASS", // Windows Terminal
 ];
 
