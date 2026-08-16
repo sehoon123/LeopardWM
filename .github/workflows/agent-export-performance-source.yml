@@ -1,0 +1,32 @@
+name: Export performance-audit source
+
+on:
+  push:
+    branches:
+      - agent/performance-audit-03
+    paths:
+      - .github/workflows/agent-export-performance-source.yml
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out exact audit branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: agent/performance-audit-03
+          fetch-depth: 0
+
+      - name: Create exact source archive
+        run: git archive --format=zip --output=LeopardWM-performance-source.zip HEAD
+
+      - name: Upload source archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: LeopardWM-performance-source
+          path: LeopardWM-performance-source.zip
+          if-no-files-found: error
+          retention-days: 1
