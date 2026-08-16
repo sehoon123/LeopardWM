@@ -1,4 +1,5 @@
 name: Export staged audit patch
+# Registration bump for branch-local workflow.
 
 on:
   push:
