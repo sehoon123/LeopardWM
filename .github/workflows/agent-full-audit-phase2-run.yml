@@ -31,25 +31,52 @@ jobs:
       - name: Apply repository-wide audit fixes
         run: python .github/scripts/apply_full_audit_phase2.py
 
-      - name: Repair generated Settings ownership and imports
+      - name: Repair generated audit source
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $path = 'crates/daemon/src/settings/win32.rs'
-          $text = Get-Content -Raw -Encoding utf8 $path
+
+          $settingsPath = 'crates/daemon/src/settings/win32.rs'
+          $text = Get-Content -Raw -Encoding utf8 $settingsPath
+
           $oldImport = 'use wry::{WebContext, WebViewBuilderExtWindows as _};'
           $newImport = 'use wry::WebContext;'
           if (-not $text.Contains($oldImport)) {
             throw "Expected obsolete Wry extension import was not found"
           }
           $text = $text.Replace($oldImport, $newImport)
+
           $oldHtml = '.with_html(&settings_html)'
           $newHtml = '.with_html(settings_html.as_str())'
           if (-not $text.Contains($oldHtml)) {
             throw "Expected cached Settings HTML call was not found"
           }
           $text = $text.Replace($oldHtml, $newHtml)
-          [System.IO.File]::WriteAllText($path, $text, [System.Text.UTF8Encoding]::new($false))
+
+          $docPattern = '(?m)(/// `evaluate_script` itself runs on the window''s own thread via its message loop\.\r?\n)\r?\n(pub fn push_failed_binds)'
+          $docRegex = [regex]::new($docPattern)
+          $updated = $docRegex.Replace($text, '$1$2', 1)
+          if ($updated -eq $text) {
+            throw "Expected blank line after push_failed_binds doc comment was not found"
+          }
+          $text = $updated
+          [System.IO.File]::WriteAllText($settingsPath, $text, [System.Text.UTF8Encoding]::new($false))
+
+          $testsPath = 'crates/daemon/src/tests.rs'
+          $tests = Get-Content -Raw -Encoding utf8 $testsPath
+          $testName = 'test_repeated_managed_geometry_snapshot_is_idempotent'
+          $decoratedPattern = "(?m)^#\[test\]\r?\nfn $testName\(\) \{"
+          if ($tests -notmatch $decoratedPattern) {
+            $functionPattern = "(?m)^(fn $testName\(\) \{)"
+            $functionRegex = [regex]::new($functionPattern)
+            $replacement = "#[test]`n" + '$1'
+            $updatedTests = $functionRegex.Replace($tests, $replacement, 1)
+            if ($updatedTests -eq $tests) {
+              throw "Expected repeated managed-geometry test function was not found"
+            }
+            $tests = $updatedTests
+          }
+          [System.IO.File]::WriteAllText($testsPath, $tests, [System.Text.UTF8Encoding]::new($false))
 
       - name: Format source
         run: cargo fmt --all
