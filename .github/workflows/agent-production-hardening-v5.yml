@@ -40,6 +40,20 @@ jobs:
       - name: Apply production hardening
         run: python .github/scripts/apply_production_hardening_v5.py
 
+      - name: Repair generated animation capacity bound
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $path = 'crates/daemon/src/transitions.rs'
+          $text = Get-Content -Raw -Encoding utf8 $path
+          $old = 'Vec::with_capacity(placements.len().min(ghosted.len()))'
+          $new = 'Vec::with_capacity(placements.len().min(ghost_handles.len()))'
+          if (-not $text.Contains($old)) {
+            throw 'Expected generated ghost capacity expression was not found'
+          }
+          $text = $text.Replace($old, $new)
+          [System.IO.File]::WriteAllText($path, $text, [System.Text.UTF8Encoding]::new($false))
+
       - name: Refresh lockfile for intentional manifest changes
         run: cargo check -p leopardwm-core-layout
 
