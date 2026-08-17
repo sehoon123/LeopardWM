@@ -1,0 +1,27 @@
+name: Export production-hardening source
+
+on:
+  push:
+    branches:
+      - agent/production-hardening-05
+    paths:
+      - .github/workflows/agent-export-production-source.yml
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/production-hardening-05
+          fetch-depth: 0
+      - run: git archive --format=zip --output=LeopardWM-production-source.zip HEAD
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LeopardWM-production-source
+          path: LeopardWM-production-source.zip
+          if-no-files-found: error
+          retention-days: 1
