@@ -8,7 +8,7 @@ on:
       - .github/workflows/agent-export-current-source.yml
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   export:
@@ -16,12 +16,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: agent/performance-audit-03
+          ref: agent/adaptive-smooth-compositor-v7
           fetch-depth: 0
-      - run: git archive --format=zip --output=LeopardWM-current-source.zip HEAD
+      - name: Archive exact adaptive-v7 working source
+        run: git archive --format=zip --output=LeopardWM-adaptive-v7-source.zip HEAD
       - uses: actions/upload-artifact@v4
         with:
-          name: LeopardWM-current-source
-          path: LeopardWM-current-source.zip
+          name: LeopardWM-adaptive-v7-source
+          path: LeopardWM-adaptive-v7-source.zip
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 2
+      - name: Publish artifact locator on control branch
+        shell: bash
+        run: |
+          git fetch origin agent/performance-audit-03
+          git switch -C agent/performance-audit-03 origin/agent/performance-audit-03
+          mkdir -p agent_docs
+          printf '{"run_id":%s,"artifact_name":"LeopardWM-adaptive-v7-source","source_sha":"%s"}\n' "$GITHUB_RUN_ID" "$(git rev-parse origin/agent/adaptive-smooth-compositor-v7)" > agent_docs/adaptive-v7-export.json
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add agent_docs/adaptive-v7-export.json
+          git commit -m "chore: record adaptive-v7 export artifact"
+          git push origin HEAD:agent/performance-audit-03
