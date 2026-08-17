@@ -1,0 +1,144 @@
+name: Validate and tag v6 MSI release retry
+
+on:
+  push:
+    branches:
+      - agent/msi-v6-clean
+    paths:
+      - .github/workflows/agent-tag-v6-retry.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: feature-msi-v6
+  cancel-in-progress: true
+
+env:
+  RELEASE_TAG: v0.2.6-sehoon.6
+
+jobs:
+  validate-and-tag:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: agent/msi-v6-clean
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Bring reviewed patch dependencies to the required versions
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $lock = Get-Content -Raw -Encoding utf8 Cargo.lock
+          if ($lock -match 'name = "clap"\r?\nversion = "4\.6\.5"') {
+            cargo update -p clap@4.6.5 --precise 4.6.6
+            if ($LASTEXITCODE -ne 0) { throw 'clap update failed' }
+          } elseif ($lock -notmatch 'name = "clap"\r?\nversion = "4\.6\.6"') {
+            throw 'Cargo.lock contains neither the expected old nor new Clap version'
+          }
+          $lock = Get-Content -Raw -Encoding utf8 Cargo.lock
+          if ($lock -match 'name = "thiserror"\r?\nversion = "2\.0\.19"') {
+            cargo update -p thiserror@2.0.19 --precise 2.0.20
+            if ($LASTEXITCODE -ne 0) { throw 'thiserror update failed' }
+          } elseif ($lock -notmatch 'name = "thiserror"\r?\nversion = "2\.0\.20"') {
+            throw 'Cargo.lock contains neither the expected old nor new thiserror version'
+          }
+
+      - name: Validate installer source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          @'
+          from pathlib import Path
+          wix = Path('wix/main.wxs').read_text(encoding='utf-8')
+          for needle in (
+              'StartMenuLeopardWM',
+              'StartMenuLeopardWMSafeMode',
+              'DesktopShortcutFeature',
+              'ARPPRODUCTICON',
+              "UpgradeCode='EE10F2D5-DA80-43EA-B4D4-A0D37C69DE83'",
+          ):
+              assert needle in wix, needle
+          assert Path('assets/leopardwm.ico').is_file()
+          assert Path('wix/License.rtf').is_file()
+          print('installer source invariants: OK')
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'installer source check failed' }
+
+      - name: Run production quality gates
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo fmt --all
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { throw 'format check failed' }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'diff check failed' }
+          cargo test --workspace --all-targets --locked
+          if ($LASTEXITCODE -ne 0) { throw 'tests failed' }
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          if ($LASTEXITCODE -ne 0) { throw 'Clippy failed' }
+          cargo check --workspace --all-targets --locked
+          if ($LASTEXITCODE -ne 0) { throw 'all-target check failed' }
+          cargo build --workspace --release --locked
+          if ($LASTEXITCODE -ne 0) { throw 'release build failed' }
+          ./.github/verify-gui-subsystems.ps1
+          if ($LASTEXITCODE -ne 0) { throw 'GUI subsystem verification failed' }
+
+      - name: Commit verified dependency lockfile
+        id: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock
+          if (-not (git diff --cached --quiet)) {
+            git diff --cached --check
+            if ($LASTEXITCODE -ne 0) { throw 'lockfile diff invalid' }
+            git commit -m "build: update clap and thiserror patch releases"
+            if ($LASTEXITCODE -ne 0) { throw 'lockfile commit failed' }
+            git push origin HEAD:agent/msi-v6-clean
+            if ($LASTEXITCODE -ne 0) { throw 'lockfile push failed' }
+          }
+          $sha = (git rev-parse HEAD).Trim()
+          $remote = git ls-remote origin refs/heads/agent/msi-v6-clean
+          if ($LASTEXITCODE -ne 0 -or -not $remote) { throw 'remote branch could not be resolved' }
+          $remoteSha = (($remote -split '\s+')[0]).Trim()
+          if ($sha -ne $remoteSha) { throw "source mismatch: $sha != $remoteSha" }
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+
+      - name: Remove any incomplete v6 publication
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY 2>$null) {
+            gh release delete $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --cleanup-tag --yes
+            if ($LASTEXITCODE -ne 0) { throw 'incomplete release cleanup failed' }
+          } else {
+            $remoteTag = git ls-remote --tags origin "refs/tags/$env:RELEASE_TAG"
+            if ($remoteTag) {
+              git push origin ":refs/tags/$env:RELEASE_TAG"
+              if ($LASTEXITCODE -ne 0) { throw 'incomplete tag cleanup failed' }
+            }
+          }
+
+      - name: Push the verified tag for the standard ZIP and MSI workflow
+        shell: pwsh
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git tag -a $env:RELEASE_TAG $env:SOURCE_SHA -m "LeopardWM $env:RELEASE_TAG - MSI installer features"
+          if ($LASTEXITCODE -ne 0) { throw 'tag creation failed' }
+          git push origin "refs/tags/$env:RELEASE_TAG"
+          if ($LASTEXITCODE -ne 0) { throw 'tag push failed' }
+          Write-Host "Tagged verified source $env:SOURCE_SHA; .github/workflows/release.yml will now build and publish ZIP and MSI"
