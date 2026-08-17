@@ -1,0 +1,27 @@
+name: Export current source for engineering audit
+
+on:
+  push:
+    branches:
+      - agent/performance-audit-03
+    paths:
+      - .github/workflows/agent-export-current-source.yml
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/performance-audit-03
+          fetch-depth: 0
+      - run: git archive --format=zip --output=LeopardWM-current-source.zip HEAD
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LeopardWM-current-source
+          path: LeopardWM-current-source.zip
+          if-no-files-found: error
+          retention-days: 1
