@@ -1,0 +1,50 @@
+name: Rebuild v6 feature patch
+
+on:
+  push:
+    branches:
+      - agent/release-msi-v6
+    paths:
+      - .github/workflows/rebuild-v6-patch.yml
+      - .github/audit/v6-feature.patch.gz.b64.part*
+
+permissions:
+  contents: write
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: agent/release-msi-v6
+          fetch-depth: 0
+      - name: Reassemble and verify patch
+        env:
+          PATCH_SHA256: 69cd44c1c3b3897d9e3f4f177aaba529568f69d46808c986c35673c7b4f23e6b
+        run: |
+          python - <<'PY'
+          import base64, gzip, hashlib, os
+          from pathlib import Path
+
+          root = Path('.github/audit')
+          parts = sorted(root.glob('v6-feature.patch.gz.b64.part*'))
+          if len(parts) != 8:
+              raise SystemExit(f'expected 8 patch chunks, found {len(parts)}')
+          encoded = ''.join(part.read_text(encoding='utf-8').strip() for part in parts)
+          patch = gzip.decompress(base64.b64decode(encoded))
+          actual = hashlib.sha256(patch).hexdigest()
+          expected = os.environ['PATCH_SHA256']
+          if actual != expected:
+              raise SystemExit(f'patch checksum mismatch: expected={expected} actual={actual}')
+          (root / 'v6-feature.patch.gz.b64').write_text(encoded + '\n', encoding='utf-8')
+          print(f'patch bytes={len(patch)} sha256={actual}')
+          PY
+      - name: Commit reconstructed patch
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .github/audit/v6-feature.patch.gz.b64
+          git diff --cached --check
+          git commit -m 'fix: reconstruct verified v6 feature patch'
+          git push origin HEAD:agent/release-msi-v6
