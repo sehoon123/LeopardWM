@@ -1,0 +1,79 @@
+install support, and in-place upgrades
+
+            Validation completed before publication:
+            - all workspace targets tested in debug and optimized modes
+            - Clippy for all targets with warnings denied
+            - all-target Cargo check
+            - repeated scratchpad/floating regression tests
+            - GUI subsystem checks
+            - WiX decompile validation and administrative MSI extraction
+            - exact remote source-commit verification
+
+            Nothing was sent upstream.
+            """
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def publish_release(source_sha: str, assets: list[Path], notes: Path) -> None:
+    tag_check = run(
+        ["git", "ls-remote", "--exit-code", "--tags", "origin", f"refs/tags/{RELEASE_TAG}"],
+        check=False,
+        capture=True,
+    )
+    if tag_check.returncode == 0:
+        raise RuntimeError(f"tag already exists: {RELEASE_TAG}")
+    if tag_check.returncode != 2:
+        raise RuntimeError("failed to check existing release tag")
+
+    command = ["gh", "release", "create", RELEASE_TAG]
+    command.extend(str(path) for path in assets)
+    command.extend([
+        "--repo", REPOSITORY,
+        "--target", source_sha,
+        "--title", f"LeopardWM {RELEASE_TAG} — desktop controls and MSI",
+        "--notes-file", str(notes),
+        "--prerelease",
+    ])
+    run(command)
+
+    release_json = output([
+        "gh", "release", "view", RELEASE_TAG, "--repo", REPOSITORY,
+        "--json", "tagName,isDraft,isPrerelease,targetCommitish,assets",
+    ])
+    release = json.loads(release_json)
+    if release["tagName"] != RELEASE_TAG or release["isDraft"] or not release["isPrerelease"]:
+        raise RuntimeError(f"published release metadata is invalid: {release}")
+
+    tag_line = output(["git", "ls-remote", "origin", f"refs/tags/{RELEASE_TAG}"])
+    tag_sha = tag_line.split()[0] if tag_line else ""
+    if tag_sha != source_sha:
+        raise RuntimeError(f"tag/source mismatch: tag={tag_sha} source={source_sha}")
+
+    expected = {path.name for path in assets}
+    actual = {asset["name"] for asset in release["assets"]}
+    missing = expected - actual
+    if missing:
+        raise RuntimeError(f"missing release assets: {sorted(missing)}")
+    print(f"published and verified {RELEASE_TAG} at {source_sha}")
+
+
+def main() -> None:
+    patch = reconstruct_patch()
+    apply_source_changes(patch)
+    validate_and_build()
+    msi = build_msi()
+    source_sha = publish_source()
+    _, assets = package_release(msi)
+    notes = write_release_notes()
+    publish_release(source_sha, assets, notes)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        raise
