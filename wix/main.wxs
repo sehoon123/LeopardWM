@@ -2,10 +2,10 @@
 <!--
   WiX installer source for LeopardWM.
 
-  The UpgradeCode below MUST stay constant across all releases — changing it
-  breaks in-place upgrade. The ProductCode (Product/@Id) is set to '*' so a
-  fresh GUID is generated per build, which combined with MajorUpgrade gives
-  re-run-newest-MSI = upgrade-in-place behavior.
+  UpgradeCode is intentionally preserved from upstream so an installed upstream
+  build or an earlier sehoon build can be upgraded in place. ProductCode is
+  generated per build and MajorUpgrade permits rebuilding the same numeric MSI
+  version while the fork uses a release suffix in the asset filename.
 -->
 
 <?if $(sys.BUILDARCH) = x64 or $(sys.BUILDARCH) = arm64 ?>
@@ -20,7 +20,7 @@
         Id='*'
         Name='LeopardWM'
         UpgradeCode='EE10F2D5-DA80-43EA-B4D4-A0D37C69DE83'
-        Manufacturer='jcardama'
+        Manufacturer='jcardama / sehoon123 fork'
         Language='1033'
         Codepage='1252'
         Version='$(var.Version)'>
@@ -28,8 +28,8 @@
         <Package Id='*'
             Keywords='Installer'
             Description='LeopardWM scrolling tiling window manager for Windows'
-            Manufacturer='jcardama'
-            InstallerVersion='450'
+            Manufacturer='jcardama / sehoon123 fork'
+            InstallerVersion='500'
             Languages='1033'
             Compressed='yes'
             InstallScope='perMachine'
@@ -41,8 +41,13 @@
             AllowSameVersionUpgrades='yes'
             DowngradeErrorMessage='A newer version of [ProductName] is already installed. Setup will now exit.'/>
 
-        <Media Id='1' Cabinet='media1.cab' EmbedCab='yes' DiskPrompt='CD-ROM #1'/>
+        <Media Id='1' Cabinet='media1.cab' EmbedCab='yes' DiskPrompt='LeopardWM installation media'/>
         <Property Id='DiskPrompt' Value='LeopardWM Installation'/>
+
+        <Icon Id='ProductIcon' SourceFile='assets\leopardwm.ico'/>
+        <Property Id='ARPPRODUCTICON' Value='ProductIcon'/>
+        <Property Id='ARPHELPLINK' Value='https://github.com/sehoon123/LeopardWM'/>
+        <Property Id='ARPURLINFOABOUT' Value='https://github.com/sehoon123/LeopardWM'/>
 
         <Directory Id='TARGETDIR' Name='SourceDir'>
             <Directory Id='$(var.PlatformProgramFilesFolder)' Name='PFiles'>
@@ -98,14 +103,68 @@
                                 KeyPath='yes'/>
                         </Component>
                     </Directory>
+
+                    <Component Id='StartMenuShortcuts' Guid='D72448C6-EB1A-45C3-A6FB-12A351513743'>
+                        <Shortcut
+                            Id='StartMenuLeopardWM'
+                            Directory='ApplicationProgramsFolder'
+                            Name='LeopardWM'
+                            Description='Start LeopardWM'
+                            Target='[Bin]leopardwm.exe'
+                            WorkingDirectory='Bin'
+                            Icon='ProductIcon'
+                            Advertise='no'/>
+                        <Shortcut
+                            Id='StartMenuLeopardWMSafeMode'
+                            Directory='ApplicationProgramsFolder'
+                            Name='LeopardWM (Safe Mode)'
+                            Description='Start LeopardWM with configuration and session restore disabled'
+                            Target='[Bin]leopardwm.exe'
+                            Arguments='--safe-mode'
+                            WorkingDirectory='Bin'
+                            Icon='ProductIcon'
+                            Advertise='no'/>
+                        <RemoveFolder Id='RemoveApplicationProgramsFolder' Directory='ApplicationProgramsFolder' On='uninstall'/>
+                        <RegistryValue
+                            Root='HKLM'
+                            Key='Software\sehoon123\LeopardWM'
+                            Name='StartMenuShortcuts'
+                            Type='integer'
+                            Value='1'
+                            KeyPath='yes'/>
+                    </Component>
+
+                    <Component Id='DesktopShortcut' Guid='5C1CBA08-9F12-4A1F-AE63-3EAB4C0DC160'>
+                        <Shortcut
+                            Id='DesktopLeopardWM'
+                            Directory='DesktopFolder'
+                            Name='LeopardWM'
+                            Description='Start LeopardWM'
+                            Target='[Bin]leopardwm.exe'
+                            WorkingDirectory='Bin'
+                            Icon='ProductIcon'
+                            Advertise='no'/>
+                        <RegistryValue
+                            Root='HKLM'
+                            Key='Software\sehoon123\LeopardWM'
+                            Name='DesktopShortcut'
+                            Type='integer'
+                            Value='1'
+                            KeyPath='yes'/>
+                    </Component>
                 </Directory>
             </Directory>
+
+            <Directory Id='ProgramMenuFolder'>
+                <Directory Id='ApplicationProgramsFolder' Name='LeopardWM'/>
+            </Directory>
+            <Directory Id='DesktopFolder'/>
         </Directory>
 
         <Feature
             Id='Binaries'
             Title='Application'
-            Description='Installs the LeopardWM daemon, CLI, and license.'
+            Description='Installs the LeopardWM daemon, command-line tools, watchdog, and license.'
             Level='1'
             ConfigurableDirectory='APPLICATIONFOLDER'
             AllowAdvertise='no'
@@ -120,17 +179,32 @@
             <Feature
                 Id='Environment'
                 Title='PATH Environment Variable'
-                Description='Add the LeopardWM bin folder to the PATH so leopardwm-cli is callable from any terminal.'
+                Description='Add the LeopardWM bin folder to the system PATH.'
                 Level='1'
                 Absent='allow'>
                 <ComponentRef Id='Path'/>
             </Feature>
+
+            <Feature
+                Id='StartMenuFeature'
+                Title='Start Menu Shortcuts'
+                Description='Add normal and Safe Mode shortcuts to the Start Menu.'
+                Level='1'
+                Absent='allow'>
+                <ComponentRef Id='StartMenuShortcuts'/>
+            </Feature>
+
+            <Feature
+                Id='DesktopShortcutFeature'
+                Title='Desktop Shortcut'
+                Description='Add a LeopardWM shortcut to the public desktop.'
+                Level='2'
+                Absent='allow'>
+                <ComponentRef Id='DesktopShortcut'/>
+            </Feature>
         </Feature>
 
         <SetProperty Id='ARPINSTALLLOCATION' Value='[APPLICATIONFOLDER]' After='CostFinalize'/>
-
-        <Property Id='ARPHELPLINK' Value='https://github.com/jcardama/LeopardWM'/>
-        <Property Id='ARPURLINFOABOUT' Value='https://github.com/jcardama/LeopardWM'/>
 
         <UI>
             <UIRef Id='WixUI_FeatureTree'/>
