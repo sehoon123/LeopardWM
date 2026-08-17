@@ -1,0 +1,38 @@
+name: Export adaptive-v7 working source
+
+on:
+  push:
+    branches:
+      - agent/adaptive-smooth-compositor-v7
+    paths:
+      - .github/workflows/agent-export-adaptive-v7.yml
+
+permissions:
+  contents: write
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/adaptive-smooth-compositor-v7
+          fetch-depth: 0
+      - name: Archive exact working tree
+        run: git archive --format=zip --output=LeopardWM-adaptive-v7-source.zip HEAD
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LeopardWM-adaptive-v7-source
+          path: LeopardWM-adaptive-v7-source.zip
+          if-no-files-found: error
+          retention-days: 2
+      - name: Mark successful export
+        shell: bash
+        run: |
+          mkdir -p agent_docs
+          printf '%s\n' "${GITHUB_SHA}" > agent_docs/adaptive-v7-export.done
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add agent_docs/adaptive-v7-export.done
+          git commit -m "chore: mark adaptive-v7 source export"
+          git push origin HEAD:agent/adaptive-smooth-compositor-v7
