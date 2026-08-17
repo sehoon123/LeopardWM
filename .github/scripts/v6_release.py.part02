@@ -1,0 +1,64 @@
+s_managed_active_window() {\n"
+        "    let mut state = AppState::new_with_config(test_config(), test_monitors());\n"
+        "    state\n"
+    )
+    new = (
+        "fn test_active_border_target_accepts_managed_active_window() {\n"
+        "    let mut state = AppState::new_with_config(test_config(), test_monitors());\n"
+        "    state.paused = false;\n"
+        "    state\n"
+    )
+    if text.count(old) != 1:
+        raise RuntimeError("active-border regression test insertion point was not unique")
+    test_path.write_text(text.replace(old, new, 1), encoding="utf-8", newline="\n")
+    run(["git", "diff", "--check"])
+
+
+def verify_invariants() -> None:
+    ipc = (ROOT / "crates/ipc/src/lib.rs").read_text(encoding="utf-8")
+    assert "IPC_PROTOCOL_VERSION: u32 = 3" in ipc
+    assert "OpenSettings" in ipc and "ReleaseAllWindows" in ipc
+
+    manifest = (ROOT / "crates/cli/Cargo.toml").read_text(encoding="utf-8")
+    assert 'name = "leopardwm-settings"' in manifest
+    assert 'src/bin/leopardwm-settings.rs' in manifest
+    assert (ROOT / "crates/cli/src/bin/leopardwm-settings.rs").is_file()
+
+    config = (ROOT / "crates/daemon/src/config.rs").read_text(encoding="utf-8")
+    html = (ROOT / "crates/daemon/src/settings/settings.html").read_text(encoding="utf-8")
+    assert "always_center_single_column" in config
+    assert "always_center_single_column" in html
+
+    wix = (ROOT / "wix/main.wxs").read_text(encoding="windows-1252")
+    for marker in (
+        "Manufacturer='sehoon123'",
+        "UpgradeCode='EE10F2D5-DA80-43EA-B4D4-A0D37C69DE83'",
+        "leopardwm-settings.exe",
+        "Id='StartMenuLeopardWM'",
+        "Id='StartMenuSettings'",
+        "Id='ARPPRODUCTICON'",
+    ):
+        assert marker in wix, marker
+
+    assert (ROOT / ".github/verify-msi.ps1").is_file()
+    assert (ROOT / "agent_docs/release-v0.2.6-sehoon.6.md").is_file()
+    stale = [
+        ".github/workflows/agent-production-hardening-v5.yml",
+        ".github/workflows/agent-export-current-source.yml",
+        ".github/scripts/apply_production_hardening_v5.py",
+        ".github/audit/trigger-production-hardening-v5",
+    ]
+    assert not any((ROOT / path).exists() for path in stale), stale
+    print("source and MSI invariants: OK")
+
+
+def validate_and_build() -> None:
+    run(["cargo", "update", "-p", "clap@4.6.5", "--precise", "4.6.6"])
+    run(["cargo", "update", "-p", "thiserror@2.0.19", "--precise", "2.0.20"])
+    run(["cargo", "fmt", "--all"])
+    verify_invariants()
+    run(["cargo", "fmt", "--all", "--", "--check"])
+    run(["git", "diff", "--check"])
+    run(["cargo", "test", "--workspace", "--all-targets", "--locked"])
+    run(["cargo", "clippy", "--workspace", "--all-targets", "--locked", "--", "-D", "warnings"])
+    run(
