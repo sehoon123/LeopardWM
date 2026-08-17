@@ -1,0 +1,219 @@
+name: Final feature and MSI release v6
+
+on:
+  push:
+    branches:
+      - agent/release-msi-v6
+    paths:
+      - .github/workflows/agent-release-msi-v6-final.yml
+      - .github/audit/v6-feature.patch.gz.b64.part*
+
+permissions:
+  contents: write
+
+concurrency:
+  group: leopardwm-v0.2.6-sehoon.6-final
+  cancel-in-progress: false
+
+env:
+  SOURCE_BRANCH: agent/features-msi-v6
+  RELEASE_TAG: v0.2.6-sehoon.6
+  RELEASE_VERSION: 0.2.6-sehoon.6
+  PATCH_SHA256: 69cd44c1c3b3897d9e3f4f177aaba529568f69d46808c986c35673c7b4f23e6b
+
+jobs:
+  verify-build-msi-release:
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out release control branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: agent/release-msi-v6
+          fetch-depth: 0
+
+      - name: Reassemble and verify reviewed feature patch
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          @'
+          import base64, gzip, hashlib, os
+          from pathlib import Path
+
+          root = Path('.github/audit')
+          parts = sorted(root.glob('v6-feature.patch.gz.b64.part*'))
+          if len(parts) != 8:
+              raise SystemExit(f'expected 8 patch chunks, found {len(parts)}')
+          encoded = ''.join(part.read_text(encoding='utf-8').strip() for part in parts)
+          patch = gzip.decompress(base64.b64decode(encoded))
+          actual = hashlib.sha256(patch).hexdigest()
+          expected = os.environ['PATCH_SHA256'].lower()
+          if actual != expected:
+              raise SystemExit(f'patch checksum mismatch: expected={expected} actual={actual}')
+          output = Path(os.environ['RUNNER_TEMP'], 'v6-feature.patch')
+          output.write_bytes(patch)
+          print(f'patch bytes={len(patch)} sha256={actual}')
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'patch reconstruction failed' }
+
+      - name: Check out clean v5 feature base
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git fetch origin "$env:SOURCE_BRANCH"
+          if ($LASTEXITCODE -ne 0) { throw 'failed to fetch source branch' }
+          git checkout --detach "origin/$env:SOURCE_BRANCH"
+          if ($LASTEXITCODE -ne 0) { throw 'failed to check out source branch' }
+          $expectedBase = '68ebea44339fb9293b48334ecc081af0b198e069'
+          $actualBase = (git rev-parse HEAD).Trim()
+          if ($actualBase -ne $expectedBase) {
+            throw "source branch moved unexpectedly: expected=$expectedBase actual=$actualBase"
+          }
+
+      - name: Apply reviewed v6 feature patch and test-state correction
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $patch = Join-Path $env:RUNNER_TEMP 'v6-feature.patch'
+          git apply --check $patch
+          if ($LASTEXITCODE -ne 0) { throw 'feature patch preflight failed' }
+          git apply $patch
+          if ($LASTEXITCODE -ne 0) { throw 'feature patch application failed' }
+
+          @'
+          from pathlib import Path
+
+          path = Path('crates/daemon/src/tests.rs')
+          text = path.read_text(encoding='utf-8')
+          old = '''fn test_active_border_target_accepts_managed_active_window() {
+              let mut state = AppState::new_with_config(test_config(), test_monitors());
+              state
+          '''.replace('              ', '')
+          new = '''fn test_active_border_target_accepts_managed_active_window() {
+              let mut state = AppState::new_with_config(test_config(), test_monitors());
+              state.paused = false;
+              state
+          '''.replace('              ', '')
+          if text.count(old) != 1:
+              raise SystemExit('active-border regression test insertion point was not unique')
+          path.write_text(text.replace(old, new, 1), encoding='utf-8', newline='\n')
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'test-state correction failed' }
+
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'source patch introduced whitespace errors' }
+
+      - name: Install stable Rust with quality components
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Apply reviewed upstream patch dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo update -p clap@4.6.5 --precise 4.6.6
+          if ($LASTEXITCODE -ne 0) { throw 'failed to update clap' }
+          cargo update -p thiserror@2.0.19 --precise 2.0.20
+          if ($LASTEXITCODE -ne 0) { throw 'failed to update thiserror' }
+
+      - name: Format source
+        run: cargo fmt --all
+
+      - name: Verify source and packaging invariants
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          @'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          root = Path('.')
+          ipc = (root / 'crates/ipc/src/lib.rs').read_text(encoding='utf-8')
+          assert 'IPC_PROTOCOL_VERSION: u32 = 3' in ipc
+          assert 'OpenSettings' in ipc and 'ReleaseAllWindows' in ipc
+
+          cli_manifest = (root / 'crates/cli/Cargo.toml').read_text(encoding='utf-8')
+          assert 'name = "leopardwm-settings"' in cli_manifest
+          assert 'src/bin/leopardwm-settings.rs' in cli_manifest
+          assert (root / 'crates/cli/src/bin/leopardwm-settings.rs').is_file()
+
+          config = (root / 'crates/daemon/src/config.rs').read_text(encoding='utf-8')
+          html = (root / 'crates/daemon/src/settings/settings.html').read_text(encoding='utf-8')
+          assert 'always_center_single_column' in config
+          assert 'always_center_single_column' in html
+
+          wxs = root / 'wix/main.wxs'
+          ET.parse(wxs)
+          wix = wxs.read_text(encoding='windows-1252')
+          assert "Manufacturer='sehoon123'" in wix
+          assert "UpgradeCode='EE10F2D5-DA80-43EA-B4D4-A0D37C69DE83'" in wix
+          assert 'leopardwm-settings.exe' in wix
+          assert "Id='StartMenuLeopardWM'" in wix
+          assert "Id='StartMenuSettings'" in wix
+          assert "Id='ARPPRODUCTICON'" in wix
+
+          assert (root / '.github/verify-msi.ps1').is_file()
+          assert (root / 'agent_docs/release-v0.2.6-sehoon.6.md').is_file()
+          stale = [
+              '.github/workflows/agent-production-hardening-v5.yml',
+              '.github/workflows/agent-export-current-source.yml',
+              '.github/scripts/apply_production_hardening_v5.py',
+              '.github/audit/trigger-production-hardening-v5',
+          ]
+          assert not any((root / path).exists() for path in stale), stale
+          print('source and MSI invariants: OK')
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'source or MSI invariant check failed' }
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { throw 'format check failed' }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'diff hygiene check failed' }
+
+      - name: Run full locked tests for every target
+        run: cargo test --workspace --all-targets --locked
+
+      - name: Run Clippy for every target with warnings denied
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Check every Cargo target
+        run: cargo check --workspace --all-targets --locked
+
+      - name: Run optimized library and binary tests
+        run: cargo test --workspace --lib --bins --release --locked
+
+      - name: Stress scratchpad and floating regressions
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          for ($i = 0; $i -lt 4; $i++) {
+            cargo test -p leopardwm-daemon --bin leopardwm --release --locked scratchpad - --test-threads=1
+            if ($LASTEXITCODE -ne 0) { throw "scratchpad regression iteration $i failed" }
+            cargo test -p leopardwm-daemon --bin leopardwm --release --locked floating -- --test-threads=1
+            if ($LASTEXITCODE -ne 0) { throw "floating regression iteration $i failed" }
+          }
+
+      - name: Build optimized Windows binaries
+        run: cargo build --workspace --release --locked
+
+      - name: Verify GUI executable subsystems
+        shell: pwsh
+        run: ./.github/verify-gui-subsystems.ps1
+
+      - name: Install cargo-wix
+        run: cargo install cargo-wix --version ^0.3 --locked
+
+      - name: Build and validate MSI installer
+        id: msi
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $wixBin = 'C:\Program Files (x86)\WiX Toolset v3.14\bin'
+          cargo wix -p leopardwm-daemon -I wix/main.wxs --target x86_64-pc-windows-msvc --no-build --nocapture --bin-path $wixBin
+          if ($LASTEXITCODE -ne 0) { throw 'cargo wix failed' }
+          $sourceMsi = Get-ChildItem target/wix/*.msi | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+          if (-not $sourceMsi) { throw 'cargo-wix produced no MSI' }
+          $releaseMsi = "LeopardWM-$env:RELEASE_VERSION-x86_64.msi"
+          Copy-Item $sourceMsi.FullName $releaseMsi -Force
+          ./.github/verify7ç\…ªì¶»§q«^
