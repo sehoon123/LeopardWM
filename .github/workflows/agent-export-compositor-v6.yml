@@ -25,3 +25,4 @@ jobs:
           path: LeopardWM-compositor-v6-source.zip
           if-no-files-found: error
           retention-days: 1
+          overwrite: true
