@@ -1,0 +1,318 @@
+name: Compositor-safe v6 build and release
+
+on:
+  push:
+    branches:
+      - agent/fix-compositor-desync-v6
+    paths:
+      - .github/workflows/agent-compositor-safe-v6-release.yml
+      - .github/audit/compositor-v6.patch.b64.*
+
+permissions:
+  contents: write
+
+concurrency:
+  group: compositor-safe-v6-release
+  cancel-in-progress: false
+
+env:
+  BASE_SHA: bf08d4f6969032d17bbde70266eccccbc27b621a
+  SOURCE_BRANCH: agent/compositor-safe-v6-source
+  RELEASE_TAG: v0.2.6-sehoon.6
+  RELEASE_VERSION: 0.2.6-sehoon.6
+  PATCH_SHA256: 94e233554930f3b3f912f19c7416e3058b1c8fe166d8e5ab5a0aadb0c1de5a9f
+
+jobs:
+  verify-build-release:
+    runs-on: windows-2022
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out release control branch
+        uses: actions/checkout@v4
+        with:
+          ref: agent/fix-compositor-desync-v6
+          fetch-depth: 0
+
+      - name: Reconstruct and verify reviewed source patch
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $parts = Get-ChildItem '.github/audit/compositor-v6.patch.b64.*' | Sort-Object Name
+          if ($parts.Count -ne 6) { throw "Expected 6 patch chunks, found $($parts.Count)" }
+          $encoded = ($parts | ForEach-Object { (Get-Content -Raw -Encoding ascii $_.FullName).Trim() }) -join ''
+          $bytes = [Convert]::FromBase64String($encoded)
+          $patch = Join-Path $env:RUNNER_TEMP 'compositor-v6.patch'
+          [IO.File]::WriteAllBytes($patch, $bytes)
+          $actual = (Get-FileHash -Algorithm SHA256 $patch).Hash.ToLowerInvariant()
+          if ($actual -ne $env:PATCH_SHA256) {
+            throw "Patch checksum mismatch: expected=$env:PATCH_SHA256 actual=$actual"
+          }
+          "PATCH_PATH=$patch" >> $env:GITHUB_ENV
+          Write-Host "Verified patch: $($bytes.Length) bytes / $actual"
+
+      - name: Check out exact v5 source and apply patch
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git checkout --detach $env:BASE_SHA
+          git reset --hard $env:BASE_SHA
+          git clean -fdx
+          git apply --check $env:PATCH_PATH
+          git apply $env:PATCH_PATH
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'Patch hygiene check failed' }
+
+      - name: Install stable Rust with quality components
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Format and verify source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo fmt --all
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { throw 'cargo fmt check failed' }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'git diff check failed' }
+
+      - name: Verify compositor-safety invariants
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          @'
+          from pathlib import Path
+          root = Path('.')
+          config = (root / 'crates/daemon/src/config.rs').read_text(encoding='utf-8')
+          transitions = (root / 'crates/daemon/src/transitions.rs').read_text(encoding='utf-8')
+          apply = (root / 'crates/daemon/src/layout_apply.rs').read_text(encoding='utf-8')
+          placement = (root / 'crates/platform_win32/src/placement.rs').read_text(encoding='utf-8')
+          settings = (root / 'crates/daemon/src/settings/settings.html').read_text(encoding='utf-8')
+          assert '#[serde(default = "default_true")]\n    pub compositor_safe_mode: bool' in config
+          assert 'settle_animations_for_compositor_safety' in transitions
+          assert 'if self.settle_animations_for_compositor_safety()' in apply
+          assert 'flags |= SWP_NOSIZE' in placement
+          assert 'behavior-compositor_safe_mode' in settings
+          assert 'is_compositor_sensitive_class_str' in placement
+          print('compositor-safety structural invariants: OK')
+          '@ | python -
+
+      - name: Run full locked tests for every target
+        run: cargo test --workspace --all-targets --locked
+
+      - name: Run Clippy for every target with warnings denied
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Check every Cargo target
+        run: cargo check --workspace --all-targets --locked
+
+      - name: Run optimized library and binary tests
+        run: cargo test --workspace --lib --bins --release --locked
+
+      - name: Repeat compositor, scratchpad, and floating regressions
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          for ($i = 0; $i -lt 5; $i++) {
+            cargo test -p leopardwm-daemon --bin leopardwm --release --locked compositor_safe -- --test-threads=1
+            if ($LASTEXITCODE -ne 0) { throw "compositor-safe iteration $i failed" }
+            cargo test -p leopardwm-daemon --bin leopardwm --release --locked scratchpad -- --test-threads=1
+            if ($LASTEXITCODE -ne 0) { throw "scratchpad iteration $i failed" }
+            cargo test -p leopardwm-daemon --bin leopardwm --release --locked floating -- --test-threads=1
+            if ($LASTEXITCODE -ne 0) { throw "floating iteration $i failed" }
+          }
+
+      - name: Build optimized Windows binaries
+        run: cargo build --workspace --release --locked
+
+      - name: Verify Windows GUI subsystems
+        shell: pwsh
+        run: ./.github/verify-gui-subsystems.ps1
+
+      - name: Install cargo-wix
+        run: cargo install cargo-wix --version ^0.3 --locked
+
+      - name: Build and administratively validate MSI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $wixCandidates = @(
+            'C:\Program Files (x86)\WiX Toolset v3.14\bin',
+            'C:\Program Files (x86)\WiX Toolset v3.11\bin'
+          )
+          $wixBin = $wixCandidates | Where-Object { Test-Path (Join-Path $_ 'candle.exe') } | Select-Object -First 1
+          if (-not $wixBin) { throw 'WiX Toolset v3 bin directory not found' }
+          cargo wix -p leopardwm-daemon -I wix/main.wxs --target x86_64-pc-windows-msvc --no-build --nocapture --bin-path "$wixBin"
+          if ($LASTEXITCODE -ne 0) { throw 'cargo wix failed' }
+          $builtMsi = Get-ChildItem target/wix/*.msi | Select-Object -First 1
+          if (-not $builtMsi) { throw 'MSI output not found' }
+          $releaseMsi = "LeopardWM-$env:RELEASE_VERSION-x86_64.msi"
+          Copy-Item $builtMsi.FullName $releaseMsi -Force
+          if ((Get-Item $releaseMsi).Length -lt 1000000) { throw 'MSI is unexpectedly small' }
+
+          $adminRoot = Join-Path $env:RUNNER_TEMP 'leopardwm-msi-admin'
+          New-Item -ItemType Directory -Path $adminRoot -Force | Out-Null
+          $msiPath = (Resolve-Path $releaseMsi).Path
+          $logPath = Join-Path $env:RUNNER_TEMP 'msi-admin.log'
+          $proc = Start-Process msiexec.exe -ArgumentList @('/a', "`"$msiPath`"", '/qn', "TARGETDIR=`"$adminRoot`"", '/l*v', "`"$logPath`"") -Wait -PassThru
+          if ($proc.ExitCode -ne 0) {
+            Get-Content $logPath -Tail 120 -ErrorAction SilentlyContinue
+            throw "MSI administrative install failed with exit code $($proc.ExitCode)"
+          }
+          foreach ($binary in @('leopardwm.exe','leopardwm-cli.exe','lwm.exe','leopardwm-watchdog.exe')) {
+            if (-not (Get-ChildItem $adminRoot -Recurse -Filter $binary -File)) {
+              throw "MSI administrative image is missing $binary"
+            }
+          }
+          "RELEASE_MSI=$releaseMsi" >> $env:GITHUB_ENV
+          Write-Host "Validated MSI: $releaseMsi"
+
+      - name: Commit and publish exact verified source branch
+        id: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add CHANGELOG.md README.md crates
+          git diff --cached --check
+          if ($LASTEXITCODE -ne 0) { throw 'Staged source failed diff check' }
+          git commit -m 'fix: prevent compositor surface drift during navigation'
+          if ($LASTEXITCODE -ne 0) { throw 'Source commit failed' }
+          $sha = (git rev-parse HEAD).Trim()
+          git push --force origin "HEAD:refs/heads/$env:SOURCE_BRANCH"
+          if ($LASTEXITCODE -ne 0) { throw 'Source branch push failed' }
+          $remote = git ls-remote origin "refs/heads/$env:SOURCE_BRANCH"
+          if ($LASTEXITCODE -ne 0 -or -not $remote) { throw 'Could not resolve source branch after push' }
+          $remoteSha = (($remote -split '\s+')[0]).Trim()
+          if ($remoteSha -ne $sha) { throw "Remote source mismatch: local=$sha remote=$remoteSha" }
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+          Write-Host "Verified source commit: $sha"
+
+      - name: Package portable release and checksums
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $candidateDirs = @('target/x86_64-pc-windows-msvc/release', 'target/release')
+          $binDir = $candidateDirs | Where-Object { Test-Path (Join-Path $_ 'leopardwm.exe') } | Select-Object -First 1
+          if (-not $binDir) { throw 'Release binary directory not found' }
+          $packageDir = "LeopardWM-$env:RELEASE_VERSION-x86_64-windows"
+          $zipPath = "$packageDir.zip"
+          New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
+          $binaries = @('leopardwm.exe','leopardwm-cli.exe','lwm.exe','leopardwm-watchdog.exe')
+          foreach ($binary in $binaries) {
+            $source = Join-Path $binDir $binary
+            if (-not (Test-Path $source)) { throw "Missing release binary: $source" }
+            Copy-Item $source (Join-Path $packageDir $binary) -Force
+            Copy-Item $source $binary -Force
+          }
+          Copy-Item README.md, LICENSE $packageDir
+          Compress-Archive -Path $packageDir -DestinationPath $zipPath -CompressionLevel Optimal -Force
+          $assets = @($zipPath, $env:RELEASE_MSI) + $binaries
+          $checksumLines = foreach ($asset in $assets) {
+            $hash = (Get-FileHash -Algorithm SHA256 $asset).Hash.ToLowerInvariant()
+            "$hash *$asset"
+          }
+          $checksumLines | Set-Content -Encoding ascii checksums.txt
+          "RELEASE_ZIP=$zipPath" >> $env:GITHUB_ENV
+          Get-Content checksums.txt
+
+      - name: Write release notes
+        shell: pwsh
+        run: |
+          @'
+          Personal-fork prerelease from `sehoon123/LeopardWM`.
+
+          The default compositor-safe movement path removes per-frame asynchronous live-HWND movement. Active scroll and structural animations are collapsed at the central frame-dispatch boundary into one exact synchronous landing, so keyboard focus, mouse focus, workspace switching, drag/drop, and future animation entry paths share the same protection against internal DirectComposition/swap-chain surface drift.
+
+          Additional hardening:
+          - legacy animation mode uses SWP_NOSIZE for pure horizontal moves
+          - final repair covers Chromium/Electron, Firefox, Explorer, Terminal, WinUI, WPF/WinForms, CEF, and Qt families
+          - failed or timed-out landing workers preserve the required repair for retry
+          - Settings exposes `Compositor-safe window movement`, enabled by default
+
+          Validation before publication:
+          - full debug test suite for all Cargo targets
+          - Clippy for all targets with warnings denied
+          - all-target Cargo check
+          - optimized library and binary tests
+          - repeated compositor/scratchpad/floating regressions
+          - optimized Windows build and GUI-subsystem verification
+          - WiX MSI build plus administrative-install extraction validation
+          - remote source-SHA verification before tag creation
+
+          Existing user configuration remains compatible. Disable `behavior.compositor_safe_mode` only to opt back into the legacy animated live-window path.
+          '@ | Set-Content -Encoding utf8 release-notes-v6.md
+
+      - name: Publish verified ZIP, MSI, and binaries
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:SOURCE_SHA) { throw 'Verified source SHA is empty' }
+          if (git ls-remote --exit-code --tags origin "refs/tags/$env:RELEASE_TAG") {
+            throw "Tag already exists: $env:RELEASE_TAG"
+          }
+          gh release create $env:RELEASE_TAG `
+            $env:RELEASE_ZIP `
+            $env:RELEASE_MSI `
+            leopardwm.exe `
+            leopardwm-cli.exe `
+            lwm.exe `
+            leopardwm-watchdog.exe `
+            checksums.txt `
+            --repo $env:GITHUB_REPOSITORY `
+            --target $env:SOURCE_SHA `
+            --title "LeopardWM $env:RELEASE_TAG — compositor-safe movement" `
+            --notes-file release-notes-v6.md `
+            --prerelease
+          if ($LASTEXITCODE -ne 0) { throw 'GitHub Release creation failed' }
+
+      - name: Verify published release, tag, assets, and checksums
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git fetch origin "refs/tags/$env:RELEASE_TAG:refs/tags/$env:RELEASE_TAG"
+          $tagSha = (git rev-list -n 1 $env:RELEASE_TAG).Trim()
+          if ($tagSha -ne $env:SOURCE_SHA) { throw "Tag/source mismatch: tag=$tagSha source=$env:SOURCE_SHA" }
+          $release = gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --json tagName,isDraft,isPrerelease,assets | ConvertFrom-Json
+          if ($release.tagName -ne $env:RELEASE_TAG -or $release.isDraft -or -not $release.isPrerelease) {
+            throw 'Published release metadata is invalid'
+          }
+          $expected = @($env:RELEASE_ZIP, $env:RELEASE_MSI, 'leopardwm.exe', 'leopardwm-cli.exe', 'lwm.exe', 'leopardwm-watchdog.exe', 'checksums.txt') | ForEach-Object { Split-Path $_ -Leaf }
+          $actual = @($release.assets | ForEach-Object { $_.name })
+          foreach ($name in $expected) {
+            if ($name -notin $actual) { throw "Missing release asset: $name" }
+          }
+          $report = [ordered]@{
+            tag = $env:RELEASE_TAG
+            source_sha = $env:SOURCE_SHA
+            tag_sha = $tagSha
+            assets = $actual
+            checksums = Get-Content checksums.txt
+          }
+          $report | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 verification-report.json
+          Write-Host "Published and verified $env:RELEASE_TAG at $tagSha"
+
+      - name: Upload verified release bundle as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: LeopardWM-v0.2.6-sehoon.6-verified
+          path: |
+            ${{ env.RELEASE_ZIP }}
+            ${{ env.RELEASE_MSI }}
+            leopardwm.exe
+            leopardwm-cli.exe
+            lwm.exe
+            leopardwm-watchdog.exe
+            checksums.txt
+            verification-report.json
+          if-no-files-found: error
+          retention-days: 7
