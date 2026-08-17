@@ -1,0 +1,71 @@
+n path
+    raise RuntimeError("release binary directory not found")
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def package_release(msi: Path) -> tuple[Path, list[Path]]:
+    bin_dir = release_bin_dir()
+    package_dir = ROOT / f"LeopardWM-{RELEASE_VERSION}-x86_64-windows"
+    if package_dir.exists():
+        shutil.rmtree(package_dir)
+    package_dir.mkdir()
+
+    root_binaries: list[Path] = []
+    for name in BINARIES:
+        source = bin_dir / name
+        if not source.is_file():
+            raise RuntimeError(f"missing binary: {source}")
+        shutil.copy2(source, package_dir / name)
+        root_copy = ROOT / name
+        shutil.copy2(source, root_copy)
+        root_binaries.append(root_copy)
+
+    report = ROOT / "agent_docs/release-v0.2.6-sehoon.6.md"
+    for source in (ROOT / "README.md", ROOT / "LICENSE", report):
+        shutil.copy2(source, package_dir / source.name)
+
+    zip_path = ROOT / f"LeopardWM-{RELEASE_VERSION}-x86_64-windows.zip"
+    if zip_path.exists():
+        zip_path.unlink()
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+        for path in sorted(package_dir.rglob("*")):
+            if path.is_file():
+                archive.write(path, path.relative_to(ROOT))
+
+    assets = [zip_path, msi, *root_binaries, report]
+    checksums = ROOT / "checksums.txt"
+    checksums.write_text(
+        "".join(f"{sha256(path)} *{path.relative_to(ROOT)}\n" for path in assets),
+        encoding="ascii",
+    )
+    print(checksums.read_text(encoding="ascii"))
+    return zip_path, [*assets, checksums]
+
+
+def write_release_notes() -> Path:
+    path = ROOT / "release-notes-v6.md"
+    path.write_text(
+        textwrap.dedent(
+            """\
+            Personal-fork prerelease from `sehoon123/LeopardWM`.
+
+            Features and fixes:
+            - adds `lwm settings` plus a console-free Start Menu Settings launcher
+            - adds `lwm release-all` and routes tray recovery through the same tested command
+            - adds optional always-center-single-column behavior
+            - preserves physical animation direction while cycling workspace 1 and 9
+            - removes stale active-border overlays when the focused window closes or hides
+            - upgrades the additive IPC protocol to v3
+            - includes upstream clap 4.6.6 and thiserror 2.0.20 patch updates
+
+            Distribution:
+            - portable ZIP and individual executables
+            - validated per-machine MSI with Start Menu shortcuts, PATH integration, ARP icon,
+              un
