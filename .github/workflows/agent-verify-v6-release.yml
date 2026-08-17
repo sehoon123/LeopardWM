@@ -1,0 +1,99 @@
+name: Verify published v6 release
+
+on:
+  push:
+    branches:
+      - agent/msi-v6-clean
+    paths:
+      - .github/workflows/agent-verify-v6-release.yml
+      - .github/audit/trigger-verify-v6
+
+permissions:
+  contents: write
+
+concurrency:
+  group: verify-v6-release
+  cancel-in-progress: true
+
+env:
+  RELEASE_TAG: v0.2.6-sehoon.6
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: agent/msi-v6-clean
+          fetch-depth: 0
+
+      - name: Verify GitHub Release, tag, ZIP, MSI, and checksums
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          rm -rf release-check
+          mkdir release-check
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json tagName,isDraft,isPrerelease,targetCommitish,assets > release-check/release.json
+          python - <<'PY'
+          import json
+          d=json.load(open('release-check/release.json',encoding='utf-8'))
+          assert d['tagName']=='v0.2.6-sehoon.6'
+          assert d['isDraft'] is False
+          assert d['isPrerelease'] is True
+          names={a['name'] for a in d['assets']}
+          assert 'LeopardWM-0.2.6-sehoon.6-x86_64-windows.zip' in names, names
+          assert 'checksums.txt' in names, names
+          assert any(n.lower().endswith('.msi') for n in names), names
+          PY
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir release-check
+          python - <<'PY'
+          from pathlib import Path
+          import hashlib, json, zipfile
+          root=Path('release-check')
+          msis=list(root.glob('*.msi'))
+          zips=list(root.glob('*.zip'))
+          assert len(msis)==1, msis
+          assert len(zips)==1, zips
+          msi=msis[0]
+          assert msi.stat().st_size > 1_000_000
+          assert msi.read_bytes()[:8] == bytes.fromhex('d0cf11e0a1b11ae1')
+          with zipfile.ZipFile(zips[0]) as zf:
+              assert zf.testzip() is None
+              names={Path(n).name for n in zf.namelist()}
+              for exe in ('leopardwm.exe','leopardwm-cli.exe','lwm.exe','leopardwm-watchdog.exe'):
+                  assert exe in names, (exe,names)
+          release=json.load(open(root/'release.json',encoding='utf-8'))
+          assets={a['name'] for a in release['assets']}
+          data={
+              'tag': release['tagName'],
+              'target': release['targetCommitish'],
+              'msi': msi.name,
+              'msi_size': msi.stat().st_size,
+              'msi_sha256': hashlib.sha256(msi.read_bytes()).hexdigest(),
+              'zip': zips[0].name,
+              'zip_size': zips[0].stat().st_size,
+              'zip_sha256': hashlib.sha256(zips[0].read_bytes()).hexdigest(),
+              'assets': sorted(assets),
+          }
+          Path('agent_docs/v6-release-verified.json').write_text(json.dumps(data,indent=2)+'\n',encoding='utf-8')
+          PY
+          (cd release-check && sha256sum -c checksums.txt)
+          git fetch --tags origin
+          TAG_SHA=$(git rev-list -n 1 "$RELEASE_TAG")
+          TARGET=$(python -c "import json; print(json.load(open('release-check/release.json'))['targetCommitish'])")
+          RESOLVED_TARGET=$(git rev-parse "$TARGET")
+          test "$TAG_SHA" = "$RESOLVED_TARGET"
+
+      - name: Commit verification receipt
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add agent_docs/v6-release-verified.json
+          if ! git diff --cached --quiet; then
+            git commit -m 'chore: record verified v6 MSI release assets'
+            git push origin HEAD:agent/msi-v6-clean
+          fi
