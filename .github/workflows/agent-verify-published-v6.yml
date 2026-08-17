@@ -140,14 +140,14 @@ jobs:
             $actualHash = (Get-FileHash -Algorithm SHA256 $path).Hash.ToLowerInvariant()
             $expectedHash = $publishedChecksums[$name]
             if ($actualHash -ne $expectedHash) {
-              throw "Checksum mismatch for $name: expected=$expectedHash actual=$actualHash"
+              throw "Checksum mismatch for ${name}: expected=$expectedHash actual=$actualHash"
             }
             if (-not $apiAssets.ContainsKey($name)) {
               throw "GitHub API metadata is missing: $name"
             }
             $apiDigest = [string]$apiAssets[$name].digest
             if ($apiDigest -ne "sha256:$actualHash") {
-              throw "GitHub asset digest mismatch for $name: api=$apiDigest actual=sha256:$actualHash"
+              throw "GitHub asset digest mismatch for ${name}: api=$apiDigest actual=sha256:$actualHash"
             }
             $verifiedAssets += [ordered]@{
               name = $name
