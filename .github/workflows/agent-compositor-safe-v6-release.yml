@@ -20,7 +20,7 @@ env:
   SOURCE_BRANCH: agent/compositor-safe-v6-source
   RELEASE_TAG: v0.2.6-sehoon.6
   RELEASE_VERSION: 0.2.6-sehoon.6
-  PATCH_SHA256: 94e233554930f3b3f912f19c7416e3058b1c8fe166d8e5ab5a0aadb0c1de5a9f
+  PATCH_SHA256: d2ecbf65ee12b178a2b1af8638db4cd4a74a79de98ef5afc4521a32b17b0782b
 
 jobs:
   verify-build-release:
