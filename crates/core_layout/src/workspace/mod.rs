@@ -40,6 +40,14 @@ pub struct FloatingWindow {
     pub pinned: bool,
 }
 
+/// Tiling state needed to restore a manually floated window.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FloatOrigin {
+    pub(crate) left_neighbor: Option<WindowId>,
+    pub(crate) fallback_index: usize,
+    pub(crate) column_width: i32,
+}
+
 /// The scrollable workspace.
 /// This is the core data structure representing the infinite horizontal strip.
 ///
@@ -114,11 +122,10 @@ pub struct Workspace {
     #[serde(skip)]
     pub(crate) pending_min_size_clears: HashSet<WindowId>,
     /// Origin info for windows floated via toggle_floating.
-    /// Stores (left_neighbor, fallback_index) to restore position when unfloating.
-    /// Left neighbor is used to find the right neighborhood even after column changes;
-    /// fallback index is used when the neighbor no longer exists.
+    /// The left-neighbor/index pair restores position after intervening column changes;
+    /// `column_width` preserves the user's custom tiled width across the round trip.
     #[serde(skip)]
-    pub(crate) float_origin_column: HashMap<WindowId, (Option<WindowId>, usize)>,
+    pub(crate) float_origin_column: HashMap<WindowId, FloatOrigin>,
     /// Snap scroll instantly instead of animating (Windows "Show animations" off).
     #[serde(skip)]
     pub(crate) reduce_motion: bool,

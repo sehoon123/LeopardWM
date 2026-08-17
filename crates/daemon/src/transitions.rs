@@ -384,7 +384,8 @@ impl AppState {
     ) {
         let mut live: Vec<leopardwm_core_layout::WindowPlacement> =
             Vec::with_capacity(placements.len());
-        let mut ghosts: Vec<animation_worker::GhostFrame> = Vec::new();
+        let mut ghosts: Vec<animation_worker::GhostFrame> =
+            Vec::with_capacity(placements.len().min(ghost_handles.len()));
 
         let host_origin = leopardwm_platform_win32::thumbnail::host().origin();
         let ghosted_wids = transition.map(|t| &t.ghosted_wids);

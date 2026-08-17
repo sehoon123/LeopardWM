@@ -7,7 +7,7 @@
 //! with `window.ipc.postMessage`.
 
 use std::sync::mpsc;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::Result;
 use tracing::{info, warn};
@@ -20,13 +20,14 @@ use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Controls::MARGINS;
+use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForSystem, GetDpiForWindow};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use raw_window_handle::{
     HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle, Win32WindowHandle,
     WindowsDisplayHandle,
 };
-use wry::{WebContext, WebViewBuilderExtWindows as _};
+use wry::WebContext;
 
 use crate::config::Config;
 
@@ -40,8 +41,11 @@ const DWMWA_SYSTEMBACKDROP_TYPE_VAL: i32 = 38;
 const DWMWCP_ROUND: u32 = 2;
 const DWMSBT_MAINWINDOW: u32 = 2; // Mica
 
-const WINDOW_WIDTH: i32 = 780;
-const WINDOW_HEIGHT: i32 = 560;
+const BASE_DPI: u32 = 96;
+const WINDOW_CLIENT_WIDTH: i32 = 780;
+const WINDOW_CLIENT_HEIGHT: i32 = 560;
+const WINDOW_MIN_CLIENT_WIDTH: i32 = 640;
+const WINDOW_MIN_CLIENT_HEIGHT: i32 = 420;
 
 // Dark mode background (COLORREF = 0x00BBGGRR)
 const DARK_BG: u32 = 0x00202020;
@@ -50,6 +54,10 @@ const DARK_BG: u32 = 0x00202020;
 /// warning. Carries no payload; the new list is read from `PENDING_FAILED_BINDS`
 /// on the window's own thread (the only thread that may touch the webview).
 const WM_SETTINGS_PUSH_BINDS: u32 = WM_APP + 1;
+/// Custom message: restore and foreground the existing settings window.
+/// Sent to the settings thread so all window activation work stays on the
+/// owning GUI thread.
+const WM_SETTINGS_ACTIVATE: u32 = WM_APP + 2;
 
 /// Thread id of the open settings window's message loop, or `None` when closed.
 /// We target the thread queue (not the HWND) so a destroyed or recycled window
@@ -57,23 +65,51 @@ const WM_SETTINGS_PUSH_BINDS: u32 = WM_APP + 1;
 static SETTINGS_THREAD: Mutex<Option<u32>> = Mutex::new(None);
 /// Latest rejected-bind list as a JSON array, staged for the next push.
 static PENDING_FAILED_BINDS: Mutex<Option<String>> = Mutex::new(None);
+/// Rendered static settings resources are shared across opens.
+static SETTINGS_HTML_RENDERED: OnceLock<String> = OnceLock::new();
+static SETTINGS_HOTKEY_CATALOG_JSON: OnceLock<String> = OnceLock::new();
 
 /// Push an updated rejected-hotkey list to the open settings window, if one is
 /// open. Safe to call from any thread and no-ops when no window is open; the
 /// `evaluate_script` itself runs on the window's own thread via its message loop.
 pub fn push_failed_binds(failed_binds: &[String]) {
     let thread_id = match SETTINGS_THREAD.lock() {
-        Ok(g) => *g,
+        Ok(guard) => *guard,
         Err(_) => return,
     };
     let Some(thread_id) = thread_id else { return };
     let json = serde_json::to_string(failed_binds).unwrap_or_else(|_| "[]".to_string());
-    if let Ok(mut pending) = PENDING_FAILED_BINDS.lock() {
-        *pending = Some(json);
+    let Ok(mut pending) = PENDING_FAILED_BINDS.lock() else {
+        return;
+    };
+
+    // Keep the staging mutex held until the thread message has been accepted.
+    // The window thread takes the same mutex before consuming the payload, so it
+    // can never observe a message without its matching data. A failed post does
+    // not leave stale data for a later settings-window lifetime.
+    *pending = Some(json);
+    let posted = unsafe {
+        PostThreadMessageW(thread_id, WM_SETTINGS_PUSH_BINDS, WPARAM(0), LPARAM(0)).is_ok()
+    };
+    if !posted {
+        *pending = None;
     }
-    unsafe {
-        let _ = PostThreadMessageW(thread_id, WM_SETTINGS_PUSH_BINDS, WPARAM(0), LPARAM(0));
-    }
+}
+
+/// Bring the already-open settings window back to the foreground.
+///
+/// Activation is posted to the owning message loop rather than manipulating
+/// the HWND from the daemon thread. Returns false only when the window is not
+/// ready yet, has already closed, or its thread queue rejected the message.
+pub fn focus_existing_window() -> bool {
+    let thread_id = match SETTINGS_THREAD.lock() {
+        Ok(guard) => *guard,
+        Err(_) => return false,
+    };
+    let Some(thread_id) = thread_id else {
+        return false;
+    };
+    unsafe { PostThreadMessageW(thread_id, WM_SETTINGS_ACTIVATE, WPARAM(0), LPARAM(0)).is_ok() }
 }
 
 /// Wrapper that implements `HasWindowHandle` + `HasDisplayHandle` for a raw HWND.
@@ -100,6 +136,62 @@ impl HasDisplayHandle for Win32Handle {
         let raw = RawDisplayHandle::Windows(WindowsDisplayHandle::new());
         Ok(unsafe { raw_window_handle::DisplayHandle::borrow_raw(raw) })
     }
+}
+
+fn settings_window_style() -> WINDOW_STYLE {
+    // WS_OVERLAPPEDWINDOW supplies the resize frame and both caption buttons.
+    // WS_CLIPCHILDREN prevents the Mica/background erase pass from painting over
+    // WebView2 while its child controller follows an interactive resize.
+    WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN
+}
+
+fn normalized_dpi(dpi: u32) -> u32 {
+    if dpi == 0 {
+        BASE_DPI
+    } else {
+        dpi
+    }
+}
+
+fn scale_logical_px(value: i32, dpi: u32) -> i32 {
+    let value = i64::from(value.max(1));
+    let dpi = i64::from(normalized_dpi(dpi));
+    let scaled = (value * dpi + i64::from(BASE_DPI / 2)) / i64::from(BASE_DPI);
+    scaled.clamp(1, i64::from(i32::MAX)) as i32
+}
+
+/// Convert a desired logical client size into the top-level window size needed
+/// for the active DPI, including caption and resize-frame metrics.
+unsafe fn outer_size_for_client(client_width: i32, client_height: i32, dpi: u32) -> (i32, i32) {
+    let dpi = normalized_dpi(dpi);
+    let mut rect = RECT {
+        left: 0,
+        top: 0,
+        right: scale_logical_px(client_width, dpi),
+        bottom: scale_logical_px(client_height, dpi),
+    };
+    if AdjustWindowRectExForDpi(
+        &mut rect,
+        settings_window_style(),
+        false,
+        WINDOW_EX_STYLE::default(),
+        dpi,
+    )
+    .is_err()
+    {
+        return (rect.right.max(1), rect.bottom.max(1));
+    }
+    (
+        rect.right.saturating_sub(rect.left).max(1),
+        rect.bottom.saturating_sub(rect.top).max(1),
+    )
+}
+
+fn initial_section_script(section: &str) -> String {
+    let section_json = serde_json::to_string(section).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        "(function(section){{var items=document.querySelectorAll('.nav-item[data-section]');for(var i=0;i<items.length;i++){{if(items[i].dataset.section===section){{items[i].click();break;}}}}}})({section_json});"
+    )
 }
 
 /// Build and run the settings window. Blocks until the window is closed.
@@ -149,27 +241,40 @@ pub fn run_settings_window(
         };
         RegisterClassExW(&wc);
 
-        // Create the window
-        let hwnd = CreateWindowExW(
-            WINDOW_EX_STYLE::default(),
+        // Create a DPI-correct, normally resizable top-level window. Wry's
+        // Windows backend automatically resizes the WebView2 controller when its
+        // parent HWND changes size.
+        let ex_style = WINDOW_EX_STYLE::default();
+        let style = settings_window_style();
+        let dpi = normalized_dpi(GetDpiForSystem());
+        let (window_width, window_height) =
+            outer_size_for_client(WINDOW_CLIENT_WIDTH, WINDOW_CLIENT_HEIGHT, dpi);
+        let hwnd = match CreateWindowExW(
+            ex_style,
             class_name,
             w!("LeopardWM Settings"),
-            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
+            style,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
-            WINDOW_WIDTH,
-            WINDOW_HEIGHT,
+            window_width,
+            window_height,
             None,
             None,
             Some(hinstance.into()),
             None,
-        )?;
-
-        // Expose this thread's id so the daemon can push live updates to the
-        // window's message queue (see push_failed_binds).
-        if let Ok(mut g) = SETTINGS_THREAD.lock() {
-            *g = Some(GetCurrentThreadId());
-        }
+        ) {
+            Ok(hwnd) => hwnd,
+            Err(error) => {
+                let _ = UnregisterClassW(class_name, Some(hinstance.into()));
+                if dark {
+                    let _ = DeleteObject(HGDIOBJ(bg_brush.0));
+                }
+                if let Some(icon_sm) = icon_sm {
+                    let _ = DestroyIcon(icon_sm);
+                }
+                return Err(error.into());
+            }
+        };
 
         // Apply Windows 11 DWM theming (Mica backdrop, dark title bar, rounded corners)
         apply_win11_theming(hwnd, dark);
@@ -210,8 +315,10 @@ pub fn run_settings_window(
         };
         // The settings UI derives its hotkey-list labels, order, and
         // reset-to-defaults from this single catalog (see ipc::hotkeys).
-        let catalog_json = serde_json::to_string(&leopardwm_ipc::hotkeys::hotkey_catalog())
-            .unwrap_or_else(|_| "[]".to_string());
+        let catalog_json = SETTINGS_HOTKEY_CATALOG_JSON.get_or_init(|| {
+            serde_json::to_string(&leopardwm_ipc::hotkeys::hotkey_catalog())
+                .unwrap_or_else(|_| "[]".to_string())
+        });
         let failed_binds_json =
             serde_json::to_string(&failed_binds).unwrap_or_else(|_| "[]".to_string());
 
@@ -219,9 +326,10 @@ pub fn run_settings_window(
         // moved into the IPC handler closure below.
         let close_tx = event_tx.clone();
 
-        let settings_html = SETTINGS_HTML.replace("{VERSION}", env!("CARGO_PKG_VERSION"));
-        let webview = wry::WebViewBuilder::new_with_web_context(&mut web_context)
-            .with_html(&settings_html)
+        let settings_html = SETTINGS_HTML_RENDERED
+            .get_or_init(|| SETTINGS_HTML.replace("{VERSION}", env!("CARGO_PKG_VERSION")));
+        let webview_result = wry::WebViewBuilder::new_with_web_context(&mut web_context)
+            .with_html(settings_html.as_str())
             .with_initialization_script(format!(
                 "window._initConfig = {}; window._hotkeyCatalog = {}; window._failedHotkeys = {};",
                 config_json, catalog_json, failed_binds_json
@@ -231,20 +339,38 @@ pub fn run_settings_window(
             })
             .with_transparent(true)
             .with_background_color((0, 0, 0, 0))
-            .with_additional_browser_args("--disable-features=msSmartScreenProtection")
-            .build(&win_handle)?;
+            .build(&win_handle);
+        let webview = match webview_result {
+            Ok(webview) => webview,
+            Err(error) => {
+                let _ = DestroyWindow(hwnd);
+                let _ = UnregisterClassW(class_name, Some(hinstance.into()));
+                if dark {
+                    let _ = DeleteObject(HGDIOBJ(bg_brush.0));
+                }
+                if let Some(icon_sm) = icon_sm {
+                    let _ = DestroyIcon(icon_sm);
+                }
+                return Err(error.into());
+            }
+        };
+
+        // Publish the thread id only after the window and WebView are fully
+        // initialized. This prevents live-update or focus messages from racing
+        // a half-constructed settings surface.
+        if let Ok(mut guard) = SETTINGS_THREAD.lock() {
+            *guard = Some(GetCurrentThreadId());
+        }
 
         // Populate the form with the current config
         let init_js = "init(window._initConfig)".to_string();
         let _ = webview.evaluate_script(&init_js);
 
-        // Navigate to initial section if requested
+        // Navigate without interpolating the section into a CSS selector. The
+        // current callers use internal constants, but JSON quoting keeps this
+        // boundary safe and a missing section now degrades to a no-op.
         if let Some(section) = initial_section {
-            let nav_js = format!(
-                "document.querySelector('.nav-item[data-section=\"{}\"]').click()",
-                section
-            );
-            let _ = webview.evaluate_script(&nav_js);
+            let _ = webview.evaluate_script(&initial_section_script(section));
         }
 
         // Show the window
@@ -258,6 +384,15 @@ pub fn run_settings_window(
             let rc = GetMessageW(&mut msg_buf, None, 0, 0).0;
             if rc <= 0 {
                 break;
+            }
+            if msg_buf.message == WM_SETTINGS_ACTIVATE {
+                if IsIconic(hwnd).as_bool() {
+                    let _ = ShowWindow(hwnd, SW_RESTORE);
+                } else {
+                    let _ = ShowWindow(hwnd, SW_SHOW);
+                }
+                let _ = SetForegroundWindow(hwnd);
+                continue;
             }
             // Daemon-initiated live refresh of the rejected-hotkey warning. The
             // webview is only valid on this thread, so we apply it here rather
@@ -277,21 +412,32 @@ pub fn run_settings_window(
             DispatchMessageW(&msg_buf);
         }
 
-        // The window is gone; stop the daemon from posting to a dead thread.
-        if let Ok(mut g) = SETTINGS_THREAD.lock() {
-            *g = None;
+        // Stop the daemon from posting to this thread before tearing down
+        // WebView2 and its parent HWND.
+        if let Ok(mut guard) = SETTINGS_THREAD.lock() {
+            *guard = None;
+        }
+        if let Ok(mut pending) = PENDING_FAILED_BINDS.lock() {
+            *pending = None;
         }
         // Let the daemon resume hotkeys if the window closed mid-recording.
         let _ = close_tx.send(SettingsEvent::Closed);
 
-        // Hide window before tearing down WebView2 to prevent white flash.
+        // Keep the parent alive until the WebView2 controller has been dropped;
+        // destroying the HWND first can leave COM teardown racing a dead host.
         let _ = ShowWindow(hwnd, SW_HIDE);
         drop(webview);
         drop(web_context);
+        if IsWindow(Some(hwnd)).as_bool() {
+            let _ = DestroyWindow(hwnd);
+        }
+        let _ = UnregisterClassW(class_name, Some(hinstance.into()));
         if dark {
             let _ = DeleteObject(HGDIOBJ(bg_brush.0));
         }
-        let _ = UnregisterClassW(class_name, Some(hinstance.into()));
+        if let Some(icon_sm) = icon_sm {
+            let _ = DestroyIcon(icon_sm);
+        }
     }
 
     Ok(())
@@ -415,6 +561,33 @@ unsafe extern "system" fn wndproc(
             FillRect(hdc, &rc, HBRUSH(GetStockObject(BLACK_BRUSH).0));
             LRESULT(1)
         }
+        WM_GETMINMAXINFO => {
+            let dpi = normalized_dpi(GetDpiForWindow(hwnd));
+            let (min_width, min_height) =
+                outer_size_for_client(WINDOW_MIN_CLIENT_WIDTH, WINDOW_MIN_CLIENT_HEIGHT, dpi);
+            let info = &mut *(lparam.0 as *mut MINMAXINFO);
+            info.ptMinTrackSize.x = min_width;
+            info.ptMinTrackSize.y = min_height;
+            LRESULT(0)
+        }
+        WM_DPICHANGED => {
+            // Per-monitor DPI awareness requires accepting Windows' suggested
+            // outer rectangle when the settings window crosses monitor scales.
+            let suggested = lparam.0 as *const RECT;
+            if !suggested.is_null() {
+                let suggested = &*suggested;
+                let _ = SetWindowPos(
+                    hwnd,
+                    None,
+                    suggested.left,
+                    suggested.top,
+                    suggested.right.saturating_sub(suggested.left),
+                    suggested.bottom.saturating_sub(suggested.top),
+                    SWP_NOACTIVATE | SWP_NOZORDER,
+                );
+            }
+            LRESULT(0)
+        }
         WM_SETTINGCHANGE => {
             // Re-apply DWM theming on any system setting change (theme toggle, etc.).
             // Cheap and idempotent — avoids unsafe lparam string parsing.
@@ -422,7 +595,11 @@ unsafe extern "system" fn wndproc(
             DefWindowProcW(hwnd, message, wparam, lparam)
         }
         WM_CLOSE => {
-            let _ = DestroyWindow(hwnd);
+            // Hide first, then let the owning message loop drop WebView2 before
+            // it destroys the parent HWND. This avoids a white teardown flash and
+            // keeps COM/controller destruction ordered.
+            let _ = ShowWindow(hwnd, SW_HIDE);
+            PostQuitMessage(0);
             LRESULT(0)
         }
         WM_DESTROY => {
@@ -494,6 +671,39 @@ unsafe fn apply_win11_theming(hwnd: HWND, dark: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_window_style_is_resizable_and_child_flicker_safe() {
+        let style = settings_window_style();
+        for required in [
+            WS_THICKFRAME,
+            WS_MAXIMIZEBOX,
+            WS_MINIMIZEBOX,
+            WS_CLIPCHILDREN,
+        ] {
+            assert_ne!(style.0 & required.0, 0, "missing style bit: {required:?}");
+        }
+    }
+
+    #[test]
+    fn logical_pixel_scaling_handles_common_dpi_and_zero_fallback() {
+        assert_eq!(scale_logical_px(100, 0), 100);
+        assert_eq!(scale_logical_px(100, 96), 100);
+        assert_eq!(scale_logical_px(100, 120), 125);
+        assert_eq!(scale_logical_px(100, 144), 150);
+        assert_eq!(scale_logical_px(100, 192), 200);
+    }
+
+    #[test]
+    fn initial_section_script_json_quotes_the_section() {
+        let section = "layout\");window.__leopardwm_injected=true;//";
+        let encoded = serde_json::to_string(section).unwrap();
+        let script = initial_section_script(section);
+
+        assert!(script.ends_with(&format!("({encoded});")));
+        assert!(script.contains("dataset.section===section"));
+        assert!(!script.contains("data-section=\\\"{}\\\""));
+    }
 
     #[test]
     fn allowed_urls_include_settings_links_and_mixed_case_schemes() {

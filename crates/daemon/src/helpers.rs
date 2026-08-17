@@ -254,12 +254,11 @@ impl AppState {
     /// Capture the latest geometry for a managed floating window before it is
     /// removed from its workspace. A stored floating entry is required before
     /// probing DWM, so tiled windows can never seed floating-size history.
-    pub(crate) fn capture_floating_geometry(&mut self, hwnd: u64) -> Option<Rect> {
-        let stored_rect = self.floating_rect_for_window(hwnd)?;
-        #[cfg(not(test))]
-        let rect = leopardwm_platform_win32::get_window_visible_rect(hwnd).unwrap_or(stored_rect);
-        #[cfg(test)]
-        let rect = stored_rect;
+    pub(crate) fn snapshot_managed_floating_geometry(&mut self, hwnd: u64) -> Option<Rect> {
+        // A hide/show, float/unfloat, or scratchpad transition must snapshot
+        // LeopardWM's managed geometry, not DWM's asynchronously updated frame.
+        // User-confirmed resizing is learned separately by the MoveSizeEnd path.
+        let rect = self.floating_rect_for_window(hwnd)?;
 
         if self.update_floating_geometry(hwnd, rect) {
             Some(rect)
@@ -721,5 +720,26 @@ impl AppState {
             self.sync_foreground_window();
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+#[cfg(test)]
+mod floating_capture_tests {
+    #[test]
+    fn transition_snapshot_uses_only_managed_geometry() {
+        let source = include_str!("helpers.rs");
+        let start = source
+            .find("pub(crate) fn snapshot_managed_floating_geometry")
+            .expect("snapshot helper must exist");
+        let tail = &source[start..];
+        let end = tail
+            .find("\n    }\n")
+            .map_or(tail.len(), |idx| idx + "\n    }\n".len());
+        let body = &tail[..end];
+        let forbidden_probe = ["get_window_", "visible_rect"].concat();
+
+        assert!(body.contains("floating_rect_for_window(hwnd)"));
+        assert!(!body.contains(&forbidden_probe));
     }
 }

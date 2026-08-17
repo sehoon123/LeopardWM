@@ -2258,7 +2258,7 @@ impl AppState {
                 }
                 if let Err(e) = workspace.focus_window(hwnd) {
                     debug!(
-            "Failed to focus window {} for focus-follows-mouse: {}",
+                        "Failed to focus window {} for focus-follows-mouse: {}",
                         hwnd, e
                     );
                     return false;

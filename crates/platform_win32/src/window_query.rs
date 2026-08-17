@@ -262,8 +262,7 @@ pub fn is_shift_key_pressed() -> bool {
 /// cannot change the preview/drop contract halfway through.
 pub fn is_ctrl_alt_pressed() -> bool {
     unsafe {
-        (GetAsyncKeyState(VK_LCONTROL.0 as i32) < 0
-            || GetAsyncKeyState(VK_RCONTROL.0 as i32) < 0)
+        (GetAsyncKeyState(VK_LCONTROL.0 as i32) < 0 || GetAsyncKeyState(VK_RCONTROL.0 as i32) < 0)
             && GetAsyncKeyState(VK_LMENU.0 as i32) < 0
     }
 }

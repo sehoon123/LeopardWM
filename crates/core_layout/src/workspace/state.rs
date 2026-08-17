@@ -1,6 +1,6 @@
 use crate::*;
 
-use crate::workspace::Workspace;
+use crate::workspace::{FloatOrigin, Workspace};
 
 impl Workspace {
     // ========================================================================
@@ -175,7 +175,11 @@ impl Workspace {
             } else {
                 None
             };
-            (left_neighbor, col_idx)
+            FloatOrigin {
+                left_neighbor,
+                fallback_index: col_idx,
+                column_width: self.columns[col_idx].width,
+            }
         });
 
         // Remove from columns
@@ -197,18 +201,18 @@ impl Workspace {
         // Read origin before remove_floating (which clears it)
         let origin = self.float_origin_column.remove(&window_id);
         if self.remove_floating(window_id) {
-            if let Some((left_neighbor, fallback_idx)) = origin {
+            if let Some(origin) = origin {
                 // Try to find the left neighbor's current column and insert after it.
                 // Falls back to the saved index if the neighbor no longer exists.
-                let target = if let Some(neighbor_id) = left_neighbor {
+                let target = if let Some(neighbor_id) = origin.left_neighbor {
                     self.find_window_location(neighbor_id)
                         .map(|(col_idx, _)| col_idx + 1)
-                        .unwrap_or_else(|| fallback_idx.min(self.columns.len()))
+                        .unwrap_or_else(|| origin.fallback_index.min(self.columns.len()))
                 } else {
                     // Was the leftmost column — insert at 0
                     0
                 };
-                let column_width = self.default_column_width.max(crate::MIN_COLUMN_WIDTH);
+                let column_width = origin.column_width.max(crate::MIN_COLUMN_WIDTH);
                 let column = Column::new(window_id, column_width);
                 let target = target.min(self.columns.len());
                 self.insert_column_at(column, target);

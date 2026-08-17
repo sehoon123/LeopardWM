@@ -8,6 +8,7 @@ authors.workspace = true
 description = "Platform-agnostic scrollable tiling layout engine for LeopardWM"
 
 [dependencies]
+smallvec = "1.15"
 serde = { workspace = true }
 thiserror = { workspace = true }
 

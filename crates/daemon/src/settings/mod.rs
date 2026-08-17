@@ -34,6 +34,15 @@ pub enum SettingsEvent {
 /// Singleton guard — only one settings window at a time.
 static SETTINGS_OPEN: AtomicBool = AtomicBool::new(false);
 
+/// Resets the singleton flag even if the settings thread unwinds unexpectedly.
+struct SettingsOpenGuard;
+
+impl Drop for SettingsOpenGuard {
+    fn drop(&mut self) {
+        SETTINGS_OPEN.store(false, Ordering::SeqCst);
+    }
+}
+
 /// Handle to the settings window thread.
 pub struct SettingsWindowHandle {
     _thread: std::thread::JoinHandle<()>,
@@ -55,14 +64,19 @@ impl SettingsWindowHandle {
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
-            info!("Settings window already open — focusing existing");
+            if win32::focus_existing_window() {
+                info!("Settings window already open — focused existing window");
+            } else {
+                info!("Settings window already open — it is still initializing");
+            }
             return None;
         }
 
         let section = initial_section.map(String::from);
-        let handle = std::thread::Builder::new()
+        let handle = match std::thread::Builder::new()
             .name("settings-window".into())
             .spawn(move || {
+                let _open_guard = SettingsOpenGuard;
                 if let Err(e) = win32::run_settings_window(
                     config,
                     event_tx,
@@ -72,9 +86,14 @@ impl SettingsWindowHandle {
                 ) {
                     warn!("Settings window error: {}", e);
                 }
+            }) {
+            Ok(handle) => handle,
+            Err(error) => {
                 SETTINGS_OPEN.store(false, Ordering::SeqCst);
-            })
-            .ok()?;
+                warn!("Failed to spawn settings window thread: {}", error);
+                return None;
+            }
+        };
 
         Some(SettingsWindowHandle { _thread: handle })
     }
