@@ -1,0 +1,28 @@
+name: Export smooth-v7 source
+
+on:
+  push:
+    branches:
+      - agent/smooth-compositor-v7-control
+    paths:
+      - .github/workflows/agent-export-smooth-v7-source.yml
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 2dfab51243a5cffa4f34bb4bd3f19e10280757f8
+          fetch-depth: 0
+      - name: Archive exact verified source
+        run: git archive --format=zip --output=LeopardWM-smooth-v7-source.zip HEAD
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LeopardWM-smooth-v7-source
+          path: LeopardWM-smooth-v7-source.zip
+          if-no-files-found: error
+          retention-days: 2
