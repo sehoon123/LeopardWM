@@ -1,0 +1,342 @@
+name: Feature and MSI release v6
+
+on:
+  push:
+    branches:
+      - agent/features-msi-v6
+    paths:
+      - .github/workflows/agent-features-msi-v6.yml
+      - wix/main.wxs
+      - crates/**
+      - Cargo.toml
+      - Cargo.lock
+
+permissions:
+  contents: write
+
+concurrency:
+  group: feature-msi-v6
+  cancel-in-progress: false
+
+env:
+  RELEASE_TAG: v0.2.6-sehoon.6
+  RELEASE_VERSION: 0.2.6-sehoon.6
+
+jobs:
+  verify-build-msi-release:
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out exact feature branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: agent/features-msi-v6
+          fetch-depth: 0
+
+      - name: Install stable Rust with quality components
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Apply reviewed upstream patch dependency updates
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo update -p clap --precise 4.6.6
+          if ($LASTEXITCODE -ne 0) { throw 'clap lockfile update failed' }
+          cargo update -p thiserror --precise 2.0.20
+          if ($LASTEXITCODE -ne 0) { throw 'thiserror lockfile update failed' }
+
+      - name: Format source
+        run: cargo fmt --all
+
+      - name: Verify source and installer invariants
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { throw 'cargo fmt check failed' }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'git diff check failed' }
+          @'
+          from pathlib import Path
+          root = Path('.')
+          wix = (root / 'wix/main.wxs').read_text(encoding='utf-8')
+          required = [
+              "StartMenuLeopardWM",
+              "StartMenuLeopardWMSafeMode",
+              "DesktopShortcutFeature",
+              "ARPPRODUCTICON",
+              "AllowSameVersionUpgrades='yes'",
+              "UpgradeCode='EE10F2D5-DA80-43EA-B4D4-A0D37C69DE83'",
+          ]
+          missing = [item for item in required if item not in wix]
+          assert not missing, f'missing WiX invariants: {missing}'
+          cargo = (root / 'crates/cli/Cargo.toml').read_text(encoding='utf-8')
+          assert cargo.count('path = "src/main.rs"') == 1
+          assert 'path = "src/bin/lwm.rs"' in cargo
+          assert (root / 'crates/cli/src/lib.rs').is_file()
+          assert (root / 'crates/daemon/src/atomic_file.rs').is_file()
+          assert (root / 'crates/daemon/src/settings/settings.html').is_file()
+          print('source and installer invariants: OK')
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'structural invariant verification failed' }
+
+      - name: Run full locked tests for every target
+        run: cargo test --workspace --all-targets --locked
+
+      - name: Run Clippy for every target with warnings denied
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Check every Cargo target
+        run: cargo check --workspace --all-targets --locked
+
+      - name: Run optimized library and binary tests
+        run: cargo test --workspace --lib --bins --release --locked
+
+      - name: Stress scratchpad and floating regressions
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          for ($i = 0; $i -lt 8; $i++) {
+            cargo test -p leopardwm-daemon --bin leopardwm --release --locked scratchpad -- --test-threads=1
+            if ($LASTEXITCODE -ne 0) { throw "scratchpad stress iteration $i failed" }
+            cargo test -p leopardwm-daemon --bin leopardwm --release --locked floating -- --test-threads=1
+            if ($LASTEXITCODE -ne 0) { throw "floating stress iteration $i failed" }
+          }
+
+      - name: Build optimized Windows binaries
+        run: cargo build --workspace --release --locked
+
+      - name: Verify GUI executable subsystems
+        shell: pwsh
+        run: ./.github/verify-gui-subsystems.ps1
+
+      - name: Install cargo-wix
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo install cargo-wix --version '^0.3' --locked
+          if ($LASTEXITCODE -ne 0) { throw 'cargo-wix installation failed' }
+
+      - name: Locate WiX Toolset
+        id: wix
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $candidates = @(
+            'C:\Program Files (x86)\WiX Toolset v3.14\bin',
+            'C:\Program Files (x86)\WiX Toolset v3.11\bin',
+            'C:\Program Files\WiX Toolset v3.14\bin',
+            'C:\Program Files\WiX Toolset v3.11\bin'
+          )
+          $wixBin = $candidates | Where-Object { Test-Path (Join-Path $_ 'candle.exe') } | Select-Object -First 1
+          if (-not $wixBin) {
+            choco install wixtoolset --no-progress -y
+            if ($LASTEXITCODE -ne 0) { throw 'WiX Toolset installation failed' }
+            $wixBin = $candidates | Where-Object { Test-Path (Join-Path $_ 'candle.exe') } | Select-Object -First 1
+          }
+          if (-not $wixBin) { throw 'WiX Toolset 3.x was not found' }
+          "bin=$wixBin" >> $env:GITHUB_OUTPUT
+          Write-Host "WiX bin: $wixBin"
+
+      - name: Build and smoke-test MSI installer
+        id: msi
+        shell: pwsh
+        env:
+          WIX_BIN: ${{ steps.wix.outputs.bin }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo wix -p leopardwm-daemon -I wix/main.wxs `
+            --target x86_64-pc-windows-msvc `
+            --no-build --nocapture `
+            --bin-path "$env:WIX_BIN"
+          if ($LASTEXITCODE -ne 0) { throw 'cargo wix failed' }
+
+          $generated = Get-ChildItem target/wix/*.msi | Select-Object -First 1
+          if (-not $generated) { throw 'cargo wix produced no MSI' }
+          $releaseMsi = "LeopardWM-$env:RELEASE_VERSION-x86_64.msi"
+          Copy-Item $generated.FullName $releaseMsi -Force
+
+          $dark = Join-Path $env:WIX_BIN 'dark.exe'
+          $darkDir = Join-Path $env:RUNNER_TEMP 'msi-dark'
+          New-Item -ItemType Directory -Path $darkDir -Force | Out-Null
+          & $dark -nologo -x (Join-Path $darkDir 'files') -o (Join-Path $darkDir 'decompiled.wxs') $releaseMsi
+          if ($LASTEXITCODE -ne 0) { throw 'dark.exe could not decompile MSI' }
+          $decompiled = Get-Content -Raw -Encoding utf8 (Join-Path $darkDir 'decompiled.wxs')
+          foreach ($needle in @('leopardwm.exe', 'leopardwm-cli.exe', 'lwm.exe', 'leopardwm-watchdog.exe', 'StartMenuLeopardWMSafeMode', 'DesktopShortcutFeature')) {
+            if (-not $decompiled.Contains($needle)) { throw "MSI table validation failed: $needle" }
+          }
+
+          $adminRoot = Join-Path $env:RUNNER_TEMP 'msi-admin-image'
+          New-Item -ItemType Directory -Path $adminRoot -Force | Out-Null
+          $process = Start-Process msiexec.exe -ArgumentList @('/a', (Resolve-Path $releaseMsi).Path, '/qn', "TARGETDIR=$adminRoot") -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "MSI administrative extraction failed: $($process.ExitCode)" }
+          foreach ($binary in @('leopardwm.exe', 'leopardwm-cli.exe', 'lwm.exe', 'leopardwm-watchdog.exe')) {
+            $found = Get-ChildItem $adminRoot -Recurse -Filter $binary | Select-Object -First 1
+            if (-not $found) { throw "MSI administrative image is missing $binary" }
+          }
+          "path=$releaseMsi" >> $env:GITHUB_OUTPUT
+          Write-Host "MSI validated: $releaseMsi"
+
+      - name: Commit verified lockfile and installer source
+        id: source_commit
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock wix/main.wxs
+          if (git diff --cached --quiet) {
+            Write-Host 'No generated source changes to commit'
+          } else {
+            git diff --cached --check
+            if ($LASTEXITCODE -ne 0) { throw 'staged source failed diff check' }
+            git commit -m "build: update patch dependencies and MSI packaging"
+            if ($LASTEXITCODE -ne 0) { throw 'source commit failed' }
+            git push origin HEAD:refs/heads/agent/features-msi-v6
+            if ($LASTEXITCODE -ne 0) { throw 'source push failed' }
+          }
+          $localSha = (git rev-parse HEAD).Trim()
+          $remoteLine = git ls-remote origin refs/heads/agent/features-msi-v6
+          if ($LASTEXITCODE -ne 0 -or -not $remoteLine) { throw 'could not resolve pushed feature branch' }
+          $remoteSha = (($remoteLine -split '\s+')[0]).Trim()
+          if ($remoteSha -ne $localSha) { throw "remote source mismatch: local=$localSha remote=$remoteSha" }
+          "sha=$localSha" >> $env:GITHUB_OUTPUT
+
+      - name: Package portable release and checksums
+        shell: pwsh
+        env:
+          MSI_PATH: ${{ steps.msi.outputs.path }}
+          SOURCE_SHA: ${{ steps.source_commit.outputs.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $candidateDirs = @('target/x86_64-pc-windows-msvc/release', 'target/release')
+          $binDir = $candidateDirs | Where-Object { Test-Path (Join-Path $_ 'leopardwm.exe') } | Select-Object -First 1
+          if (-not $binDir) { throw 'release binary directory not found' }
+          $packageDir = "LeopardWM-$env:RELEASE_VERSION-x86_64-windows"
+          $zipPath = "$packageDir.zip"
+          New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
+          $binaries = @('leopardwm.exe', 'leopardwm-cli.exe', 'lwm.exe', 'leopardwm-watchdog.exe')
+          foreach ($binary in $binaries) {
+            $source = Join-Path $binDir $binary
+            Copy-Item $source (Join-Path $packageDir $binary)
+            Copy-Item $source $binary
+          }
+          Copy-Item README.md, LICENSE $packageDir
+          @"
+          LeopardWM personal-fork build
+          Version: $env:RELEASE_VERSION
+          Source commit: $env:SOURCE_SHA
+
+          Installer additions:
+          - Start Menu launch shortcut
+          - Start Menu Safe Mode shortcut
+          - optional desktop shortcut
+          - Add/Remove Programs icon and in-place upgrade support
+          - automated MSI table and administrative-image smoke tests
+
+          Dependency maintenance:
+          - clap 4.6.6
+          - thiserror 2.0.20
+          "@ | Set-Content -Encoding utf8 "$packageDir/BUILD-INFO.txt"
+          Compress-Archive -Path $packageDir -DestinationPath $zipPath -CompressionLevel Optimal -Force
+          $assets = @($zipPath, $env:MSI_PATH) + $binaries
+          $checksumLines = foreach ($asset in $assets) {
+            $hash = (Get-FileHash -Algorithm SHA256 $asset).Hash.ToLowerInvariant()
+            "$hash *$asset"
+          }
+          $checksumLines | Set-Content -Encoding ascii checksums.txt
+          Get-Content checksums.txt
+
+      - name: Write release notes
+        shell: pwsh
+        env:
+          SOURCE_SHA: ${{ steps.source_commit.outputs.sha }}
+        run: |
+          @"
+          Personal-fork prerelease from ``sehoon123/LeopardWM``.
+
+          Source commit: ``$env:SOURCE_SHA``
+
+          ### New installer features
+          - Restores an MSI alongside the portable ZIP.
+          - Adds normal and Safe Mode Start Menu shortcuts.
+          - Adds an optional desktop shortcut through WiX FeatureTree.
+          - Shows the LeopardWM icon in Add/Remove Programs.
+          - Keeps the upstream UpgradeCode and allows same-version upgrades so existing LeopardWM MSI installations can be upgraded in place.
+          - Smoke-tests the MSI by decompiling its tables and creating an administrative image before publication.
+
+          ### Maintenance
+          - Updates Clap to 4.6.6.
+          - Updates thiserror to 2.0.20.
+          - Preserves all v0.2.6-sehoon.5 stability, floating/scratchpad, Settings resize, persistence, and layout-allocation improvements.
+
+          ### Validation
+          - ``cargo fmt --all -- --check``
+          - full debug tests for every workspace target
+          - Clippy for every target with warnings denied
+          - all-target Cargo check
+          - optimized library and binary tests
+          - repeated release-mode scratchpad/floating regressions
+          - optimized Windows build and GUI-subsystem verification
+          - cargo-wix MSI build, WiX table inspection, and MSI administrative extraction
+
+          This release exists only in the user fork. Nothing was sent upstream.
+          "@ | Set-Content -Encoding utf8 release-notes-v6.md
+
+      - name: Publish verified ZIP and MSI
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.source_commit.outputs.sha }}
+          MSI_PATH: ${{ steps.msi.outputs.path }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY 2>$null) {
+            throw "release already exists: $env:RELEASE_TAG"
+          }
+          gh release create $env:RELEASE_TAG `
+            "LeopardWM-$env:RELEASE_VERSION-x86_64-windows.zip" `
+            "$env:MSI_PATH" `
+            leopardwm.exe `
+            leopardwm-cli.exe `
+            lwm.exe `
+            leopardwm-watchdog.exe `
+            checksums.txt `
+            --repo $env:GITHUB_REPOSITORY `
+            --target $env:SOURCE_SHA `
+            --title "LeopardWM $env:RELEASE_TAG - features and MSI" `
+            --notes-file release-notes-v6.md `
+            --prerelease
+          if ($LASTEXITCODE -ne 0) { throw 'GitHub Release creation failed' }
+
+      - name: Verify published release, tag, and assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.source_commit.outputs.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git fetch --tags origin
+          $tagSha = (git rev-list -n 1 $env:RELEASE_TAG).Trim()
+          if ($tagSha -ne $env:SOURCE_SHA) { throw "tag/source mismatch: tag=$tagSha source=$env:SOURCE_SHA" }
+          $release = gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --json tagName,isDraft,isPrerelease,assets | ConvertFrom-Json
+          if ($release.tagName -ne $env:RELEASE_TAG -or $release.isDraft -or -not $release.isPrerelease) {
+            throw 'published release metadata is invalid'
+          }
+          $expected = @(
+            "LeopardWM-$env:RELEASE_VERSION-x86_64-windows.zip",
+            "LeopardWM-$env:RELEASE_VERSION-x86_64.msi",
+            'leopardwm.exe',
+            'leopardwm-cli.exe',
+            'lwm.exe',
+            'leopardwm-watchdog.exe',
+            'checksums.txt'
+          )
+          $actual = @($release.assets | ForEach-Object { $_.name })
+          foreach ($name in $expected) {
+            if ($name -notin $actual) { throw "missing release asset: $name" }
+          }
+          Write-Host "Published and verified $env:RELEASE_TAG at $tagSha"
