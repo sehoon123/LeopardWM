@@ -205,7 +205,9 @@ impl AppState {
 
     /// Compute animated placements and send them to the animation worker.
     ///
-    /// Returns `Ok(true)` if a frame was sent, `Ok(false)` if paused or no placements.
+    /// Returns `Ok(true)` if a frame was sent. Returns `Ok(false)` when paused,
+    /// empty, or when compositor-safe mode collapsed the animation into one
+    /// exact synchronous landing.
     pub(crate) fn send_animation_frame(
         &mut self,
         worker: &animation_worker::AnimationWorkerHandle,
@@ -218,6 +220,26 @@ impl AppState {
         if self.apply_worker_cancelled.load(Ordering::SeqCst) {
             return Ok(false);
         }
+
+        // Product-safe default: never emit a burst of asynchronous live-HWND
+        // moves. DirectComposition and swap-chain applications can leave their
+        // internal render surface at an intermediate transform even when the
+        // outer HWND lands correctly. Collapse every animation source here so
+        // hotkeys, mouse focus, workspace switches, drag/drop, and future event
+        // paths all share the same guarantee.
+        if self.settle_animations_for_compositor_safety() {
+            self.apply_layout()?;
+            self.sync_taskbar_buttons();
+            let pending_sticky = self.pending_sticky_refocus.take();
+            if !self.paused {
+                self.sync_foreground_window();
+                if let Some(window_id) = pending_sticky {
+                    self.refocus_sticky_window(window_id);
+                }
+            }
+            return Ok(false);
+        }
+
         // Commit deferred min-size clears before the frame reads constraints,
         // matching the invariant maintained by apply_layout. Without this, a
         // composition change occurring during an active animation would leave
@@ -454,6 +476,10 @@ impl AppState {
 
         self.record_last_placed_rects(&all_placements);
 
+        // `spawn_apply_worker` consumes this flag only after a successful
+        // thread spawn. Remember the request so any later placement failure or
+        // timeout can re-arm the compositor repair for the next exact landing.
+        let landing_repair_requested = self.post_animation_nudge_pending;
         let timeout = self.layout_apply_timeout;
         let (rx, worker_handle) = match self.spawn_apply_worker(all_placements) {
             Ok(worker) => worker,
@@ -549,6 +575,9 @@ impl AppState {
             }
         };
         if result.is_err() {
+            if landing_repair_requested {
+                self.post_animation_nudge_pending = true;
+            }
             // Desired rectangles are recorded before the worker runs so the
             // normal success path can use the fast cache immediately. A
             // failed or timed-out batch did not reliably apply them, so an

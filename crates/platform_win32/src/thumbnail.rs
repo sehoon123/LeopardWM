@@ -322,29 +322,41 @@ pub fn screen_to_host_client(screen: Rect, host_origin: (i32, i32)) -> Rect {
     }
 }
 
-/// Predicate: does this window's class belong to a family that renders poorly
-/// under per-frame `SetWindowPos` during layout moves, so it should be animated
-/// via a cloaked DWM thumbnail (the "ghost" path) instead?
+/// Predicate: does this top-level window belong to a renderer family whose
+/// client surface can desynchronize from the outer HWND after repeated moves?
 ///
-/// Matches:
-/// - `Chrome_WidgetWin_*` — Chromium / Electron (Chrome, Edge, Slack,
-///   Discord, Beeper, Spotify, VS Code, Cursor, Notion, ...)
-/// - `MozillaWindowClass` — Firefox, Zen
-/// - `CASCADIA_HOSTING_WINDOW_CLASS` — Windows Terminal Preview
-/// - `WindowsForms10.*` — .NET Framework WinForms
-/// - `HwndWrapper*` — .NET WPF top-level windows
-pub fn is_ghost_animation_class(wid: WindowId) -> bool {
-    is_ghost_animation_class_str(&class_name(wid))
+/// This list is used only for targeted landing refreshes and for the optional
+/// legacy thumbnail path. Compositor-safe mode itself is class-agnostic and
+/// avoids per-frame live HWND movement for every application.
+pub fn is_compositor_sensitive_class(wid: WindowId) -> bool {
+    is_compositor_sensitive_class_str(&class_name(wid))
 }
 
-/// String variant of [`is_ghost_animation_class`] for callers that have
+/// String variant of [`is_compositor_sensitive_class`] for callers that have
 /// already read the class name (avoids a redundant `GetClassNameW` call).
-pub fn is_ghost_animation_class_str(class: &str) -> bool {
+pub fn is_compositor_sensitive_class_str(class: &str) -> bool {
     class.starts_with("Chrome_WidgetWin_")
         || class == "MozillaWindowClass"
         || class == "CASCADIA_HOSTING_WINDOW_CLASS"
         || class.starts_with("WindowsForms10.")
         || class.starts_with("HwndWrapper")
+        || class == "CabinetWClass"
+        || class == "ExploreWClass"
+        || class == "ApplicationFrameWindow"
+        || class == "WinUIDesktopWin32WindowClass"
+        || class == "CEF-OSC-WIDGET"
+        || class.starts_with("Qt5QWindow")
+        || class.starts_with("Qt6QWindow")
+}
+
+/// Backward-compatible name for the experimental thumbnail eligibility check.
+pub fn is_ghost_animation_class(wid: WindowId) -> bool {
+    is_compositor_sensitive_class(wid)
+}
+
+/// Backward-compatible string variant used by existing daemon call sites.
+pub fn is_ghost_animation_class_str(class: &str) -> bool {
+    is_compositor_sensitive_class_str(class)
 }
 
 /// Read the class name of a window. Returns empty string on failure
@@ -751,6 +763,14 @@ mod tests {
         assert!(is_ghost_animation_class_str(
             "HwndWrapper[MyApp.exe;;abc-123]"
         ));
+        assert!(is_compositor_sensitive_class_str("CabinetWClass"));
+        assert!(is_compositor_sensitive_class_str("ExploreWClass"));
+        assert!(is_compositor_sensitive_class_str("ApplicationFrameWindow"));
+        assert!(is_compositor_sensitive_class_str(
+            "WinUIDesktopWin32WindowClass"
+        ));
+        assert!(is_compositor_sensitive_class_str("CEF-OSC-WIDGET"));
+        assert!(is_compositor_sensitive_class_str("Qt6QWindowIcon"));
 
         assert!(!is_ghost_animation_class_str("Notepad"));
         assert!(!is_ghost_animation_class_str(""));

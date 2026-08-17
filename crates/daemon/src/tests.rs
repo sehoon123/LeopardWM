@@ -50,6 +50,30 @@ fn test_appearance_change_reapplies_unchanged_layout_with_fresh_insets() {
 }
 
 #[test]
+fn test_compositor_safe_settle_finishes_scroll_and_arms_exact_landing() {
+    let mut config = test_config();
+    config.behavior.compositor_safe_mode = true;
+    let mut state = AppState::new_with_config(config, test_monitors());
+    state.paused = false;
+
+    let workspace = &mut state.workspaces.get_mut(&1).unwrap()[0];
+    workspace.insert_window(100, Some(1200)).unwrap();
+    workspace.insert_window(101, Some(1200)).unwrap();
+    workspace.start_scroll_animation(400.0, 1920, Some(200), None);
+    assert!(workspace.is_animating());
+
+    state
+        .last_placed_layout_rects
+        .insert(100, Rect::new(10, 10, 1200, 900));
+
+    assert!(state.settle_animations_for_compositor_safety());
+    assert!(!state.is_animating());
+    assert!(state.post_animation_nudge_pending);
+    assert!(state.last_placed_layout_rects.is_empty());
+    assert_eq!(state.workspaces[&1][0].scroll_offset().round() as i32, 400);
+}
+
+#[test]
 fn test_app_state_startup_reduce_motion_matches_all_workspaces() {
     let mut monitors = test_monitors();
     monitors.push(MonitorInfo {
@@ -2689,6 +2713,23 @@ fn test_failed_apply_worker_spawn_preserves_post_animation_landing() {
         .unwrap();
     state.post_animation_nudge_pending = true;
     state.injected_apply_placements_behavior = Some(TestApplyPlacementsBehavior::FailWorkerSpawn);
+
+    assert!(state.apply_layout().is_err());
+    assert!(state.post_animation_nudge_pending);
+}
+
+#[test]
+fn test_failed_apply_after_spawn_rearms_post_animation_landing() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.paused = false;
+    state
+        .focused_workspace_mut()
+        .unwrap()
+        .insert_window(100, Some(800))
+        .unwrap();
+    state.post_animation_nudge_pending = true;
+    state.injected_apply_placements_behavior =
+        Some(TestApplyPlacementsBehavior::SleepAndFail(Duration::ZERO));
 
     assert!(state.apply_layout().is_err());
     assert!(state.post_animation_nudge_pending);

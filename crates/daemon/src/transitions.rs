@@ -3,7 +3,7 @@
 use crate::animation_worker;
 use crate::state::*;
 use std::collections::HashMap;
-use tracing::info;
+use tracing::{debug, info};
 
 pub(crate) fn reduce_motion_enabled(
     animations_enabled: bool,
@@ -11,6 +11,21 @@ pub(crate) fn reduce_motion_enabled(
     reduce_motion_on_battery: bool,
 ) -> bool {
     !animations_enabled || (on_battery_or_saver && reduce_motion_on_battery)
+}
+
+/// Whether a live-window animation must be collapsed into one exact landing.
+///
+/// DirectComposition and swap-chain applications can retain a stale internal
+/// surface transform after a burst of asynchronous per-frame SetWindowPos calls.
+/// The only renderer-agnostic prevention is to avoid that burst entirely. The
+/// policy is deliberately central and class-agnostic so mouse focus, hotkeys,
+/// workspace switches, drag/drop, and future animation entry points cannot
+/// accidentally bypass it.
+pub(crate) fn compositor_safe_snap_required(
+    compositor_safe_mode: bool,
+    has_active_animation: bool,
+) -> bool {
+    compositor_safe_mode && has_active_animation
 }
 
 impl AppState {
@@ -21,6 +36,51 @@ impl AppState {
                 .workspaces
                 .values()
                 .any(|ws_vec| ws_vec.iter().any(|w| w.is_animating()))
+    }
+
+    /// Collapse every active live-window animation to its final state.
+    ///
+    /// This is the compositor-safe path. It is intentionally executed at the
+    /// single frame-dispatch choke point rather than in individual commands, so
+    /// no event source can reintroduce per-frame movement accidentally.
+    pub(crate) fn settle_animations_for_compositor_safety(&mut self) -> bool {
+        if !compositor_safe_snap_required(
+            self.config.behavior.compositor_safe_mode,
+            self.is_animating(),
+        ) {
+            return false;
+        }
+
+        let exit_windows: Vec<u64> = self
+            .layout_transition
+            .as_ref()
+            .map(|transition| transition.exit_rects.keys().copied().collect())
+            .unwrap_or_default();
+
+        for workspaces in self.workspaces.values_mut() {
+            for workspace in workspaces {
+                workspace.stop_animation();
+            }
+        }
+
+        // Release any thumbnail/crossfade state before touching source HWNDs.
+        self.abort_active_ghost_transition();
+
+        // Structural/workspace transitions own their exiting HWNDs until the
+        // animation completes. Since safe mode skips the frames, park them now
+        // so clearing the transition cannot leave an old workspace on screen.
+        for window_id in exit_windows {
+            let _ = leopardwm_platform_win32::move_window_offscreen(window_id);
+        }
+        self.layout_transition = None;
+
+        // Force the exact synchronous landing even when the desired rectangles
+        // match the cache. The landing performs edge verification and a guarded
+        // compositor refresh for known swap-chain renderers.
+        self.post_animation_nudge_pending = true;
+        self.last_placed_layout_rects.clear();
+        debug!("Collapsed live-window animation into a compositor-safe landing");
+        true
     }
 
     /// Tick all active animations by the given delta time.
@@ -113,7 +173,9 @@ impl AppState {
         // for the ghost-animation path. Targets are evaluated against the
         // structural placements that will be live after this transition.
         let mut ghosted_wids = std::collections::HashSet::new();
-        if self.config.behavior.swap_chain_ghost_animation {
+        if !self.config.behavior.compositor_safe_mode
+            && self.config.behavior.swap_chain_ghost_animation
+        {
             self.register_ghosts_for_transition(&start_rects, &mut ghosted_wids);
         }
 
@@ -444,7 +506,15 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
-    use super::reduce_motion_enabled;
+    use super::{compositor_safe_snap_required, reduce_motion_enabled};
+
+    #[test]
+    fn compositor_safe_policy_only_collapses_active_animations() {
+        assert!(compositor_safe_snap_required(true, true));
+        assert!(!compositor_safe_snap_required(true, false));
+        assert!(!compositor_safe_snap_required(false, true));
+        assert!(!compositor_safe_snap_required(false, false));
+    }
 
     #[test]
     fn reduce_motion_policy_honors_accessibility_and_battery_preference() {

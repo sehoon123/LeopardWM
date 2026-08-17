@@ -1128,7 +1128,11 @@ input[type="range"]::-webkit-slider-thumb {
             <label class="toggle"><input type="checkbox" id="behavior-drag_to_merge"><span class="track"></span><span class="thumb"></span></label>
           </div>
           <div class="field">
-            <div class="field-info"><div class="field-label">Smooth app animations (experimental)</div><div class="field-desc">Attempt DWM-thumbnail animation only when Windows permits the source window to be hidden. Unsupported external apps automatically use safe live placement.</div></div>
+            <div class="field-info"><div class="field-label">Compositor-safe window movement</div><div class="field-desc">Use one exact landing instead of moving application windows every animation frame. Prevents Chrome, Edge, Firefox, Explorer, Terminal, and Electron content from drifting inside the frame.</div></div>
+            <label class="toggle"><input type="checkbox" id="behavior-compositor_safe_mode"><span class="track"></span><span class="thumb"></span></label>
+          </div>
+          <div class="field">
+            <div class="field-info"><div class="field-label">DWM thumbnail animation (experimental)</div><div class="field-desc">When compositor-safe mode is off, attempt thumbnail animation only when Windows permits the source window to be hidden. Unsupported external apps use the legacy live-window path.</div></div>
             <label class="toggle"><input type="checkbox" id="behavior-swap_chain_ghost_animation"><span class="track"></span><span class="thumb"></span></label>
           </div>
           <div class="field">
@@ -1585,6 +1589,7 @@ function init(cfg) {
   setChecked('behavior-disable_snap_layouts', cfg.behavior.disable_snap_layouts !== false);
   setChecked('behavior-cross_monitor_drag', cfg.behavior.cross_monitor_drag !== false);
   setChecked('behavior-drag_to_merge', cfg.behavior.drag_to_merge !== false);
+  setChecked('behavior-compositor_safe_mode', cfg.behavior.compositor_safe_mode !== false);
   setChecked('behavior-swap_chain_ghost_animation', cfg.behavior.swap_chain_ghost_animation === true);
   setChecked('behavior-hide_offscreen_taskbar_buttons', cfg.behavior.hide_offscreen_taskbar_buttons !== false);
   setCb('cb-behavior-log_level', cfg.behavior.log_level);
@@ -2191,6 +2196,7 @@ function readConfig() {
       disable_snap_layouts: checked('behavior-disable_snap_layouts'),
       cross_monitor_drag: checked('behavior-cross_monitor_drag'),
       drag_to_merge: checked('behavior-drag_to_merge'),
+      compositor_safe_mode: checked('behavior-compositor_safe_mode'),
       swap_chain_ghost_animation: checked('behavior-swap_chain_ghost_animation'),
       hide_offscreen_taskbar_buttons: checked('behavior-hide_offscreen_taskbar_buttons'),
       check_for_updates: window._initConfig.behavior.check_for_updates,

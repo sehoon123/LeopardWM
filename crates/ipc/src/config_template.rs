@@ -102,9 +102,16 @@ focus_follows_mouse = false
 # api.github.com on startup + every 24h. Disable to skip entirely.
 # check_for_updates = false
 
-# Experimental DWM-thumbnail animation. LeopardWM attempts the path only if
-# Windows confirms the source HWND was physically cloaked; unsupported external
-# applications automatically fall back to safe live placement.
+# Compositor-safe movement (recommended). When true, LeopardWM lands live
+# application HWNDs once at their exact final rect instead of sending per-frame
+# moves. This prevents DirectComposition / swap-chain surfaces from drifting
+# inside their frame after repeated horizontal navigation. Disable only to opt
+# back into legacy live-window animation.
+# compositor_safe_mode = true
+
+# Experimental DWM-thumbnail animation, used only when compositor_safe_mode is
+# false. LeopardWM attempts it only if Windows confirms the source HWND was
+# physically cloaked; unsupported external applications use the legacy path.
 # swap_chain_ghost_animation = true
 
 # Where newly opened windows go: "new_column" (default, own column to the
