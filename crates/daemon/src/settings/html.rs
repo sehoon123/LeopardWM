@@ -69,6 +69,12 @@ mod tests {
             "setChecked('behavior-drag_to_merge', cfg.behavior.drag_to_merge !== false);"
         ));
         assert!(SETTINGS_HTML.contains("drag_to_merge: checked('behavior-drag_to_merge')"));
+        assert!(SETTINGS_HTML.contains(r#"id="behavior-compositor_safe_mode""#));
+        assert!(SETTINGS_HTML.contains(
+            "setChecked('behavior-compositor_safe_mode', cfg.behavior.compositor_safe_mode !== false);"
+        ));
+        assert!(SETTINGS_HTML
+            .contains("compositor_safe_mode: checked('behavior-compositor_safe_mode')"));
     }
 
     #[test]

@@ -2,6 +2,25 @@
 
 All notable changes to LeopardWM will be documented in this file.
 
+## 0.2.6-sehoon.6
+
+### Fixes
+
+- **Prevent cumulative left/right render-surface drift.** The new
+  `behavior.compositor_safe_mode` is enabled by default and collapses every
+  live-window animation into one exact synchronous landing at the central
+  frame-dispatch boundary. This removes the asynchronous per-frame HWND move
+  burst that could leave Chromium, Electron, Firefox, Explorer, Terminal,
+  WinUI, WPF, WinForms, CEF, and Qt client surfaces offset inside an otherwise
+  correctly positioned frame.
+- **Make the legacy animation path less destructive.** When compositor-safe
+  mode is explicitly disabled, unchanged window dimensions now use
+  `SWP_NOSIZE`, and the final landing refresh covers additional compositor
+  families with a forced non-client recalculation and a final `DwmFlush`.
+- **Never lose a required landing repair after an apply failure.** A failed,
+  disconnected, or timed-out placement worker re-arms the compositor refresh
+  for the next exact landing instead of silently consuming it.
+
 ## 0.2.6
 
 ### Fixes

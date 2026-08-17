@@ -466,10 +466,17 @@ pub struct BehaviorConfig {
     #[serde(default)]
     pub tab_close_action: TabCloseAction,
 
+    /// Prefer one exact synchronous landing over per-frame live HWND moves.
+    /// This prevents DirectComposition / swap-chain surfaces from drifting
+    /// inside their outer frame after repeated horizontal navigation. Enabled
+    /// by default; disable only to opt back into legacy live-window animation.
+    #[serde(default = "default_true")]
+    pub compositor_safe_mode: bool,
+
     /// Use DWM thumbnails only when Windows permits the live source HWND to
     /// be physically cloaked. External application windows commonly reject
-    /// cloaking, so this experimental path safely falls back to live placement
-    /// when enabled but unsupported.
+    /// cloaking, so this experimental path is used only when compositor-safe
+    /// mode is disabled and the source can be hidden reliably.
     #[serde(default = "default_true")]
     pub swap_chain_ghost_animation: bool,
 
@@ -531,6 +538,7 @@ impl Default for BehaviorConfig {
             drag_to_merge: true,
             check_for_updates: true,
             tab_close_action: TabCloseAction::default(),
+            compositor_safe_mode: true,
             swap_chain_ghost_animation: true,
             new_window_placement: NewWindowPlacement::default(),
             hide_offscreen_taskbar_buttons: true,
@@ -1617,6 +1625,7 @@ mod tests {
         assert!(config.behavior.focus_new_windows);
         assert!(config.behavior.cross_monitor_drag);
         assert!(config.behavior.drag_to_merge);
+        assert!(config.behavior.compositor_safe_mode);
         assert!(config.behavior.swap_chain_ghost_animation);
     }
 
@@ -1631,6 +1640,7 @@ mod tests {
             [behavior]
             cross_monitor_drag = false
             drag_to_merge = false
+            compositor_safe_mode = false
             "#,
         )
         .unwrap();
@@ -1639,6 +1649,7 @@ mod tests {
         assert!(!config.layout.remember_scratchpad_size);
         assert!(!config.behavior.cross_monitor_drag);
         assert!(!config.behavior.drag_to_merge);
+        assert!(!config.behavior.compositor_safe_mode);
     }
 
     #[test]

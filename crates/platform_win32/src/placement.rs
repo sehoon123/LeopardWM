@@ -618,6 +618,21 @@ fn offscreen_position(placement: &WindowPlacement, inset_l: i32, inset_t: i32) -
     }
 }
 
+/// Whether an animation frame can move a visible window without re-sending
+/// its unchanged size. This keeps legacy animation mode from driving the
+/// target application's resize/swap-chain path on every horizontal frame.
+fn animation_move_is_position_only(
+    previous: Option<(Rect, Visibility)>,
+    current: &WindowPlacement,
+) -> bool {
+    previous.is_some_and(|(rect, visibility)| {
+        visibility == Visibility::Visible
+            && current.visibility == Visibility::Visible
+            && rect.width == current.rect.width
+            && rect.height == current.rect.height
+    })
+}
+
 /// Build the defer-entry list for all placements, skipping cache-unchanged windows.
 fn build_defer_entries(
     placements: &[WindowPlacement],
@@ -629,14 +644,14 @@ fn build_defer_entries(
     let mut entries: Vec<DeferEntry> = Vec::with_capacity(placements.len());
 
     for placement in placements {
-        if let Some(ref cache) = *cache {
-            if cache.positions.get(&placement.window_id)
-                == Some(&(placement.rect, placement.visibility))
-            {
-                skipped += 1;
-                continue;
-            }
+        let previous = cache
+            .as_ref()
+            .and_then(|cache| cache.positions.get(&placement.window_id).copied());
+        if previous == Some((placement.rect, placement.visibility)) {
+            skipped += 1;
+            continue;
         }
+        let position_only = animation_move_is_position_only(previous, placement);
         let Ok(hwnd) = window_id_to_hwnd(placement.window_id) else {
             continue;
         };
@@ -675,6 +690,9 @@ fn build_defer_entries(
             };
             if needs_frame_changed {
                 flags |= SWP_FRAMECHANGED;
+            }
+            if position_only {
+                flags |= SWP_NOSIZE;
             }
             entries.push(DeferEntry {
                 hwnd,
@@ -1135,15 +1153,6 @@ fn sync_cloak_state(
     }
 }
 
-/// Window classes whose compositor (DirectComposition / swap-chain based)
-/// fails to rebuild after rapid async SetWindowPos during animation. A real
-/// size delta must reach the window for the render target to re-sync.
-const STICKY_COMPOSITOR_CLASSES: &[&str] = &[
-    "Chrome_WidgetWin_1", // Electron / Chromium (Slack, Beeper, Spotify, TradingView)
-    "MozillaWindowClass", // Firefox / Zen
-    "CASCADIA_HOSTING_WINDOW_CLASS", // Windows Terminal
-];
-
 /// Read the class name of a window. Returns empty string on failure.
 fn window_class_name(hwnd: HWND) -> String {
     let mut buf: [u16; 256] = [0; 256];
@@ -1164,12 +1173,12 @@ struct NudgeTarget {
     h: i32,
 }
 
-/// Send a (w-1 -> w) synchronous SetWindowPos pair to each entry whose window
-/// class matches a known sticky-compositor class. The 1px shrink forces a real
-/// size delta through the message pump; the immediate restore returns the rect
-/// to the layout-requested size. The compositor sees two size-changes and
-/// rebuilds the swap chain, resolving the stuck-interim-size bug.
+/// Send a (w-1 -> w) synchronous SetWindowPos pair to each known
+/// compositor-sensitive window. The final restore also forces non-client
+/// recalculation, then one DwmFlush publishes the repaired surfaces before the
+/// landing is considered complete.
 fn nudge_sticky_compositor_windows(targets: &[NudgeTarget]) {
+    let mut repaired_any = false;
     for t in targets {
         unsafe {
             if !IsWindow(Some(t.hwnd)).as_bool() {
@@ -1177,7 +1186,7 @@ fn nudge_sticky_compositor_windows(targets: &[NudgeTarget]) {
             }
         }
         let class = window_class_name(t.hwnd);
-        if !STICKY_COMPOSITOR_CLASSES.iter().any(|c| *c == class) {
+        if !crate::thumbnail::is_compositor_sensitive_class_str(&class) {
             continue;
         }
         let flags = SWP_NOZORDER | SWP_NOACTIVATE;
@@ -1198,7 +1207,8 @@ fn nudge_sticky_compositor_windows(targets: &[NudgeTarget]) {
             if window_class_name(t.hwnd) != class {
                 continue;
             }
-            if let Err(e) = SetWindowPos(t.hwnd, None, t.x, t.y, t.w, t.h, flags) {
+            if let Err(e) = SetWindowPos(t.hwnd, None, t.x, t.y, t.w, t.h, flags | SWP_FRAMECHANGED)
+            {
                 // Restore failed — window is stranded at w-1 (1px narrower)
                 // until the next apply_layout re-places it. Log so the state
                 // is diagnosable; the next apply will correct geometry.
@@ -1209,11 +1219,17 @@ fn nudge_sticky_compositor_windows(targets: &[NudgeTarget]) {
                 continue;
             }
         }
+        repaired_any = true;
         tracing::debug!(
-            "Nudged sticky-compositor window (class={}, hwnd={:?})",
+            "Refreshed compositor-sensitive window (class={}, hwnd={:?})",
             class,
             t.hwnd
         );
+    }
+    if repaired_any {
+        unsafe {
+            let _ = DwmFlush();
+        }
     }
 }
 
@@ -1367,6 +1383,30 @@ mod tests {
         // Absurdly large -> never trusted, even reproduced (chronic stale read).
         assert_eq!(classify_oversize(true, true, true, true), (false, false));
         assert_eq!(classify_oversize(true, true, false, true), (false, false));
+    }
+
+    #[test]
+    fn test_animation_move_uses_no_size_only_for_stable_visible_dimensions() {
+        let current = WindowPlacement {
+            window_id: 1,
+            rect: Rect::new(120, 40, 800, 600),
+            visibility: Visibility::Visible,
+            column_index: 0,
+        };
+
+        assert!(animation_move_is_position_only(
+            Some((Rect::new(100, 40, 800, 600), Visibility::Visible)),
+            &current,
+        ));
+        assert!(!animation_move_is_position_only(
+            Some((Rect::new(100, 40, 799, 600), Visibility::Visible)),
+            &current,
+        ));
+        assert!(!animation_move_is_position_only(
+            Some((Rect::new(100, 40, 800, 600), Visibility::OffScreenLeft)),
+            &current,
+        ));
+        assert!(!animation_move_is_position_only(None, &current));
     }
 
     #[test]
