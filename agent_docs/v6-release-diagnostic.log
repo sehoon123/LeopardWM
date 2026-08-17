@@ -1,0 +1,867 @@
+run_id=32033606017
+status=completed
+conclusion=failure
+html_url=https://github.com/sehoon123/LeopardWM/actions/runs/32033606017
+head_sha=07e47e6e3556eb670a0a90a336e961415d35d607
+
+JOB 95398863062 completed failure verify-build-release
+STEP 1 completed success Set up job
+STEP 2 completed success Check out clean source
+STEP 3 completed success Install stable Rust
+STEP 4 completed failure Clear an incomplete v6 release from an earlier attempt
+STEP 5 completed skipped Update reviewed patch dependencies
+STEP 6 completed skipped Format and verify source
+STEP 7 completed skipped Test every debug target
+STEP 8 completed skipped Clippy every target with warnings denied
+STEP 9 completed skipped Check every target
+STEP 10 completed skipped Test optimized libraries and binaries
+STEP 11 completed skipped Repeat floating and scratchpad regressions
+STEP 12 completed skipped Build release binaries
+STEP 13 completed skipped Verify GUI subsystems
+STEP 14 completed skipped Install cargo-wix
+STEP 15 completed skipped Build MSI
+STEP 16 completed skipped Smoke-test MSI administrative image
+STEP 17 completed skipped Commit and push verified lockfile
+STEP 18 completed skipped Package ZIP and checksums
+STEP 19 completed skipped Write release notes
+STEP 20 completed skipped Publish release
+STEP 21 completed skipped Verify release and assets
+STEP 42 completed success Post Check out clean source
+STEP 43 completed success Complete job
+
+===== 0_verify-build-release.txt =====
+2026-08-17T13:10:11.4730090Z Current runner version: '2.336.0'
+2026-08-17T13:10:11.4757323Z ##[group]Runner Image Provisioner
+2026-08-17T13:10:11.4758138Z Hosted Compute Agent
+2026-08-17T13:10:11.4759543Z Version: 20260729.566
+2026-08-17T13:10:11.4760388Z Commit: cf7153fe6e25b664e8693c24944bf2b00355d109
+2026-08-17T13:10:11.4761493Z Build Date: 2026-07-29T19:17:02Z
+2026-08-17T13:10:11.4762367Z Worker ID: {3f2dc603-7b9c-486d-838a-0ed3aa1d7cbb}
+2026-08-17T13:10:11.4763641Z Azure Region: eastus2
+2026-08-17T13:10:11.4764454Z ##[endgroup]
+2026-08-17T13:10:11.4766350Z ##[group]Operating System
+2026-08-17T13:10:11.4767255Z Microsoft Windows Server 2025
+2026-08-17T13:10:11.4768108Z 10.0.26100
+2026-08-17T13:10:11.4768792Z Datacenter
+2026-08-17T13:10:11.4769502Z ##[endgroup]
+2026-08-17T13:10:11.4770246Z ##[group]Runner Image
+2026-08-17T13:10:11.4771140Z Image: windows-2025-vs2026
+2026-08-17T13:10:11.4771976Z Version: 20260810.198.2
+2026-08-17T13:10:11.4774355Z Included Software: https://github.com/actions/runner-images/blob/win25-vs2026/20260810.198/images/windows/Windows2025-VS2026-Readme.md
+2026-08-17T13:10:11.4776881Z Image Release: https://github.com/actions/runner-images/releases/tag/win25-vs2026%2F20260810.198
+2026-08-17T13:10:11.4778821Z ##[endgroup]
+2026-08-17T13:10:11.4780698Z ##[group]GITHUB_TOKEN Permissions
+2026-08-17T13:10:11.4783651Z Contents: write
+2026-08-17T13:10:11.4784492Z Metadata: read
+2026-08-17T13:10:11.4785363Z ##[endgroup]
+2026-08-17T13:10:11.4788661Z Secret source: Actions
+2026-08-17T13:10:11.4790484Z Prepare workflow directory
+2026-08-17T13:10:11.5217979Z Prepare all required actions
+2026-08-17T13:10:11.5272315Z Getting action download info
+2026-08-17T13:10:11.7046959Z Download action repository 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1' (SHA:3d3c42e5aac5ba805825da76410c181273ba90b1)
+2026-08-17T13:10:11.8421587Z Download action repository 'dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7' (SHA:631a55b12751854ce901bb631d5902ceb48146f7)
+2026-08-17T13:10:12.1149810Z Complete job name: verify-build-release
+2026-08-17T13:10:12.2635422Z ##[group]Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+2026-08-17T13:10:12.2636690Z with:
+2026-08-17T13:10:12.2637077Z   ref: agent/msi-v6-clean
+2026-08-17T13:10:12.2637510Z   fetch-depth: 0
+2026-08-17T13:10:12.2637916Z   repository: sehoon123/LeopardWM
+2026-08-17T13:10:12.2641849Z   token: ***
+2026-08-17T13:10:12.2642248Z   ssh-strict: true
+2026-08-17T13:10:12.2642631Z   ssh-user: git
+2026-08-17T13:10:12.2643019Z   persist-credentials: true
+2026-08-17T13:10:12.2643451Z   clean: true
+2026-08-17T13:10:12.2643840Z   sparse-checkout-cone-mode: true
+2026-08-17T13:10:12.2644300Z   fetch-tags: false
+2026-08-17T13:10:12.2644686Z   show-progress: true
+2026-08-17T13:10:12.2645071Z   lfs: false
+2026-08-17T13:10:12.2645419Z   submodules: false
+2026-08-17T13:10:12.2645812Z   set-safe-directory: true
+2026-08-17T13:10:12.2646255Z   allow-unsafe-pr-checkout: false
+2026-08-17T13:10:12.2646914Z env:
+2026-08-17T13:10:12.2647307Z   RELEASE_TAG: v0.2.6-sehoon.6
+2026-08-17T13:10:12.2647791Z   RELEASE_VERSION: 0.2.6-sehoon.6
+2026-08-17T13:10:12.2648242Z ##[endgroup]
+2026-08-17T13:10:12.4159295Z Syncing repository: sehoon123/LeopardWM
+2026-08-17T13:10:12.4160968Z ##[group]Getting Git version info
+2026-08-17T13:10:12.4162016Z Working directory is 'D:\a\LeopardWM\LeopardWM'
+2026-08-17T13:10:12.5029135Z [command]"C:\Program Files\Git\bin\git.exe" version
+2026-08-17T13:10:12.8674486Z git version 2.55.0.windows.3
+2026-08-17T13:10:12.8722640Z ##[endgroup]
+2026-08-17T13:10:12.8740203Z Temporarily overriding HOME='D:\a\_temp\30424a4c-9b6b-4e7f-9ab0-df80f4e8174a' before making global git config changes
+2026-08-17T13:10:12.8742015Z Adding repository directory to the temporary git global config as a safe directory
+2026-08-17T13:10:12.8750889Z [command]"C:\Program Files\Git\bin\git.exe" config --global --add safe.directory D:\a\LeopardWM\LeopardWM
+2026-08-17T13:10:12.9427347Z Deleting the contents of 'D:\a\LeopardWM\LeopardWM'
+2026-08-17T13:10:12.9432954Z ##[group]Determining repository object format
+2026-08-17T13:10:13.1117291Z ##[endgroup]
+2026-08-17T13:10:13.1119050Z ##[group]Initializing the repository
+2026-08-17T13:10:13.1136384Z [command]"C:\Program Files\Git\bin\git.exe" init D:\a\LeopardWM\LeopardWM
+2026-08-17T13:10:13.2102305Z Initialized empty Git repository in D:/a/LeopardWM/LeopardWM/.git/
+2026-08-17T13:10:13.2146770Z [command]"C:\Program Files\Git\bin\git.exe" remote add origin https://github.com/sehoon123/LeopardWM
+2026-08-17T13:10:13.2686044Z ##[endgroup]
+2026-08-17T13:10:13.2686611Z ##[group]Disabling automatic garbage collection
+2026-08-17T13:10:13.2695276Z [command]"C:\Program Files\Git\bin\git.exe" config --local gc.auto 0
+2026-08-17T13:10:13.2976156Z ##[endgroup]
+2026-08-17T13:10:13.2976839Z ##[group]Setting up auth
+2026-08-17T13:10:13.2977902Z Removing SSH command configuration
+2026-08-17T13:10:13.2987333Z [command]"C:\Program Files\Git\bin\git.exe" config --local --name-only --get-regexp core\.sshCommand
+2026-08-17T13:10:13.3329757Z [command]"C:\Program Files\Git\bin\git.exe" submodule foreach --recursive "sh -c \"git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :\""
+2026-08-17T13:10:14.8294156Z Removing HTTP extra header
+2026-08-17T13:10:14.8304174Z [command]"C:\Program Files\Git\bin\git.exe" config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-08-17T13:10:14.8590836Z [command]"C:\Program Files\Git\bin\git.exe" submodule foreach --recursive "sh -c \"git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :\""
+2026-08-17T13:10:15.3466025Z Removing includeIf entries pointing to credentials config files
+2026-08-17T13:10:15.3477792Z [command]"C:\Program Files\Git\bin\git.exe" config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-08-17T13:10:15.3769385Z [command]"C:\Program Files\Git\bin\git.exe" submodule foreach --recursive "git config --local --show-origin --name-only --get-regexp remote.origin.url"
+2026-08-17T13:10:16.0937908Z [command]"C:\Program Files\Git\bin\git.exe" config --file D:\a\_temp\git-credentials-56423a0b-6132-4613-bd91-c0dd69b22e44.config http.https://github.com/.extraheader "AUTHORIZATION: basic ***"
+2026-08-17T13:10:16.1299774Z [command]"C:\Program Files\Git\bin\git.exe" config --local includeIf.gitdir:D:/a/LeopardWM/LeopardWM/.git.path D:\a\_temp\git-credentials-56423a0b-6132-4613-bd91-c0dd69b22e44.config
+2026-08-17T13:10:16.1608451Z [command]"C:\Program Files\Git\bin\git.exe" config --local includeIf.gitdir:D:/a/LeopardWM/LeopardWM/.git/worktrees/*.path D:\a\_temp\git-credentials-56423a0b-6132-4613-bd91-c0dd69b22e44.config
+2026-08-17T13:10:16.1980014Z [command]"C:\Program Files\Git\bin\git.exe" config --local includeIf.gitdir:/github/workspace/.git.path /github/runner_temp/git-credentials-56423a0b-6132-4613-bd91-c0dd69b22e44.config
+2026-08-17T13:10:16.2294369Z [command]"C:\Program Files\Git\bin\git.exe" config --local includeIf.gitdir:/github/workspace/.git/worktrees/*.path /github/runner_temp/git-credentials-56423a0b-6132-4613-bd91-c0dd69b22e44.config
+2026-08-17T13:10:16.2599758Z ##[endgroup]
+2026-08-17T13:10:16.2600166Z ##[group]Fetching the repository
+2026-08-17T13:10:16.2612740Z [command]"C:\Program Files\Git\bin\git.exe" -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules origin +refs/heads/*:refs/remotes/origin/* +refs/tags/*:refs/tags/*
+2026-08-17T13:10:17.8821724Z From https://github.com/sehoon123/LeopardWM
+2026-08-17T13:10:17.8822775Z  * [new branch]      agent/features-msi-v6 -> origin/agent/features-msi-v6
+2026-08-17T13:10:17.8823580Z  * [new branch]      agent/fix-floating-size-drift -> origin/agent/fix-floating-size-drift
+2026-08-17T13:10:17.8825099Z  * [new branch]      agent/full-audit-scratchpad-02 -> origin/agent/full-audit-scratchpad-02
+2026-08-17T13:10:17.8825983Z  * [new branch]      agent/msi-v6-clean    -> origin/agent/msi-v6-clean
+2026-08-17T13:10:17.8828199Z  * [new branch]      agent/performance-audit-03 -> origin/agent/performance-audit-03
+2026-08-17T13:10:17.8829080Z  * [new branch]      agent/production-hardening-05 -> origin/agent/production-hardening-05
+2026-08-17T13:10:17.8829881Z  * [new branch]      agent/release-msi-v6  -> origin/agent/release-msi-v6
+2026-08-17T13:10:17.8831796Z  * [new branch]      agent/settings-resize-audit-01 -> origin/agent/settings-resize-audit-01
+2026-08-17T13:10:17.8832737Z  * [new branch]      agent/v5-release-control -> origin/agent/v5-release-control
+2026-08-17T13:10:17.8833577Z  * [new branch]      feat/preserve-floating-sizes -> origin/feat/preserve-floating-sizes
+2026-08-17T13:10:17.8834409Z  * [new branch]      main                  -> origin/main
+2026-08-17T13:10:17.8834912Z  * [new tag]         v0.1.0                -> v0.1.0
+2026-08-17T13:10:17.8835597Z  * [new tag]         v0.1.1                -> v0.1.1
+2026-08-17T13:10:17.8836069Z  * [new tag]         v0.1.10               -> v0.1.10
+2026-08-17T13:10:17.8836580Z  * [new tag]         v0.1.11               -> v0.1.11
+2026-08-17T13:10:17.8837047Z  * [new tag]         v0.1.12               -> v0.1.12
+2026-08-17T13:10:17.8837502Z  * [new tag]         v0.1.13               -> v0.1.13
+2026-08-17T13:10:17.8837944Z  * [new tag]         v0.1.14               -> v0.1.14
+2026-08-17T13:10:17.8838392Z  * [new tag]         v0.1.15               -> v0.1.15
+2026-08-17T13:10:17.8838846Z  * [new tag]         v0.1.16               -> v0.1.16
+2026-08-17T13:10:17.8839288Z  * [new tag]         v0.1.17               -> v0.1.17
+2026-08-17T13:10:17.8839738Z  * [new tag]         v0.1.18               -> v0.1.18
+2026-08-17T13:10:17.8840210Z  * [new tag]         v0.1.19               -> v0.1.19
+2026-08-17T13:10:17.8840668Z  * [new tag]         v0.1.2                -> v0.1.2
+2026-08-17T13:10:17.8841148Z  * [new tag]         v0.1.3                -> v0.1.3
+2026-08-17T13:10:17.8841696Z  * [new tag]         v0.1.4                -> v0.1.4
+2026-08-17T13:10:17.8843125Z  * [new tag]         v0.1.5                -> v0.1.5
+2026-08-17T13:10:17.8843655Z  * [new tag]         v0.1.6                -> v0.1.6
+2026-08-17T13:10:17.8844201Z  * [new tag]         v0.1.7                -> v0.1.7
+2026-08-17T13:10:17.8844498Z  * [new tag]         v0.1.8                -> v0.1.8
+2026-08-17T13:10:17.8844776Z  * [new tag]         v0.1.9                -> v0.1.9
+2026-08-17T13:10:17.8845111Z  * [new tag]         v0.2.0                -> v0.2.0
+2026-08-17T13:10:17.8845477Z  * [new tag]         v0.2.1                -> v0.2.1
+2026-08-17T13:10:17.8845787Z  * [new tag]         v0.2.2                -> v0.2.2
+2026-08-17T13:10:17.8846049Z  * [new tag]         v0.2.3                -> v0.2.3
+2026-08-17T13:10:17.8846306Z  * [new tag]         v0.2.4                -> v0.2.4
+2026-08-17T13:10:17.8846579Z  * [new tag]         v0.2.5                -> v0.2.5
+2026-08-17T13:10:17.8846838Z  * [new tag]         v0.2.6                -> v0.2.6
+2026-08-17T13:10:17.8847159Z  * [new tag]         v0.2.6-sehoon.1       -> v0.2.6-sehoon.1
+2026-08-17T13:10:17.8847475Z  * [new tag]         v0.2.6-sehoon.2       -> v0.2.6-sehoon.2
+2026-08-17T13:10:17.8847771Z  * [new tag]         v0.2.6-sehoon.3       -> v0.2.6-sehoon.3
+2026-08-17T13:10:17.8848066Z  * [new tag]         v0.2.6-sehoon.4       -> v0.2.6-sehoon.4
+2026-08-17T13:10:17.8848359Z  * [new tag]         v0.2.6-sehoon.5       -> v0.2.6-sehoon.5
+2026-08-17T13:10:17.8864668Z ##[endgroup]
+2026-08-17T13:10:17.8865045Z ##[group]Determining the checkout info
+2026-08-17T13:10:17.8875874Z [command]"C:\Program Files\Git\bin\git.exe" branch --list --remote origin/agent/msi-v6-clean
+2026-08-17T13:10:17.9216295Z   origin/agent/msi-v6-clean
+2026-08-17T13:10:17.9249243Z ##[endgroup]
+2026-08-17T13:10:17.9256872Z [command]"C:\Program Files\Git\bin\git.exe" sparse-checkout disable
+2026-08-17T13:10:17.9799804Z [command]"C:\Program Files\Git\bin\git.exe" config --local --unset-all extensions.worktreeConfig
+2026-08-17T13:10:18.0087400Z ##[group]Checking out the ref
+2026-08-17T13:10:18.0096092Z [command]"C:\Program Files\Git\bin\git.exe" checkout --progress --force -B agent/msi-v6-clean refs/remotes/origin/agent/msi-v6-clean
+2026-08-17T13:10:18.1061872Z Switched to a new branch 'agent/msi-v6-clean'
+2026-08-17T13:10:18.1083374Z branch 'agent/msi-v6-clean' set up to track 'origin/agent/msi-v6-clean'.
+2026-08-17T13:10:18.1129732Z ##[endgroup]
+2026-08-17T13:10:18.1552051Z [command]"C:\Program Files\Git\bin\git.exe" log -1 --format=%H
+2026-08-17T13:10:18.1812805Z 07e47e6e3556eb670a0a90a336e961415d35d607
+2026-08-17T13:10:18.2412720Z ##[group]Run dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7
+2026-08-17T13:10:18.2413249Z with:
+2026-08-17T13:10:18.2413459Z   components: rustfmt, clippy
+2026-08-17T13:10:18.2413709Z   toolchain: stable
+2026-08-17T13:10:18.2413899Z env:
+2026-08-17T13:10:18.2414081Z   RELEASE_TAG: v0.2.6-sehoon.6
+2026-08-17T13:10:18.2414328Z   RELEASE_VERSION: 0.2.6-sehoon.6
+2026-08-17T13:10:18.2414595Z ##[endgroup]
+2026-08-17T13:10:18.2510553Z ##[start-action display=Run : parse toolchain version;id=__dtolnay_rust-toolchain.parse]
+2026-08-17T13:10:18.2657563Z ##[group]Run : parse toolchain version
+2026-08-17T13:10:18.2657974Z [36;1m: parse toolchain version[0m
+2026-08-17T13:10:18.2658250Z [36;1mif [[ -z $toolchain ]]; then[0m
+2026-08-17T13:10:18.2658767Z [36;1m  # GitHub does not enforce `required: true` inputs itself. https://github.com/actions/runner/issues/1070[0m
+2026-08-17T13:10:18.2659673Z [36;1m  echo "'toolchain' is a required input" >&2[0m
+2026-08-17T13:10:18.2660011Z [36;1m  exit 1[0m
+2026-08-17T13:10:18.2660335Z [36;1melif [[ $toolchain =~ ^stable' '[0-9]+' '(year|month|week|day)s?' 'ago$ ]]; then[0m
+2026-08-17T13:10:18.2660726Z [36;1m  if [[ Windows == macOS ]]; then[0m
+2026-08-17T13:10:18.2661513Z [36;1m    echo "toolchain=1.$((($(date -v-$(sed 's/stable \([0-9]*\) \(.\).*/\1\2/' <<< $toolchain) +%s)/60/60/24-16569)/7/6))" >> $GITHUB_OUTPUT[0m
+2026-08-17T13:10:18.2662043Z [36;1m  else[0m
+2026-08-17T13:10:18.2662444Z [36;1m    echo "toolchain=1.$((($(date --date "${toolchain#stable }" +%s)/60/60/24-16569)/7/6))" >> $GITHUB_OUTPUT[0m
+2026-08-17T13:10:18.2662889Z [36;1m  fi[0m
+2026-08-17T13:10:18.2663187Z [36;1melif [[ $toolchain =~ ^stable' 'minus' '[0-9]+' 'releases?$ ]]; then[0m
+2026-08-17T13:10:18.2663691Z [36;1m  echo "toolchain=1.$((($(date +%s)/60/60/24-16569)/7/6-${toolchain//[^0-9]/}))" >> $GITHUB_OUTPUT[0m
+2026-08-17T13:10:18.2664117Z [36;1melif [[ $toolchain =~ ^1\.[0-9]+$ ]]; then[0m
+2026-08-17T13:10:18.2664615Z [36;1m  echo "toolchain=1.$((i=${toolchain#1.}, c=($(date +%s)/60/60/24-16569)/7/6, i+9*i*(10*i<=c)+90*i*(100*i<=c)))" >> $GITHUB_OUTPUT[0m
+2026-08-17T13:10:18.2665066Z [36;1melse[0m
+2026-08-17T13:10:18.2665287Z [36;1m  echo "toolchain=$toolchain" >> $GITHUB_OUTPUT[0m
+2026-08-17T13:10:18.2665557Z [36;1mfi[0m
+2026-08-17T13:10:18.2683344Z shell: C:\Program Files\Git\bin\bash.EXE --noprofile --norc -e -o pipefail {0}
+2026-08-17T13:10:18.2683771Z env:
+2026-08-17T13:10:18.2683966Z   RELEASE_TAG: v0.2.6-sehoon.6
+2026-08-17T13:10:18.2684205Z   RELEASE_VERSION: 0.2.6-sehoon.6
+2026-08-17T13:10:18.2684431Z   toolchain: stable
+2026-08-17T13:10:18.2684618Z ##[endgroup]
+2026-08-17T13:10:18.8415462Z ##[end-action id=__dtolnay_rust-toolchain.parse;outcome=success;conclusion=success;duration_ms=590]
+2026-08-17T13:10:18.8440061Z ##[start-action display=Run : construct rustup command line;id=__dtolnay_rust-toolchain.flags]
+2026-08-17T13:10:18.8568873Z ##[group]Run : construct rustup command line
+2026-08-17T13:10:18.8569209Z [36;1m: construct rustup command line[0m
+2026-08-17T13:10:18.8569641Z [36;1mecho "targets=$(for t in ${targets//,/ }; do echo -n ' --target' $t; done)" >> $GITHUB_OUTPUT[0m
+2026-08-17T13:10:18.8570238Z [36;1mecho "components=$(for c in ${components//,/ }; do echo -n ' --component' $c; done)" >> $GITHUB_OUTPUT[0m
+2026-08-17T13:10:18.8570692Z [36;1mecho "downgrade=" >> $GITHUB_OUTPUT[0m
+2026-08-17T13:10:18.8583170Z shell: C:\Program Files\Git\bin\bash.EXE --noprofile --norc -e -o pipefail {0}
+2026-08-17T13:10:18.8583541Z env:
+2026-08-17T13:10:18.8583732Z   RELEASE_TAG: v0.2.6-sehoon.6
+2026-08-17T13:10:18.8584164Z   RELEASE_VERSION: 0.2.6-sehoon.6
+2026-08-17T13:10:18.8584411Z   targets: 
+2026-08-17T13:10:18.8584593Z   components: rustfmt, clippy
+2026-08-17T13:10:18.8584806Z ##[endgroup]
+2026-08-17T13:10:18.9223557Z ##[end-action id=__dtolnay_rust-toolchain.flags;outcome=success;conclusion=success;duration_ms=78]
+2026-08-17T13:10:18.9230680Z ##[start-action display=Run : set $CARGO_HOME;id=__dtolnay_rust-toolchain.__run]
+2026-08-17T13:10:18.9359450Z ##[group]Run : set $CARGO_HOME
+2026-08-17T13:10:18.9359706Z [36;1m: set $CARGO_HOME[0m
+2026-08-17T13:10:18.9360047Z [36;1mecho CARGO_HOME=${CARGO_HOME:-"$USERPROFILE\.cargo"} >> $GITHUB_ENV[0m
+2026-08-17T13:10:18.9372838Z shell: C:\Program Files\Git\bin\bash.EXE --noprofile --norc -e -o pipefail {0}
+2026-08-17T13:10:18.9373238Z env:
+2026-08-17T13:10:18.9373437Z   RELEASE_TAG: v0.2.6-sehoon.6
+2026-08-17T13:10:18.9373663Z   RELEASE_VERSION: 0.2.6-sehoon.6
+2026-08-17T13:10:18.9373887Z ##[endgroup]
+2026-08-17T13:10:18.9754736Z ##[end-action id=__dtolnay_rust-toolchain.__run;outcome=success;conclusion=success;duration_ms=52]
+2026-08-17T13:10:18.9757291Z ##[start-action display=Run : install rustup if needed;id=__dtolnay_rust-toolchain.__run_2]
+2026-08-17T13:10:18.9767957Z ##[end-action id=__dtolnay_rust-toolchain.__run_2;outcome=skipped;conclusion=skipped;duration_ms=0]
+2026-08-17T13:10:18.9771688Z ##[start-action display=Run : install rustup if needed on windows;id=__dtolnay_rust-toolchain.__run_3]
+2026-08-17T13:10:18.9891456Z ##[group]Run : install rustup if needed on windows
+2026-08-17T13:10:18.9891801Z [36;1m: install rustup if needed on windows[0m
+2026-08-17T13:10:18.9892505Z [36;1mif ! command -v rustup &>/dev/null; then[0m
+2026-08-17T13:10:18.9893340Z [36;1m  curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused --location --silent --show-error --fail https://win.rustup.rs/x86_64 --output 'D:\a\_temp\rustup-init.exe'[0m
+2026-08-17T13:10:18.9894187Z [36;1m  'D:\a\_temp\rustup-init.exe' --default-toolchain none --no-modify-path -y[0m
+2026-08-17T13:10:18.9894583Z [36;1m  echo "$CARGO_HOME\bin" >> $GITHUB_PATH[0m
+2026-08-17T13:10:18.9894836Z [36;1mfi[0m
+2026-08-17T13:10:18.9906799Z shell: C:\Program Files\Git\bin\bash.EXE --noprofile --norc -e -o pipefail {0}
+2026-08-17T13:10:18.9907181Z env:
+2026-08-17T13:10:18.9907359Z   RELEASE_TAG: v0.2.6-sehoon.6
+2026-08-17T13:10:18.9907597Z   RELEASE_VERSION: 0.2.6-sehoon.6
+2026-08-17T13:10:18.9907843Z   CARGO_HOME: C:\Users\runneradmin\.cargo
+2026-08-17T13:10:18.9908083Z ##[endgroup]
+2026-08-17T13:10:19.0394497Z ##[end-action id=__dtolnay_rust-toolchain.__run_3;outcome=success;conclusion=success;duration_ms=62]
+2026-08-17T13:10:19.0398925Z ##[start-action display=rustup toolchain install stable;id=__dtolnay_rust-toolchain.__run_4]
+2026-08-17T13:10:19.0523570Z ##[group]Run rustup toolchain install stable --component rustfmt --component clippy --profile minimal --no-self-update
+2026-08-17T13:10:19.0524392Z [36;1mrustup toolchain install stable --component rustfmt --component clippy --profile minimal --no-self-update[0m
+2026-08-17T13:10:19.0537995Z shell: C:\Program Files\Git\bin\bash.EXE --noprofile --norc -e -o pipefail {0}
+2026-08-17T13:10:19.0538389Z env:
+2026-08-17T13:10:19.0538573Z   RELEASE_TAG: v0.2.6-sehoon.6
+2026-08-17T13:10:19.0538808Z   RELEASE_VERSION: 0.2.6-sehoon.6
+2026-08-17T13:10:19.0539070Z   CARGO_HOME: C:\Users\runneradmin\.cargo
+2026-08-17T13:10:19.0539338Z   RUSTUP_PERMIT_COPY_RENAME: 1
+2026-08-17T13:10:19.0539561Z ##[endgroup]
+2026-08-17T13:10:22.5349914Z info: syncing channel updates for stable-x86_64-pc-windows-msvc
+2026-08-17T13:10:24.1981992Z info: latest update on 2026-07-16 for version 1.97.1 (8bab26f4f 2026-07-14)
+2026-08-17T13:10:24.3023547Z info: component clippy is up to date
+2026-08-17T13:10:24.3023883Z info: component rustfmt is up to date
+2026-08-17T13:10:24.3044942Z 
+2026-08-17T13:10:24.3254611Z   stable-x86_64-pc-windows-msvc unchanged - rustc 1.97.1 (8bab26f4f 2026-07-14)
+2026-08-17T13:10:24.3256324Z 
+2026-08-17T13:10:24.3874733Z ##[end-action id=__dtolnay_rust-toolchain.__run_4;outcome=success;conclusion=success;duration_ms=5347]
+2026-08-17T13:10:24.3880789Z ##[start-action display=Run rustup default stable;id=__dtolnay_rust-toolchain.__run_5]
+2026-08-17T13:10:24.4041954Z ##[group]Run rustup default stable
+2026-08-17T13:10:24.4042239Z [36;1mrustup default stable[0m
+2026-08-17T13:10:24.4055422Z shell: C:\Program Files\Git\bin\bash.EXE --noprofile --norc -e -o pipefail {0}
+2026-08-17T13:10:24.4055805Z env:
+2026-08-17T13:10:24.4055990Z   RELEASE_TAG: v0.2.6-sehoon.6
+2026-08-17T13:10:24.4056231Z   RELEASE_VERSION: 0.2.6-sehoon.6
+2026-08-17T13:10:24.4056482Z   CARGO_HOME: C:\Users\runneradmin\.cargo
+2026-08-17T13:10:24.4056731Z ##[endgroup]
+2026-08-17T13:10:24.4739148Z info: using existing install for stable-x86_64-pc-windows-msvc
+2026-08-17T13:10:24.4928141Z info: default toolchain set to stable-x86_64-pc-windows-msvc
+2026-08-17T13:10:24.4928455Z 
+2026-08-17T13:10:24.5130359Z   stable-x86_64-pc-windows-msvc unchanged - rustc 1.97.1 (8bab26f4f 2026-07-14)
+2026-08-17T13:10:24.5130738Z 
+2026-08-17T13:10:24.5203794Z ##[end-action id=__dtolnay_rust-toolchain.__run_5;outcome=success;conclusion=success;duration_ms=132]
+2026-08-17T13:10:24.5209062Z ##[start-action display=Run : create cachekey;id=__dtolnay_rust-toolchain.rustc-version]
+2026-08-17T13:10:24.5328219Z ##[group]Run : create cachekey
+2026-08-17T13:10:24.5328513Z [36;1m: create cachekey[0m
+2026-08-17T13:10:24.5329014Z [36;1mDATE=$(rustc +stable --version --verbose | sed -ne 's/^commit-date: \(20[0-9][0-9]\)-\([01][0-9]\)-\([0-3][0-9]\)$/\1\2\3/p')[0m
+2026-08-17T13:10:24.5329628Z [36;1mHASH=$(rustc +stable --version --verbose | sed -ne 's/^commit-hash: //p')[0m
+2026-08-17T13:10:24.5330093Z [36;1mecho "cachekey=$(echo $DATE$HASH | head -c12)" >> $GITHUB_OUTPUT[0m
+2026-08-17T13:10:24.5342247Z shell: C:\Program Files\Git\bin\bash.EXE --noprofile --norc -e -o pipefail {0}
+2026-08-17T13:10:24.5342624Z env:
+2026-08-17T13:10:24.5342803Z   RELEASE_TAG: v0.2.6-sehoon.6
+2026-08-17T13:10:24.5343031Z   RELEASE_VERSION: 0.2.6-sehoon.6
+2026-08-17T13:10:24.5343271Z   CARGO_HOME: C:\Users\runneradmin\.cargo
+2026-08-17T13:10:24.5343516Z ##[endgroup]
+2026-08-17T13:10:25.5878605Z ##[end-action id=__dtolnay_rust-toolchain.rustc-version;outcome=success;conclusion=success;duration_ms=1066]
+2026-08-17T13:10:25.5881889Z ##[start-action display=Run : disable incremental compilation;id=__dtolnay_rust-toolchain.__run_6]
+2026-08-17T13:10:25.6020331Z ##[group]Run : disable incremental compilation
+2026-08-17T13:10:25.6020877Z [36;1m: disable incremental compilation[0m
+2026-08-17T13:10:25.6021384Z [36;1mif [ -z "${CARGO_INCREMENTAL+set}" ]; then[0m
+2026-08-17T13:10:25.6021912Z [36;1m  echo CARGO_INCREMENTAL=0 >> $GITHUB_ENV[0m
+2026-08-17T13:10:25.6022348Z [36;1mfi[0m
+2026-08-17T13:10:25.6041564Z shell: C:\Program Files\Git\bin\bash.EXE --noprofile --norc -e -o pipefail {0}
+2026-08-17T13:10:25.6042173Z env:
+2026-08-17T13:10:25.6042434Z   RELEASE_TAG: v0.2.6-sehoon.6
+2026-08-17T13:10:25.6042792Z   RELEASE_VERSION: 0.2.6-sehoon.6
+2026-08-17T13:10:25.6043189Z   CARGO_HOME: C:\Users\runneradmin\.cargo
+2026-08-17T13:10:25.6043588Z ##[endgroup]
+2026-08-17T13:10:25.6464402Z ##[end-action id=__dtolnay_rust-toolchain.__run_6;outcome=success;conclusion=success;duration_ms=58]
+2026-08-17T13:10:25.6466856Z ##[start-action display=Run : enable colors in Cargo output;id=__dtolnay_rust-toolchain.__run_7]
+2026-08-17T13:10:25.6582471Z ##[group]Run : enable colors in Cargo output
+2026-08-17T13:10:25.6582789Z [36;1m: enable colors in Cargo output[0m
+2026-08-17T13:10:25.6583075Z [36;1mif [ -z "${CARGO_TERM_COLOR+set}" ]; then[0m
+2026-08-17T13:10:25.6583389Z [36;1m  echo CARGO_TERM_COLOR=always >> $GITHUB_ENV[0m
+2026-08-17T13:10:25.6583657Z [36;1mfi[0m
+2026-08-17T13:10:25.6596911Z shell: C:\Program Files\Git\bin\bash.EXE --noprofile --norc -e -o pipefail {0}
+2026-08-17T13:10:25.6597285Z env:
+2026-08-17T13:10:25.6597462Z   RELEASE_TAG: v0.2.6-sehoon.6
+2026-08-17T13:10:25.6597698Z   RELEASE_VERSION: 0.2.6-sehoon.6
+2026-08-17T13:10:25.6597946Z   CARGO_HOME: C:\Users\runneradmin\.cargo
+2026-08-17T13:10:25.6598191Z   CARGO_INCREMENTAL: 0
+2026-08-17T13:10:25.6598387Z ##[endgroup]
+2026-08-17T13:10:25.6979198Z ##[end-action id=__dtolnay_rust-toolchain.__run_7;outcome=success;conclusion=success;duration_ms=51]
+2026-08-17T13:10:25.6983617Z ##[start-action display=Run : enable Cargo sparse registry;id=__dtolnay_rust-toolchain.__run_8]
+2026-08-17T13:10:25.7099563Z ##[group]Run : enable Cargo sparse registry
+2026-08-17T13:10:25.7099887Z [36;1m: enable Cargo sparse registry[0m
+2026-08-17T13:10:25.7100231Z [36;1m# implemented in 1.66, stabilized in 1.68, made default in 1.70[0m
+2026-08-17T13:10:25.7100897Z [36;1mif [ -z "${CARGO_REGISTRIES_CRATES_IO_PROTOCOL+set}" -o -f "D:\a\_temp"/.implicit_cargo_registries_crates_io_protocol ]; then[0m
+2026-08-17T13:10:25.7101576Z [36;1m  if rustc +stable --version --verbose | grep -q '^release: 1\.6[89]\.'; then[0m
+2026-08-17T13:10:25.7102072Z [36;1m    touch "D:\a\_temp"/.implicit_cargo_registries_crates_io_protocol || true[0m
+2026-08-17T13:10:25.7102535Z [36;1m    echo CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse >> $GITHUB_ENV[0m
+2026-08-17T13:10:25.7102999Z [36;1m  elif rustc +stable --version --verbose | grep -q '^release: 1\.6[67]\.'; then[0m
+2026-08-17T13:10:25.7103484Z [36;1m    touch "D:\a\_temp"/.implicit_cargo_registries_crates_io_protocol || true[0m
+2026-08-17T13:10:25.7103919Z [36;1m    echo CARGO_REGISTRIES_CRATES_IO_PROTOCOL=git >> $GITHUB_ENV[0m
+2026-08-17T13:10:25.7104236Z [36;1m  fi[0m
+2026-08-17T13:10:25.7104406Z [36;1mfi[0m
+2026-08-17T13:10:25.7117118Z shell: C:\Program Files\Git\bin\bash.EXE --noprofile --norc -e -o pipefail {0}
+2026-08-17T13:10:25.7117498Z env:
+2026-08-17T13:10:25.7117681Z   RELEASE_TAG: v0.2.6-sehoon.6
+2026-08-17T13:10:25.7117922Z   RELEASE_VERSION: 0.2.6-sehoon.6
+2026-08-17T13:10:25.7118166Z   CARGO_HOME: C:\Users\runneradmin\.cargo
+2026-08-17T13:10:25.7118418Z   CARGO_INCREMENTAL: 0
+2026-08-17T13:10:25.7118615Z   CARGO_TERM_COLOR: always
+2026-08-17T13:10:25.7118817Z ##[endgroup]
+2026-08-17T13:10:26.0484782Z ##[end-action id=__dtolnay_rust-toolchain.__run_8;outcome=success;conclusion=success;duration_ms=350]
+2026-08-17T13:10:26.0490996Z ##[start-action display=Run : work around spurious network errors in curl 8.0;id=__dtolnay_rust-toolchain.__run_9]
+2026-08-17T13:10:26.0651127Z ##[group]Run : work around spurious network errors in curl 8.0
+2026-08-17T13:10:26.0651569Z [36;1m: work around spurious network errors in curl 8.0[0m
+2026-08-17T13:10:26.0652143Z [36;1m# https://rust-lang.zulipchat.com/#narrow/stream/246057-t-cargo/topic/timeout.20investigation[0m
+2026-08-17T13:10:26.0652756Z [36;1mif rustc +stable --version --verbose | grep -q '^release: 1\.7[01]\.'; then[0m
+2026-08-17T13:10:26.0653254Z [36;1m  echo CARGO_HTTP_MULTIPLEXING=false >> $GITHUB_ENV[0m
+2026-08-17T13:10:26.0653558Z [36;1mfi[0m
+2026-08-17T13:10:26.0666402Z shell: C:\Program Files\Git\bin\bash.EXE --noprofile --norc -e -o pipefail {0}
+2026-08-17T13:10:26.0666805Z env:
+2026-08-17T13:10:26.0666986Z   RELEASE_TAG: v0.2.6-sehoon.6
+2026-08-17T13:10:26.0667235Z   RELEASE_VERSION: 0.2.6-sehoon.6
+2026-08-17T13:10:26.0667489Z   CARGO_HOME: C:\Users\runneradmin\.cargo
+2026-08-17T13:10:26.0667747Z   CARGO_INCREMENTAL: 0
+2026-08-17T13:10:26.0667964Z   CARGO_TERM_COLOR: always
+2026-08-17T13:10:26.0668183Z ##[endgroup]
+2026-08-17T13:10:26.1745255Z ##[end-action id=__dtolnay_rust-toolchain.__run_9;outcome=success;conclusion=success;duration_ms=125]
+2026-08-17T13:10:26.1749472Z ##[start-action display=Run rustc +stable --version --verbose;id=__dtolnay_rust-toolchain.__run_10]
+2026-08-17T13:10:26.1871088Z ##[group]Run rustc +stable --version --verbose
+2026-08-17T13:10:26.1871422Z [36;1mrustc +stable --version --verbose[0m
+2026-08-17T13:10:26.1883377Z shell: C:\Program Files\Git\bin\bash.EXE --noprofile --norc -e -o pipefail {0}
+2026-08-17T13:10:26.1883772Z env:
+2026-08-17T13:10:26.1883956Z   RELEASE_TAG: v0.2.6-sehoon.6
+2026-08-17T13:10:26.1884190Z   RELEASE_VERSION: 0.2.6-sehoon.6
+2026-08-17T13:10:26.1884433Z   CARGO_HOME: C:\Users\runneradmin\.cargo
+2026-08-17T13:10:26.1884680Z   CARGO_INCREMENTAL: 0
+2026-08-17T13:10:26.1884874Z   CARGO_TERM_COLOR: always
+2026-08-17T13:10:26.1885075Z ##[endgroup]
+2026-08-17T13:10:26.2708887Z rustc 1.97.1 (8bab26f4f 2026-07-14)
+2026-08-17T13:10:26.2709752Z binary: rustc
+2026-08-17T13:10:26.2710125Z commit-hash: 8bab26f4f68e0e26f0bb7960be334d5b520ea452
+2026-08-17T13:10:26.2710430Z commit-date: 2026-07-14
+2026-08-17T13:10:26.2710654Z host: x86_64-pc-windows-msvc
+2026-08-17T13:10:26.2710866Z release: 1.97.1
+2026-08-17T13:10:26.2711561Z LLVM version: 22.1.6
+2026-08-17T13:10:26.2823089Z ##[end-action id=__dtolnay_rust-toolchain.__run_10;outcome=success;conclusion=success;duration_ms=107]
+2026-08-17T13:10:26.3004779Z ##[group]Run $ErrorActionPreference = 'Stop'
+2026-08-17T13:10:26.3005243Z [36;1m$ErrorActionPreference = 'Stop'[0m
+2026-08-17T13:10:26.3005676Z [36;1mif (gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY 2>$null) {[0m
+2026-08-17T13:10:26.3006248Z [36;1m  gh release delete $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --cleanup-tag --yes[0m
+2026-08-17T13:10:26.3006778Z [36;1m  if ($LASTEXITCODE -ne 0) { throw 'failed to remove incomplete v6 release' }[0m
+2026-08-17T13:10:26.3007123Z [36;1m}[0m
+2026-08-17T13:10:26.4706416Z shell: C:\Program Files\PowerShell\7\pwsh.EXE -command ". '{0}'"
+2026-08-17T13:10:26.4706808Z env:
+2026-08-17T13:10:26.4707007Z   RELEASE_TAG: v0.2.6-sehoon.6
+2026-08-17T13:10:26.4707245Z   RELEASE_VERSION: 0.2.6-sehoon.6
+2026-08-17T13:10:26.4707490Z   CARGO_HOME: C:\Users\runneradmin\.cargo
+2026-08-17T13:10:26.4707743Z   CARGO_INCREMENTAL: 0
+2026-08-17T13:10:26.4707948Z   CARGO_TERM_COLOR: always
+2026-08-17T13:10:26.4711062Z   GH_TOKEN: ***
+2026-08-17T13:10:26.4711256Z ##[endgroup]
+2026-08-17T13:10:40.8191427Z ##[error]Process completed with exit code 1.
+2026-08-17T13:10:40.8504203Z Post job cleanup.
+2026-08-17T13:10:41.0248197Z [command]"C:\Program Files\Git\bin\git.exe" version
+2026-08-17T13:10:41.0519511Z git version 2.55.0.windows.3
+2026-08-17T13:10:41.0581233Z Temporarily overriding HOME='D:\a\_temp\06a3af54-d3c9-497b-8ea8-babfaa691b93' before making global git config changes
+2026-08-17T13:10:41.0582515Z Adding repository directory to the temporary git global config as a safe directory
+2026-08-17T13:10:41.0591572Z [command]"C:\Program Files\Git\bin\git.exe" config --global --add safe.directory D:\a\LeopardWM\LeopardWM
+2026-08-17T13:10:41.0875866Z Removing SSH command configuration
+2026-08-17T13:10:41.0887234Z [command]"C:\Program Files\Git\bin\git.exe" config --local --name-only --get-regexp core\.sshCommand
+2026-08-17T13:10:41.1180024Z [command]"C:\Program Files\Git\bin\git.exe" submodule foreach --recursive "sh -c \"git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :\""
+2026-08-17T13:10:41.6765365Z Removing HTTP extra header
+2026-08-17T13:10:41.6776453Z [command]"C:\Program Files\Git\bin\git.exe" config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-08-17T13:10:41.7072988Z [command]"C:\Program Files\Git\bin\git.exe" submodule foreach --recursive "sh -c \"git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :\""
+2026-08-17T13:10:42.2468024Z Removing includeIf entries pointing to credentials config files
+2026-08-17T13:10:42.2478489Z [command]"C:\Program Files\Git\bin\git.exe" config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-08-17T13:10:42.2736489Z includeif.gitdir:D:/a/LeopardWM/LeopardWM/.git.path
+2026-08-17T13:10:42.2737171Z includeif.gitdir:D:/a/LeopardWM/LeopardWM/.git/worktrees/*.path
+2026-08-17T13:10:42.2737860Z includeif.gitdir:/github/workspace/.git.path
+2026-08-17T13:10:42.2738210Z includeif.gitdir:/github/workspace/.git/worktrees/*.path
+2026-08-17T13:10:42.2774498Z [command]"C:\Program Files\Git\bin\git.exe" config --local --get-all includeif.gitdir:D:/a/LeopardWM/LeopardWM/.git.path
+2026-08-17T13:10:42.3028191Z D:\a\_temp\git-credentials-56423a0b-6132-4613-bd91-c0dd69b22e44.config
+2026-08-17T13:10:42.3067859Z [command]"C:\Program Files\Git\bin\git.exe" config --local --unset includeif.gitdir:D:/a/LeopardWM/LeopardWM/.git.path D\:\\a\\_temp\\git\-credentials\-56423a0b\-6132\-4613\-bd91\-c0dd69b22e44\.config
+2026-08-17T13:10:42.3412626Z [command]"C:\Program Files\Git\bin\git.exe" config --local --get-all includeif.gitdir:D:/a/LeopardWM/LeopardWM/.git/worktrees/*.path
+2026-08-17T13:10:42.3667253Z D:\a\_temp\git-credentials-56423a0b-6132-4613-bd91-c0dd69b22e44.config
+2026-08-17T13:10:42.3706784Z [command]"C:\Program Files\Git\bin\git.exe" config --local --unset includeif.gitdir:D:/a/LeopardWM/LeopardWM/.git/worktrees/*.path D\:\\a\\_temp\\git\-credentials\-56423a0b\-6132\-4613\-bd91\-c0dd69b22e44\.config
+2026-08-17T13:10:42.3995132Z [command]"C:\Program Files\Git\bin\git.exe" config --local --get-all includeif.gitdir:/github/workspace/.git.path
+2026-08-17T13:10:42.4241603Z /github/runner_temp/git-credentials-56423a0b-6132-4613-bd91-c0dd69b22e44.config
+2026-08-17T13:10:42.4279542Z [command]"C:\Program Files\Git\bin\git.exe" config --local --unset includeif.gitdir:/github/workspace/.git.path \/github\/runner_temp\/git\-credentials\-56423a0b\-6132\-4613\-bd91\-c0dd69b22e44\.config
+2026-08-17T13:10:42.4568316Z [command]"C:\Program Files\Git\bin\git.exe" config --local --get-all includeif.gitdir:/github/workspace/.git/worktrees/*.path
+2026-08-17T13:10:42.4814394Z /github/runner_temp/git-credentials-56423a0b-6132-4613-bd91-c0dd69b22e44.config
+2026-08-17T13:10:42.4852466Z [command]"C:\Program Files\Git\bin\git.exe" config --local --unset includeif.gitdir:/github/workspace/.git/worktrees/*.path \/github\/runner_temp\/git\-credentials\-56423a0b\-6132\-4613\-bd91\-c0dd69b22e44\.config
+2026-08-17T13:10:42.5144667Z [command]"C:\Program Files\Git\bin\git.exe" submodule foreach --recursive "git config --local --show-origin --name-only --get-regexp remote.origin.url"
+2026-08-17T13:10:43.0427917Z Removing credentials config 'D:\a\_temp\git-credentials-56423a0b-6132-4613-bd91-c0dd69b22e44.config'
+2026-08-17T13:10:43.0622829Z Cleaning up orphan processes
+
+
+===== 1_Set up job.txt =====
+2026-08-17T13:10:11.4704267Z Current runner version: '2.336.0'
+2026-08-17T13:10:11.4757295Z ##[group]Runner Image Provisioner
+2026-08-17T13:10:11.4758134Z Hosted Compute Agent
+2026-08-17T13:10:11.4759533Z Version: 20260729.566
+2026-08-17T13:10:11.4760381Z Commit: cf7153fe6e25b664e8693c24944bf2b00355d109
+2026-08-17T13:10:11.4761483Z Build Date: 2026-07-29T19:17:02Z
+2026-08-17T13:10:11.4762362Z Worker ID: {3f2dc603-7b9c-486d-838a-0ed3aa1d7cbb}
+2026-08-17T13:10:11.4763632Z Azure Region: eastus2
+2026-08-17T13:10:11.4764445Z ##[endgroup]
+2026-08-17T13:10:11.4766333Z ##[group]Operating System
+2026-08-17T13:10:11.4767244Z Microsoft Windows Server 2025
+2026-08-17T13:10:11.4768103Z 10.0.26100
+2026-08-17T13:10:11.4768788Z Datacenter
+2026-08-17T13:10:11.4769494Z ##[endgroup]
+2026-08-17T13:10:11.4770239Z ##[group]Runner Image
+2026-08-17T13:10:11.4771129Z Image: windows-2025-vs2026
+2026-08-17T13:10:11.4771971Z Version: 20260810.198.2
+2026-08-17T13:10:11.4773650Z Included Software: https://github.com/actions/runner-images/blob/win25-vs2026/20260810.198/images/windows/Windows2025-VS2026-Readme.md
+2026-08-17T13:10:11.4776811Z Image Release: https://github.com/actions/runner-images/releases/tag/win25-vs2026%2F20260810.198
+2026-08-17T13:10:11.4778801Z ##[endgroup]
+2026-08-17T13:10:11.4780677Z ##[group]GITHUB_TOKEN Permissions
+2026-08-17T13:10:11.4783595Z Contents: write
+2026-08-17T13:10:11.4784487Z Metadata: read
+2026-08-17T13:10:11.4785356Z ##[endgroup]
+2026-08-17T13:10:11.4788633Z Secret source: Actions
+2026-08-17T13:10:11.4790469Z Prepare workflow directory
+2026-08-17T13:10:11.5217940Z Prepare all required actions
+2026-08-17T13:10:11.5272279Z Getting action download info
+2026-08-17T13:10:11.7046924Z Download action repository 'actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1' (SHA:3d3c42e5aac5ba805825da76410c181273ba90b1)
+2026-08-17T13:10:11.8421559Z Download action repository 'dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7' (SHA:631a55b12751854ce901bb631d5902ceb48146f7)
+2026-08-17T13:10:12.1149763Z Complete job name: verify-build-release
+
+
+===== 2_Check out clean source.txt =====
+2026-08-17T13:10:12.2635370Z ##[group]Run actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+2026-08-17T13:10:12.2636684Z with:
+2026-08-17T13:10:12.2637073Z   ref: agent/msi-v6-clean
+2026-08-17T13:10:12.2637506Z   fetch-depth: 0
+2026-08-17T13:10:12.2637913Z   repository: sehoon123/LeopardWM
+2026-08-17T13:10:12.2641845Z   token: ***
+2026-08-17T13:10:12.2642245Z   ssh-strict: true
+2026-08-17T13:10:12.2642628Z   ssh-user: git
+2026-08-17T13:10:12.2643016Z   persist-credentials: true
+2026-08-17T13:10:12.2643447Z   clean: true
+2026-08-17T13:10:12.2643837Z   sparse-checkout-cone-mode: true
+2026-08-17T13:10:12.2644298Z   fetch-tags: false
+2026-08-17T13:10:12.2644684Z   show-progress: true
+2026-08-17T13:10:12.2645069Z   lfs: false
+2026-08-17T13:10:12.2645417Z   submodules: false
+2026-08-17T13:10:12.2645810Z   set-safe-directory: true
+2026-08-17T13:10:12.2646252Z   allow-unsafe-pr-checkout: false
+2026-08-17T13:10:12.2646910Z env:
+2026-08-17T13:10:12.2647303Z   RELEASE_TAG: v0.2.6-sehoon.6
+2026-08-17T13:10:12.2647757Z   RELEASE_VERSION: 0.2.6-sehoon.6
+2026-08-17T13:10:12.2648240Z ##[endgroup]
+2026-08-17T13:10:12.4159232Z Syncing repository: sehoon123/LeopardWM
+2026-08-17T13:10:12.4160960Z ##[group]Getting Git version info
+2026-08-17T13:10:12.4162006Z Working directory is 'D:\a\LeopardWM\LeopardWM'
+2026-08-17T13:10:12.5027870Z [command]"C:\Program Files\Git\bin\git.exe" version
+2026-08-17T13:10:12.8674366Z git version 2.55.0.windows.3
+2026-08-17T13:10:12.8722596Z ##[endgroup]
+2026-08-17T13:10:12.8740158Z Temporarily overriding HOME='D:\a\_temp\30424a4c-9b6b-4e7f-9ab0-df80f4e8174a' before making global git config changes
+2026-08-17T13:10:12.8742008Z Adding repository directory to the temporary git global config as a safe directory
+2026-08-17T13:10:12.8750846Z [command]"C:\Program Files\Git\bin\git.exe" config --global --add safe.directory D:\a\LeopardWM\LeopardWM
+2026-08-17T13:10:12.9427239Z Deleting the contents of 'D:\a\LeopardWM\LeopardWM'
+2026-08-17T13:10:12.9432885Z ##[group]Determining repository object format
+2026-08-17T13:10:13.1117191Z ##[endgroup]
+2026-08-17T13:10:13.1119016Z ##[group]Initializing the repository
+2026-08-17T13:10:13.1136346Z [command]"C:\Program Files\Git\bin\git.exe" init D:\a\LeopardWM\LeopardWM
+2026-08-17T13:10:13.2102231Z Initialized empty Git repository in D:/a/LeopardWM/LeopardWM/.git/
+2026-08-17T13:10:13.2146718Z [command]"C:\Program Files\Git\bin\git.exe" remote add origin https://github.com/sehoon123/LeopardWM
+2026-08-17T13:10:13.2685961Z ##[endgroup]
+2026-08-17T13:10:13.2686595Z ##[group]Disabling automatic garbage collection
+2026-08-17T13:10:13.2695236Z [command]"C:\Program Files\Git\bin\git.exe" config --local gc.auto 0
+2026-08-17T13:10:13.2976106Z ##[endgroup]
+2026-08-17T13:10:13.2976834Z ##[group]Setting up auth
+2026-08-17T13:10:13.2977863Z Removing SSH command configuration
+2026-08-17T13:10:13.2987307Z [command]"C:\Program Files\Git\bin\git.exe" config --local --name-only --get-regexp core\.sshCommand
+2026-08-17T13:10:13.3329598Z [command]"C:\Program Files\Git\bin\git.exe" submodule foreach --recursive "sh -c \"git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :\""
+2026-08-17T13:10:14.8294097Z Removing HTTP extra header
+2026-08-17T13:10:14.8304155Z [command]"C:\Program Files\Git\bin\git.exe" config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-08-17T13:10:14.8590802Z [command]"C:\Program Files\Git\bin\git.exe" submodule foreach --recursive "sh -c \"git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :\""
+2026-08-17T13:10:15.3465957Z Removing includeIf entries pointing to credentials config files
+2026-08-17T13:10:15.3477765Z [command]"C:\Program Files\Git\bin\git.exe" config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-08-17T13:10:15.3766800Z [command]"C:\Program Files\Git\bin\git.exe" submodule foreach --recursive "git config --local --show-origin --name-only --get-regexp remote.origin.url"
+2026-08-17T13:10:16.0937856Z [command]"C:\Program Files\Git\bin\git.exe" config --file D:\a\_temp\git-credentials-56423a0b-6132-4613-bd91-c0dd69b22e44.config http.https://github.com/.extraheader "AUTHORIZATION: basic ***"
+2026-08-17T13:10:16.1299713Z [command]"C:\Program Files\Git\bin\git.exe" config --local includeIf.gitdir:D:/a/LeopardWM/LeopardWM/.git.path D:\a\_temp\git-credentials-56423a0b-6132-4613-bd91-c0dd69b22e44.config
+2026-08-17T13:10:16.1608399Z [command]"C:\Program Files\Git\bin\git.exe" config --local includeIf.gitdir:D:/a/LeopardWM/LeopardWM/.git/worktrees/*.path D:\a\_temp\git-credentials-56423a0b-6132-4613-bd91-c0dd69b22e44.config
+2026-08-17T13:10:16.1979918Z [command]"C:\Program Files\Git\bin\git.exe" config --local includeIf.gitdir:/github/workspace/.git.path /github/runner_temp/git-credentials-56423a0b-6132-4613-bd91-c0dd69b22e44.config
+2026-08-17T13:10:16.2294224Z [command]"C:\Program Files\Git\bin\git.exe" config --local includeIf.gitdir:/github/workspace/.git/worktrees/*.path /github/runner_temp/git-credentials-56423a0b-6132-4613-bd91-c0dd69b22e44.config
+2026-08-17T13:10:16.2599731Z ##[endgroup]
+2026-08-17T13:10:16.2600163Z ##[group]Fetching the repository
+2026-08-17T13:10:16.2612723Z [command]"C:\Program Files\Git\bin\git.exe" -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules origin +refs/heads/*:refs/remotes/origin/* +refs/tags/*:refs/tags/*
+2026-08-17T13:10:17.8821622Z From https://github.com/sehoon123/LeopardWM
+2026-08-17T13:10:17.8822751Z  * [new branch]      agent/features-msi-v6 -> origin/agent/features-msi-v6
+2026-08-17T13:10:17.8823573Z  * [new branch]      agent/fix-floating-size-drift -> origin/agent/fix-floating-size-drift
+2026-08-17T13:10:17.8825083Z  * [new branch]      agent/full-audit-scratchpad-02 -> origin/agent/full-audit-scratchpad-02
+2026-08-17T13:10:17.8825974Z  * [new branch]      agent/msi-v6-clean    -> origin/agent/msi-v6-clean
+2026-08-17T13:10:17.8828163Z  * [new branch]      agent/performance-audit-03 -> origin/agent/performance-audit-03
+2026-08-17T13:10:17.8829074Z  * [new branch]      agent/production-hardening-05 -> origin/agent/production-hardening-05
+2026-08-17T13:10:17.8829875Z  * [new branch]      agent/release-msi-v6  -> origin/agent/release-msi-v6
+2026-08-17T13:10:17.8831772Z  * [new branch]      agent/settings-resize-audit-01 -> origin/agent/settings-resize-audit-01
+2026-08-17T13:10:17.8832729Z  * [new branch]      agent/v5-release-control -> origin/agent/v5-release-control
+2026-08-17T13:10:17.8833566Z  * [new branch]      feat/preserve-floating-sizes -> origin/feat/preserve-floating-sizes
+2026-08-17T13:10:17.8834395Z  * [new branch]      main                  -> origin/main
+2026-08-17T13:10:17.8834907Z  * [new tag]         v0.1.0                -> v0.1.0
+2026-08-17T13:10:17.8835582Z  * [new tag]         v0.1.1                -> v0.1.1
+2026-08-17T13:10:17.8836063Z  * [new tag]         v0.1.10               -> v0.1.10
+2026-08-17T13:10:17.8836564Z  * [new tag]         v0.1.11               -> v0.1.11
+2026-08-17T13:10:17.8837042Z  * [new tag]         v0.1.12               -> v0.1.12
+2026-08-17T13:10:17.8837498Z  * [new tag]         v0.1.13               -> v0.1.13
+2026-08-17T13:10:17.8837939Z  * [new tag]         v0.1.14               -> v0.1.14
+2026-08-17T13:10:17.8838388Z  * [new tag]         v0.1.15               -> v0.1.15
+2026-08-17T13:10:17.8838842Z  * [new tag]         v0.1.16               -> v0.1.16
+2026-08-17T13:10:17.8839283Z  * [new tag]         v0.1.17               -> v0.1.17
+2026-08-17T13:10:17.8839734Z  * [new tag]         v0.1.18               -> v0.1.18
+2026-08-17T13:10:17.8840196Z  * [new tag]         v0.1.19               -> v0.1.19
+2026-08-17T13:10:17.8840654Z  * [new tag]         v0.1.2                -> v0.1.2
+2026-08-17T13:10:17.8841143Z  * [new tag]         v0.1.3                -> v0.1.3
+2026-08-17T13:10:17.8841691Z  * [new tag]         v0.1.4                -> v0.1.4
+2026-08-17T13:10:17.8842185Z  * [new tag]         v0.1.5                -> v0.1.5
+2026-08-17T13:10:17.8843650Z  * [new tag]         v0.1.6                -> v0.1.6
+2026-08-17T13:10:17.8844195Z  * [new tag]         v0.1.7                -> v0.1.7
+2026-08-17T13:10:17.8844495Z  * [new tag]         v0.1.8                -> v0.1.8
+2026-08-17T13:10:17.8844774Z  * [new tag]         v0.1.9                -> v0.1.9
+2026-08-17T13:10:17.8845109Z  * [new tag]         v0.2.0                -> v0.2.0
+2026-08-17T13:10:17.8845474Z  * [new tag]         v0.2.1                -> v0.2.1
+2026-08-17T13:10:17.8845782Z  * [new tag]         v0.2.2                -> v0.2.2
+2026-08-17T13:10:17.8846046Z  * [new tag]         v0.2.3                -> v0.2.3
+2026-08-17T13:10:17.8846303Z  * [new tag]         v0.2.4                -> v0.2.4
+2026-08-17T13:10:17.8846576Z  * [new tag]         v0.2.5                -> v0.2.5
+2026-08-17T13:10:17.8846835Z  * [new tag]         v0.2.6                -> v0.2.6
+2026-08-17T13:10:17.8847150Z  * [new tag]         v0.2.6-sehoon.1       -> v0.2.6-sehoon.1
+2026-08-17T13:10:17.8847472Z  * [new tag]         v0.2.6-sehoon.2       -> v0.2.6-sehoon.2
+2026-08-17T13:10:17.8847768Z  * [new tag]         v0.2.6-sehoon.3       -> v0.2.6-sehoon.3
+2026-08-17T13:10:17.8848063Z  * [new tag]         v0.2.6-sehoon.4       -> v0.2.6-sehoon.4
+2026-08-17T13:10:17.8848356Z  * [new tag]         v0.2.6-sehoon.5       -> v0.2.6-sehoon.5
+2026-08-17T13:10:17.8864653Z ##[endgroup]
+2026-08-17T13:10:17.8865042Z ##[group]Determining the checkout info
+2026-08-17T13:10:17.8875849Z [command]"C:\Program Files\Git\bin\git.exe" branch --list --remote origin/agent/msi-v6-clean
+2026-08-17T13:10:17.9216236Z   origin/agent/msi-v6-clean
+2026-08-17T13:10:17.9249220Z ##[endgroup]
+2026-08-17T13:10:17.9256855Z [command]"C:\Program Files\Git\bin\git.exe" sparse-checkout disable
+2026-08-17T13:10:17.9799764Z [command]"C:\Program Files\Git\bin\git.exe" config --local --unset-all extensions.worktreeConfig
+2026-08-17T13:10:18.0087351Z ##[group]Checking out the ref
+2026-08-17T13:10:18.0096014Z [command]"C:\Program Files\Git\bin\git.exe" checkout --progress --force -B agent/msi-v6-clean refs/remotes/origin/agent/msi-v6-clean
+2026-08-17T13:10:18.1061778Z Switched to a new branch 'agent/msi-v6-clean'
+2026-08-17T13:10:18.1083349Z branch 'agent/msi-v6-clean' set up to track 'origin/agent/msi-v6-clean'.
+2026-08-17T13:10:18.1129713Z ##[endgroup]
+2026-08-17T13:10:18.1552012Z [command]"C:\Program Files\Git\bin\git.exe" log -1 --format=%H
+2026-08-17T13:10:18.1812762Z 07e47e6e3556eb670a0a90a336e961415d35d607
+
+
+===== 3_Install stable Rust.txt =====
+2026-08-17T13:10:18.2412687Z ##[group]Run dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7
+2026-08-17T13:10:18.2413245Z with:
+2026-08-17T13:10:18.2413454Z   components: rustfmt, clippy
+2026-08-17T13:10:18.2413705Z   toolchain: stable
+2026-08-17T13:10:18.2413894Z env:
+2026-08-17T13:10:18.2414078Z   RELEASE_TAG: v0.2.6-sehoon.6
+2026-08-17T13:10:18.2414325Z   RELEASE_VERSION: 0.2.6-sehoon.6
+2026-08-17T13:10:18.2414591Z ##[endgroup]
+2026-08-17T13:10:18.2510531Z ##[start-action display=Run : parse toolchain version;id=__dtolnay_rust-toolchain.parse]
+2026-08-17T13:10:18.2657541Z ##[group]Run : parse toolchain version
+2026-08-17T13:10:18.2657970Z [36;1m: parse toolchain version[0m
+2026-08-17T13:10:18.2658248Z [36;1mif [[ -z $toolchain ]]; then[0m
+2026-08-17T13:10:18.2658763Z [36;1m  # GitHub does not enforce `required: true` inputs itself. https://github.com/actions/runner/issues/1070[0m
+2026-08-17T13:10:18.2659668Z [36;1m  echo "'toolchain' is a required input" >&2[0m
+2026-08-17T13:10:18.2659954Z [36;1m  exit 1[0m
+2026-08-17T13:10:18.2660331Z [36;1melif [[ $toolchain =~ ^stable' '[0-9]+' '(year|month|week|day)s?' 'ago$ ]]; then[0m
+2026-08-17T13:10:18.2660723Z [36;1m  if [[ Windows == macOS ]]; then[0m
+2026-08-17T13:10:18.2661501Z [36;1m    echo "toolchain=1.$((($(date -v-$(sed 's/stable \([0-9]*\) \(.\).*/\1\2/' <<< $toolchain) +%s)/60/60/24-16569)/7/6))" >> $GITHUB_OUTPUT[0m
+2026-08-17T13:10:18.2662039Z [36;1m  else[0m
+2026-08-17T13:10:18.2662439Z [36;1m    echo "toolchain=1.$((($(date --date "${toolchain#stable }" +%s)/60/60/24-16569)/7/6))" >> $GITHUB_OUTPUT[0m
+2026-08-17T13:10:18.2662886Z [36;1m  fi[0m
+2026-08-17T13:10:18.2663183Z [36;1melif [[ $toolchain =~ ^stable' 'minus' '[0-9]+' 'releases?$ ]]; then[0m
+2026-08-17T13:10:18.2663687Z [36;1m  echo "toolchain=1.$((($(date +%s)/60/60/24-16569)/7/6-${toolchain//[^0-9]/}))" >> $GITHUB_OUTPUT[0m
+2026-08-17T13:10:18.2664113Z [36;1melif [[ $toolchain =~ ^1\.[0-9]+$ ]]; then[0m
+2026-08-17T13:10:18.2664600Z [36;1m  echo "toolchain=1.$((i=${toolchain#1.}, c=($(date +%s)/60/60/24-16569)/7/6, i+9*i*(10*i<=c)+90*i*(100*i<=c)))" >> $GITHUB_OUTPUT[0m
+2026-08-17T13:10:18.2665063Z [36;1melse[0m
+2026-08-17T13:10:18.2665283Z [36;1m  echo "toolchain=$toolchain" >> $GITHUB_OUTPUT[0m
+2026-08-17T13:10:18.2665554Z [36;1mfi[0m
+2026-08-17T13:10:18.2683325Z shell: C:\Program Files\Git\bin\bash.EXE --noprofile --norc -e -o pipefail {0}
+2026-08-17T13:10:18.2683768Z env:
+2026-08-17T13:10:18.2683962Z   RELEASE_TAG: v0.2.6-sehoon.6
+2026-08-17T13:10:18.2684202Z   RELEASE_VERSION: 0.2.6-sehoon.6
+2026-08-17T13:10:18.2684429Z   toolchain: stable
+2026-08-17T13:10:18.2684615Z ##[endgroup]
+2026-08-17T13:10:18.8415438Z ##[end-action id=__dtolnay_rust-toolchain.parse;outcome=success;conclusion=success;duration_ms=590]
+2026-08-17T13:10:18.8440044Z ##[start-action display=Run : construct rustup command line;id=__dtolnay_rust-toolchain.flags]
+2026-08-17T13:10:18.8568861Z ##[group]Run : construct rustup command line
+2026-08-17T13:10:18.8569184Z [36;1m: construct rustup command line[0m
+2026-08-17T13:10:18.8569639Z [36;1mecho "targets=$(for t in ${targets//,/ }; do echo -n ' --target' $t; done)" >> $GITHUB_OUTPUT[0m
+2026-08-17T13:10:18.8570236Z [36;1mecho "components=$(for c in ${components//,/ }; do echo -n ' --component' $c; done)" >> $GITHUB_OUTPUT[0m
+2026-08-17T13:10:18.8570690Z [36;1mecho "downgrade=" >> $GITHUB_OUTPUT[0m
+2026-08-17T13:10:18.8583159Z shell: C:\Program Files\Git\bin\bash.EXE --noprofile --norc -e -o pipefail {0}
+2026-08-17T13:10:18.8583539Z env:
+2026-08-17T13:10:18.8583729Z   RELEASE_TAG: v0.2.6-sehoon.6
+2026-08-17T13:10:18.8584160Z   RELEASE_VERSION: 0.2.6-sehoon.6
+2026-08-17T13:10:18.8584409Z   targets: 
+2026-08-17T13:10:18.8584590Z   components: rustfmt, clippy
+2026-08-17T13:10:18.8584805Z ##[endgroup]
+2026-08-17T13:10:18.9223539Z ##[end-action id=__dtolnay_rust-toolchain.flags;outcome=success;conclusion=success;duration_ms=78]
+2026-08-17T13:10:18.9228173Z ##[start-action display=Run : set $CARGO_HOME;id=__dtolnay_rust-toolchain.__run]
+2026-08-17T13:10:18.9359439Z ##[group]Run : set $CARGO_HOME
+2026-08-17T13:10:18.9359704Z [36;1m: set $CARGO_HOME[0m
+2026-08-17T13:10:18.9360044Z [36;1mecho CARGO_HOME=${CARGO_HOME:-"$USERPROFILE\.cargo"} >> $GITHUB_ENV[0m
+2026-08-17T13:10:18.9372831Z shell: C:\Program Files\Git\bin\bash.EXE --noprofile --norc -e -o pipefail {0}
+2026-08-17T13:10:18.9373235Z env:
+2026-08-17T13:10:18.9373434Z   RELEASE_TAG: v0.2.6-sehoon.6
+2026-08-17T13:10:18.9373661Z   RELEASE_VERSION: 0.2.6-sehoon.6
+2026-08-17T13:10:18.9373885Z ##[endgroup]
+2026-08-17T13:10:18.9754716Z ##[end-action id=__dtolnay_rust-toolchain.__run;outcome=success;conclusion=success;duration_ms=52]
+2026-08-17T13:10:18.9757286Z ##[start-action display=Run : install rustup if needed;id=__dtolnay_rust-toolchain.__run_2]
+2026-08-17T13:10:18.9767948Z ##[end-action id=__dtolnay_rust-toolchain.__run_2;outcome=skipped;conclusion=skipped;duration_ms=0]
+2026-08-17T13:10:18.9771659Z ##[start-action display=Run : install rustup if needed on windows;id=__dtolnay_rust-toolchain.__run_3]
+2026-08-17T13:10:18.9891447Z ##[group]Run : install rustup if needed on windows
+2026-08-17T13:10:18.9891799Z [36;1m: install rustup if needed on windows[0m
+2026-08-17T13:10:18.9892502Z [36;1mif ! command -v rustup &>/dev/null; then[0m
+2026-08-17T13:10:18.9893327Z [36;1m  curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused --location --silent --show-error --fail https://win.rustup.rs/x86_64 --output 'D:\a\_temp\rustup-init.exe'[0m
+2026-08-17T13:10:18.9894184Z [36;1m  'D:\a\_temp\rustup-init.exe' --default-toolchain none --no-modify-path -y[0m
+2026-08-17T13:10:18.9894581Z [36;1m  echo "$CARGO_HOME\bin" >> $GITHUB_PATH[0m
+2026-08-17T13:10:18.9894833Z [36;1mfi[0m
+2026-08-17T13:10:18.9906792Z shell: C:\Program Files\Git\bin\bash.EXE --noprofile --norc -e -o pipefail {0}
+2026-08-17T13:10:18.9907178Z env:
+2026-08-17T13:10:18.9907357Z   RELEASE_TAG: v0.2.6-sehoon.6
+2026-08-17T13:10:18.9907584Z   RELEASE_VERSION: 0.2.6-sehoon.6
+2026-08-17T13:10:18.9907840Z   CARGO_HOME: C:\Users\runneradmin\.cargo
+2026-08-17T13:10:18.9908081Z ##[endgroup]
+2026-08-17T13:10:19.0394477Z ##[end-action id=__dtolnay_rust-toolchain.__run_3;outcome=success;conclusion=success;duration_ms=62]
+2026-08-17T13:10:19.0398917Z ##[start-action display=rustup toolchain install stable;id=__dtolnay_rust-toolchain.__run_4]
+2026-08-17T13:10:19.0523557Z ##[group]Run rustup toolchain install stable --component rustfmt --component clippy --profile minimal --no-self-update
+2026-08-17T13:10:19.0524389Z [36;1mrustup toolchain install stable --component rustfmt --component clippy --profile minimal --no-self-update[0m
+2026-08-17T13:10:19.0537985Z shell: C:\Program Files\Git\bin\bash.EXE --noprofile --norc -e -o pipefail {0}
+2026-08-17T13:10:19.0538386Z env:
+2026-08-17T13:10:19.0538570Z   RELEASE_TAG: v0.2.6-sehoon.6
+2026-08-17T13:10:19.0538805Z   RELEASE_VERSION: 0.2.6-sehoon.6
+2026-08-17T13:10:19.0539049Z   CARGO_HOME: C:\Users\runneradmin\.cargo
+2026-08-17T13:10:19.0539335Z   RUSTUP_PERMIT_COPY_RENAME: 1
+2026-08-17T13:10:19.0539560Z ##[endgroup]
+2026-08-17T13:10:22.5349870Z info: syncing channel updates for stable-x86_64-pc-windows-msvc
+2026-08-17T13:10:24.1981944Z info: latest update on 2026-07-16 for version 1.97.1 (8bab26f4f 2026-07-14)
+2026-08-17T13:10:24.3023524Z info: component clippy is up to date
+2026-08-17T13:10:24.3023881Z info: component rustfmt is up to date
+2026-08-17T13:10:24.3044923Z 
+2026-08-17T13:10:24.3254359Z   stable-x86_64-pc-windows-msvc unchanged - rustc 1.97.1 (8bab26f4f 2026-07-14)
+2026-08-17T13:10:24.3256315Z 
+2026-08-17T13:10:24.3874717Z ##[end-action id=__dtolnay_rust-toolchain.__run_4;outcome=success;conclusion=success;duration_ms=5347]
+2026-08-17T13:10:24.3880778Z ##[start-action display=Run rustup default stable;id=__dtolnay_rust-toolchain.__run_5]
+2026-08-17T13:10:24.4041942Z ##[group]Run rustup default stable
+2026-08-17T13:10:24.4042237Z [36;1mrustup default stable[0m
+2026-08-17T13:10:24.4054814Z shell: C:\Program Files\Git\bin\bash.EXE --noprofile --norc -e -o pipefail {0}
+2026-08-17T13:10:24.4055802Z env:
+2026-08-17T13:10:24.4055987Z   RELEASE_TAG: v0.2.6-sehoon.6
+2026-08-17T13:10:24.4056229Z   RELEASE_VERSION: 0.2.6-sehoon.6
+2026-08-17T13:10:24.4056480Z   CARGO_HOME: C:\Users\runneradmin\.cargo
+2026-08-17T13:10:24.4056729Z ##[endgroup]
+2026-08-17T13:10:24.4739111Z info: using existing install for stable-x86_64-pc-windows-msvc
+2026-08-17T13:10:24.4928117Z info: default toolchain set to stable-x86_64-pc-windows-msvc
+2026-08-17T13:10:24.4928450Z 
+2026-08-17T13:10:24.5130332Z   stable-x86_64-pc-windows-msvc unchanged - rustc 1.97.1 (8bab26f4f 2026-07-14)
+2026-08-17T13:10:24.5130731Z 
+2026-08-17T13:10:24.5203783Z ##[end-action id=__dtolnay_rust-toolchain.__run_5;outcome=success;conclusion=success;duration_ms=132]
+2026-08-17T13:10:24.5209053Z ##[start-action display=Run : create cachekey;id=__dtolnay_rust-toolchain.rustc-version]
+2026-08-17T13:10:24.5328210Z ##[group]Run : create cachekey
+2026-08-17T13:10:24.5328493Z [36;1m: create cachekey[0m
+2026-08-17T13:10:24.5329011Z [36;1mDATE=$(rustc +stable --version --verbose | sed -ne 's/^commit-date: \(20[0-9][0-9]\)-\([01][0-9]\)-\([0-3][0-9]\)$/\1\2\3/p')[0m
+2026-08-17T13:10:24.5329626Z [36;1mHASH=$(rustc +stable --version --verbose | sed -ne 's/^commit-hash: //p')[0m
+2026-08-17T13:10:24.5330091Z [36;1mecho "cachekey=$(echo $DATE$HASH | head -c12)" >> $GITHUB_OUTPUT[0m
+2026-08-17T13:10:24.5342241Z shell: C:\Program Files\Git\bin\bash.EXE --noprofile --norc -e -o pipefail {0}
+2026-08-17T13:10:24.5342621Z env:
+2026-08-17T13:10:24.5342801Z   RELEASE_TAG: v0.2.6-sehoon.6
+2026-08-17T13:10:24.5343029Z   RELEASE_VERSION: 0.2.6-sehoon.6
+2026-08-17T13:10:24.5343269Z   CARGO_HOME: C:\Users\runneradmin\.cargo
+2026-08-17T13:10:24.5343514Z ##[endgroup]
+2026-08-17T13:10:25.5878588Z ##[end-action id=__dtolnay_rust-toolchain.rustc-version;outcome=success;conclusion=success;duration_ms=1066]
+2026-08-17T13:10:25.5881863Z ##[start-action display=Run : disable incremental compilation;id=__dtolnay_rust-toolchain.__run_6]
+2026-08-17T13:10:25.6020322Z ##[group]Run : disable incremental compilation
+2026-08-17T13:10:25.6020874Z [36;1m: disable incremental compilation[0m
+2026-08-17T13:10:25.6021381Z [36;1mif [ -z "${CARGO_INCREMENTAL+set}" ]; then[0m
+2026-08-17T13:10:25.6021909Z [36;1m  echo CARGO_INCREMENTAL=0 >> $GITHUB_ENV[0m
+2026-08-17T13:10:25.6022345Z [36;1mfi[0m
+2026-08-17T13:10:25.6041553Z shell: C:\Program Files\Git\bin\bash.EXE --noprofile --norc -e -o pipefail {0}
+2026-08-17T13:10:25.6042169Z env:
+2026-08-17T13:10:25.6042431Z   RELEASE_TAG: v0.2.6-sehoon.6
+2026-08-17T13:10:25.6042788Z   RELEASE_VERSION: 0.2.6-sehoon.6
+2026-08-17T13:10:25.6043185Z   CARGO_HOME: C:\Users\runneradmin\.cargo
+2026-08-17T13:10:25.6043584Z ##[endgroup]
+2026-08-17T13:10:25.6464390Z ##[end-action id=__dtolnay_rust-toolchain.__run_6;outcome=success;conclusion=success;duration_ms=58]
+2026-08-17T13:10:25.6466835Z ##[start-action display=Run : enable colors in Cargo output;id=__dtolnay_rust-toolchain.__run_7]
+2026-08-17T13:10:25.6582461Z ##[group]Run : enable colors in Cargo output
+2026-08-17T13:10:25.6582786Z [36;1m: enable colors in Cargo output[0m
+2026-08-17T13:10:25.6583073Z [36;1mif [ -z "${CARGO_TERM_COLOR+set}" ]; then[0m
+2026-08-17T13:10:25.6583387Z [36;1m  echo CARGO_TERM_COLOR=always >> $GITHUB_ENV[0m
+2026-08-17T13:10:25.6583654Z [36;1mfi[0m
+2026-08-17T13:10:25.6596902Z shell: C:\Program Files\Git\bin\bash.EXE --noprofile --norc -e -o pipefail {0}
+2026-08-17T13:10:25.6597282Z env:
+2026-08-17T13:10:25.6597459Z   RELEASE_TAG: v0.2.6-sehoon.6
+2026-08-17T13:10:25.6597695Z   RELEASE_VERSION: 0.2.6-sehoon.6
+2026-08-17T13:10:25.6597942Z   CARGO_HOME: C:\Users\runneradmin\.cargo
+2026-08-17T13:10:25.6598189Z   CARGO_INCREMENTAL: 0
+2026-08-17T13:10:25.6598385Z ##[endgroup]
+2026-08-17T13:10:25.6979184Z ##[end-action id=__dtolnay_rust-toolchain.__run_7;outcome=success;conclusion=success;duration_ms=51]
+2026-08-17T13:10:25.6983406Z ##[start-action display=Run : enable Cargo sparse registry;id=__dtolnay_rust-toolchain.__run_8]
+2026-08-17T13:10:25.7099554Z ##[group]Run : enable Cargo sparse registry
+2026-08-17T13:10:25.7099884Z [36;1m: enable Cargo sparse registry[0m
+2026-08-17T13:10:25.7100228Z [36;1m# implemented in 1.66, stabilized in 1.68, made default in 1.70[0m
+2026-08-17T13:10:25.7100893Z [36;1mif [ -z "${CARGO_REGISTRIES_CRATES_IO_PROTOCOL+set}" -o -f "D:\a\_temp"/.implicit_cargo_registries_crates_io_protocol ]; then[0m
+2026-08-17T13:10:25.7101574Z [36;1m  if rustc +stable --version --verbose | grep -q '^release: 1\.6[89]\.'; then[0m
+2026-08-17T13:10:25.7102070Z [36;1m    touch "D:\a\_temp"/.implicit_cargo_registries_crates_io_protocol || true[0m
+2026-08-17T13:10:25.7102532Z [36;1m    echo CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse >> $GITHUB_ENV[0m
+2026-08-17T13:10:25.7102996Z [36;1m  elif rustc +stable --version --verbose | grep -q '^release: 1\.6[67]\.'; then[0m
+2026-08-17T13:10:25.7103473Z [36;1m    touch "D:\a\_temp"/.implicit_cargo_registries_crates_io_protocol || true[0m
+2026-08-17T13:10:25.7103917Z [36;1m    echo CARGO_REGISTRIES_CRATES_IO_PROTOCOL=git >> $GITHUB_ENV[0m
+2026-08-17T13:10:25.7104234Z [36;1m  fi[0m
+2026-08-17T13:10:25.7104404Z [36;1mfi[0m
+2026-08-17T13:10:25.7117110Z shell: C:\Program Files\Git\bin\bash.EXE --noprofile --norc -e -o pipefail {0}
+2026-08-17T13:10:25.7117496Z env:
+2026-08-17T13:10:25.7117678Z   RELEASE_TAG: v0.2.6-sehoon.6
+2026-08-17T13:10:25.7117919Z   RELEASE_VERSION: 0.2.6-sehoon.6
+2026-08-17T13:10:25.7118164Z   CARGO_HOME: C:\Users\runneradmin\.cargo
+2026-08-17T13:10:25.7118416Z   CARGO_INCREMENTAL: 0
+2026-08-17T13:10:25.7118613Z   CARGO_TERM_COLOR: always
+2026-08-17T13:10:25.7118815Z ##[endgroup]
+2026-08-17T13:10:26.0484766Z ##[end-action id=__dtolnay_rust-toolchain.__run_8;outcome=success;conclusion=success;duration_ms=350]
+2026-08-17T13:10:26.0490963Z ##[start-action display=Run : work around spurious network errors in curl 8.0;id=__dtolnay_rust-toolchain.__run_9]
+2026-08-17T13:10:26.0651113Z ##[group]Run : work around spurious network errors in curl 8.0
+2026-08-17T13:10:26.0651567Z [36;1m: work around spurious network errors in curl 8.0[0m
+2026-08-17T13:10:26.0652139Z [36;1m# https://rust-lang.zulipchat.com/#narrow/stream/246057-t-cargo/topic/timeout.20investigation[0m
+2026-08-17T13:10:26.0652753Z [36;1mif rustc +stable --version --verbose | grep -q '^release: 1\.7[01]\.'; then[0m
+2026-08-17T13:10:26.0653252Z [36;1m  echo CARGO_HTTP_MULTIPLEXING=false >> $GITHUB_ENV[0m
+2026-08-17T13:10:26.0653556Z [36;1mfi[0m
+2026-08-17T13:10:26.0666393Z shell: C:\Program Files\Git\bin\bash.EXE --noprofile --norc -e -o pipefail {0}
+2026-08-17T13:10:26.0666802Z env:
+2026-08-17T13:10:26.0666984Z   RELEASE_TAG: v0.2.6-sehoon.6
+2026-08-17T13:10:26.0667233Z   RELEASE_VERSION: 0.2.6-sehoon.6
+2026-08-17T13:10:26.0667487Z   CARGO_HOME: C:\Users\runneradmin\.cargo
+2026-08-17T13:10:26.0667745Z   CARGO_INCREMENTAL: 0
+2026-08-17T13:10:26.0667948Z   CARGO_TERM_COLOR: always
+2026-08-17T13:10:26.0668181Z ##[endgroup]
+2026-08-17T13:10:26.1745234Z ##[end-action id=__dtolnay_rust-toolchain.__run_9;outcome=success;conclusion=success;duration_ms=125]
+2026-08-17T13:10:26.1749461Z ##[start-action display=Run rustc +stable --version --verbose;id=__dtolnay_rust-toolchain.__run_10]
+2026-08-17T13:10:26.1871079Z ##[group]Run rustc +stable --version --verbose
+2026-08-17T13:10:26.1871414Z [36;1mrustc +stable --version --verbose[0m
+2026-08-17T13:10:26.1883370Z shell: C:\Program Files\Git\bin\bash.EXE --noprofile --norc -e -o pipefail {0}
+2026-08-17T13:10:26.1883770Z env:
+2026-08-17T13:10:26.1883952Z   RELEASE_TAG: v0.2.6-sehoon.6
+2026-08-17T13:10:26.1884188Z   RELEASE_VERSION: 0.2.6-sehoon.6
+2026-08-17T13:10:26.1884431Z   CARGO_HOME: C:\Users\runneradmin\.cargo
+2026-08-17T13:10:26.1884678Z   CARGO_INCREMENTAL: 0
+2026-08-17T13:10:26.1884872Z   CARGO_TERM_COLOR: always
+2026-08-17T13:10:26.1885073Z ##[endgroup]
+2026-08-17T13:10:26.2708841Z rustc 1.97.1 (8bab26f4f 2026-07-14)
+2026-08-17T13:10:26.2709343Z binary: rustc
+2026-08-17T13:10:26.2710121Z commit-hash: 8bab26f4f68e0e26f0bb7960be334d5b520ea452
+2026-08-17T13:10:26.2710428Z commit-date: 2026-07-14
+2026-08-17T13:10:26.2710652Z host: x86_64-pc-windows-msvc
+2026-08-17T13:10:26.2710864Z release: 1.97.1
+2026-08-17T13:10:26.2711557Z LLVM version: 22.1.6
+2026-08-17T13:10:26.2823071Z ##[end-action id=__dtolnay_rust-toolchain.__run_10;outcome=success;conclusion=success;duration_ms=107]
+
+
+===== 4_Clear an incomplete v6 release from an earlier attempt.txt =====
+2026-08-17T13:10:26.3004760Z ##[group]Run $ErrorActionPreference = 'Stop'
+2026-08-17T13:10:26.3005240Z [36;1m$ErrorActionPreference = 'Stop'[0m
+2026-08-17T13:10:26.3005674Z [36;1mif (gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY 2>$null) {[0m
+2026-08-17T13:10:26.3006246Z [36;1m  gh release delete $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --cleanup-tag --yes[0m
+2026-08-17T13:10:26.3006775Z [36;1m  if ($LASTEXITCODE -ne 0) { throw 'failed to remove incomplete v6 release' }[0m
+2026-08-17T13:10:26.3007120Z [36;1m}[0m
+2026-08-17T13:10:26.4706394Z shell: C:\Program Files\PowerShell\7\pwsh.EXE -command ". '{0}'"
+2026-08-17T13:10:26.4706805Z env:
+2026-08-17T13:10:26.4707005Z   RELEASE_TAG: v0.2.6-sehoon.6
+2026-08-17T13:10:26.4707242Z   RELEASE_VERSION: 0.2.6-sehoon.6
+2026-08-17T13:10:26.4707487Z   CARGO_HOME: C:\Users\runneradmin\.cargo
+2026-08-17T13:10:26.4707741Z   CARGO_INCREMENTAL: 0
+2026-08-17T13:10:26.4707945Z   CARGO_TERM_COLOR: always
+2026-08-17T13:10:26.4710995Z   GH_TOKEN: ***
+2026-08-17T13:10:26.4711254Z ##[endgroup]
+2026-08-17T13:10:40.8191387Z ##[error]Process completed with exit code 1.
+
+
+===== 42_Post Check out clean source.txt =====
+2026-08-17T13:10:40.8504181Z Post job cleanup.
+2026-08-17T13:10:41.0248167Z [command]"C:\Program Files\Git\bin\git.exe" version
+2026-08-17T13:10:41.0519494Z git version 2.55.0.windows.3
+2026-08-17T13:10:41.0581218Z Temporarily overriding HOME='D:\a\_temp\06a3af54-d3c9-497b-8ea8-babfaa691b93' before making global git config changes
+2026-08-17T13:10:41.0582500Z Adding repository directory to the temporary git global config as a safe directory
+2026-08-17T13:10:41.0591560Z [command]"C:\Program Files\Git\bin\git.exe" config --global --add safe.directory D:\a\LeopardWM\LeopardWM
+2026-08-17T13:10:41.0875842Z Removing SSH command configuration
+2026-08-17T13:10:41.0887221Z [command]"C:\Program Files\Git\bin\git.exe" config --local --name-only --get-regexp core\.sshCommand
+2026-08-17T13:10:41.1179991Z [command]"C:\Program Files\Git\bin\git.exe" submodule foreach --recursive "sh -c \"git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :\""
+2026-08-17T13:10:41.6765249Z Removing HTTP extra header
+2026-08-17T13:10:41.6776445Z [command]"C:\Program Files\Git\bin\git.exe" config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-08-17T13:10:41.7072961Z [command]"C:\Program Files\Git\bin\git.exe" submodule foreach --recursive "sh -c \"git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :\""
+2026-08-17T13:10:42.2467980Z Removing includeIf entries pointing to credentials config files
+2026-08-17T13:10:42.2478472Z [command]"C:\Program Files\Git\bin\git.exe" config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-08-17T13:10:42.2736466Z includeif.gitdir:D:/a/LeopardWM/LeopardWM/.git.path
+2026-08-17T13:10:42.2737168Z includeif.gitdir:D:/a/LeopardWM/LeopardWM/.git/worktrees/*.path
+2026-08-17T13:10:42.2737856Z includeif.gitdir:/github/workspace/.git.path
+2026-08-17T13:10:42.2738191Z includeif.gitdir:/github/workspace/.git/worktrees/*.path
+2026-08-17T13:10:42.2774477Z [command]"C:\Program Files\Git\bin\git.exe" config --local --get-all includeif.gitdir:D:/a/LeopardWM/LeopardWM/.git.path
+2026-08-17T13:10:42.3028167Z D:\a\_temp\git-credentials-56423a0b-6132-4613-bd91-c0dd69b22e44.config
+2026-08-17T13:10:42.3067838Z [command]"C:\Program Files\Git\bin\git.exe" config --local --unset includeif.gitdir:D:/a/LeopardWM/LeopardWM/.git.path D\:\\a\\_temp\\git\-credentials\-56423a0b\-6132\-4613\-bd91\-c0dd69b22e44\.config
+2026-08-17T13:10:42.3412553Z [command]"C:\Program Files\Git\bin\git.exe" config --local --get-all includeif.gitdir:D:/a/LeopardWM/LeopardWM/.git/worktrees/*.path
+2026-08-17T13:10:42.3667217Z D:\a\_temp\git-credentials-56423a0b-6132-4613-bd91-c0dd69b22e44.config
+2026-08-17T13:10:42.3706729Z [command]"C:\Program Files\Git\bin\git.exe" config --local --unset includeif.gitdir:D:/a/LeopardWM/LeopardWM/.git/worktrees/*.path D\:\\a\\_temp\\git\-credentials\-56423a0b\-6132\-4613\-bd91\-c0dd69b22e44\.config
+2026-08-17T13:10:42.3995105Z [command]"C:\Program Files\Git\bin\git.exe" config --local --get-all includeif.gitdir:/github/workspace/.git.path
+2026-08-17T13:10:42.4241580Z /github/runner_temp/git-credentials-56423a0b-6132-4613-bd91-c0dd69b22e44.config
+2026-08-17T13:10:42.4279521Z [command]"C:\Program Files\Git\bin\git.exe" config --local --unset includeif.gitdir:/github/workspace/.git.path \/github\/runner_temp\/git\-credentials\-56423a0b\-6132\-4613\-bd91\-c0dd69b22e44\.config
+2026-08-17T13:10:42.4568282Z [command]"C:\Program Files\Git\bin\git.exe" config --local --get-all includeif.gitdir:/github/workspace/.git/worktrees/*.path
+2026-08-17T13:10:42.4814359Z /github/runner_temp/git-credentials-56423a0b-6132-4613-bd91-c0dd69b22e44.config
+2026-08-17T13:10:42.4852447Z [command]"C:\Program Files\Git\bin\git.exe" config --local --unset includeif.gitdir:/github/workspace/.git/worktrees/*.path \/github\/runner_temp\/git\-credentials\-56423a0b\-6132\-4613\-bd91\-c0dd69b22e44\.config
+2026-08-17T13:10:42.5142695Z [command]"C:\Program Files\Git\bin\git.exe" submodule foreach --recursive "git config --local --show-origin --name-only --get-regexp remote.origin.url"
+2026-08-17T13:10:43.0427873Z Removing credentials config 'D:\a\_temp\git-credentials-56423a0b-6132-4613-bd91-c0dd69b22e44.config'
+
+
+===== 43_Complete job.txt =====
+2026-08-17T13:10:43.0622810Z Cleaning up orphan processes
+
+
+===== system.txt =====
+2026-08-17T13:10:09.5040000Z Evaluating verify-build-release.if
+2026-08-17T13:10:09.5040000Z Evaluating: success()
+2026-08-17T13:10:09.5040000Z Result: true
+2026-08-17T13:10:09.6080000Z Job is waiting for a hosted runner to come online.
+2026-08-17T13:10:09.6080000Z Job is about to start running on the hosted runner: GitHub Actions 1000003985
+2026-08-17T13:10:09.5930000Z Requested labels: windows-latest
+2026-08-17T13:10:09.5930000Z Job defined at: sehoon123/LeopardWM/.github/workflows/agent-msi-v6-clean2.yml@refs/heads/agent/msi-v6-clean
+2026-08-17T13:10:09.5930000Z Waiting for a runner to pick up this job...
