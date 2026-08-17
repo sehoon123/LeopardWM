@@ -40,6 +40,9 @@ jobs:
       - name: Apply production hardening
         run: python .github/scripts/apply_production_hardening_v5.py
 
+      - name: Refresh lockfile for intentional manifest changes
+        run: cargo check -p leopardwm-core-layout
+
       - name: Format source
         run: cargo fmt --all
 
@@ -54,7 +57,6 @@ jobs:
         run: |
           @'
           from pathlib import Path
-          import re
           root = Path('.')
           cargo = (root / 'crates/cli/Cargo.toml').read_text(encoding='utf-8')
           assert cargo.count('path = "src/main.rs"') == 1, cargo
@@ -107,6 +109,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           Remove-Item .github/workflows/agent-production-hardening-v5.yml -ErrorAction SilentlyContinue
           Remove-Item .github/workflows/agent-export-perf-source.yml -ErrorAction SilentlyContinue
+          Remove-Item .github/workflows/agent-export-current-source.yml -ErrorAction SilentlyContinue
           Remove-Item .github/scripts/apply_production_hardening_v5.py -ErrorAction SilentlyContinue
           Remove-Item .github/audit/trigger-production-hardening-v5 -ErrorAction SilentlyContinue
           Remove-Item agent_docs/README.tmp -ErrorAction SilentlyContinue
