@@ -36,12 +36,13 @@ impl Workspace {
         viewport: Rect,
         viewport_left: i32,
     ) -> Vec<WindowPlacement> {
-        let mut placements = Vec::with_capacity(self.window_count() + self.floating_windows.len());
+        let mut placements = Vec::with_capacity(self.window_count());
         // Reuse per-column scratch buffers instead of allocating three Vecs
         // for every column on every animation frame.
-        let mut visible_windows: Vec<(usize, WindowId)> = Vec::new();
-        let mut visible_weights: Vec<f64> = Vec::new();
-        let mut min_heights: Vec<i32> = Vec::new();
+        let mut visible_windows: smallvec::SmallVec<[(usize, WindowId); 8]> =
+            smallvec::SmallVec::new();
+        let mut visible_weights: smallvec::SmallVec<[f64; 8]> = smallvec::SmallVec::new();
+        let mut min_heights: smallvec::SmallVec<[i32; 8]> = smallvec::SmallVec::new();
 
         // Defensively clamp gaps to >= 0 in case fields were set directly
         let gap = self.gap.max(0);

@@ -12,6 +12,7 @@
 //! - System tray icon and menu
 
 mod animation_worker;
+mod atomic_file;
 mod command_handler;
 mod config;
 mod drag;

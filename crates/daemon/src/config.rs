@@ -1527,7 +1527,7 @@ impl Config {
 
         let content = toml::to_string_pretty(self).context("Failed to serialize config to TOML")?;
 
-        fs::write(path, &content)
+        crate::atomic_file::write(path, &content)
             .with_context(|| format!("Failed to write config file: {}", path.display()))?;
 
         tracing::info!("Config saved to: {}", path.display());
@@ -1553,7 +1553,7 @@ pub fn ensure_config_on_disk() -> Result<Option<PathBuf>> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&path, generate_default_config_content())?;
+    crate::atomic_file::write(&path, generate_default_config_content())?;
 
     // Also ensure data directory exists (for workspace persistence)
     if let Some(proj_dirs) = ProjectDirs::from("", "", "leopardwm") {
@@ -3043,7 +3043,7 @@ mod tests {
         config.appearance.active_border_color = "FF0000".to_string();
 
         let content = toml::to_string_pretty(&config).unwrap();
-        fs::write(&path, &content).unwrap();
+        crate::atomic_file::write(&path, &content).unwrap();
 
         let loaded = Config::load_from_path(&path).unwrap();
         assert_eq!(loaded.layout.gap, 42);

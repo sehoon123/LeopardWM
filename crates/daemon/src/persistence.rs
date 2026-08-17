@@ -38,7 +38,7 @@ impl AppState {
         // (and tear) the same temp file before their renames.
         let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
         let tmp = path.with_extension(format!("{seq}.tmp"));
-        std::fs::write(&tmp, json)?;
+        crate::atomic_file::write(&tmp, json)?;
         std::fs::rename(&tmp, &path)?;
         Ok(())
     }

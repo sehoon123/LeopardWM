@@ -7,6 +7,11 @@ repository.workspace = true
 authors.workspace = true
 description = "Command-line interface for controlling LeopardWM"
 
+
+[lib]
+name = "leopardwm_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "leopardwm-cli"
 path = "src/main.rs"
@@ -15,10 +20,7 @@ path = "src/main.rs"
 # channels ship both binaries.
 [[bin]]
 name = "lwm"
-path = "src/main.rs"
-test = false
-bench = false
-
+path = "src/bin/lwm.rs"
 [dependencies]
 leopardwm-ipc = { path = "../ipc" }
 leopardwm-platform-win32 = { path = "../platform_win32" }
