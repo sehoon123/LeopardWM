@@ -1,0 +1,60 @@
+["cargo", "check", "--workspace", "--all-targets", "--locked"])
+    run(["cargo", "test", "--workspace", "--lib", "--bins", "--release", "--locked"])
+    for iteration in range(4):
+        print(f"scratchpad/floating stress iteration {iteration + 1}/4")
+        run([
+            "cargo", "test", "-p", "leopardwm-daemon", "--bin", "leopardwm",
+            "--release", "--locked", "scratchpad", "--", "--test-threads=1",
+        ])
+        run([
+            "cargo", "test", "-p", "leopardwm-daemon", "--bin", "leopardwm",
+            "--release", "--locked", "floating", "--", "--test-threads=1",
+        ])
+    run(["cargo", "build", "--workspace", "--release", "--locked"])
+    run(["pwsh", "-NoProfile", "-File", ".github/verify-gui-subsystems.ps1"])
+
+
+def build_msi() -> Path:
+    run(["cargo", "install", "cargo-wix", "--version", "^0.3", "--locked"])
+    wix_bin = r"C:\Program Files (x86)\WiX Toolset v3.14\bin"
+    run([
+        "cargo", "wix", "-p", "leopardwm-daemon", "-I", "wix/main.wxs",
+        "--target", "x86_64-pc-windows-msvc", "--no-build", "--nocapture",
+        "--bin-path", wix_bin,
+    ])
+    candidates = sorted((ROOT / "target/wix").glob("*.msi"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not candidates:
+        raise RuntimeError("cargo-wix produced no MSI")
+    release_msi = ROOT / f"LeopardWM-{RELEASE_VERSION}-x86_64.msi"
+    shutil.copy2(candidates[0], release_msi)
+    run(["pwsh", "-NoProfile", "-File", ".github/verify-msi.ps1", "-MsiPath", str(release_msi)])
+    return release_msi
+
+
+def publish_source() -> str:
+    run(["git", "config", "user.name", "github-actions[bot]"])
+    run(["git", "config", "user.email", "41898282+github-actions[bot]@users.noreply.github.com"])
+    run(["git", "add", "-A"])
+    run(["git", "diff", "--cached", "--check"])
+    staged = output(["git", "diff", "--cached", "--name-only"])
+    if not staged:
+        raise RuntimeError("no source changes to publish")
+    print("staged source files:\n" + staged)
+    run(["git", "commit", "-m", "feat: add desktop controls and production MSI"])
+    local_sha = output(["git", "rev-parse", "HEAD"])
+    run(["git", "push", "origin", f"HEAD:refs/heads/{SOURCE_BRANCH}"])
+    remote_line = output(["git", "ls-remote", "origin", f"refs/heads/{SOURCE_BRANCH}"])
+    remote_sha = remote_line.split()[0] if remote_line else ""
+    if remote_sha != local_sha:
+        raise RuntimeError(f"remote source mismatch: local={local_sha} remote={remote_sha}")
+    print(f"verified source commit: {local_sha}")
+    return local_sha
+
+
+def release_bin_dir() -> Path:
+    for path in (
+        ROOT / "target/x86_64-pc-windows-msvc/release",
+        ROOT / "target/release",
+    ):
+        if (path / "leopardwm.exe").is_file():
+            retur
