@@ -63,8 +63,11 @@ jobs:
       - name: Verify formatting and patch hygiene
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { throw 'cargo fmt check failed' }
           git diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'git diff check failed' }
 
       - name: Verify structural invariants
         shell: pwsh
@@ -106,7 +109,9 @@ jobs:
           $ErrorActionPreference = 'Stop'
           for ($i = 0; $i -lt 8; $i++) {
             cargo test -p leopardwm-daemon --bin leopardwm --release --locked scratchpad -- --test-threads=1
+            if ($LASTEXITCODE -ne 0) { throw "scratchpad stress iteration $i failed" }
             cargo test -p leopardwm-daemon --bin leopardwm --release --locked floating -- --test-threads=1
+            if ($LASTEXITCODE -ne 0) { throw "floating stress iteration $i failed" }
           }
 
       - name: Build optimized Windows binaries
@@ -116,25 +121,35 @@ jobs:
         shell: pwsh
         run: ./.github/verify-gui-subsystems.ps1
 
-      - name: Commit only verified production source
+      - name: Commit and push only verified production source
         id: source_commit
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          Remove-Item .github/workflows/agent-production-hardening-v5.yml -ErrorAction SilentlyContinue
-          Remove-Item .github/workflows/agent-export-perf-source.yml -ErrorAction SilentlyContinue
-          Remove-Item .github/workflows/agent-export-current-source.yml -ErrorAction SilentlyContinue
-          Remove-Item .github/scripts/apply_production_hardening_v5.py -ErrorAction SilentlyContinue
-          Remove-Item .github/audit/trigger-production-hardening-v5 -ErrorAction SilentlyContinue
+          # Do not modify workflow files from GITHUB_TOKEN. That can be rejected even
+          # with contents:write and previously left the release pointing at no remote commit.
           Remove-Item agent_docs/README.tmp -ErrorAction SilentlyContinue
           Remove-Item agent_docs/control-note.tmp -ErrorAction SilentlyContinue
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
           git diff --cached --check
+          if ($LASTEXITCODE -ne 0) { throw 'staged source failed diff check' }
+          $staged = git diff --cached --name-only
+          if (-not $staged) { throw 'No verified production source changes were generated' }
           git commit -m "perf: harden persistence and remove hot-path duplication"
-          git push origin HEAD:agent/performance-audit-03
-          "sha=$(git rev-parse HEAD)" >> $env:GITHUB_OUTPUT
+          if ($LASTEXITCODE -ne 0) { throw 'git commit failed' }
+          $localSha = (git rev-parse HEAD).Trim()
+          git push origin HEAD:refs/heads/agent/performance-audit-03
+          if ($LASTEXITCODE -ne 0) { throw 'git push failed' }
+          $remoteLine = git ls-remote origin refs/heads/agent/performance-audit-03
+          if ($LASTEXITCODE -ne 0 -or -not $remoteLine) { throw 'Could not resolve pushed remote branch' }
+          $remoteSha = (($remoteLine -split '\s+')[0]).Trim()
+          if ($remoteSha -ne $localSha) {
+            throw "Remote branch mismatch: local=$localSha remote=$remoteSha"
+          }
+          "sha=$localSha" >> $env:GITHUB_OUTPUT
+          Write-Host "Verified remote source commit: $localSha"
 
       - name: Package binaries and checksums
         shell: pwsh
@@ -175,8 +190,7 @@ jobs:
           - reduces common layout-frame heap allocation with exact capacity reservation and inline SmallVec scratch storage
           - makes configuration/session persistence crash-safe with flushed sibling files and Win32 write-through replacement
           - retries transient antivirus/sharing-lock replacement failures without exposing partial state
-          - expands CI/release gates to all Cargo targets and serializes publication
-          - removes temporary audit-control files from the distributable source tree
+          - expands validation to all Cargo targets and serializes publication
           - preserves and repeatedly exercises scratchpad/floating size regression coverage
 
           Validation completed before publication:
@@ -188,6 +202,7 @@ jobs:
           - repeated release-mode scratchpad/floating regression tests
           - optimized Windows build
           - GUI subsystem verification
+          - remote source-commit identity verification after push
 
           This release exists only in the user fork. Nothing was sent upstream.
           '@ | Set-Content -Encoding utf8 release-notes-v5.md
@@ -199,9 +214,7 @@ jobs:
           SOURCE_SHA: ${{ steps.source_commit.outputs.sha }}
         run: |
           $ErrorActionPreference = 'Stop'
-          if (git ls-remote --exit-code --tags origin "refs/tags/$env:RELEASE_TAG") {
-            throw "Tag already exists: $env:RELEASE_TAG"
-          }
+          if (-not $env:SOURCE_SHA) { throw 'Verified source SHA is empty' }
           gh release create $env:RELEASE_TAG `
             "LeopardWM-$env:RELEASE_VERSION-x86_64-windows.zip" `
             leopardwm.exe `
@@ -215,17 +228,24 @@ jobs:
             --title "LeopardWM $env:RELEASE_TAG — production hardening" `
             --notes-file release-notes-v5.md `
             --prerelease
+          if ($LASTEXITCODE -ne 0) { throw 'gh release create failed' }
 
       - name: Verify published release and assets
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.source_commit.outputs.sha }}
         run: |
           $ErrorActionPreference = 'Stop'
           $release = gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --json tagName,isDraft,isPrerelease,targetCommitish,assets | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'Could not read newly published release' }
           if ($release.tagName -ne $env:RELEASE_TAG) { throw 'Release tag mismatch' }
           if ($release.isDraft) { throw 'Release remained a draft' }
           if (-not $release.isPrerelease) { throw 'Expected prerelease flag' }
+          $tagSha = (git rev-list -n 1 $env:RELEASE_TAG).Trim()
+          if ($LASTEXITCODE -ne 0 -or $tagSha -ne $env:SOURCE_SHA) {
+            throw "Published tag does not identify verified source: tag=$tagSha source=$env:SOURCE_SHA"
+          }
           $expected = @(
             "LeopardWM-$env:RELEASE_VERSION-x86_64-windows.zip",
             'leopardwm.exe',
@@ -239,4 +259,4 @@ jobs:
           foreach ($name in $expected) {
             if ($name -notin $actual) { throw "Missing release asset: $name" }
           }
-          Write-Host "Published and verified $env:RELEASE_TAG"
+          Write-Host "Published and verified $env:RELEASE_TAG at $tagSha"
