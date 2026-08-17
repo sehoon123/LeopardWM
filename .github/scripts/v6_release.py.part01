@@ -1,0 +1,82 @@
+from __future__ import annotations
+
+import base64
+import gzip
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import textwrap
+import zipfile
+
+ROOT = Path.cwd()
+TEMP = Path(os.environ["RUNNER_TEMP"])
+REPOSITORY = os.environ["GITHUB_REPOSITORY"]
+SOURCE_BRANCH = "agent/features-msi-v6"
+EXPECTED_BASE = "68ebea44339fb9293b48334ecc081af0b198e069"
+RELEASE_TAG = "v0.2.6-sehoon.6"
+RELEASE_VERSION = "0.2.6-sehoon.6"
+PATCH_SHA256 = "69cd44c1c3b3897d9e3f4f177aaba529568f69d46808c986c35673c7b4f23e6b"
+BINARIES = [
+    "leopardwm.exe",
+    "leopardwm-cli.exe",
+    "lwm.exe",
+    "leopardwm-watchdog.exe",
+    "leopardwm-settings.exe",
+]
+
+
+def run(args: list[str], *, check: bool = True, capture: bool = False) -> subprocess.CompletedProcess[str]:
+    print("+", subprocess.list2cmdline(args), flush=True)
+    proc = subprocess.run(
+        args,
+        cwd=ROOT,
+        text=True,
+        check=False,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.STDOUT if capture else None,
+    )
+    if capture and proc.stdout:
+        print(proc.stdout, end="" if proc.stdout.endswith("\n") else "\n")
+    if check and proc.returncode != 0:
+        raise RuntimeError(f"command failed ({proc.returncode}): {subprocess.list2cmdline(args)}")
+    return proc
+
+
+def output(args: list[str]) -> str:
+    proc = run(args, capture=True)
+    return (proc.stdout or "").strip()
+
+
+def reconstruct_patch() -> Path:
+    audit = ROOT / ".github" / "audit"
+    parts = sorted(audit.glob("v6-feature.patch.gz.b64.part*"))
+    if len(parts) != 8:
+        raise RuntimeError(f"expected 8 patch chunks, found {len(parts)}")
+    encoded = "".join(part.read_text(encoding="utf-8").strip() for part in parts)
+    patch = gzip.decompress(base64.b64decode(encoded))
+    actual = hashlib.sha256(patch).hexdigest()
+    if actual != PATCH_SHA256:
+        raise RuntimeError(f"patch checksum mismatch: expected={PATCH_SHA256} actual={actual}")
+    path = TEMP / "v6-feature.patch"
+    path.write_bytes(patch)
+    print(f"verified feature patch: bytes={len(patch)} sha256={actual}")
+    return path
+
+
+def apply_source_changes(patch: Path) -> None:
+    run(["git", "fetch", "origin", SOURCE_BRANCH])
+    run(["git", "checkout", "--detach", f"origin/{SOURCE_BRANCH}"])
+    actual_base = output(["git", "rev-parse", "HEAD"])
+    if actual_base != EXPECTED_BASE:
+        raise RuntimeError(f"source branch moved: expected={EXPECTED_BASE} actual={actual_base}")
+    run(["git", "apply", "--check", str(patch)])
+    run(["git", "apply", str(patch)])
+
+    test_path = ROOT / "crates" / "daemon" / "src" / "tests.rs"
+    text = test_path.read_text(encoding="utf-8")
+    old = (
+        "fn test_active_border_target_accept
