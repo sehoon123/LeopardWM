@@ -1,0 +1,246 @@
+name: Verify published compositor-safe v6
+
+on:
+  push:
+    branches:
+      - agent/fix-compositor-desync-v6
+    paths:
+      - .github/workflows/agent-verify-published-v6.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: verify-published-compositor-safe-v6
+  cancel-in-progress: false
+
+env:
+  SOURCE_SHA: 2dfab51243a5cffa4f34bb4bd3f19e10280757f8
+  RELEASE_TAG: v0.2.6-sehoon.6
+  RELEASE_VERSION: 0.2.6-sehoon.6
+
+jobs:
+  verify-published-release:
+    runs-on: windows-2022
+    timeout-minutes: 25
+
+    steps:
+      - name: Check out exact verified source commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          fetch-depth: 0
+
+      - name: Verify tag, release metadata, assets, ZIP, and MSI
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $actualSource = (git rev-parse HEAD).Trim()
+          if ($actualSource -ne $env:SOURCE_SHA) {
+            throw "Source identity mismatch: expected=$env:SOURCE_SHA actual=$actualSource"
+          }
+
+          $remoteTag = @(git ls-remote --tags --refs origin "refs/tags/$env:RELEASE_TAG")
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not query the published tag: exit $LASTEXITCODE"
+          }
+          if ($remoteTag.Count -ne 1) {
+            throw "Expected exactly one published tag, found $($remoteTag.Count)"
+          }
+          $tagSha = (($remoteTag[0] -split '\s+')[0]).Trim()
+          if ($tagSha -ne $env:SOURCE_SHA) {
+            throw "Tag/source mismatch: tag=$tagSha source=$env:SOURCE_SHA"
+          }
+
+          $release = gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY `
+            --json tagName,isDraft,isPrerelease,targetCommitish,assets | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Could not read the published GitHub Release'
+          }
+          if ($release.tagName -ne $env:RELEASE_TAG) {
+            throw "Release tag mismatch: $($release.tagName)"
+          }
+          if ($release.isDraft) {
+            throw 'Published release must not be a draft'
+          }
+          if (-not $release.isPrerelease) {
+            throw 'Published release must be marked as a prerelease'
+          }
+          if ($release.targetCommitish -ne $env:SOURCE_SHA) {
+            throw "Release target mismatch: target=$($release.targetCommitish) source=$env:SOURCE_SHA"
+          }
+
+          $releaseZip = "LeopardWM-$env:RELEASE_VERSION-x86_64-windows.zip"
+          $releaseMsi = "LeopardWM-$env:RELEASE_VERSION-x86_64.msi"
+          $binaries = @(
+            'leopardwm.exe',
+            'leopardwm-cli.exe',
+            'lwm.exe',
+            'leopardwm-watchdog.exe'
+          )
+          $payloads = @($releaseZip, $releaseMsi) + $binaries
+          $expectedAssets = $payloads + @('checksums.txt')
+          $actualAssets = @($release.assets | ForEach-Object { $_.name })
+
+          foreach ($name in $expectedAssets) {
+            if ($name -notin $actualAssets) {
+              throw "Published release is missing asset: $name"
+            }
+          }
+          $unexpectedAssets = @($actualAssets | Where-Object { $_ -notin $expectedAssets })
+          if ($unexpectedAssets.Count -gt 0) {
+            throw "Published release contains unexpected assets: $($unexpectedAssets -join ', ')"
+          }
+
+          $downloadDir = Join-Path $env:RUNNER_TEMP 'published-assets'
+          Remove-Item $downloadDir -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $downloadDir -Force | Out-Null
+          gh release download $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --dir $downloadDir
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Published assets could not be downloaded'
+          }
+
+          foreach ($name in $expectedAssets) {
+            if (-not (Test-Path (Join-Path $downloadDir $name) -PathType Leaf)) {
+              throw "Downloaded release is missing asset: $name"
+            }
+          }
+
+          $checksumPath = Join-Path $downloadDir 'checksums.txt'
+          $publishedChecksums = @{}
+          foreach ($line in Get-Content $checksumPath) {
+            if ($line -notmatch '^([0-9a-fA-F]{64}) \*(.+)$') {
+              throw "Malformed checksum line: $line"
+            }
+            $publishedChecksums[$matches[2]] = $matches[1].ToLowerInvariant()
+          }
+          if ($publishedChecksums.Count -ne $payloads.Count) {
+            throw "Checksum entry count mismatch: expected=$($payloads.Count) actual=$($publishedChecksums.Count)"
+          }
+
+          $releaseApi = gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$env:RELEASE_TAG" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Could not read GitHub Release asset digests'
+          }
+          $apiAssets = @{}
+          foreach ($asset in $releaseApi.assets) {
+            $apiAssets[$asset.name] = $asset
+          }
+
+          $verifiedAssets = @()
+          foreach ($name in $payloads) {
+            $path = Join-Path $downloadDir $name
+            if (-not $publishedChecksums.ContainsKey($name)) {
+              throw "checksums.txt is missing: $name"
+            }
+            $actualHash = (Get-FileHash -Algorithm SHA256 $path).Hash.ToLowerInvariant()
+            $expectedHash = $publishedChecksums[$name]
+            if ($actualHash -ne $expectedHash) {
+              throw "Checksum mismatch for $name: expected=$expectedHash actual=$actualHash"
+            }
+            if (-not $apiAssets.ContainsKey($name)) {
+              throw "GitHub API metadata is missing: $name"
+            }
+            $apiDigest = [string]$apiAssets[$name].digest
+            if ($apiDigest -ne "sha256:$actualHash") {
+              throw "GitHub asset digest mismatch for $name: api=$apiDigest actual=sha256:$actualHash"
+            }
+            $verifiedAssets += [ordered]@{
+              name = $name
+              size = (Get-Item $path).Length
+              sha256 = $actualHash
+            }
+          }
+
+          $zipPath = Join-Path $downloadDir $releaseZip
+          $zipRoot = Join-Path $env:RUNNER_TEMP 'portable-zip-verification'
+          Remove-Item $zipRoot -Recurse -Force -ErrorAction SilentlyContinue
+          Expand-Archive -Path $zipPath -DestinationPath $zipRoot -Force
+          foreach ($binary in $binaries) {
+            $zipBinary = Get-ChildItem $zipRoot -Recurse -Filter $binary -File | Select-Object -First 1
+            if (-not $zipBinary) {
+              throw "Portable ZIP is missing $binary"
+            }
+            $standaloneHash = (Get-FileHash -Algorithm SHA256 (Join-Path $downloadDir $binary)).Hash
+            $zipHash = (Get-FileHash -Algorithm SHA256 $zipBinary.FullName).Hash
+            if ($zipHash -ne $standaloneHash) {
+              throw "Portable ZIP binary differs from standalone asset: $binary"
+            }
+          }
+          foreach ($document in @('README.md', 'LICENSE')) {
+            if (-not (Get-ChildItem $zipRoot -Recurse -Filter $document -File | Select-Object -First 1)) {
+              throw "Portable ZIP is missing $document"
+            }
+          }
+
+          $msiPath = Join-Path $downloadDir $releaseMsi
+          if ((Get-Item $msiPath).Length -lt 1000000) {
+            throw 'Published MSI is unexpectedly small'
+          }
+          $adminRoot = Join-Path $env:RUNNER_TEMP 'published-msi-admin'
+          Remove-Item $adminRoot -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $adminRoot -Force | Out-Null
+          $adminLog = Join-Path $env:RUNNER_TEMP 'published-msi-admin.log'
+          $arguments = @(
+            '/a', "`"$msiPath`"",
+            '/qn', "TARGETDIR=`"$adminRoot`"",
+            '/l*v', "`"$adminLog`""
+          )
+          $process = Start-Process msiexec.exe -ArgumentList $arguments -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            Get-Content $adminLog -Tail 150 -ErrorAction SilentlyContinue
+            throw "Published MSI administrative installation failed: $($process.ExitCode)"
+          }
+          foreach ($binary in $binaries) {
+            $msiBinary = Get-ChildItem $adminRoot -Recurse -Filter $binary -File | Select-Object -First 1
+            if (-not $msiBinary) {
+              throw "Published MSI is missing $binary"
+            }
+            $standaloneHash = (Get-FileHash -Algorithm SHA256 (Join-Path $downloadDir $binary)).Hash
+            $msiHash = (Get-FileHash -Algorithm SHA256 $msiBinary.FullName).Hash
+            if ($msiHash -ne $standaloneHash) {
+              throw "MSI binary differs from standalone asset: $binary"
+            }
+          }
+
+          $report = [ordered]@{
+            verified_at_utc = [DateTime]::UtcNow.ToString('o')
+            repository = $env:GITHUB_REPOSITORY
+            tag = $env:RELEASE_TAG
+            source_sha = $env:SOURCE_SHA
+            tag_sha = $tagSha
+            release_target = $release.targetCommitish
+            draft = $release.isDraft
+            prerelease = $release.isPrerelease
+            assets = $verifiedAssets
+            portable_zip_contents_verified = $true
+            msi_administrative_install_verified = $true
+            distribution_binary_identity_verified = $true
+          }
+          $reportPath = Join-Path (Get-Location) 'verification-report.json'
+          $report | ConvertTo-Json -Depth 8 | Set-Content -Encoding utf8 $reportPath
+          Get-Content $reportPath
+          Write-Host "Published release, seven assets, ZIP contents, and MSI administrative image verified at $tagSha"
+
+      - name: Stage verified release bundle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $source = Join-Path $env:RUNNER_TEMP 'published-assets'
+          $bundle = Join-Path (Get-Location) 'verified-release-bundle'
+          Remove-Item $bundle -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $bundle -Force | Out-Null
+          Copy-Item (Join-Path $source '*') $bundle -Force
+          Copy-Item verification-report.json $bundle -Force
+
+      - name: Upload independently verified release bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: LeopardWM-v0.2.6-sehoon.6-published-verified
+          path: verified-release-bundle/*
+          if-no-files-found: error
+          retention-days: 14
