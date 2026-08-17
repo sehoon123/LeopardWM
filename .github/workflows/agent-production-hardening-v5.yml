@@ -126,8 +126,16 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          # Do not modify workflow files from GITHUB_TOKEN. That can be rejected even
-          # with contents:write and previously left the release pointing at no remote commit.
+          # The hardening generator also proposes permanent CI changes. The
+          # workflow token may not push workflow-file mutations, so keep this
+          # release commit limited to application source that passed the gates.
+          git restore --source=HEAD -- .github/workflows/ci.yml .github/workflows/release.yml
+          if ($LASTEXITCODE -ne 0) { throw 'failed to restore permanent workflow files' }
+          $reportPath = 'agent_docs/production-hardening-v0.2.6-sehoon.5.md'
+          if (Test-Path $reportPath) {
+            $report = Get-Content $reportPath | Where-Object { $_ -notmatch 'github/workflows/(ci|release)\.yml' }
+            $report | Set-Content -Encoding utf8 $reportPath
+          }
           Remove-Item agent_docs/README.tmp -ErrorAction SilentlyContinue
           Remove-Item agent_docs/control-note.tmp -ErrorAction SilentlyContinue
           git config user.name "github-actions[bot]"
