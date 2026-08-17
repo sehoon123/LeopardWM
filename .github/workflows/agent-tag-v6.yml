@@ -1,0 +1,107 @@
+name: Validate and tag v6 MSI release
+
+on:
+  push:
+    branches:
+      - agent/msi-v6-clean
+    paths:
+      - .github/workflows/agent-tag-v6.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: feature-msi-v6
+  cancel-in-progress: true
+
+env:
+  RELEASE_TAG: v0.2.6-sehoon.6
+
+jobs:
+  validate-and-tag:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: agent/msi-v6-clean
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Update patch dependencies
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo update -p clap@4.6.5 --precise 4.6.6
+          if ($LASTEXITCODE -ne 0) { throw 'clap update failed' }
+          cargo update -p thiserror@2.0.19 --precise 2.0.20
+          if ($LASTEXITCODE -ne 0) { throw 'thiserror update failed' }
+
+      - name: Validate source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo fmt --all
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { throw 'format check failed' }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'diff check failed' }
+          cargo test --workspace --all-targets --locked
+          if ($LASTEXITCODE -ne 0) { throw 'test suite failed' }
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          if ($LASTEXITCODE -ne 0) { throw 'Clippy failed' }
+          cargo check --workspace --all-targets --locked
+          if ($LASTEXITCODE -ne 0) { throw 'all-target check failed' }
+          cargo build --workspace --release --locked
+          if ($LASTEXITCODE -ne 0) { throw 'release build failed' }
+          ./.github/verify-gui-subsystems.ps1
+
+      - name: Commit verified lockfile
+        id: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock
+          if (-not (git diff --cached --quiet)) {
+            git diff --cached --check
+            git commit -m "build: update clap and thiserror patch releases"
+            if ($LASTEXITCODE -ne 0) { throw 'lockfile commit failed' }
+            git push origin HEAD:agent/msi-v6-clean
+            if ($LASTEXITCODE -ne 0) { throw 'lockfile push failed' }
+          }
+          $sha = (git rev-parse HEAD).Trim()
+          $remote = git ls-remote origin refs/heads/agent/msi-v6-clean
+          $remoteSha = (($remote -split '\s+')[0]).Trim()
+          if ($sha -ne $remoteSha) { throw "source mismatch: $sha != $remoteSha" }
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+
+      - name: Replace incomplete v6 tag or release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY 2>$null) {
+            gh release delete $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --cleanup-tag --yes
+            if ($LASTEXITCODE -ne 0) { throw 'could not remove incomplete release' }
+          } elseif (git ls-remote --exit-code --tags origin "refs/tags/$env:RELEASE_TAG") {
+            git push origin ":refs/tags/$env:RELEASE_TAG"
+            if ($LASTEXITCODE -ne 0) { throw 'could not remove incomplete tag' }
+          }
+
+      - name: Push verified release tag
+        shell: pwsh
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git tag -a $env:RELEASE_TAG $env:SOURCE_SHA -m "LeopardWM $env:RELEASE_TAG - MSI installer features"
+          if ($LASTEXITCODE -ne 0) { throw 'tag creation failed' }
+          git push origin "refs/tags/$env:RELEASE_TAG"
+          if ($LASTEXITCODE -ne 0) { throw 'tag push failed' }
+          Write-Host "Pushed $env:RELEASE_TAG at $env:SOURCE_SHA; standard release.yml will build ZIP and MSI"
