@@ -522,10 +522,12 @@ impl Workspace {
         duration_ms: Option<u64>,
         easing: Option<Easing>,
     ) {
-        // Clamp target to valid range (visible area = viewport minus outer padding)
+        // Center mode may intentionally scroll past the strip edges so the
+        // first and last active columns can reach the viewport center. Manual
+        // scrolling remains clamped by `scroll_by`.
         let vis_w = self.visible_width(viewport_width);
-        let max_scroll = (self.total_width() - vis_w).max(0);
-        let clamped_target = target.clamp(0.0, max_scroll as f64);
+        let (min_scroll, max_scroll) = self.focused_scroll_bounds(vis_w);
+        let clamped_target = target.clamp(min_scroll, max_scroll);
 
         // Use current effective position as start (handles interrupting animations)
         let start = self.effective_scroll_offset();
@@ -673,5 +675,71 @@ impl Workspace {
 
             self.start_scroll_animation(target, viewport_width, None, None);
         }
+    }
+}
+
+#[cfg(test)]
+mod edge_centering_tests {
+    use super::*;
+
+    fn five_columns() -> Workspace {
+        let mut workspace = Workspace::with_gaps(10, 10);
+        for window_id in 1..=5 {
+            workspace.insert_window(window_id, Some(600)).unwrap();
+        }
+        workspace.set_centering_mode(CenteringMode::Center);
+        workspace.set_center_past_edges(true);
+        workspace
+    }
+
+    fn finish_scroll(workspace: &mut Workspace) {
+        assert!(!workspace.tick_animation(10_000));
+    }
+
+    #[test]
+    fn animated_centering_places_first_column_at_viewport_center() {
+        let mut workspace = five_columns();
+        workspace.set_focus(0, 0).unwrap();
+
+        workspace.ensure_focused_visible_animated(1920);
+        finish_scroll(&mut workspace);
+
+        // visible width = 1920 - 10 - 10 = 1900
+        // target = 0 + 600/2 - 1900/2 = -650
+        assert_eq!(workspace.scroll_offset(), -650.0);
+    }
+
+    #[test]
+    fn animated_centering_places_last_column_at_viewport_center() {
+        let mut workspace = five_columns();
+        workspace.set_focus(4, 0).unwrap();
+
+        workspace.ensure_focused_visible_animated(1920);
+        finish_scroll(&mut workspace);
+
+        // last x = 4 * (600 + 10) = 2440
+        // target = 2440 + 600/2 - 1900/2 = 1790
+        assert_eq!(workspace.scroll_offset(), 1790.0);
+    }
+
+    #[test]
+    fn disabling_edge_centering_keeps_normal_scroll_bounds() {
+        let mut workspace = five_columns();
+        workspace.set_center_past_edges(false);
+        workspace.set_focus(0, 0).unwrap();
+
+        workspace.ensure_focused_visible_animated(1920);
+        finish_scroll(&mut workspace);
+
+        assert_eq!(workspace.scroll_offset(), 0.0);
+    }
+
+    #[test]
+    fn manual_scroll_never_creates_edge_blank_space() {
+        let mut workspace = five_columns();
+        workspace.set_focus(0, 0).unwrap();
+
+        workspace.scroll_by(-10_000.0, 1920);
+        assert_eq!(workspace.scroll_offset(), 0.0);
     }
 }

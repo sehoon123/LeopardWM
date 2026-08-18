@@ -92,20 +92,39 @@ fn park_offscreen_avoiding_neighbors(
     >,
     monitor_rects: &[leopardwm_core_layout::Rect],
 ) {
-    let Some(owner) = monitors.get(&owner_id).map(|m| m.rect) else {
+    use leopardwm_core_layout::Visibility;
+
+    let Some(owner) = monitors.get(&owner_id).map(|monitor| monitor.rect) else {
         return;
     };
-    for p in placements.iter_mut() {
-        if p.visibility == leopardwm_core_layout::Visibility::Visible {
-            continue;
-        }
-        let bleeds = monitors
+
+    for placement in placements {
+        let intersects_neighbor = monitors
             .iter()
             .filter(|(id, _)| **id != owner_id)
-            .any(|(_, m)| p.rect.intersects(&m.rect));
-        if bleeds {
-            p.rect = offscreen_park_rect(p.rect, owner, monitor_rects);
+            .any(|(_, monitor)| placement.rect.intersects(&monitor.rect));
+        if !intersects_neighbor {
+            continue;
         }
+
+        if placement.visibility == Visibility::Visible {
+            let crosses_owner_edge = placement.rect.x < owner.x
+                || placement.rect.right() > owner.right()
+                || placement.rect.y < owner.y
+                || placement.rect.bottom() > owner.bottom();
+            // Floating windows may intentionally span monitors. Tiled windows
+            // are hidden as a unit rather than leaking into a neighbor output.
+            if placement.column_index == usize::MAX || !crosses_owner_edge {
+                continue;
+            }
+            placement.visibility = if placement.rect.x < owner.x {
+                Visibility::OffScreenLeft
+            } else {
+                Visibility::OffScreenRight
+            };
+        }
+
+        placement.rect = offscreen_park_rect(placement.rect, owner, monitor_rects);
     }
 }
 
@@ -258,34 +277,54 @@ impl AppState {
         }
         let mut all_placements = Vec::new();
         let monitor_rects: Vec<_> = self.monitors.values().map(|monitor| monitor.rect).collect();
+        let mut owner_ranges = Vec::with_capacity(self.monitors.len());
         for (monitor_id, ws_vec) in &self.workspaces {
             let idx = self.active_workspace_idx(*monitor_id);
             if let Some(workspace) = ws_vec.get(idx) {
                 if self.monitors.contains_key(monitor_id) {
                     let viewport = self.layout_viewport(*monitor_id);
-                    let mut placements = workspace.compute_placements_animated(viewport);
-                    park_offscreen_avoiding_neighbors(
-                        &mut placements,
-                        *monitor_id,
-                        &self.monitors,
-                        &monitor_rects,
-                    );
-                    all_placements.extend(placements);
+                    let start = all_placements.len();
+                    all_placements.extend(workspace.compute_placements_animated(viewport));
+                    owner_ranges.push((*monitor_id, start, all_placements.len()));
                 }
             }
         }
+        let base_placement_len = all_placements.len();
         if all_placements.is_empty()
             && self
                 .layout_transition
                 .as_ref()
-                .is_none_or(|t| t.exit_rects.is_empty())
+                .is_none_or(|transition| transition.exit_rects.is_empty())
         {
             return Ok(false);
         }
 
-        // Interpolate layout transitions (structural changes like move/expel).
+        // Interpolate first, then enforce monitor isolation against the actual
+        // frame rectangles. Doing this earlier lets a transition move a visible
+        // tiled window into a neighboring monitor after the safety check.
         if let Some(ref transition) = self.layout_transition {
             Self::apply_transition_interpolation(transition, &mut all_placements);
+        }
+        for (owner_id, start, end) in owner_ranges {
+            park_offscreen_avoiding_neighbors(
+                &mut all_placements[start..end],
+                owner_id,
+                &self.monitors,
+                &monitor_rects,
+            );
+        }
+        // `apply_transition_interpolation` appends exiting windows. They are
+        // few, so resolve only those owners rather than allocating a per-frame
+        // HWND-to-monitor map for every placement.
+        for placement in &mut all_placements[base_placement_len..] {
+            if let Some((owner_id, _)) = self.find_window_workspace(placement.window_id) {
+                park_offscreen_avoiding_neighbors(
+                    std::slice::from_mut(placement),
+                    owner_id,
+                    &self.monitors,
+                    &monitor_rects,
+                );
+            }
         }
 
         // Filter out the dragged window and placeholder so SetWindowPos doesn't
@@ -1130,7 +1169,10 @@ mod park_tests {
         let monitor_rects = [owner.rect, right.rect];
         park_offscreen_avoiding_neighbors(&mut placements, 1, &monitors, &monitor_rects);
 
-        assert_eq!(placements[0].rect, visible, "safe visible placement untouched");
+        assert_eq!(
+            placements[0].rect, visible,
+            "safe visible placement untouched"
+        );
         assert_eq!(
             placements[1].rect, non_bleed,
             "non-bleeding off-screen untouched"
@@ -1154,5 +1196,118 @@ mod park_tests {
         let monitor_rects = [monitors[&2].rect];
         park_offscreen_avoiding_neighbors(&mut placements, 1, &monitors, &monitor_rects);
         assert_eq!(placements[0].rect, orig);
+    }
+}
+
+#[cfg(test)]
+mod monitor_isolation_tests {
+    use super::*;
+    use leopardwm_core_layout::{Rect, Visibility, WindowPlacement};
+    use leopardwm_platform_win32::{MonitorId, MonitorInfo};
+    use std::collections::HashMap;
+
+    fn monitor(id: MonitorId, x: i32) -> MonitorInfo {
+        let rect = Rect::new(x, 0, 1920, 1080);
+        MonitorInfo {
+            id,
+            rect,
+            work_area: rect,
+            is_primary: id == 1,
+            device_name: format!("DISPLAY{id}"),
+            scale_factor: 1.0,
+        }
+    }
+
+    fn side_by_side_monitors() -> HashMap<MonitorId, MonitorInfo> {
+        HashMap::from([(1, monitor(1, 0)), (2, monitor(2, 1920))])
+    }
+
+    fn isolate(placements: &mut [WindowPlacement], owner_id: MonitorId) {
+        let monitors = side_by_side_monitors();
+        let rects: Vec<_> = monitors.values().map(|monitor| monitor.rect).collect();
+        park_offscreen_avoiding_neighbors(placements, owner_id, &monitors, &rects);
+    }
+
+    #[test]
+    fn partially_visible_tiled_window_is_hidden_from_right_neighbor() {
+        let mut placements = vec![WindowPlacement {
+            window_id: 1,
+            rect: Rect::new(1800, 40, 400, 800),
+            visibility: Visibility::Visible,
+            column_index: 0,
+        }];
+
+        isolate(&mut placements, 1);
+
+        assert_eq!(placements[0].visibility, Visibility::OffScreenRight);
+        assert!(side_by_side_monitors()
+            .values()
+            .all(|monitor| !placements[0].rect.intersects(&monitor.rect)));
+    }
+
+    #[test]
+    fn partially_visible_tiled_window_is_hidden_from_left_neighbor() {
+        let mut placements = vec![WindowPlacement {
+            window_id: 2,
+            rect: Rect::new(1800, 40, 400, 800),
+            visibility: Visibility::Visible,
+            column_index: 0,
+        }];
+
+        isolate(&mut placements, 2);
+
+        assert_eq!(placements[0].visibility, Visibility::OffScreenLeft);
+        assert!(side_by_side_monitors()
+            .values()
+            .all(|monitor| !placements[0].rect.intersects(&monitor.rect)));
+    }
+
+    #[test]
+    fn fully_contained_tiled_window_remains_visible() {
+        let original = Rect::new(100, 40, 800, 800);
+        let mut placements = vec![WindowPlacement {
+            window_id: 3,
+            rect: original,
+            visibility: Visibility::Visible,
+            column_index: 0,
+        }];
+
+        isolate(&mut placements, 1);
+
+        assert_eq!(placements[0].visibility, Visibility::Visible);
+        assert_eq!(placements[0].rect, original);
+    }
+
+    #[test]
+    fn floating_window_may_intentionally_span_monitors() {
+        let original = Rect::new(1800, 40, 400, 800);
+        let mut placements = vec![WindowPlacement {
+            window_id: 4,
+            rect: original,
+            visibility: Visibility::Visible,
+            column_index: usize::MAX,
+        }];
+
+        isolate(&mut placements, 1);
+
+        assert_eq!(placements[0].visibility, Visibility::Visible);
+        assert_eq!(placements[0].rect, original);
+    }
+
+    #[test]
+    fn existing_offscreen_placement_is_reparked_clear_of_neighbors() {
+        let mut placements = vec![WindowPlacement {
+            window_id: 5,
+            rect: Rect::new(1920, 40, 600, 800),
+            visibility: Visibility::OffScreenRight,
+            column_index: 1,
+        }];
+
+        isolate(&mut placements, 1);
+
+        assert_eq!(placements[0].visibility, Visibility::OffScreenRight);
+        assert!(side_by_side_monitors()
+            .values()
+            .all(|monitor| !placements[0].rect.intersects(&monitor.rect)));
     }
 }
