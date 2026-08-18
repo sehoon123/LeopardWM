@@ -1,0 +1,29 @@
+name: Export edge-centering source
+
+on:
+  push:
+    branches:
+      - agent/edge-centering-monitor-isolation
+    paths:
+      - .github/workflows/agent-export-edge-centering.yml
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/edge-centering-monitor-isolation
+          fetch-depth: 0
+      - run: git archive --format=zip --output=LeopardWM-edge-centering-source.zip HEAD
+      - id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: LeopardWM-edge-centering-source
+          path: LeopardWM-edge-centering-source.zip
+          if-no-files-found: error
+          retention-days: 2
