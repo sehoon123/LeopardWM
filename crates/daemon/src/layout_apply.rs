@@ -1111,14 +1111,14 @@ mod park_tests {
     }
 
     #[test]
-    fn wrapper_reparks_only_bleeding_offscreen_placements() {
+    fn wrapper_reparks_bleeding_placements_and_preserves_safe_ones() {
         let owner = monitor(1, 0, 0, 5120, 1440);
         let right = monitor(2, 5120, 0, 1920, 1080);
         let monitors: HashMap<MonitorId, MonitorInfo> = [(1, owner.clone()), (2, right.clone())]
             .into_iter()
             .collect();
 
-        let visible = Rect::new(5200, 10, 400, 400); // overlaps neighbor but Visible
+        let visible = Rect::new(4700, 10, 400, 400); // fully contained by owner
         let non_bleed = Rect::new(-500, 10, 400, 400); // off-screen, on owner only
         let bleeding = Rect::new(5300, 10, 400, 400); // off-screen, on neighbor
         let mut placements = vec![
@@ -1130,7 +1130,7 @@ mod park_tests {
         let monitor_rects = [owner.rect, right.rect];
         park_offscreen_avoiding_neighbors(&mut placements, 1, &monitors, &monitor_rects);
 
-        assert_eq!(placements[0].rect, visible, "visible placement untouched");
+        assert_eq!(placements[0].rect, visible, "safe visible placement untouched");
         assert_eq!(
             placements[1].rect, non_bleed,
             "non-bleeding off-screen untouched"
