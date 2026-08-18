@@ -8,7 +8,8 @@ on:
       - .github/workflows/agent-export-smooth-v7-source.yml
 
 permissions:
-  contents: read
+  actions: read
+  contents: write
 
 jobs:
   export:
@@ -18,11 +19,39 @@ jobs:
         with:
           ref: 2dfab51243a5cffa4f34bb4bd3f19e10280757f8
           fetch-depth: 0
+
       - name: Archive exact verified source
         run: git archive --format=zip --output=LeopardWM-smooth-v7-source.zip HEAD
-      - uses: actions/upload-artifact@v4
+
+      - name: Upload source archive
+        id: upload
+        uses: actions/upload-artifact@v4
         with:
           name: LeopardWM-smooth-v7-source
           path: LeopardWM-smooth-v7-source.zip
           if-no-files-found: error
           retention-days: 2
+
+      - name: Publish export coordinates
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+        run: |
+          set -euo pipefail
+          branch='agent/smooth-compositor-v7-control'
+          path='agent_docs/smooth-v7-export-status.json'
+          status=$(jq -n \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg artifact_id "$ARTIFACT_ID" \
+            --arg digest "$ARTIFACT_DIGEST" \
+            --arg source_sha '2dfab51243a5cffa4f34bb4bd3f19e10280757f8' \
+            '{run_id:$run_id, artifact_id:$artifact_id, artifact_digest:$digest, source_sha:$source_sha}')
+          content=$(printf '%s\n' "$status" | base64 -w0)
+          current_sha=$(gh api "repos/$GITHUB_REPOSITORY/contents/$path?ref=$branch" --jq .sha 2>/dev/null || true)
+          args=(--method PUT "repos/$GITHUB_REPOSITORY/contents/$path" -f message='ci: record smooth-v7 source export' -f content="$content" -f branch="$branch")
+          if [[ -n "$current_sha" ]]; then
+            args+=(-f sha="$current_sha")
+          fi
+          gh api "${args[@]}" >/dev/null
