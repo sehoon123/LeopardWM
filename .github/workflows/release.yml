@@ -1,26 +1,43 @@
 name: Release
+
 on:
   push:
     tags: ["v*"]
+
 permissions:
   contents: read
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
+    # Personal `-sehoon.N` releases use the separately verified adaptive
+    # release pipeline. This standard workflow remains for plain semver tags.
+    if: ${{ !contains(github.ref_name, '-sehoon.') }}
     permissions:
       contents: write
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          components: rustfmt, clippy
       - name: Install cargo-wix
-        run: cargo install cargo-wix --version ^0.3
-      - run: cargo build --release
+        run: cargo install cargo-wix --version ^0.3 --locked
+      - name: Verify formatting
+        run: cargo fmt --all -- --check
+      - name: Run full test suite
+        run: cargo test --workspace --all-targets --locked
+      - name: Run Clippy with warnings denied
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Build optimized binaries
+        run: cargo build --workspace --release --locked
       - name: Verify GUI executable subsystems
         shell: pwsh
-        run: ./.github/verify-gui-subsystems.ps1
-      - run: cargo test --all
-      - name: Package zip
+        run: ./.github/verify-gui-subsystems.ps1 -RepoRoot (Get-Location).Path
+      - name: Package ZIP
         shell: bash
         run: |
           VERSION=${GITHUB_REF_NAME#v}
@@ -30,63 +47,42 @@ jobs:
           cp target/x86_64-pc-windows-msvc/release/leopardwm-cli.exe "$DIR/"
           cp target/x86_64-pc-windows-msvc/release/lwm.exe "$DIR/"
           cp target/x86_64-pc-windows-msvc/release/leopardwm-watchdog.exe "$DIR/"
-          cp README.md LICENSE "$DIR/"
+          cp README.md LICENSE CHANGELOG.md "$DIR/"
           7z a "${DIR}.zip" "$DIR"
       - name: Build MSI installer
         shell: bash
         run: |
-          # WiX 3.14 is pre-installed at this path on windows-latest runners.
+          VERSION=${GITHUB_REF_NAME#v}
           cargo wix -p leopardwm-daemon -I wix/main.wxs \
             --target x86_64-pc-windows-msvc \
             --no-build --nocapture \
             --bin-path "C:\Program Files (x86)\WiX Toolset v3.14\bin"
-          cp target/wix/*.msi .
-          ls *.msi
+          cp target/wix/*.msi "LeopardWM-${VERSION}-x86_64.msi"
+          ls -l "LeopardWM-${VERSION}-x86_64.msi"
       - name: Extract changelog
         id: changelog
         shell: bash
         run: |
           VERSION=${GITHUB_REF_NAME#v}
-          # Extract the section for this version from CHANGELOG.md
           NOTES=$(awk "/^## \\[?${VERSION//./\\.}\\]?/{found=1; next} /^## /{if(found) exit} found{print}" CHANGELOG.md 2>/dev/null || true)
           if [ -z "$NOTES" ]; then
-            echo "body=" >> $GITHUB_OUTPUT
+            echo "body=" >> "$GITHUB_OUTPUT"
           else
-            # Use a delimiter for multiline output
             EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
-            echo "body<<$EOF" >> $GITHUB_OUTPUT
-            echo "$NOTES" >> $GITHUB_OUTPUT
-            echo "$EOF" >> $GITHUB_OUTPUT
+            echo "body<<$EOF" >> "$GITHUB_OUTPUT"
+            echo "$NOTES" >> "$GITHUB_OUTPUT"
+            echo "$EOF" >> "$GITHUB_OUTPUT"
           fi
-      - name: Generate SHA256 checksums
+      - name: Generate SHA-256 checksums
         shell: bash
         run: |
-          sha256sum LeopardWM-*.zip *.msi > checksums.txt
+          sha256sum LeopardWM-*.zip LeopardWM-*.msi > checksums.txt
           cat checksums.txt
       - uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
-        id: gh_release
         with:
           files: |
             LeopardWM-*.zip
-            *.msi
+            LeopardWM-*.msi
             checksums.txt
           body: ${{ steps.changelog.outputs.body }}
           generate_release_notes: ${{ steps.changelog.outputs.body == '' }}
-
-  publish-winget:
-    needs: build
-    runs-on: windows-latest
-    # WINGET_TOKEN must be a CLASSIC PAT with the `public_repo` and `workflow`
-    # scopes. Fork sync may import upstream workflow files, which GitHub rejects
-    # without `workflow`; fine-grained PATs can't open the upstream PR. The action
-    # forks microsoft/winget-pkgs, then opens a version-bump PR from that fork.
-    if: ${{ !github.event.repository.fork }}
-    steps:
-      - uses: vedantmgoyal9/winget-releaser@b3a5dae0047c6180023acba3f548c55fdf6b7193 # main 2026-07-28
-        with:
-          identifier: jcardama.LeopardWM
-          installers-regex: '\.msi$'
-          token: ${{ secrets.WINGET_TOKEN }}
-        # No continue-on-error: a winget failure should surface as a failed
-        # job (the GitHub Release is already published by the `build` job, so
-        # this can't block the release) rather than silently no-op for months.
