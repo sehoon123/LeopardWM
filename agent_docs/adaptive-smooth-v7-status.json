@@ -1,8 +1,8 @@
 {
-  "run_id": "32086241092",
-  "result": "failure",
+  "run_id": "32088020003",
+  "result": "success",
   "source_branch": "agent/adaptive-smooth-v7-source",
-  "source_sha": "",
+  "source_sha": "e6055e05b8b775fef4c10dd590603fdbb71b68e5",
   "base_sha": "2dfab51243a5cffa4f34bb4bd3f19e10280757f8",
   "patch_sha256": "a7469af71383d799077f0e6594646ffa68b3af3288e369a19ccd64e02761527d"
 }
