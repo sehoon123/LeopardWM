@@ -1,0 +1,11 @@
+{
+  "monitor_state": "observed",
+  "release_tag": "v0.2.6-sehoon.7",
+  "run_id": "32089466202",
+  "run_status": "in_progress",
+  "conclusion": "",
+  "head_branch": "agent/adaptive-smooth-v7-release-control",
+  "head_sha": "8b204d3324af8c950753d89848abf3657c7dc797",
+  "html_url": "https://github.com/sehoon123/LeopardWM/actions/runs/32089466202",
+  "updated_at_utc": "2026-08-18T01:50:14.4225133Z"
+}
