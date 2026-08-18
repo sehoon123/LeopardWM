@@ -1,0 +1,244 @@
+name: Apply and verify adaptive smooth v7
+
+on:
+  push:
+    branches:
+      - agent/adaptive-smooth-v7-control2
+    paths:
+      - .github/workflows/agent-apply-adaptive-smooth-v7.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: adaptive-smooth-v7-source
+  cancel-in-progress: false
+
+env:
+  CONTROL_BRANCH: agent/adaptive-smooth-v7-control2
+  SOURCE_BRANCH: agent/adaptive-smooth-v7-source
+  BASE_SHA: 2dfab51243a5cffa4f34bb4bd3f19e10280757f8
+  PATCH_SHA256: a7469af71383d799077f0e6594646ffa68b3af3288e369a19ccd64e02761527d
+  GZIP_SHA256: 230c5055c799e6f939a7ff764852cb082bbe3cb920239696d13be47a80f4bc11
+
+jobs:
+  verify-and-push:
+    runs-on: windows-2022
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out patch control branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CONTROL_BRANCH }}
+          path: control
+          fetch-depth: 0
+
+      - name: Check out exact source branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_BRANCH }}
+          path: source
+          fetch-depth: 0
+
+      - name: Reconstruct and authenticate patch
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $parts = Get-ChildItem 'control/.github/audit/adaptive-smooth-v7.patch.gz.b64.*' | Sort-Object Name
+          if ($parts.Count -ne 4) { throw "Expected four patch chunks, found $($parts.Count)" }
+          $base64 = ($parts | ForEach-Object { (Get-Content -Raw $_.FullName).Trim() }) -join ''
+          $gzipBytes = [Convert]::FromBase64String($base64)
+          $gzipPath = Join-Path $PWD 'adaptive-smooth-v7.patch.gz'
+          [IO.File]::WriteAllBytes($gzipPath, $gzipBytes)
+          $gzipHash = (Get-FileHash -Algorithm SHA256 $gzipPath).Hash.ToLowerInvariant()
+          if ($gzipHash -ne $env:GZIP_SHA256) {
+            throw "Compressed patch hash mismatch: expected=$env:GZIP_SHA256 actual=$gzipHash"
+          }
+
+          $patchPath = Join-Path $PWD 'adaptive-smooth-v7.patch'
+          $input = [IO.File]::OpenRead($gzipPath)
+          try {
+            $gzip = [IO.Compression.GZipStream]::new($input, [IO.Compression.CompressionMode]::Decompress)
+            try {
+              $output = [IO.File]::Create($patchPath)
+              try { $gzip.CopyTo($output) } finally { $output.Dispose() }
+            } finally { $gzip.Dispose() }
+          } finally { $input.Dispose() }
+          $patchHash = (Get-FileHash -Algorithm SHA256 $patchPath).Hash.ToLowerInvariant()
+          if ($patchHash -ne $env:PATCH_SHA256) {
+            throw "Patch hash mismatch: expected=$env:PATCH_SHA256 actual=$patchHash"
+          }
+          "PATCH_PATH=$patchPath" >> $env:GITHUB_ENV
+          Write-Host "Authenticated adaptive patch: $patchHash"
+
+      - name: Apply focused source patch
+        shell: pwsh
+        working-directory: source
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $actual = (git rev-parse HEAD).Trim()
+          if ($actual -ne $env:BASE_SHA) {
+            throw "Source branch moved before validation: expected=$env:BASE_SHA actual=$actual"
+          }
+          git apply --check $env:PATCH_PATH
+          if ($LASTEXITCODE -ne 0) { throw 'git apply --check failed' }
+          git apply $env:PATCH_PATH
+          if ($LASTEXITCODE -ne 0) { throw 'git apply failed' }
+
+      - name: Install stable Rust with quality components
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Format and verify patch hygiene
+        shell: pwsh
+        working-directory: source
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo fmt --all
+          if ($LASTEXITCODE -ne 0) { throw 'cargo fmt failed' }
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { throw 'cargo fmt check failed' }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'git diff check failed' }
+
+      - name: Verify narrow design surface and invariants
+        shell: pwsh
+        working-directory: source
+        run: |
+          @'
+          from pathlib import Path
+          import subprocess
+
+          expected = {
+              'CHANGELOG.md',
+              'README.md',
+              'crates/daemon/src/animation_worker.rs',
+              'crates/daemon/src/config.rs',
+              'crates/daemon/src/layout_apply.rs',
+              'crates/daemon/src/main.rs',
+              'crates/daemon/src/settings/settings.html',
+              'crates/daemon/src/state.rs',
+              'crates/daemon/src/tests.rs',
+              'crates/daemon/src/transitions.rs',
+              'crates/ipc/src/config_template.rs',
+              'crates/platform_win32/src/lib.rs',
+              'crates/platform_win32/src/placement.rs',
+              'crates/platform_win32/src/thumbnail.rs',
+              'crates/platform_win32/src/types.rs',
+          }
+          changed = set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines())
+          assert changed == expected, f'unexpected changed-file set: {sorted(changed ^ expected)}'
+
+          placement = Path('crates/platform_win32/src/placement.rs').read_text(encoding='utf-8')
+          transitions = Path('crates/daemon/src/transitions.rs').read_text(encoding='utf-8')
+          layout = Path('crates/daemon/src/layout_apply.rs').read_text(encoding='utf-8')
+          state = Path('crates/daemon/src/state.rs').read_text(encoding='utf-8')
+          tests = Path('crates/daemon/src/tests.rs').read_text(encoding='utf-8')
+
+          assert 'AnimationPlacementPolicy::AdaptiveCompositorSafe' in placement
+          assert 'AnimationDispatchMode::Synchronous' in placement
+          assert 'SWP_NOSIZE' in placement and 'SWP_ASYNCWINDOWPOS' in placement
+          assert 'IsHungAppWindow' in placement
+          assert 'transition_requires_compositor_safe_snap' in transitions
+          assert 'requires_compositor_safe_snap' in state
+          assert 'post_animation_landing_pending' in layout
+          assert 'post_animation_nudge_pending' not in ''.join(
+              p.read_text(encoding='utf-8', errors='replace') for p in Path('crates/daemon/src').glob('*.rs')
+          )
+          for name in (
+              'test_compositor_safe_mode_keeps_position_only_scroll_smooth',
+              'test_compositor_safe_mode_snaps_unprotected_size_transition',
+              'test_aborting_safe_ghost_transition_rearms_exact_landing',
+              'test_post_animation_landing_cannot_take_unchanged_fast_path',
+              'test_failed_apply_after_spawn_rearms_post_animation_landing',
+          ):
+              assert name in tests, name
+          print('Adaptive animation design invariants: OK')
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'Structural invariant verification failed' }
+
+      - name: Run every debug target test
+        working-directory: source
+        run: cargo test --workspace --all-targets --locked
+
+      - name: Run Clippy for every target with warnings denied
+        working-directory: source
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Check every Cargo target
+        working-directory: source
+        run: cargo check --workspace --all-targets --locked
+
+      - name: Run optimized library and binary tests
+        working-directory: source
+        run: cargo test --workspace --lib --bins --release --locked
+
+      - name: Repeat animation and geometry regressions in release mode
+        shell: pwsh
+        working-directory: source
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($iteration in 1..5) {
+            foreach ($filter in @('compositor_safe', 'adaptive', 'animation', 'geometry_mismatch', 'ghost', 'scratchpad', 'floating')) {
+              cargo test -p leopardwm-daemon --bin leopardwm --release --locked $filter -- --test-threads=1
+              if ($LASTEXITCODE -ne 0) { throw "$filter regression iteration $iteration failed" }
+            }
+            cargo test -p leopardwm-platform-win32 --release --locked adaptive -- --test-threads=1
+            if ($LASTEXITCODE -ne 0) { throw "platform adaptive regression iteration $iteration failed" }
+          }
+
+      - name: Build optimized Windows binaries
+        working-directory: source
+        run: cargo build --workspace --release --locked
+
+      - name: Verify GUI executable subsystems
+        shell: pwsh
+        working-directory: source
+        run: ./.github/verify-gui-subsystems.ps1
+
+      - name: Commit and push verified source only
+        id: commit
+        shell: pwsh
+        working-directory: source
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add CHANGELOG.md README.md crates
+          git diff --cached --check
+          if ($LASTEXITCODE -ne 0) { throw 'staged diff check failed' }
+          git commit -m 'feat: preserve smooth compositor-safe window animation'
+          if ($LASTEXITCODE -ne 0) { throw 'source commit failed' }
+          $sha = (git rev-parse HEAD).Trim()
+          git push origin "HEAD:refs/heads/$env:SOURCE_BRANCH"
+          if ($LASTEXITCODE -ne 0) { throw 'verified source push failed' }
+          $remote = (git ls-remote origin "refs/heads/$env:SOURCE_BRANCH" | ForEach-Object { ($_ -split '\s+')[0] }).Trim()
+          if ($remote -ne $sha) { throw "remote source mismatch: local=$sha remote=$remote" }
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+          Write-Host "Verified source commit: $sha"
+
+      - name: Record workflow result on control branch
+        if: always()
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULT: ${{ job.status }}
+          VERIFIED_SHA: ${{ steps.commit.outputs.sha }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $status = [ordered]@{
+            run_id = "$env:GITHUB_RUN_ID"
+            result = $env:RESULT
+            source_branch = $env:SOURCE_BRANCH
+            source_sha = $env:VERIFIED_SHA
+            base_sha = $env:BASE_SHA
+            patch_sha256 = $env:PATCH_SHA256
+          } | ConvertTo-Json
+          $path = 'agent_docs/adaptive-smooth-v7-status.json'
+          $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($status + "`n"))
+          $current = gh api "repos/$env:GITHUB_REPOSITORY/contents/$path`?ref=$env:CONTROL_BRANCH" --jq .sha 2>$null
+          $args = @('--method','PUT',"repos/$env:GITHUB_REPOSITORY/contents/$path",'-f','message=ci: record adaptive smooth v7 result','-f',"content=$encoded",'-f',"branch=$env:CONTROL_BRANCH")
+          if ($current) { $args += @('-f',"sha=$current") }
+          gh api @args | Out-Null
