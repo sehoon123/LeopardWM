@@ -68,7 +68,9 @@ pub use system::{
     are_animations_enabled, get_system_highlight_color_bgr, is_high_contrast_enabled,
     is_on_battery_or_power_saver, scale_px, set_dpi_awareness,
 };
-pub use types::{MonitorId, MonitorInfo, PlatformConfig, Win32Error, WindowInfo};
+pub use types::{
+    AnimationPlacementPolicy, MonitorId, MonitorInfo, PlatformConfig, Win32Error, WindowInfo,
+};
 pub use visibility::{
     cascade_windows, is_move_offscreen_sentinel_position, is_move_offscreen_sentinel_rect,
     move_window_offscreen, position_window, restore_all_windows_moved_offscreen_best_effort,

@@ -217,6 +217,10 @@ pub(crate) struct LayoutTransition {
     pub(crate) duration_ms: u64,
     /// Easing curve for this transition (from `[animation].easing`).
     pub(crate) easing: leopardwm_core_layout::Easing,
+    /// Whether this structural transition contains an unprotected size
+    /// interpolation. Position-only live movement stays smooth; a size-changing
+    /// transition is collapsed unless every changing window has a safe ghost.
+    pub(crate) requires_compositor_safe_snap: bool,
     /// Window IDs being driven via a DWM thumbnail "ghost" rather than
     /// per-frame `SetWindowPos` on the live HWND. Pure data — the owning
     /// `ThumbnailHandle`s live in `AppState.ghost_handles`, which decouples
@@ -574,14 +578,11 @@ pub(crate) struct AppState {
     /// paths that don't have direct access to the owning worker).
     /// Installed once at daemon startup via `install_animation_worker_control`.
     pub(crate) animation_worker_control: Option<crate::animation_worker::AnimationWorkerControl>,
-    /// True when the next sync `apply_layout` is the landing pass after an
-    /// animation (scroll or layout transition) and therefore needs the
-    /// `(w-1 → w)` nudge to repair sticky-compositor swap-chain desyncs.
-    /// Routine `apply_layout` calls (focus shifts in the already-visible
-    /// range, event-handler refreshes, drag finalizations) do not run after
-    /// an async-frame burst, so nudging them just produces a visible 1 px
-    /// resize on every Chromium / Firefox / Cascadia window with no benefit.
-    pub(crate) post_animation_nudge_pending: bool,
+    /// True when the next sync `apply_layout` must perform the exact landing
+    /// after an animation. It bypasses the unchanged-layout fast path. Adaptive
+    /// mode needs only the landing and edge verification; legacy async mode also
+    /// uses the targeted `(w-1 → w)` compositor repair.
+    pub(crate) post_animation_landing_pending: bool,
     /// Injected window info for testing. When set, `lookup_window_info()` returns
     /// entries from this map instead of calling `enumerate_windows()`.
     #[cfg(test)]
@@ -821,7 +822,7 @@ impl AppState {
             crossfade_sources: std::collections::HashMap::new(),
             crossfade_epoch_counter: 0,
             animation_worker_control: None,
-            post_animation_nudge_pending: false,
+            post_animation_landing_pending: false,
             #[cfg(test)]
             injected_window_info: HashMap::new(),
             #[cfg(test)]

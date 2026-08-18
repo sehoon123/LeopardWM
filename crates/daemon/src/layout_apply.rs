@@ -24,14 +24,21 @@ pub(crate) fn viewport_equality_is_proven(
 
 /// Whether an unchanged desired layout may bypass the synchronous placement
 /// worker. A completed animation must always perform one exact landing pass:
-/// that pass drains `post_animation_nudge_pending`, repairs sticky compositor
-/// surfaces, and verifies all four DWM edges.
+/// that pass drains `post_animation_landing_pending`, verifies all four DWM
+/// edges, and only in legacy mode repairs sticky compositor surfaces.
 pub(crate) fn can_skip_unchanged_layout(
     placements_unchanged: bool,
     bypass_fast_path: bool,
     post_animation_landing_pending: bool,
 ) -> bool {
     placements_unchanged && !bypass_fast_path && !post_animation_landing_pending
+}
+
+pub(crate) fn legacy_compositor_nudge_required(
+    landing_pending: bool,
+    compositor_safe_mode: bool,
+) -> bool {
+    landing_pending && !compositor_safe_mode
 }
 
 fn bounded_timeout_diagnostic(value: String) -> Option<String> {
@@ -206,8 +213,8 @@ impl AppState {
     /// Compute animated placements and send them to the animation worker.
     ///
     /// Returns `Ok(true)` if a frame was sent. Returns `Ok(false)` when paused,
-    /// empty, or when compositor-safe mode collapsed the animation into one
-    /// exact synchronous landing.
+    /// empty, or when adaptive safe mode collapsed an unprotected size-changing
+    /// transition into one exact synchronous landing.
     pub(crate) fn send_animation_frame(
         &mut self,
         worker: &animation_worker::AnimationWorkerHandle,
@@ -303,10 +310,16 @@ impl AppState {
             &self.ghost_handles,
         );
 
+        let mut platform_config = self.platform_config.clone();
+        platform_config.animation_placement_policy = if self.config.behavior.compositor_safe_mode {
+            leopardwm_platform_win32::AnimationPlacementPolicy::AdaptiveCompositorSafe
+        } else {
+            leopardwm_platform_win32::AnimationPlacementPolicy::LegacyAsync
+        };
         let request = animation_worker::FrameRequest {
             placements: live_placements,
             ghost_updates,
-            platform_config: self.platform_config.clone(),
+            platform_config,
         };
         if let Err(e) = worker.send_frame(request) {
             self.applying_layout = false;
@@ -458,13 +471,13 @@ impl AppState {
         if can_skip_unchanged_layout(
             placements_unchanged,
             bypass_fast_path,
-            self.post_animation_nudge_pending,
+            self.post_animation_landing_pending,
         ) {
             self.applying_layout = false;
             return Ok(());
         }
-        if placements_unchanged && self.post_animation_nudge_pending {
-            debug!("Forcing exact landing for unchanged post-animation placements");
+        if placements_unchanged && self.post_animation_landing_pending {
+            debug!("Forcing exact post-animation landing for unchanged placements");
         }
 
         let timeout_candidate_ids: Vec<u64> = all_placements
@@ -479,7 +492,7 @@ impl AppState {
         // `spawn_apply_worker` consumes this flag only after a successful
         // thread spawn. Remember the request so any later placement failure or
         // timeout can re-arm the compositor repair for the next exact landing.
-        let landing_repair_requested = self.post_animation_nudge_pending;
+        let landing_repair_requested = self.post_animation_landing_pending;
         let timeout = self.layout_apply_timeout;
         let (rx, worker_handle) = match self.spawn_apply_worker(all_placements) {
             Ok(worker) => worker,
@@ -576,7 +589,7 @@ impl AppState {
         };
         if result.is_err() {
             if landing_repair_requested {
-                self.post_animation_nudge_pending = true;
+                self.post_animation_landing_pending = true;
             }
             // Desired rectangles are recorded before the worker runs so the
             // normal success path can use the fast cache immediately. A
@@ -711,12 +724,14 @@ impl AppState {
         let apply_epoch_ref = self.apply_epoch.clone();
         let apply_epoch = apply_epoch_ref.fetch_add(1, Ordering::SeqCst) + 1;
         let apply_window_ids: Vec<u64> = all_placements.iter().map(|p| p.window_id).collect();
-        // Only the landing pass after an actual scroll / transition fires the
-        // (w-1 → w) sticky-compositor nudge. Routine applies skip it, which
-        // avoids a visible 1 px wobble on every focus shift, drag, or window
-        // event. Consume the flag only after creating the worker successfully;
-        // a spawn failure must leave the required landing armed for retry.
-        let post_animation_nudge = self.post_animation_nudge_pending;
+        // Adaptive frames are serialized for sensitive renderers, so their
+        // exact landing needs no synthetic resize. Preserve the historical
+        // `(w-1 → w)` repair only for the explicitly selected legacy async path.
+        // Consume the landing flag only after worker creation succeeds.
+        let post_animation_nudge = legacy_compositor_nudge_required(
+            self.post_animation_landing_pending,
+            self.config.behavior.compositor_safe_mode,
+        );
         #[cfg(test)]
         let injected_behavior = self.injected_apply_placements_behavior;
         #[cfg(test)]
@@ -817,7 +832,7 @@ impl AppState {
 
         match spawn_result {
             Ok(handle) => {
-                self.post_animation_nudge_pending = false;
+                self.post_animation_landing_pending = false;
                 Ok((rx, handle))
             }
             Err(e) => {

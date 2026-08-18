@@ -1,6 +1,6 @@
 //! Window placement application via SetWindowPos / DeferWindowPos.
 
-use crate::types::{PlatformConfig, Win32Error};
+use crate::types::{AnimationPlacementPolicy, PlatformConfig, Win32Error};
 use crate::window_id_to_hwnd;
 use leopardwm_core_layout::{Rect, Visibility, WindowId, WindowPlacement};
 use std::collections::{HashMap, HashSet};
@@ -13,9 +13,9 @@ use windows::Win32::Graphics::Dwm::{
     DWMWINDOWATTRIBUTE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, GetClassNameW, GetWindowRect, IsIconic,
-    IsWindow, IsZoomed, SetWindowPos, ShowWindow, SET_WINDOW_POS_FLAGS, SWP_ASYNCWINDOWPOS,
-    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_RESTORE,
+    BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, GetClassNameW, GetWindowRect,
+    IsHungAppWindow, IsIconic, IsWindow, IsZoomed, SetWindowPos, ShowWindow, SET_WINDOW_POS_FLAGS,
+    SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_RESTORE,
 };
 
 /// Undocumented but well-known DWM attribute for cloaking windows.
@@ -318,6 +318,10 @@ static GLOBAL_CLOAKED: Mutex<Option<HashSet<WindowId>>> = Mutex::new(None);
 pub struct PlacementCache {
     positions: HashMap<WindowId, (Rect, Visibility)>,
     insets: HashMap<WindowId, (i32, i32, i32, i32)>,
+    /// Renderer classification cached for the lifetime of a placement entry.
+    /// It is pruned as soon as the HWND leaves the current layout, preventing
+    /// recycled handles from inheriting an old animation policy.
+    compositor_sensitive: HashMap<WindowId, bool>,
     /// Generation of `GLOBAL_INSET_CACHE` reflected by `insets`. An atomic
     /// generation lets display/theme/DPI changes invalidate the animation
     /// worker's thread-local cache without locking on every frame.
@@ -335,13 +339,15 @@ impl PlacementCache {
         Self {
             positions: HashMap::new(),
             insets: HashMap::new(),
+            compositor_sensitive: HashMap::new(),
             inset_generation: INSET_CACHE_GENERATION.load(Ordering::Acquire),
         }
     }
 
     pub fn clear(&mut self) {
         self.positions.clear();
-        // Keep inset cache — insets are a window property, not position-dependent
+        self.compositor_sensitive.clear();
+        // Keep inset cache — insets are a window property, not position-dependent.
     }
 
     /// Clear the cached border insets. Call when system theme or DWM metrics
@@ -442,7 +448,7 @@ struct DeferEntry {
 /// where most windows haven't moved.
 pub fn apply_placements(
     placements: &[WindowPlacement],
-    _config: &PlatformConfig,
+    config: &PlatformConfig,
     mut cache: Option<&mut PlacementCache>,
     nudge_sticky_compositors: bool,
 ) -> Result<ApplyPlacementsResult, Win32Error> {
@@ -465,14 +471,11 @@ pub fn apply_placements(
         cache.sync_inset_generation();
     }
 
-    // Animation frames (cache present) use async positioning so hung windows
-    // don't stall the vsync-driven animation loop. Landing passes (no cache)
-    // stay synchronous for precise final placement.
-    let async_flag = if cache.is_some() {
-        SWP_ASYNCWINDOWPOS
-    } else {
-        SET_WINDOW_POS_FLAGS(0)
-    };
+    // Cache presence identifies an intermediate animation frame. The exact
+    // landing pass has no cache and remains fully synchronous. Intermediate
+    // dispatch is selected per HWND so ordinary windows keep the low-latency
+    // async path while compositor-sensitive renderers cannot build a backlog.
+    let animation_frame = cache.is_some();
 
     // Prepare all window entries — visible and off-screen alike.
     // All windows get full position + size with border inset adjustment.
@@ -488,7 +491,13 @@ pub fn apply_placements(
     // overlap and the layout gaps disappear.  Zero the insets to keep correct spacing.
     let high_contrast = crate::is_high_contrast_enabled();
 
-    let (entries, skipped) = build_defer_entries(placements, &mut cache, async_flag, high_contrast);
+    let (entries, skipped) = build_defer_entries(
+        placements,
+        &mut cache,
+        animation_frame,
+        config.animation_placement_policy,
+        high_contrast,
+    );
 
     // Uncloak windows that are becoming visible BEFORE positioning,
     // so DWM starts compositing them at the correct location on this frame.
@@ -518,12 +527,11 @@ pub fn apply_placements(
     // bounds which would create false constraints that prevent columns from
     // shrinking. The synchronous landing pass detects real violations
     // authoritatively.
-    let (width_violations, height_violations, geometry_mismatches) =
-        if async_flag == SET_WINDOW_POS_FLAGS(0) {
-            detect_size_violations(&entries, &failed_window_ids, &mut cache)
-        } else {
-            (Vec::new(), Vec::new(), Vec::new())
-        }; // end: skip landing verification during async frames
+    let (width_violations, height_violations, geometry_mismatches) = if !animation_frame {
+        detect_size_violations(&entries, &failed_window_ids, &mut cache)
+    } else {
+        (Vec::new(), Vec::new(), Vec::new())
+    }; // end: skip landing verification during async frames
 
     // Update cache: remove stale entries (windows no longer in placements),
     // update positioned entries, and keep skipped-unchanged entries intact.
@@ -533,6 +541,9 @@ pub fn apply_placements(
         // Remove windows that are no longer in the layout
         cache.positions.retain(|id, _| current_ids.contains(id));
         cache.insets.retain(|id, _| current_ids.contains(id));
+        cache
+            .compositor_sensitive
+            .retain(|id, _| current_ids.contains(id));
         // Update entries for windows that were actually positioned
         let positioned: std::collections::HashSet<u64> = entries
             .iter()
@@ -566,7 +577,7 @@ pub fn apply_placements(
     // sees "no size change" and never rebuilds. A brief (w-1 -> w) resize pair
     // forces a real delta through. Scoped to known-affected classes to avoid a
     // universal flicker tax.
-    if async_flag == SET_WINDOW_POS_FLAGS(0) && nudge_sticky_compositors {
+    if !animation_frame && nudge_sticky_compositors {
         let nudge_targets: Vec<NudgeTarget> = entries
             .iter()
             .filter(|e| {
@@ -619,8 +630,8 @@ fn offscreen_position(placement: &WindowPlacement, inset_l: i32, inset_t: i32) -
 }
 
 /// Whether an animation frame can move a visible window without re-sending
-/// its unchanged size. This keeps legacy animation mode from driving the
-/// target application's resize/swap-chain path on every horizontal frame.
+/// its unchanged size. Avoiding redundant size messages keeps a horizontal
+/// animation out of the target application's swap-chain resize path.
 fn animation_move_is_position_only(
     previous: Option<(Rect, Visibility)>,
     current: &WindowPlacement,
@@ -633,11 +644,79 @@ fn animation_move_is_position_only(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnimationDispatchMode {
+    Synchronous,
+    Asynchronous,
+    SkipHungSensitive,
+}
+
+/// Select per-HWND dispatch without consulting Win32, keeping policy testable.
+fn animation_dispatch_mode(
+    policy: AnimationPlacementPolicy,
+    compositor_sensitive: bool,
+    target_is_hung: bool,
+) -> AnimationDispatchMode {
+    match (policy, compositor_sensitive, target_is_hung) {
+        (AnimationPlacementPolicy::AdaptiveCompositorSafe, true, true) => {
+            AnimationDispatchMode::SkipHungSensitive
+        }
+        (AnimationPlacementPolicy::AdaptiveCompositorSafe, true, false) => {
+            AnimationDispatchMode::Synchronous
+        }
+        _ => AnimationDispatchMode::Asynchronous,
+    }
+}
+
+fn visible_position_flags(
+    animation_frame: bool,
+    dispatch: AnimationDispatchMode,
+    position_only: bool,
+) -> SET_WINDOW_POS_FLAGS {
+    let mut flags = SWP_NOZORDER | SWP_NOACTIVATE;
+    if animation_frame && dispatch == AnimationDispatchMode::Asynchronous {
+        flags |= SWP_ASYNCWINDOWPOS;
+    }
+    // WM_NCCALCSIZE is unnecessary on intermediate movement frames and is a
+    // major source of renderer churn. The exact landing always recalculates it.
+    if !animation_frame {
+        flags |= SWP_FRAMECHANGED;
+    }
+    if position_only {
+        flags |= SWP_NOSIZE;
+    }
+    flags
+}
+
+fn cached_compositor_sensitive(
+    hwnd: HWND,
+    window_id: WindowId,
+    cache: Option<&mut PlacementCache>,
+) -> bool {
+    if let Some(value) = cache
+        .as_ref()
+        .and_then(|cache| cache.compositor_sensitive.get(&window_id).copied())
+    {
+        return value;
+    }
+
+    let class = window_class_name(hwnd);
+    // A valid HWND with a temporarily unreadable class is treated as sensitive:
+    // the safe failure mode is one synchronous movement frame, not an async
+    // burst whose renderer behavior we cannot classify.
+    let value = class.is_empty() || crate::thumbnail::is_compositor_sensitive_class_str(&class);
+    if let Some(cache) = cache {
+        cache.compositor_sensitive.insert(window_id, value);
+    }
+    value
+}
+
 /// Build the defer-entry list for all placements, skipping cache-unchanged windows.
 fn build_defer_entries(
     placements: &[WindowPlacement],
     cache: &mut Option<&mut PlacementCache>,
-    async_flag: SET_WINDOW_POS_FLAGS,
+    animation_frame: bool,
+    policy: AnimationPlacementPolicy,
     high_contrast: bool,
 ) -> (Vec<DeferEntry>, u32) {
     let mut skipped = 0u32;
@@ -671,6 +750,22 @@ fn build_defer_entries(
             }
         }
 
+        let dispatch = if animation_frame {
+            let sensitive = policy == AnimationPlacementPolicy::AdaptiveCompositorSafe
+                && cached_compositor_sensitive(hwnd, placement.window_id, cache.as_deref_mut());
+            let hung = sensitive && unsafe { IsHungAppWindow(hwnd).as_bool() };
+            animation_dispatch_mode(policy, sensitive, hung)
+        } else {
+            AnimationDispatchMode::Synchronous
+        };
+        if dispatch == AnimationDispatchMode::SkipHungSensitive {
+            // Do not let a hung renderer pin the persistent animation worker.
+            // Its cache entry stays unchanged, and the bounded exact landing
+            // worker will retry it when the animation finishes.
+            skipped += 1;
+            continue;
+        }
+
         let (inset_l, inset_t, inset_r, inset_b) = if high_contrast {
             (0, 0, 0, 0)
         } else {
@@ -680,20 +775,7 @@ fn build_defer_entries(
         let frame_h = placement.rect.height + inset_t + inset_b;
 
         if placement.visibility == Visibility::Visible {
-            let mut flags = SWP_NOZORDER | SWP_NOACTIVATE | async_flag;
-            // Only send SWP_FRAMECHANGED (expensive WM_NCCALCSIZE) on first
-            // frame or landing pass — not every animation frame.
-            let needs_frame_changed = if let Some(ref cache) = *cache {
-                !cache.positions.contains_key(&placement.window_id)
-            } else {
-                true
-            };
-            if needs_frame_changed {
-                flags |= SWP_FRAMECHANGED;
-            }
-            if position_only {
-                flags |= SWP_NOSIZE;
-            }
+            let flags = visible_position_flags(animation_frame, dispatch, position_only);
             entries.push(DeferEntry {
                 hwnd,
                 window_id: placement.window_id,
@@ -713,6 +795,10 @@ fn build_defer_entries(
             // w stores estimated frame width for clamping only — SetWindowPos
             // ignores it due to SWP_NOSIZE.
             let (x, y) = offscreen_position(placement, inset_l, inset_t);
+            let mut flags = SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE;
+            if animation_frame && dispatch == AnimationDispatchMode::Asynchronous {
+                flags |= SWP_ASYNCWINDOWPOS;
+            }
             entries.push(DeferEntry {
                 hwnd,
                 window_id: placement.window_id,
@@ -724,7 +810,7 @@ fn build_defer_entries(
                 used_insets: (inset_l, inset_t, inset_r, inset_b),
                 validate_insets: !high_contrast,
                 visibility: placement.visibility,
-                flags: SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | async_flag,
+                flags,
                 column_index: placement.column_index,
             });
         }
@@ -1410,6 +1496,57 @@ mod tests {
     }
 
     #[test]
+    fn test_adaptive_animation_dispatch_serializes_sensitive_windows() {
+        assert_eq!(
+            animation_dispatch_mode(
+                AnimationPlacementPolicy::AdaptiveCompositorSafe,
+                true,
+                false,
+            ),
+            AnimationDispatchMode::Synchronous
+        );
+        assert_eq!(
+            animation_dispatch_mode(AnimationPlacementPolicy::AdaptiveCompositorSafe, true, true,),
+            AnimationDispatchMode::SkipHungSensitive
+        );
+        assert_eq!(
+            animation_dispatch_mode(
+                AnimationPlacementPolicy::AdaptiveCompositorSafe,
+                false,
+                false,
+            ),
+            AnimationDispatchMode::Asynchronous
+        );
+        assert_eq!(
+            animation_dispatch_mode(AnimationPlacementPolicy::LegacyAsync, true, true),
+            AnimationDispatchMode::Asynchronous
+        );
+    }
+
+    #[test]
+    fn test_adaptive_sensitive_move_is_sync_position_only_without_frame_change() {
+        let flags = visible_position_flags(true, AnimationDispatchMode::Synchronous, true);
+        assert_eq!(flags.0 & SWP_ASYNCWINDOWPOS.0, 0);
+        assert_ne!(flags.0 & SWP_NOSIZE.0, 0);
+        assert_eq!(flags.0 & SWP_FRAMECHANGED.0, 0);
+
+        let ordinary = visible_position_flags(true, AnimationDispatchMode::Asynchronous, true);
+        assert_ne!(ordinary.0 & SWP_ASYNCWINDOWPOS.0, 0);
+        assert_ne!(ordinary.0 & SWP_NOSIZE.0, 0);
+        assert_eq!(ordinary.0 & SWP_FRAMECHANGED.0, 0);
+
+        let first_sensitive_frame =
+            visible_position_flags(true, AnimationDispatchMode::Synchronous, false);
+        assert_eq!(first_sensitive_frame.0 & SWP_ASYNCWINDOWPOS.0, 0);
+        assert_eq!(first_sensitive_frame.0 & SWP_NOSIZE.0, 0);
+        assert_eq!(first_sensitive_frame.0 & SWP_FRAMECHANGED.0, 0);
+
+        let landing = visible_position_flags(false, AnimationDispatchMode::Synchronous, false);
+        assert_eq!(landing.0 & SWP_ASYNCWINDOWPOS.0, 0);
+        assert_ne!(landing.0 & SWP_FRAMECHANGED.0, 0);
+    }
+
+    #[test]
     fn test_geometry_mismatch_flags_cover_all_edges_with_tolerance() {
         let requested = Rect::new(100, 200, 800, 600);
         assert_eq!(
@@ -1457,6 +1594,23 @@ mod tests {
 
         assert!(cache.positions.is_empty());
         assert!(cache.insets.is_empty());
+    }
+
+    #[test]
+    fn test_placement_cache_clear_drops_renderer_classification() {
+        let mut cache = PlacementCache::new();
+        let wid = 0x7FFF_FF03;
+        cache
+            .positions
+            .insert(wid, (Rect::new(1, 2, 300, 200), Visibility::Visible));
+        cache.insets.insert(wid, (8, 0, 8, 8));
+        cache.compositor_sensitive.insert(wid, true);
+
+        cache.clear();
+
+        assert!(cache.positions.is_empty());
+        assert!(cache.compositor_sensitive.is_empty());
+        assert_eq!(cache.insets.get(&wid), Some(&(8, 0, 8, 8)));
     }
 
     #[test]

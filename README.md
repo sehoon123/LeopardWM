@@ -58,9 +58,9 @@ A few deliberate **non-features**, so you know what you're getting:
 
 - Multi-monitor workspaces with monitor-aware focus and move (9 workspaces per monitor)
 - Global hotkeys with live config reload
-- Compositor-safe movement by default: exact one-step landings prevent browser,
-  Explorer, Terminal, and Electron render surfaces from drifting inside frames
-- Optional legacy smooth scroll animations with layout transition effects
+- Adaptive compositor-safe animation by default: smooth position-only scrolling
+  with synchronized GPU-backed HWNDs, plus exact landings for unsafe resizes
+- Optional fully asynchronous legacy animation path
 - Touchpad gestures with configurable swipe actions
 - DPI-aware drag-and-drop across monitors — plain drag moves one window; hold Shift before drag start to move its whole column
 - **Tabbed columns** — toggle a column between vertical-stack and tab-strip mode (`Ctrl+Alt+T`); only the active tab fills the column rect, the rest sit in a clickable strip above
@@ -127,10 +127,11 @@ Start the daemon:
 
 A default config is created automatically at `%APPDATA%\leopardwm\config\config.toml`. Customize via the tray icon → Settings, or edit the file directly.
 
-`behavior.compositor_safe_mode = true` is the default. It uses a single exact
-window landing rather than per-frame live HWND movement, preventing GPU-backed
-application surfaces from accumulating horizontal visual offsets. Disable it
-only when intentionally opting into the legacy smooth live-window path.
+`behavior.compositor_safe_mode = true` is the default. Position-only scrolling
+remains smooth, but GPU-backed windows are serialized per frame so their client
+surface cannot lag behind the HWND. Size-changing transitions use a safe DWM
+ghost when available and otherwise land exactly once. Set it to `false` only to
+restore the fully asynchronous legacy path.
 
 ## Default Hotkeys
 
