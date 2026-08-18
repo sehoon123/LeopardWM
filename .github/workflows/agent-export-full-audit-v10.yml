@@ -1,0 +1,54 @@
+name: Export full-audit v10 source
+
+on:
+  push:
+    branches:
+      - agent/full-audit-v10-control
+    paths:
+      - .github/workflows/agent-export-full-audit-v10.yml
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bfb2bb1409f39e29fa3530d3858fe6fab733d0c7
+          fetch-depth: 0
+
+      - name: Archive exact main source
+        run: git archive --format=zip --output=LeopardWM-full-audit-v10-source.zip HEAD
+
+      - name: Upload source archive
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: LeopardWM-full-audit-v10-source
+          path: LeopardWM-full-audit-v10-source.zip
+          if-no-files-found: error
+          retention-days: 2
+
+      - name: Record artifact coordinates
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+        run: |
+          set -euo pipefail
+          path='agent_docs/full-audit-v10-export.json'
+          payload=$(jq -n \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg artifact_id "$ARTIFACT_ID" \
+            --arg artifact_digest "$ARTIFACT_DIGEST" \
+            --arg source_sha 'bfb2bb1409f39e29fa3530d3858fe6fab733d0c7' \
+            '{run_id:$run_id,artifact_id:$artifact_id,artifact_digest:$artifact_digest,source_sha:$source_sha}')
+          content=$(printf '%s\n' "$payload" | base64 -w0)
+          gh api --method PUT "repos/$GITHUB_REPOSITORY/contents/$path" \
+            -f message='ci: record full-audit v10 source export' \
+            -f content="$content" \
+            -f branch='agent/full-audit-v10-control' >/dev/null
