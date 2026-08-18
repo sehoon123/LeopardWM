@@ -1,0 +1,54 @@
+name: Align legacy monitor-isolation test
+
+on:
+  push:
+    branches:
+      - agent/edge-centering-monitor-isolation
+    paths:
+      - .github/workflows/agent-fix-edge-test.yml
+
+permissions:
+  contents: write
+
+jobs:
+  fix-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/edge-centering-monitor-isolation-source
+          fetch-depth: 0
+
+      - name: Update the obsolete safe-visible fixture
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('crates/daemon/src/layout_apply.rs')
+          text = path.read_text(encoding='utf-8')
+          replacements = {
+              'fn wrapper_reparks_only_bleeding_offscreen_placements()':
+                  'fn wrapper_reparks_bleeding_placements_and_preserves_safe_ones()',
+              'let visible = Rect::new(5200, 10, 400, 400); // overlaps neighbor but Visible':
+                  'let visible = Rect::new(4700, 10, 400, 400); // fully contained by owner',
+              '"visible placement untouched"':
+                  '"safe visible placement untouched"',
+          }
+          for old, new in replacements.items():
+              if text.count(old) != 1:
+                  raise SystemExit(f'expected one occurrence: {old!r}')
+              text = text.replace(old, new)
+          path.write_text(text, encoding='utf-8', newline='\n')
+          PY
+          git diff --check
+
+      - name: Commit the test contract update
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add crates/daemon/src/layout_apply.rs
+          git commit -m 'test: align monitor isolation contract'
+          git push origin HEAD:refs/heads/agent/edge-centering-monitor-isolation-source
