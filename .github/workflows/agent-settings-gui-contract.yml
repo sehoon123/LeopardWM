@@ -1,0 +1,403 @@
+name: Complete and verify settings GUI
+
+on:
+  push:
+    branches:
+      - agent/settings-gui-contract-control
+    paths:
+      - .github/workflows/agent-settings-gui-contract.yml
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: settings-gui-contract-v9
+  cancel-in-progress: false
+
+env:
+  SOURCE_BRANCH: agent/settings-gui-contract-source
+  CONTROL_BRANCH: agent/settings-gui-contract-control
+  EXPECTED_MAIN_SHA: ed48603d6417a3f2e5af846e1182cbb7aee5cea5
+  RELEASE_TAG: v0.2.6-sehoon.9
+  RELEASE_VERSION: 0.2.6-sehoon.9
+
+jobs:
+  verify-build-publish:
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out control files
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CONTROL_BRANCH }}
+          path: control
+          fetch-depth: 0
+
+      - name: Check out clean source branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_BRANCH }}
+          path: source
+          fetch-depth: 0
+
+      - name: Record workflow coordinates
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          path='agent_docs/settings-gui-v9-status.json'
+          payload=$(jq -n \
+            --arg state started \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --arg expected_main_sha "$EXPECTED_MAIN_SHA" \
+            '{state:$state,run_id:$run_id,run_url:$run_url,expected_main_sha:$expected_main_sha}')
+          content=$(printf '%s\n' "$payload" | base64 -w0)
+          current=$(gh api "repos/$GITHUB_REPOSITORY/contents/$path?ref=$CONTROL_BRANCH" --jq .sha 2>/dev/null || true)
+          args=(--method PUT "repos/$GITHUB_REPOSITORY/contents/$path" -f message='ci: record settings GUI v9 run' -f content="$content" -f branch="$CONTROL_BRANCH")
+          if [[ -n "$current" ]]; then args+=(-f sha="$current"); fi
+          gh api "${args[@]}" >/dev/null
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Verify source identity
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $actual = (git rev-parse HEAD).Trim()
+          if ($actual -ne $env:EXPECTED_MAIN_SHA) {
+            throw "Source mismatch: expected=$env:EXPECTED_MAIN_SHA actual=$actual"
+          }
+          $main = ((git ls-remote origin refs/heads/main) -split '\s+')[0]
+          if ($main -ne $env:EXPECTED_MAIN_SHA) {
+            throw "main moved before verification: expected=$env:EXPECTED_MAIN_SHA actual=$main"
+          }
+
+      - name: Apply reviewed settings GUI patch
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          @'
+          import base64
+          import gzip
+          from pathlib import Path
+
+          encoded = Path('../control/.github/patches/settings-gui-contract.patch.gz.b64').read_text(encoding='utf-8').strip()
+          Path('../settings-gui-contract.patch').write_bytes(gzip.decompress(base64.b64decode(encoded)))
+          '@ | python -
+          git apply --index ../settings-gui-contract.patch
+          if ($LASTEXITCODE -ne 0) { throw 'settings GUI patch failed to apply' }
+
+          $changed = @(git diff --cached --name-only)
+          $expected = @(
+            '.github/smoke-settings-ui.ps1',
+            '.github/workflows/ci.yml',
+            'crates/daemon/src/settings/html.rs',
+            'crates/daemon/src/settings/settings.html'
+          )
+          if (@(Compare-Object $changed $expected).Count -ne 0) {
+            throw "Unexpected staged files: $($changed -join ', ')"
+          }
+          git diff --cached --check
+          if ($LASTEXITCODE -ne 0) { throw 'patch hygiene check failed' }
+
+      - name: Format and inspect final patch
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo fmt --all
+          if ($LASTEXITCODE -ne 0) { throw 'cargo fmt failed' }
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { throw 'cargo fmt check failed' }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'git diff check failed' }
+
+          $changed = @(git diff --name-only HEAD)
+          $expected = @(
+            '.github/smoke-settings-ui.ps1',
+            '.github/workflows/ci.yml',
+            'crates/daemon/src/settings/html.rs',
+            'crates/daemon/src/settings/settings.html'
+          )
+          if (@(Compare-Object $changed $expected).Count -ne 0) {
+            throw "Unexpected final files: $($changed -join ', ')"
+          }
+
+      - name: Smoke-test settings UI at supported window sizes
+        working-directory: source
+        shell: pwsh
+        run: ./.github/smoke-settings-ui.ps1 -RepoRoot (Get-Location).Path
+
+      - name: Run full locked test suite
+        working-directory: source
+        run: cargo test --workspace --all-targets --locked
+
+      - name: Run Clippy with warnings denied
+        working-directory: source
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Check every Cargo target
+        working-directory: source
+        run: cargo check --workspace --all-targets --locked
+
+      - name: Run optimized library and binary tests
+        working-directory: source
+        run: cargo test --workspace --lib --bins --release --locked
+
+      - name: Build optimized Windows binaries
+        working-directory: source
+        run: cargo build --workspace --release --locked
+
+      - name: Verify Windows GUI subsystems
+        working-directory: source
+        shell: pwsh
+        run: ./.github/verify-gui-subsystems.ps1 -RepoRoot (Get-Location).Path
+
+      - name: Install cargo-wix
+        run: cargo install cargo-wix --version ^0.3 --locked
+
+      - name: Commit verified source and fast-forward main
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add \
+            .github/smoke-settings-ui.ps1 \
+            .github/workflows/ci.yml \
+            crates/daemon/src/settings/html.rs \
+            crates/daemon/src/settings/settings.html
+          git commit -m 'feat: complete and harden settings GUI'
+          source_sha=$(git rev-parse HEAD)
+          echo "SOURCE_SHA=$source_sha" >> "$GITHUB_ENV"
+
+          git fetch origin main --force
+          actual_main=$(git rev-parse origin/main)
+          if [[ "$actual_main" != "$EXPECTED_MAIN_SHA" ]]; then
+            echo "main moved during verification: expected=$EXPECTED_MAIN_SHA actual=$actual_main" >&2
+            exit 1
+          fi
+          git push origin HEAD:"refs/heads/$SOURCE_BRANCH"
+          git push origin HEAD:refs/heads/main
+
+      - name: Package ZIP and standalone binaries
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $candidateDirs = @('target/x86_64-pc-windows-msvc/release', 'target/release')
+          $binDir = $candidateDirs | Where-Object { Test-Path (Join-Path $_ 'leopardwm.exe') } | Select-Object -First 1
+          if (-not $binDir) { throw 'Release binary directory not found' }
+
+          $packageDir = "LeopardWM-$env:RELEASE_VERSION-x86_64-windows"
+          New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
+          foreach ($binary in @('leopardwm.exe', 'leopardwm-cli.exe', 'lwm.exe', 'leopardwm-watchdog.exe')) {
+            $source = Join-Path $binDir $binary
+            if (-not (Test-Path $source)) { throw "Missing binary: $source" }
+            Copy-Item $source (Join-Path $packageDir $binary)
+            Copy-Item $source $binary
+          }
+          Copy-Item README.md, LICENSE, CHANGELOG.md $packageDir
+          7z a "$packageDir.zip" $packageDir | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw 'ZIP packaging failed' }
+
+      - name: Build MSI installer
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo wix -p leopardwm-daemon -I wix/main.wxs --target x86_64-pc-windows-msvc --no-build --nocapture --bin-path 'C:\Program Files (x86)\WiX Toolset v3.14\bin'
+          if ($LASTEXITCODE -ne 0) { throw 'cargo wix failed' }
+          $built = Get-ChildItem target/wix/*.msi | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $built) { throw 'cargo wix produced no MSI' }
+          Copy-Item $built.FullName "LeopardWM-$env:RELEASE_VERSION-x86_64.msi"
+
+      - name: Verify MSI administrative installation
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msi = (Resolve-Path "LeopardWM-$env:RELEASE_VERSION-x86_64.msi").Path
+          $admin = Join-Path (Get-Location) 'msi-admin-image'
+          New-Item -ItemType Directory -Path $admin -Force | Out-Null
+          $arguments = "/a `"$msi`" /qn TARGETDIR=`"$admin`""
+          $process = Start-Process -FilePath "$env:SystemRoot\System32\msiexec.exe" -ArgumentList $arguments -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            throw "MSI administrative install failed: $($process.ExitCode)"
+          }
+          foreach ($binary in @('leopardwm.exe', 'leopardwm-cli.exe', 'lwm.exe', 'leopardwm-watchdog.exe')) {
+            $installed = Get-ChildItem $admin -Recurse -Filter $binary | Select-Object -First 1
+            if (-not $installed) { throw "MSI is missing $binary" }
+            $expected = (Get-FileHash $binary -Algorithm SHA256).Hash
+            $actual = (Get-FileHash $installed.FullName -Algorithm SHA256).Hash
+            if ($expected -ne $actual) { throw "MSI binary mismatch: $binary" }
+          }
+
+      - name: Generate checksums and release notes
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $assets = @(
+            "LeopardWM-$env:RELEASE_VERSION-x86_64-windows.zip",
+            "LeopardWM-$env:RELEASE_VERSION-x86_64.msi",
+            'leopardwm.exe',
+            'leopardwm-cli.exe',
+            'lwm.exe',
+            'leopardwm-watchdog.exe'
+          )
+          $lines = foreach ($asset in $assets) {
+            "{0} *{1}" -f (Get-FileHash $asset -Algorithm SHA256).Hash.ToLowerInvariant(), $asset
+          }
+          $lines | Set-Content checksums.txt -Encoding ascii
+          @'
+          Personal-fork prerelease from `sehoon123/LeopardWM`.
+
+          Settings GUI completion and hardening:
+          - exposes the previously hidden update-check preference
+          - adds editable floating width, floating height, and tiled column width to window rules
+          - preserves unmodeled configuration fields during unrelated GUI saves
+          - keeps hotkey and rule tables contained at the minimum supported window size
+          - bounds menus and closes transient overlays on scroll or resize
+          - restores keyboard focus visibility for toggles and corrects forced-colors navigation styling
+          - adds an Edge-based render, navigation, popup, and round-trip smoke test at 640x420 and 780x560
+
+          Includes the edge-centering and adjacent-monitor isolation behavior from v0.2.6-sehoon.8.
+          '@ | Set-Content release-notes-v9.md -Encoding utf8
+
+      - name: Publish prerelease
+        working-directory: source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release already exists: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Tag already exists: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" \
+            "LeopardWM-$RELEASE_VERSION-x86_64-windows.zip" \
+            "LeopardWM-$RELEASE_VERSION-x86_64.msi" \
+            leopardwm.exe \
+            leopardwm-cli.exe \
+            lwm.exe \
+            leopardwm-watchdog.exe \
+            checksums.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$SOURCE_SHA" \
+            --title "LeopardWM $RELEASE_TAG — completed settings GUI" \
+            --notes-file release-notes-v9.md \
+            --prerelease
+
+      - name: Independently verify published assets
+        working-directory: source
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $verify = Join-Path (Get-Location) 'published-verification'
+          New-Item -ItemType Directory -Path $verify -Force | Out-Null
+          gh release download $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --dir $verify
+          if ($LASTEXITCODE -ne 0) { throw 'Release download failed' }
+
+          foreach ($line in Get-Content (Join-Path $verify 'checksums.txt')) {
+            if ($line -notmatch '^([0-9a-f]{64}) \*(.+)$') { throw "Invalid checksum line: $line" }
+            $path = Join-Path $verify $Matches[2]
+            if (-not (Test-Path $path)) { throw "Missing published asset: $($Matches[2])" }
+            $actual = (Get-FileHash $path -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actual -ne $Matches[1]) { throw "Checksum mismatch: $($Matches[2])" }
+          }
+
+          $zip = Join-Path $verify "LeopardWM-$env:RELEASE_VERSION-x86_64-windows.zip"
+          7z t $zip | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw 'Published ZIP CRC verification failed' }
+          $extract = Join-Path $verify 'zip-extracted'
+          7z x $zip "-o$extract" -y | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw 'Published ZIP extraction failed' }
+          foreach ($binary in @('leopardwm.exe', 'leopardwm-cli.exe', 'lwm.exe', 'leopardwm-watchdog.exe')) {
+            $fromZip = Get-ChildItem $extract -Recurse -Filter $binary | Select-Object -First 1
+            $standalone = Join-Path $verify $binary
+            if (-not $fromZip) { throw "ZIP is missing $binary" }
+            if ((Get-FileHash $fromZip.FullName -Algorithm SHA256).Hash -ne (Get-FileHash $standalone -Algorithm SHA256).Hash) {
+              throw "ZIP binary mismatch: $binary"
+            }
+          }
+
+          $publishedMsi = Join-Path $verify "LeopardWM-$env:RELEASE_VERSION-x86_64.msi"
+          $admin = Join-Path $verify 'msi-admin-image'
+          New-Item -ItemType Directory -Path $admin -Force | Out-Null
+          $arguments = "/a `"$publishedMsi`" /qn TARGETDIR=`"$admin`""
+          $process = Start-Process -FilePath "$env:SystemRoot\System32\msiexec.exe" -ArgumentList $arguments -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            throw "Published MSI administrative install failed: $($process.ExitCode)"
+          }
+          foreach ($binary in @('leopardwm.exe', 'leopardwm-cli.exe', 'lwm.exe', 'leopardwm-watchdog.exe')) {
+            $installed = Get-ChildItem $admin -Recurse -Filter $binary | Select-Object -First 1
+            $standalone = Join-Path $verify $binary
+            if (-not $installed) { throw "Published MSI is missing $binary" }
+            if ((Get-FileHash $installed.FullName -Algorithm SHA256).Hash -ne (Get-FileHash $standalone -Algorithm SHA256).Hash) {
+              throw "Published MSI binary mismatch: $binary"
+            }
+          }
+
+          git fetch origin --tags --force
+          $tagSha = (git rev-list -n 1 $env:RELEASE_TAG).Trim()
+          $mainSha = ((git ls-remote origin refs/heads/main) -split '\s+')[0]
+          if ($tagSha -ne $env:SOURCE_SHA -or $mainSha -ne $env:SOURCE_SHA) {
+            throw "Source identity mismatch: tag=$tagSha main=$mainSha expected=$env:SOURCE_SHA"
+          }
+
+      - name: Publish success status
+        working-directory: source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          path='agent_docs/settings-gui-v9-status.json'
+          zip_hash=$(sha256sum "LeopardWM-$RELEASE_VERSION-x86_64-windows.zip" | awk '{print $1}')
+          msi_hash=$(sha256sum "LeopardWM-$RELEASE_VERSION-x86_64.msi" | awk '{print $1}')
+          payload=$(jq -n \
+            --arg state success \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --arg tag "$RELEASE_TAG" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg zip_sha256 "$zip_hash" \
+            --arg msi_sha256 "$msi_hash" \
+            '{state:$state,run_id:$run_id,run_url:$run_url,tag:$tag,source_sha:$source_sha,zip_sha256:$zip_sha256,msi_sha256:$msi_sha256}')
+          content=$(printf '%s\n' "$payload" | base64 -w0)
+          current=$(gh api "repos/$GITHUB_REPOSITORY/contents/$path?ref=$CONTROL_BRANCH" --jq .sha)
+          gh api --method PUT "repos/$GITHUB_REPOSITORY/contents/$path" \
+            -f message='ci: record successful settings GUI v9 publication' \
+            -f content="$content" \
+            -f branch="$CONTROL_BRANCH" \
+            -f sha="$current" >/dev/null
+
+      - name: Upload verification bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: LeopardWM-v0.2.6-sehoon.9-verified
+          path: |
+            source/LeopardWM-0.2.6-sehoon.9-x86_64-windows.zip
+            source/LeopardWM-0.2.6-sehoon.9-x86_64.msi
+            source/checksums.txt
+            source/release-notes-v9.md
+          if-no-files-found: error
+          retention-days: 14
