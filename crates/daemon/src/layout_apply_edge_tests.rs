@@ -19,20 +19,10 @@ fn side_by_side_monitors() -> HashMap<MonitorId, MonitorInfo> {
     HashMap::from([(1, monitor(1, 0)), (2, monitor(2, 1920))])
 }
 
-fn isolate(
-    placements: &mut [WindowPlacement],
-    owner_id: MonitorId,
-    focused_column: Option<usize>,
-) {
+fn isolate(placements: &mut [WindowPlacement], owner_id: MonitorId, focused_column: Option<usize>) {
     let monitors = side_by_side_monitors();
     let rects: Vec<_> = monitors.values().map(|monitor| monitor.rect).collect();
-    park_offscreen_avoiding_neighbors(
-        placements,
-        owner_id,
-        focused_column,
-        &monitors,
-        &rects,
-    );
+    park_offscreen_avoiding_neighbors(placements, owner_id, focused_column, &monitors, &rects);
 }
 
 #[test]
@@ -70,7 +60,9 @@ fn focused_tiled_overflow_is_contained_instead_of_disappearing() {
 
     assert_eq!(placements[0].visibility, Visibility::Visible);
     assert_eq!(placements[0].rect, Rect::new(1520, 40, 400, 800));
-    assert!(!placements[0].rect.intersects(&side_by_side_monitors()[&2].rect));
+    assert!(!placements[0]
+        .rect
+        .intersects(&side_by_side_monitors()[&2].rect));
 }
 
 #[test]
@@ -86,7 +78,9 @@ fn oversized_focused_column_is_fitted_to_the_owner_work_area() {
 
     assert_eq!(placements[0].visibility, Visibility::Visible);
     assert_eq!(placements[0].rect, Rect::new(0, 40, 1920, 800));
-    assert!(!placements[0].rect.intersects(&side_by_side_monitors()[&2].rect));
+    assert!(!placements[0]
+        .rect
+        .intersects(&side_by_side_monitors()[&2].rect));
 }
 
 #[test]
