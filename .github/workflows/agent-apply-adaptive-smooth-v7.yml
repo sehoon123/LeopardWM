@@ -196,7 +196,7 @@ jobs:
       - name: Verify GUI executable subsystems
         shell: pwsh
         working-directory: source
-        run: ./.github/verify-gui-subsystems.ps1
+        run: ./.github/verify-gui-subsystems.ps1 -RepoRoot (Get-Location).Path
 
       - name: Commit and push verified source only
         id: commit
