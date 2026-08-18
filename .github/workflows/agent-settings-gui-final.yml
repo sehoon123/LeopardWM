@@ -73,15 +73,27 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           @'
-          import base64, gzip
+          import base64
+          import gzip
+          import hashlib
           from pathlib import Path
-          encoded = Path('../control/.github/patches/settings-gui-contract.patch.gz.b64').read_text(encoding='utf-8').strip()
-          Path('../settings-gui-contract.patch').write_bytes(gzip.decompress(base64.b64decode(encoded)))
+
+          patch_encoded = Path('../control/.github/patches/settings-gui-contract.patch.gz.b64').read_text(encoding='utf-8').strip()
+          Path('../settings-gui-contract.patch').write_bytes(gzip.decompress(base64.b64decode(patch_encoded)))
+
+          smoke_encoded = Path('../control/.github/patches/smoke-settings-ui.ps1.gz.b64').read_text(encoding='utf-8').strip()
+          smoke = gzip.decompress(base64.b64decode(smoke_encoded))
+          expected = 'c529a371264d6c250e0c13c063f6be143f0e699c4a5e3338f39aa049e32254c7'
+          actual = hashlib.sha256(smoke).hexdigest()
+          if actual != expected:
+              raise SystemExit(f'corrected smoke fixture checksum mismatch: {actual}')
+          Path('../corrected-smoke-settings-ui.ps1').write_bytes(smoke)
           '@ | python -
+
           git apply --index ../settings-gui-contract.patch
           if ($LASTEXITCODE -ne 0) { throw 'base settings GUI patch failed' }
-          git apply --index ../control/.github/patches/settings-smoke-settle.patch
-          if ($LASTEXITCODE -ne 0) { throw 'settings smoke synchronization patch failed' }
+          Copy-Item ../corrected-smoke-settings-ui.ps1 .github/smoke-settings-ui.ps1 -Force
+          git add .github/smoke-settings-ui.ps1
 
           $changed = @(git diff --cached --name-only)
           $expected = @(
