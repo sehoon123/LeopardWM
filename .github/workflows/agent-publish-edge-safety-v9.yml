@@ -1,0 +1,337 @@
+name: Publish verified edge safety v9
+
+on:
+  push:
+    branches:
+      - agent/edge-safety-audit-v9
+    paths:
+      - .github/workflows/agent-publish-edge-safety-v9.yml
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: publish-edge-safety-v9
+  cancel-in-progress: false
+
+env:
+  SOURCE_SHA: bfb2bb1409f39e29fa3530d3858fe6fab733d0c7
+  CONTROL_BRANCH: agent/edge-safety-audit-v9
+  RELEASE_TAG: v0.2.6-sehoon.9
+  RELEASE_VERSION: 0.2.6-sehoon.9
+
+jobs:
+  verify-build-publish:
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out exact verified main source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          fetch-depth: 0
+
+      - name: Record publication run
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          path='agent_docs/edge-safety-v9-publication.json'
+          payload=$(jq -n \
+            --arg state started \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --arg source_sha "$SOURCE_SHA" \
+            '{state:$state,run_id:$run_id,run_url:$run_url,source_sha:$source_sha}')
+          content=$(printf '%s\n' "$payload" | base64 -w0)
+          current=$(gh api "repos/$GITHUB_REPOSITORY/contents/$path?ref=$CONTROL_BRANCH" --jq .sha 2>/dev/null || true)
+          args=(--method PUT "repos/$GITHUB_REPOSITORY/contents/$path" -f message='ci: record edge-safety v9 publication' -f content="$content" -f branch="$CONTROL_BRANCH")
+          if [[ -n "$current" ]]; then args+=(-f sha="$current"); fi
+          gh api "${args[@]}" >/dev/null
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Verify source identity and contracts
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $actual = (git rev-parse HEAD).Trim()
+          if ($actual -ne $env:SOURCE_SHA) {
+            throw "Source mismatch: expected=$env:SOURCE_SHA actual=$actual"
+          }
+          $main = ((git ls-remote origin refs/heads/main) -split '\s+')[0]
+          if ($main -ne $env:SOURCE_SHA) {
+            throw "main moved after verification: expected=$env:SOURCE_SHA actual=$main"
+          }
+
+          @'
+          from pathlib import Path
+
+          operations = Path('crates/core_layout/src/workspace/operations.rs').read_text(encoding='utf-8')
+          layout = Path('crates/daemon/src/layout_apply.rs').read_text(encoding='utf-8')
+          edge_tests = Path('crates/daemon/src/layout_apply_edge_tests.rs').read_text(encoding='utf-8')
+          center_tests = Path('crates/core_layout/tests/edge_centering.rs').read_text(encoding='utf-8')
+          settings = Path('crates/daemon/src/settings/settings.html').read_text(encoding='utf-8')
+
+          required = {
+              'focus-aware animation bounds': 'let (min_scroll, max_scroll) = self.focused_scroll_bounds(vis_w);',
+              'focused containment': 'clamp_horizontally_inside(placement.rect, owner.work_area)',
+              'focused monitor scope': '(*monitor_id == self.focused_monitor)',
+              'exit-window exclusion': 'never pin an old workspace back on-screen',
+              'matrix test': 'horizontal_isolation_matrix_never_leaks_tiled_windows',
+              'edge integration test': 'first_and_last_columns_reach_the_true_viewport_center',
+              'settings control': 'id="layout-center_past_edges"',
+              'settings load': "setChecked('layout-center_past_edges', cfg.layout.center_past_edges);",
+              'settings save': "center_past_edges: checked('layout-center_past_edges')",
+          }
+          combined = operations + '\n' + layout + '\n' + edge_tests + '\n' + center_tests + '\n' + settings
+          missing = [name for name, marker in required.items() if marker not in combined]
+          if missing:
+              raise SystemExit('Missing release contracts: ' + ', '.join(missing))
+          print('release contracts: OK')
+          '@ | python -
+
+      - name: Verify formatting and patch hygiene
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { throw 'cargo fmt check failed' }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'git diff check failed' }
+
+      - name: Run full locked test suite
+        run: cargo test --workspace --all-targets --locked
+
+      - name: Run Clippy with warnings denied
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Check every Cargo target
+        run: cargo check --workspace --all-targets --locked
+
+      - name: Run optimized tests
+        run: cargo test --workspace --lib --bins --tests --release --locked
+
+      - name: Stress edge and existing geometry regressions
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          for ($i = 0; $i -lt 8; $i++) {
+            cargo test -p leopardwm-core-layout --test edge_centering --release --locked -- --test-threads=1
+            if ($LASTEXITCODE -ne 0) { throw "edge-centering iteration $i failed" }
+            cargo test -p leopardwm-daemon --bin leopardwm --release --locked edge_safety_audit_tests -- --test-threads=1
+            if ($LASTEXITCODE -ne 0) { throw "monitor-isolation iteration $i failed" }
+          }
+          foreach ($filter in @('compositor', 'geometry_mismatch', 'scratchpad', 'floating')) {
+            for ($i = 0; $i -lt 3; $i++) {
+              cargo test -p leopardwm-daemon --bin leopardwm --release --locked $filter -- --test-threads=1
+              if ($LASTEXITCODE -ne 0) { throw "$filter iteration $i failed" }
+            }
+          }
+
+      - name: Build optimized Windows binaries
+        run: cargo build --workspace --release --locked
+
+      - name: Verify Windows GUI subsystems
+        shell: pwsh
+        run: ./.github/verify-gui-subsystems.ps1 -RepoRoot (Get-Location).Path
+
+      - name: Install cargo-wix
+        run: cargo install cargo-wix --version ^0.3 --locked
+
+      - name: Package ZIP and standalone binaries
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $binDir = @('target/x86_64-pc-windows-msvc/release', 'target/release') |
+            Where-Object { Test-Path (Join-Path $_ 'leopardwm.exe') } |
+            Select-Object -First 1
+          if (-not $binDir) { throw 'Release binary directory not found' }
+
+          $packageDir = "LeopardWM-$env:RELEASE_VERSION-x86_64-windows"
+          New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
+          foreach ($binary in @('leopardwm.exe', 'leopardwm-cli.exe', 'lwm.exe', 'leopardwm-watchdog.exe')) {
+            $source = Join-Path $binDir $binary
+            if (-not (Test-Path $source)) { throw "Missing binary: $source" }
+            Copy-Item $source (Join-Path $packageDir $binary)
+            Copy-Item $source $binary
+          }
+          Copy-Item README.md, LICENSE, CHANGELOG.md $packageDir
+          7z a "$packageDir.zip" $packageDir | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw 'ZIP packaging failed' }
+
+      - name: Build MSI installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo wix -p leopardwm-daemon -I wix/main.wxs --target x86_64-pc-windows-msvc --no-build --nocapture --bin-path 'C:\Program Files (x86)\WiX Toolset v3.14\bin'
+          if ($LASTEXITCODE -ne 0) { throw 'cargo wix failed' }
+          $built = Get-ChildItem target/wix/*.msi | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $built) { throw 'cargo wix produced no MSI' }
+          Copy-Item $built.FullName "LeopardWM-$env:RELEASE_VERSION-x86_64.msi"
+
+      - name: Verify locally built MSI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msi = (Resolve-Path "LeopardWM-$env:RELEASE_VERSION-x86_64.msi").Path
+          $admin = Join-Path (Get-Location) 'msi-admin-image'
+          New-Item -ItemType Directory -Path $admin -Force | Out-Null
+          $arguments = "/a `"$msi`" /qn TARGETDIR=`"$admin`""
+          $process = Start-Process "$env:SystemRoot\System32\msiexec.exe" -ArgumentList $arguments -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "MSI administrative install failed: $($process.ExitCode)" }
+          foreach ($binary in @('leopardwm.exe', 'leopardwm-cli.exe', 'lwm.exe', 'leopardwm-watchdog.exe')) {
+            $installed = Get-ChildItem $admin -Recurse -Filter $binary | Select-Object -First 1
+            if (-not $installed) { throw "MSI is missing $binary" }
+            if ((Get-FileHash $installed.FullName -Algorithm SHA256).Hash -ne (Get-FileHash $binary -Algorithm SHA256).Hash) {
+              throw "MSI binary mismatch: $binary"
+            }
+          }
+
+      - name: Generate checksums and release notes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $assets = @(
+            "LeopardWM-$env:RELEASE_VERSION-x86_64-windows.zip",
+            "LeopardWM-$env:RELEASE_VERSION-x86_64.msi",
+            'leopardwm.exe',
+            'leopardwm-cli.exe',
+            'lwm.exe',
+            'leopardwm-watchdog.exe'
+          )
+          $lines = foreach ($asset in $assets) {
+            "{0} *{1}" -f (Get-FileHash $asset -Algorithm SHA256).Hash.ToLowerInvariant(), $asset
+          }
+          $lines | Set-Content checksums.txt -Encoding ascii
+
+          @'
+          Personal-fork prerelease from `sehoon123/LeopardWM`.
+
+          Edge-safety audit:
+          - first and last active columns reach the true viewport center when center mode and center-past-edges are enabled
+          - reduced-motion, interrupted animation, minimized edge columns, and bounded manual scrolling are covered
+          - the active focused tiled column is contained in its owner work area instead of disappearing at a monitor boundary
+          - non-focused tiled overflow is parked clear of every monitor
+          - floating windows remain free to span monitors intentionally
+          - transition interpolation cannot bypass isolation, and exiting workspace windows never receive the focus exemption
+          - the Settings GUI center-past-edges control is verified for load and save wiring
+
+          The stable whole-window policy intentionally avoids per-frame SetWindowRgn clipping.
+          '@ | Set-Content release-notes-v9.md -Encoding utf8
+
+      - name: Publish prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release already exists: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Tag already exists: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" \
+            "LeopardWM-$RELEASE_VERSION-x86_64-windows.zip" \
+            "LeopardWM-$RELEASE_VERSION-x86_64.msi" \
+            leopardwm.exe leopardwm-cli.exe lwm.exe leopardwm-watchdog.exe checksums.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$SOURCE_SHA" \
+            --title "LeopardWM $RELEASE_TAG — edge safety audit" \
+            --notes-file release-notes-v9.md \
+            --prerelease
+
+      - name: Independently verify published assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $verify = Join-Path (Get-Location) 'published-verification'
+          New-Item -ItemType Directory -Path $verify -Force | Out-Null
+          gh release download $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --dir $verify
+          if ($LASTEXITCODE -ne 0) { throw 'Release download failed' }
+
+          foreach ($line in Get-Content (Join-Path $verify 'checksums.txt')) {
+            if ($line -notmatch '^([0-9a-f]{64}) \*(.+)$') { throw "Invalid checksum line: $line" }
+            $path = Join-Path $verify $Matches[2]
+            if (-not (Test-Path $path)) { throw "Missing asset: $($Matches[2])" }
+            $actual = (Get-FileHash $path -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actual -ne $Matches[1]) { throw "Checksum mismatch: $($Matches[2])" }
+          }
+
+          $zip = Join-Path $verify "LeopardWM-$env:RELEASE_VERSION-x86_64-windows.zip"
+          7z t $zip | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw 'Published ZIP CRC check failed' }
+          $extract = Join-Path $verify 'zip-extracted'
+          7z x $zip "-o$extract" -y | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw 'Published ZIP extraction failed' }
+
+          $msi = Join-Path $verify "LeopardWM-$env:RELEASE_VERSION-x86_64.msi"
+          $admin = Join-Path $verify 'msi-admin-image'
+          New-Item -ItemType Directory -Path $admin -Force | Out-Null
+          $arguments = "/a `"$msi`" /qn TARGETDIR=`"$admin`""
+          $process = Start-Process "$env:SystemRoot\System32\msiexec.exe" -ArgumentList $arguments -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Published MSI install failed: $($process.ExitCode)" }
+
+          foreach ($binary in @('leopardwm.exe', 'leopardwm-cli.exe', 'lwm.exe', 'leopardwm-watchdog.exe')) {
+            $standalone = Join-Path $verify $binary
+            $fromZip = Get-ChildItem $extract -Recurse -Filter $binary | Select-Object -First 1
+            $fromMsi = Get-ChildItem $admin -Recurse -Filter $binary | Select-Object -First 1
+            if (-not $fromZip -or -not $fromMsi) { throw "Packaged binary missing: $binary" }
+            $expected = (Get-FileHash $standalone -Algorithm SHA256).Hash
+            if ((Get-FileHash $fromZip.FullName -Algorithm SHA256).Hash -ne $expected) { throw "ZIP binary mismatch: $binary" }
+            if ((Get-FileHash $fromMsi.FullName -Algorithm SHA256).Hash -ne $expected) { throw "MSI binary mismatch: $binary" }
+          }
+
+          git fetch origin --tags --force
+          $tagSha = (git rev-list -n 1 $env:RELEASE_TAG).Trim()
+          $mainSha = ((git ls-remote origin refs/heads/main) -split '\s+')[0]
+          if ($tagSha -ne $env:SOURCE_SHA -or $mainSha -ne $env:SOURCE_SHA) {
+            throw "Source identity mismatch: tag=$tagSha main=$mainSha expected=$env:SOURCE_SHA"
+          }
+
+      - name: Publish success status
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          path='agent_docs/edge-safety-v9-publication.json'
+          zip_hash=$(sha256sum "LeopardWM-$RELEASE_VERSION-x86_64-windows.zip" | awk '{print $1}')
+          msi_hash=$(sha256sum "LeopardWM-$RELEASE_VERSION-x86_64.msi" | awk '{print $1}')
+          payload=$(jq -n \
+            --arg state success \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --arg tag "$RELEASE_TAG" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg zip_sha256 "$zip_hash" \
+            --arg msi_sha256 "$msi_hash" \
+            '{state:$state,run_id:$run_id,run_url:$run_url,tag:$tag,source_sha:$source_sha,zip_sha256:$zip_sha256,msi_sha256:$msi_sha256}')
+          content=$(printf '%s\n' "$payload" | base64 -w0)
+          current=$(gh api "repos/$GITHUB_REPOSITORY/contents/$path?ref=$CONTROL_BRANCH" --jq .sha)
+          gh api --method PUT "repos/$GITHUB_REPOSITORY/contents/$path" \
+            -f message='ci: record successful edge-safety v9 publication' \
+            -f content="$content" -f branch="$CONTROL_BRANCH" -f sha="$current" >/dev/null
+
+      - name: Upload verified release bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: LeopardWM-v0.2.6-sehoon.9-verified
+          path: |
+            LeopardWM-0.2.6-sehoon.9-x86_64-windows.zip
+            LeopardWM-0.2.6-sehoon.9-x86_64.msi
+            checksums.txt
+            release-notes-v9.md
+          if-no-files-found: error
+          retention-days: 14
