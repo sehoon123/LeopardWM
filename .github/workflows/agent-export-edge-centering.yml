@@ -9,7 +9,7 @@ on:
 
 permissions:
   actions: read
-  contents: read
+  contents: write
 
 jobs:
   export:
@@ -27,3 +27,24 @@ jobs:
           path: LeopardWM-edge-centering-source.zip
           if-no-files-found: error
           retention-days: 2
+      - name: Record artifact coordinates
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+        run: |
+          set -euo pipefail
+          path='agent_docs/edge-centering-export.json'
+          branch='agent/edge-centering-monitor-isolation'
+          payload=$(jq -n \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg artifact_id "$ARTIFACT_ID" \
+            --arg digest "$ARTIFACT_DIGEST" \
+            --arg source_sha "$GITHUB_SHA" \
+            '{run_id:$run_id, artifact_id:$artifact_id, artifact_digest:$digest, source_sha:$source_sha}')
+          content=$(printf '%s\n' "$payload" | base64 -w0)
+          current=$(gh api "repos/$GITHUB_REPOSITORY/contents/$path?ref=$branch" --jq .sha 2>/dev/null || true)
+          args=(--method PUT "repos/$GITHUB_REPOSITORY/contents/$path" -f message='ci: record edge-centering source export' -f content="$content" -f branch="$branch")
+          if [[ -n "$current" ]]; then args+=(-f sha="$current"); fi
+          gh api "${args[@]}" >/dev/null
