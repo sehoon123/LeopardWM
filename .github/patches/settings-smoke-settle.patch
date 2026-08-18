@@ -1,0 +1,99 @@
+diff --git a/.github/smoke-settings-ui.ps1 b/.github/smoke-settings-ui.ps1
+index baec07e..f336292 100644
+--- a/.github/smoke-settings-ui.ps1
++++ b/.github/smoke-settings-ui.ps1
+@@ -97,11 +97,27 @@ $smoke = @'
+ window.addEventListener('load', function() {
+   setTimeout(function() {
+     var failures = [];
++    var finished = false;
+     function check(condition, message) { if (!condition) failures.push(message); }
++    function record(error) { failures.push(error && error.stack ? error.stack : String(error)); }
+     function insideViewport(rect) {
+       return rect.width > 0 && rect.height > 0 && rect.left >= -1 && rect.top >= -1 &&
+         rect.right <= window.innerWidth + 1 && rect.bottom <= window.innerHeight + 1;
+     }
++    function rectSummary(rect) {
++      return [rect.left, rect.top, rect.right, rect.bottom, rect.width, rect.height]
++        .map(function(value) { return Math.round(value * 10) / 10; }).join(',');
++    }
++    function finish() {
++      if (finished) return;
++      finished = true;
++      var result = document.createElement('pre');
++      result.id = 'settings-smoke-result';
++      result.textContent = failures.length ? 'FAIL: ' + failures.join(' | ') : 'PASS';
++      document.body.appendChild(result);
++      document.documentElement.dataset.settingsSmoke = failures.length ? 'fail' : 'pass';
++    }
++
+     try {
+       init(window._initConfig);
+ 
+@@ -129,30 +145,45 @@ window.addEventListener('load', function() {
+       check(document.getElementById('workspace-name-9') !== null, 'workspace controls were not built');
+ 
+       document.querySelector('[data-section="layout"]').click();
+-      var centerCombo = document.getElementById('cb-layout-centering_mode');
+-      centerCombo.querySelector('.combobox-trigger').click();
+-      check(insideViewport(centerCombo.querySelector('.combobox-popup').getBoundingClientRect()),
+-        'combobox popup escaped the viewport');
+-      closeTransientOverlays();
++      document.querySelector('.content').scrollTop = 0;
++      setTimeout(function() {
++        try {
++          var centerCombo = document.getElementById('cb-layout-centering_mode');
++          centerCombo.querySelector('.combobox-trigger').click();
++          var comboRect = centerCombo.querySelector('.combobox-popup').getBoundingClientRect();
++          check(insideViewport(comboRect),
++            'combobox popup escaped the viewport: ' + rectSummary(comboRect));
++          closeTransientOverlays();
+ 
+-      document.querySelector('[data-section="rules"]').click();
+-      var optionsButton = document.querySelector('.rule-opts-btn');
+-      optionsButton.click();
+-      check(insideViewport(document.querySelector('.rule-opts-pop').getBoundingClientRect()),
+-        'rule options popup escaped the viewport');
+-      check(document.querySelector('.rule-width').value === '900', 'rule width control was not initialized');
+-      check(document.querySelector('.rule-height').value === '700', 'rule height control was not initialized');
+-      check(document.querySelector('.rule-column-width').value === '50',
+-        'rule column width control was not initialized');
++          document.querySelector('[data-section="rules"]').click();
++          document.querySelector('.content').scrollTop = 0;
++          setTimeout(function() {
++            try {
++              var optionsButton = document.querySelector('.rule-opts-btn');
++              optionsButton.click();
++              var optionsRect = document.querySelector('.rule-opts-pop').getBoundingClientRect();
++              check(insideViewport(optionsRect),
++                'rule options popup escaped the viewport: ' + rectSummary(optionsRect));
++              check(document.querySelector('.rule-width').value === '900',
++                'rule width control was not initialized');
++              check(document.querySelector('.rule-height').value === '700',
++                'rule height control was not initialized');
++              check(document.querySelector('.rule-column-width').value === '50',
++                'rule column width control was not initialized');
++            } catch (error) {
++              record(error);
++            }
++            finish();
++          }, 50);
++        } catch (error) {
++          record(error);
++          finish();
++        }
++      }, 50);
+     } catch (error) {
+-      failures.push(error && error.stack ? error.stack : String(error));
++      record(error);
++      finish();
+     }
+-
+-    var result = document.createElement('pre');
+-    result.id = 'settings-smoke-result';
+-    result.textContent = failures.length ? 'FAIL: ' + failures.join(' | ') : 'PASS';
+-    document.body.appendChild(result);
+-    document.documentElement.dataset.settingsSmoke = failures.length ? 'fail' : 'pass';
+   }, 50);
+ });
+ </script>
