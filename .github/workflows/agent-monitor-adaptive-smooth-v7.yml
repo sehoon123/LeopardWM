@@ -1,0 +1,98 @@
+name: Monitor adaptive smooth v7 release
+
+on:
+  push:
+    branches:
+      - agent/adaptive-smooth-v7-monitor
+    paths:
+      - .github/workflows/agent-monitor-adaptive-smooth-v7.yml
+
+permissions:
+  actions: read
+  contents: write
+
+env:
+  RELEASE_BRANCH: agent/adaptive-smooth-v7-release-control
+  MONITOR_BRANCH: agent/adaptive-smooth-v7-monitor
+  RELEASE_TAG: v0.2.6-sehoon.7
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 155
+    steps:
+      - name: Locate, monitor, and publish release status
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $workflow = 'agent-release-adaptive-smooth-v7.yml'
+          $statusPath = 'agent_docs/adaptive-smooth-v7-release-status.json'
+
+          function Get-LatestReleaseRun {
+            $response = gh api --method GET `
+              "repos/$env:GITHUB_REPOSITORY/actions/workflows/$workflow/runs" `
+              -f branch="$env:RELEASE_BRANCH" `
+              -f event='push' `
+              -f per_page=10 | ConvertFrom-Json
+            if ($LASTEXITCODE -ne 0) { throw 'Could not query release workflow runs' }
+            return @($response.workflow_runs |
+              Where-Object { $_.head_branch -eq $env:RELEASE_BRANCH } |
+              Sort-Object created_at -Descending |
+              Select-Object -First 1)[0]
+          }
+
+          function Publish-Status($run, [string]$monitorState) {
+            $payload = [ordered]@{
+              monitor_state = $monitorState
+              release_tag = $env:RELEASE_TAG
+              run_id = [string]$run.id
+              run_status = [string]$run.status
+              conclusion = [string]$run.conclusion
+              head_branch = [string]$run.head_branch
+              head_sha = [string]$run.head_sha
+              html_url = [string]$run.html_url
+              updated_at_utc = [DateTime]::UtcNow.ToString('o')
+            } | ConvertTo-Json
+            $content = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($payload + "`n"))
+            $current = gh api --method GET `
+              "repos/$env:GITHUB_REPOSITORY/contents/$statusPath" `
+              -f ref="$env:MONITOR_BRANCH" --jq .sha 2>$null
+            $arguments = @(
+              '--method','PUT',
+              "repos/$env:GITHUB_REPOSITORY/contents/$statusPath",
+              '-f','message=ci: record adaptive smooth v7 release status',
+              '-f',"content=$content",
+              '-f',"branch=$env:MONITOR_BRANCH"
+            )
+            if ($current) { $arguments += @('-f',"sha=$current") }
+            gh api @arguments | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'Could not publish release status' }
+          }
+
+          $run = $null
+          foreach ($attempt in 1..30) {
+            $run = Get-LatestReleaseRun
+            if ($null -ne $run -and $run.id) { break }
+            Start-Sleep -Seconds 10
+          }
+          if ($null -eq $run -or -not $run.id) { throw 'Release workflow run was not found' }
+          Publish-Status $run 'observed'
+
+          foreach ($attempt in 1..450) {
+            if ($run.status -eq 'completed') { break }
+            Start-Sleep -Seconds 20
+            $run = gh api "repos/$env:GITHUB_REPOSITORY/actions/runs/$($run.id)" | ConvertFrom-Json
+            if ($LASTEXITCODE -ne 0) { throw 'Could not refresh release workflow run' }
+            if (($attempt % 15) -eq 0) { Publish-Status $run 'waiting' }
+          }
+
+          if ($run.status -ne 'completed') {
+            Publish-Status $run 'timed_out'
+            throw 'Release workflow did not complete before monitor timeout'
+          }
+          Publish-Status $run 'completed'
+          if ($run.conclusion -ne 'success') {
+            throw "Release workflow concluded with: $($run.conclusion)"
+          }
