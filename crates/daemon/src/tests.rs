@@ -50,7 +50,7 @@ fn test_appearance_change_reapplies_unchanged_layout_with_fresh_insets() {
 }
 
 #[test]
-fn test_compositor_safe_settle_finishes_scroll_and_arms_exact_landing() {
+fn test_compositor_safe_mode_keeps_position_only_scroll_smooth() {
     let mut config = test_config();
     config.behavior.compositor_safe_mode = true;
     let mut state = AppState::new_with_config(config, test_monitors());
@@ -66,11 +66,41 @@ fn test_compositor_safe_settle_finishes_scroll_and_arms_exact_landing() {
         .last_placed_layout_rects
         .insert(100, Rect::new(10, 10, 1200, 900));
 
+    assert!(!state.settle_animations_for_compositor_safety());
+    assert!(state.is_animating());
+    assert!(!state.post_animation_landing_pending);
+    assert!(!state.last_placed_layout_rects.is_empty());
+}
+
+#[test]
+fn test_compositor_safe_mode_snaps_unprotected_size_transition() {
+    use crate::state::LayoutTransition;
+    use std::collections::{HashMap, HashSet};
+
+    let mut config = test_config();
+    config.behavior.compositor_safe_mode = true;
+    let mut state = AppState::new_with_config(config, test_monitors());
+    state.paused = false;
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(100, Some(800))
+        .unwrap();
+    state.layout_transition = Some(LayoutTransition {
+        start_rects: HashMap::from([(100, Rect::new(0, 0, 800, 600))]),
+        exit_rects: HashMap::new(),
+        elapsed_ms: 16,
+        duration_ms: 150,
+        easing: leopardwm_core_layout::Easing::default(),
+        requires_compositor_safe_snap: true,
+        ghosted_wids: HashSet::new(),
+    });
+    state
+        .last_placed_layout_rects
+        .insert(100, Rect::new(10, 10, 800, 600));
+
     assert!(state.settle_animations_for_compositor_safety());
     assert!(!state.is_animating());
-    assert!(state.post_animation_nudge_pending);
+    assert!(state.post_animation_landing_pending);
     assert!(state.last_placed_layout_rects.is_empty());
-    assert_eq!(state.workspaces[&1][0].scroll_offset().round() as i32, 400);
 }
 
 #[test]
@@ -179,6 +209,7 @@ fn test_partition_for_animation_routes_ghosted_wids_to_ghost_stream() {
         elapsed_ms: 0,
         duration_ms: 150,
         easing: leopardwm_core_layout::Easing::default(),
+        requires_compositor_safe_snap: false,
         ghosted_wids,
     };
 
@@ -246,6 +277,37 @@ fn test_partition_for_animation_no_transition_keeps_everything_live() {
     let (live, ghosts) = AppState::partition_for_animation(placements, None, &HashMap::new());
     assert_eq!(live.len(), 1);
     assert_eq!(ghosts.len(), 0);
+}
+
+#[test]
+fn test_aborting_safe_ghost_transition_rearms_exact_landing() {
+    use crate::state::{GhostEntry, LayoutTransition};
+    use std::collections::{HashMap, HashSet};
+
+    let mut config = test_config();
+    config.behavior.compositor_safe_mode = true;
+    let mut state = AppState::new_with_config(config, test_monitors());
+    state.layout_transition = Some(LayoutTransition {
+        start_rects: HashMap::from([(42, Rect::new(0, 0, 800, 600))]),
+        exit_rects: HashMap::new(),
+        elapsed_ms: 16,
+        duration_ms: 150,
+        easing: leopardwm_core_layout::Easing::default(),
+        requires_compositor_safe_snap: false,
+        ghosted_wids: HashSet::from([42]),
+    });
+    state.ghost_handles.insert(
+        42,
+        GhostEntry::new(0, "Chrome_WidgetWin_1".into(), Rect::new(100, 0, 900, 600)),
+    );
+
+    assert!(!state.settle_animations_for_compositor_safety());
+    state.abort_active_ghost_transition();
+
+    let transition = state.layout_transition.as_ref().unwrap();
+    assert!(transition.ghosted_wids.is_empty());
+    assert!(transition.requires_compositor_safe_snap);
+    assert!(state.settle_animations_for_compositor_safety());
 }
 
 #[test]
@@ -328,6 +390,7 @@ fn test_partition_for_animation_missing_handle_drops_placement() {
         elapsed_ms: 0,
         duration_ms: 150,
         easing: leopardwm_core_layout::Easing::default(),
+        requires_compositor_safe_snap: false,
         ghosted_wids,
     };
 
@@ -2694,12 +2757,16 @@ fn test_restore_event_invalidates_desired_rect_cache() {
 
 #[test]
 fn test_post_animation_landing_cannot_take_unchanged_fast_path() {
-    use crate::layout_apply::can_skip_unchanged_layout;
+    use crate::layout_apply::{can_skip_unchanged_layout, legacy_compositor_nudge_required};
 
     assert!(can_skip_unchanged_layout(true, false, false));
     assert!(!can_skip_unchanged_layout(true, false, true));
     assert!(!can_skip_unchanged_layout(false, false, false));
     assert!(!can_skip_unchanged_layout(true, true, false));
+
+    assert!(!legacy_compositor_nudge_required(true, true));
+    assert!(legacy_compositor_nudge_required(true, false));
+    assert!(!legacy_compositor_nudge_required(false, false));
 }
 
 #[test]
@@ -2711,11 +2778,11 @@ fn test_failed_apply_worker_spawn_preserves_post_animation_landing() {
         .unwrap()
         .insert_window(100, Some(800))
         .unwrap();
-    state.post_animation_nudge_pending = true;
+    state.post_animation_landing_pending = true;
     state.injected_apply_placements_behavior = Some(TestApplyPlacementsBehavior::FailWorkerSpawn);
 
     assert!(state.apply_layout().is_err());
-    assert!(state.post_animation_nudge_pending);
+    assert!(state.post_animation_landing_pending);
 }
 
 #[test]
@@ -2727,12 +2794,12 @@ fn test_failed_apply_after_spawn_rearms_post_animation_landing() {
         .unwrap()
         .insert_window(100, Some(800))
         .unwrap();
-    state.post_animation_nudge_pending = true;
+    state.post_animation_landing_pending = true;
     state.injected_apply_placements_behavior =
         Some(TestApplyPlacementsBehavior::SleepAndFail(Duration::ZERO));
 
     assert!(state.apply_layout().is_err());
-    assert!(state.post_animation_nudge_pending);
+    assert!(state.post_animation_landing_pending);
 }
 
 #[test]

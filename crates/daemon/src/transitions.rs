@@ -13,19 +13,39 @@ pub(crate) fn reduce_motion_enabled(
     !animations_enabled || (on_battery_or_saver && reduce_motion_on_battery)
 }
 
-/// Whether a live-window animation must be collapsed into one exact landing.
+/// Whether an animation must be collapsed into one exact landing.
 ///
-/// DirectComposition and swap-chain applications can retain a stale internal
-/// surface transform after a burst of asynchronous per-frame SetWindowPos calls.
-/// The only renderer-agnostic prevention is to avoid that burst entirely. The
-/// policy is deliberately central and class-agnostic so mouse focus, hotkeys,
-/// workspace switches, drag/drop, and future animation entry points cannot
-/// accidentally bypass it.
+/// Position-only movement remains smooth under compositor-safe mode. Only a
+/// structural transition that interpolates live window dimensions without a
+/// safe DWM ghost is collapsed, because repeated live resize is the part no
+/// renderer-agnostic Win32 sequence can make reliable.
 pub(crate) fn compositor_safe_snap_required(
     compositor_safe_mode: bool,
     has_active_animation: bool,
+    transition_requires_snap: bool,
 ) -> bool {
-    compositor_safe_mode && has_active_animation
+    compositor_safe_mode && has_active_animation && transition_requires_snap
+}
+
+fn transition_requires_compositor_safe_snap(
+    compositor_safe_mode: bool,
+    start_rects: &HashMap<u64, leopardwm_core_layout::Rect>,
+    targets: &HashMap<
+        u64,
+        (
+            leopardwm_core_layout::Rect,
+            leopardwm_platform_win32::MonitorId,
+        ),
+    >,
+    ghosted_wids: &std::collections::HashSet<u64>,
+) -> bool {
+    compositor_safe_mode
+        && start_rects.iter().any(|(wid, start)| {
+            targets.get(wid).is_some_and(|(target, _)| {
+                !ghosted_wids.contains(wid)
+                    && (start.width != target.width || start.height != target.height)
+            })
+        })
 }
 
 impl AppState {
@@ -38,15 +58,20 @@ impl AppState {
                 .any(|ws_vec| ws_vec.iter().any(|w| w.is_animating()))
     }
 
-    /// Collapse every active live-window animation to its final state.
+    /// Collapse an unsafe size-changing transition to its final state.
     ///
-    /// This is the compositor-safe path. It is intentionally executed at the
-    /// single frame-dispatch choke point rather than in individual commands, so
-    /// no event source can reintroduce per-frame movement accidentally.
+    /// Pure scroll and position-only workspace/layout transitions stay smooth.
+    /// The decision remains at the central frame-dispatch choke point so no
+    /// event source can bypass it.
     pub(crate) fn settle_animations_for_compositor_safety(&mut self) -> bool {
+        let transition_requires_snap = self
+            .layout_transition
+            .as_ref()
+            .is_some_and(|transition| transition.requires_compositor_safe_snap);
         if !compositor_safe_snap_required(
             self.config.behavior.compositor_safe_mode,
             self.is_animating(),
+            transition_requires_snap,
         ) {
             return false;
         }
@@ -77,9 +102,9 @@ impl AppState {
         // Force the exact synchronous landing even when the desired rectangles
         // match the cache. The landing performs edge verification and a guarded
         // compositor refresh for known swap-chain renderers.
-        self.post_animation_nudge_pending = true;
+        self.post_animation_landing_pending = true;
         self.last_placed_layout_rects.clear();
-        debug!("Collapsed live-window animation into a compositor-safe landing");
+        debug!("Collapsed unsafe size-changing transition into an exact landing");
         true
     }
 
@@ -169,15 +194,26 @@ impl AppState {
         // sources, and tells the worker to abort the fade.
         self.abort_active_ghost_transition();
 
-        // Determine which (if any) windows in this transition are eligible
-        // for the ghost-animation path. Targets are evaluated against the
-        // structural placements that will be live after this transition.
+        let targets = self.collect_transition_targets();
+
+        // In safe mode thumbnails are attempted only for size-changing
+        // transitions; position-only movement is already safe on the adaptive
+        // synchronous path. Legacy mode keeps its broader experimental ghosting.
         let mut ghosted_wids = std::collections::HashSet::new();
-        if !self.config.behavior.compositor_safe_mode
-            && self.config.behavior.swap_chain_ghost_animation
-        {
-            self.register_ghosts_for_transition(&start_rects, &mut ghosted_wids);
+        if self.config.behavior.swap_chain_ghost_animation {
+            self.register_ghosts_for_transition(
+                &start_rects,
+                &targets,
+                self.config.behavior.compositor_safe_mode,
+                &mut ghosted_wids,
+            );
         }
+        let requires_compositor_safe_snap = transition_requires_compositor_safe_snap(
+            self.config.behavior.compositor_safe_mode,
+            &start_rects,
+            &targets,
+            &ghosted_wids,
+        );
 
         // Start with one frame (~16ms) already elapsed so the first
         // apply_layout/send_animation_frame shows visible movement.
@@ -187,6 +223,7 @@ impl AppState {
             elapsed_ms: 16,
             duration_ms,
             easing: self.config.animation.easing,
+            requires_compositor_safe_snap,
             ghosted_wids,
         });
     }
@@ -215,6 +252,7 @@ impl AppState {
             elapsed_ms: 16,
             duration_ms,
             easing: self.config.animation.easing,
+            requires_compositor_safe_snap: false,
             ghosted_wids: std::collections::HashSet::new(),
         });
     }
@@ -237,8 +275,14 @@ impl AppState {
         }
 
         // Clear ghosted_wids on any still-live transition so
-        // partition_for_animation no longer routes frames for them.
+        // partition_for_animation no longer routes frames for them. In safe
+        // mode every registered ghost represents a size-changing window; losing
+        // that protection makes the transition snap-only.
+        let compositor_safe_mode = self.config.behavior.compositor_safe_mode;
         if let Some(ref mut transition) = self.layout_transition {
+            if compositor_safe_mode && !transition.ghosted_wids.is_empty() {
+                transition.requires_compositor_safe_snap = true;
+            }
             transition.ghosted_wids.clear();
         }
 
@@ -280,13 +324,46 @@ impl AppState {
             .retain(|_, (_, at)| at.elapsed() < crate::state::CROSSFADE_BARRIER_MAX_AGE);
     }
 
-    /// Walk the placements that will be live after the structural change,
-    /// register thumbnails for swap-chain-sensitive windows whose rect
-    /// is changing, and cloak the sources via GHOST_CLOAKED. Populates
-    /// `ghosted_wids` with the WindowIds we successfully registered.
+    fn collect_transition_targets(
+        &self,
+    ) -> std::collections::HashMap<
+        u64,
+        (
+            leopardwm_core_layout::Rect,
+            leopardwm_platform_win32::MonitorId,
+        ),
+    > {
+        let mut targets = std::collections::HashMap::new();
+        for (monitor_id, ws_vec) in &self.workspaces {
+            let idx = self.active_workspace_idx(*monitor_id);
+            if let Some(workspace) = ws_vec.get(idx) {
+                if self.monitors.contains_key(monitor_id) {
+                    let viewport = self.layout_viewport(*monitor_id);
+                    for placement in workspace.compute_placements_animated(viewport) {
+                        if placement.visibility == leopardwm_core_layout::Visibility::Visible {
+                            targets.insert(placement.window_id, (placement.rect, *monitor_id));
+                        }
+                    }
+                }
+            }
+        }
+        targets
+    }
+
+    /// Register safe DWM ghosts for changing compositor-sensitive windows.
+    /// `size_changes_only` is true for adaptive safe mode, where ordinary
+    /// position-only movement remains on the synchronized live-HWND path.
     fn register_ghosts_for_transition(
         &mut self,
         start_rects: &std::collections::HashMap<u64, leopardwm_core_layout::Rect>,
+        targets: &std::collections::HashMap<
+            u64,
+            (
+                leopardwm_core_layout::Rect,
+                leopardwm_platform_win32::MonitorId,
+            ),
+        >,
+        size_changes_only: bool,
         ghosted_wids: &mut std::collections::HashSet<u64>,
     ) {
         self.sweep_stale_crossfade_barriers();
@@ -296,29 +373,6 @@ impl AppState {
         }
         let host_origin = leopardwm_platform_win32::thumbnail::host().origin();
         let focused = self.previous_focused_hwnd;
-
-        // Build a (wid -> (target_rect, monitor_id)) map from the
-        // animated placements on each monitor's active workspace.
-        let mut targets: std::collections::HashMap<
-            u64,
-            (
-                leopardwm_core_layout::Rect,
-                leopardwm_platform_win32::MonitorId,
-            ),
-        > = std::collections::HashMap::new();
-        for (monitor_id, ws_vec) in &self.workspaces {
-            let idx = self.active_workspace_idx(*monitor_id);
-            if let Some(workspace) = ws_vec.get(idx) {
-                if self.monitors.contains_key(monitor_id) {
-                    let viewport = self.layout_viewport(*monitor_id);
-                    for p in workspace.compute_placements_animated(viewport) {
-                        if p.visibility == leopardwm_core_layout::Visibility::Visible {
-                            targets.insert(p.window_id, (p.rect, *monitor_id));
-                        }
-                    }
-                }
-            }
-        }
 
         // Identify which monitor the focused window is on (used to gate
         // cross-monitor moves out of the ghost path).
@@ -331,6 +385,11 @@ impl AppState {
                 continue;
             };
             if start_rect == target_rect {
+                continue;
+            }
+            let size_changed =
+                start_rect.width != target_rect.width || start_rect.height != target_rect.height;
+            if size_changes_only && !size_changed {
                 continue;
             }
             // Cross-monitor moves use the legacy nudge path — the
@@ -506,14 +565,51 @@ impl AppState {
 
 #[cfg(test)]
 mod tests {
-    use super::{compositor_safe_snap_required, reduce_motion_enabled};
+    use super::{
+        compositor_safe_snap_required, reduce_motion_enabled,
+        transition_requires_compositor_safe_snap,
+    };
+    use leopardwm_core_layout::Rect;
+    use std::collections::{HashMap, HashSet};
 
     #[test]
-    fn compositor_safe_policy_only_collapses_active_animations() {
-        assert!(compositor_safe_snap_required(true, true));
-        assert!(!compositor_safe_snap_required(true, false));
-        assert!(!compositor_safe_snap_required(false, true));
-        assert!(!compositor_safe_snap_required(false, false));
+    fn compositor_safe_policy_preserves_position_only_animation() {
+        assert!(compositor_safe_snap_required(true, true, true));
+        assert!(!compositor_safe_snap_required(true, true, false));
+        assert!(!compositor_safe_snap_required(true, false, true));
+        assert!(!compositor_safe_snap_required(false, true, true));
+    }
+
+    #[test]
+    fn transition_policy_snaps_only_unprotected_size_changes() {
+        let start = HashMap::from([(1, Rect::new(0, 0, 800, 600))]);
+        let moved = HashMap::from([(1, (Rect::new(100, 0, 800, 600), 1))]);
+        let resized = HashMap::from([(1, (Rect::new(100, 0, 900, 600), 1))]);
+
+        assert!(!transition_requires_compositor_safe_snap(
+            true,
+            &start,
+            &moved,
+            &HashSet::new(),
+        ));
+        assert!(transition_requires_compositor_safe_snap(
+            true,
+            &start,
+            &resized,
+            &HashSet::new(),
+        ));
+        assert!(!transition_requires_compositor_safe_snap(
+            true,
+            &start,
+            &resized,
+            &HashSet::from([1]),
+        ));
+        assert!(!transition_requires_compositor_safe_snap(
+            false,
+            &start,
+            &resized,
+            &HashSet::new(),
+        ));
     }
 
     #[test]

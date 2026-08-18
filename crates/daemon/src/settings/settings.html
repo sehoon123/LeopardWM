@@ -1128,11 +1128,11 @@ input[type="range"]::-webkit-slider-thumb {
             <label class="toggle"><input type="checkbox" id="behavior-drag_to_merge"><span class="track"></span><span class="thumb"></span></label>
           </div>
           <div class="field">
-            <div class="field-info"><div class="field-label">Compositor-safe window movement</div><div class="field-desc">Use one exact landing instead of moving application windows every animation frame. Prevents Chrome, Edge, Firefox, Explorer, Terminal, and Electron content from drifting inside the frame.</div></div>
+            <div class="field-info"><div class="field-label">Adaptive compositor-safe animation</div><div class="field-desc">Keep position-only scrolling smooth while serializing GPU-backed windows per frame. Size-changing transitions use a safe DWM ghost or one exact landing.</div></div>
             <label class="toggle"><input type="checkbox" id="behavior-compositor_safe_mode"><span class="track"></span><span class="thumb"></span></label>
           </div>
           <div class="field">
-            <div class="field-info"><div class="field-label">DWM thumbnail animation (experimental)</div><div class="field-desc">When compositor-safe mode is off, attempt thumbnail animation only when Windows permits the source window to be hidden. Unsupported external apps use the legacy live-window path.</div></div>
+            <div class="field-info"><div class="field-label">DWM thumbnail animation (experimental)</div><div class="field-desc">Use a live DWM ghost for size-changing transitions when Windows can safely hide the source. Otherwise adaptive mode performs an exact landing.</div></div>
             <label class="toggle"><input type="checkbox" id="behavior-swap_chain_ghost_animation"><span class="track"></span><span class="thumb"></span></label>
           </div>
           <div class="field">

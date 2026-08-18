@@ -2892,14 +2892,14 @@ async fn handle_animation_frame_applied(
                 leopardwm_platform_win32::unmark_ghost_cloaked(wid);
             }
 
-            // Only this landing pass follows an async frame burst,
+            // Only this landing pass follows intermediate movement frames,
             // so it is the only `apply_layout` that needs to fire
             // the sticky-compositor `(w-1 → w)` nudge. Routine
             // applies (focus shifts within view, event refreshes,
             // drag finalizations) skip the nudge to avoid a
             // visible 1 px wobble on every Chromium / Firefox
             // window every time the layout is re-applied.
-            state.post_animation_nudge_pending = true;
+            state.post_animation_landing_pending = true;
             let landing_ok = state.apply_layout().is_ok();
             if !landing_ok {
                 warn!(

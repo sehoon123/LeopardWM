@@ -325,9 +325,9 @@ pub fn screen_to_host_client(screen: Rect, host_origin: (i32, i32)) -> Rect {
 /// Predicate: does this top-level window belong to a renderer family whose
 /// client surface can desynchronize from the outer HWND after repeated moves?
 ///
-/// This list is used only for targeted landing refreshes and for the optional
-/// legacy thumbnail path. Compositor-safe mode itself is class-agnostic and
-/// avoids per-frame live HWND movement for every application.
+/// This list drives adaptive synchronous movement, targeted landing refreshes,
+/// and the optional DWM ghost path. Size-changing safe-mode transitions remain
+/// class-agnostic: an unprotected resize snaps even for an unknown renderer.
 pub fn is_compositor_sensitive_class(wid: WindowId) -> bool {
     is_compositor_sensitive_class_str(&class_name(wid))
 }

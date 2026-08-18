@@ -2,6 +2,23 @@
 
 All notable changes to LeopardWM will be documented in this file.
 
+## 0.2.6-sehoon.7
+
+### Fixes
+
+- **Restore smooth navigation without reintroducing compositor drift.**
+  Position-only live-window frames remain animated. GPU-backed renderer classes
+  are applied synchronously and with `SWP_NOSIZE`, while ordinary HWNDs retain
+  the asynchronous path. This preserves responsiveness and prevents a backlog
+  of intermediate DirectComposition transforms.
+- **Snap only transitions that cannot be made safe.** Structural transitions
+  that interpolate window dimensions use a physically cloaked DWM thumbnail
+  when available; otherwise they collapse to one exact landing. Pure scrolling,
+  workspace slides, and position-only layout transitions remain smooth.
+- **Do not let a hung GPU-backed window stall the animation worker.** Hung
+  sensitive HWNDs skip intermediate frames and are retried by the existing
+  bounded final-landing worker.
+
 ## 0.2.6-sehoon.6
 
 ### Fixes

@@ -79,9 +79,24 @@ impl MonitorInfo {
     }
 }
 
+/// Per-frame placement strategy used by the animation worker.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AnimationPlacementPolicy {
+    /// Keep live movement smooth while serializing compositor-sensitive HWNDs.
+    /// Ordinary windows retain asynchronous placement; sensitive windows use
+    /// synchronous, position-only frames and hung targets are skipped until the
+    /// exact landing pass.
+    #[default]
+    AdaptiveCompositorSafe,
+    /// Original behavior: every animation-frame HWND move is asynchronous.
+    LegacyAsync,
+}
+
 /// Configuration for the Win32 platform layer.
 #[derive(Debug, Clone, Default)]
-pub struct PlatformConfig {}
+pub struct PlatformConfig {
+    pub animation_placement_policy: AnimationPlacementPolicy,
+}
 
 #[cfg(test)]
 mod tests {
@@ -89,7 +104,11 @@ mod tests {
 
     #[test]
     fn test_platform_config_default() {
-        let _config = PlatformConfig::default();
+        let config = PlatformConfig::default();
+        assert_eq!(
+            config.animation_placement_policy,
+            AnimationPlacementPolicy::AdaptiveCompositorSafe
+        );
     }
 
     #[test]

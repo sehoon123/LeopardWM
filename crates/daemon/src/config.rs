@@ -466,17 +466,16 @@ pub struct BehaviorConfig {
     #[serde(default)]
     pub tab_close_action: TabCloseAction,
 
-    /// Prefer one exact synchronous landing over per-frame live HWND moves.
-    /// This prevents DirectComposition / swap-chain surfaces from drifting
-    /// inside their outer frame after repeated horizontal navigation. Enabled
-    /// by default; disable only to opt back into legacy live-window animation.
+    /// Use adaptive compositor-safe animation. Position-only movement remains
+    /// smooth; sensitive renderers are serialized per frame, and unprotected
+    /// size-changing transitions use one exact landing. Enabled by default.
     #[serde(default = "default_true")]
     pub compositor_safe_mode: bool,
 
     /// Use DWM thumbnails only when Windows permits the live source HWND to
     /// be physically cloaked. External application windows commonly reject
-    /// cloaking, so this experimental path is used only when compositor-safe
-    /// mode is disabled and the source can be hidden reliably.
+    /// cloaking, so this path is used only when the source can be hidden
+    /// reliably; otherwise adaptive safe mode chooses an exact landing.
     #[serde(default = "default_true")]
     pub swap_chain_ghost_animation: bool,
 

@@ -313,8 +313,9 @@ fn worker_loop(
                 }
 
                 // Apply window placements, skipping unchanged windows via cache.
-                // Animation frames are SWP_ASYNCWINDOWPOS so a hung application
-                // cannot block this persistent worker.
+                // Adaptive mode keeps ordinary HWNDs asynchronous, serializes
+                // compositor-sensitive HWNDs, and omits already-hung sensitive
+                // targets until the bounded exact landing pass.
                 let (apply_result, width_violations, height_violations) =
                     match leopardwm_platform_win32::apply_placements(
                         &request.placements,
