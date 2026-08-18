@@ -1,0 +1,530 @@
+name: Deploy adaptive smooth compositor v7
+
+on:
+  push:
+    branches:
+      - agent/adaptive-smooth-v7-deploy
+    paths:
+      - .github/workflows/agent-deploy-adaptive-smooth-v7.yml
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: deploy-adaptive-smooth-v7
+  cancel-in-progress: false
+
+env:
+  SOURCE_BRANCH: agent/adaptive-smooth-v7-source
+  RELEASE_TAG: v0.2.6-sehoon.7
+  RELEASE_VERSION: 0.2.6-sehoon.7
+
+jobs:
+  verify-promote-package-release:
+    runs-on: windows-2022
+    timeout-minutes: 150
+
+    steps:
+      - name: Check out current independent main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Install stable Rust with rustfmt and Clippy
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Ensure v7 tag is unused
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tagLines = @(git ls-remote --tags --refs origin "refs/tags/$env:RELEASE_TAG")
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not query release tag availability: exit $LASTEXITCODE"
+          }
+          $tagText = ($tagLines -join "`n").Trim()
+          if (-not [string]::IsNullOrWhiteSpace($tagText)) {
+            throw "Release tag already exists: $env:RELEASE_TAG"
+          }
+          Write-Host "Release tag is unused: $env:RELEASE_TAG"
+
+      - name: Overlay only the reviewed product source onto main
+        id: candidate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $baseSha = (git rev-parse HEAD).Trim()
+          git fetch origin "+refs/heads/$env:SOURCE_BRANCH`:refs/remotes/origin/$env:SOURCE_BRANCH"
+          if ($LASTEXITCODE -ne 0) { throw "Could not fetch $env:SOURCE_BRANCH" }
+          $sourceRef = "origin/$env:SOURCE_BRANCH"
+          $sourceSha = (git rev-parse $sourceRef).Trim()
+
+          # Copy only product source and user-facing documentation. CI control,
+          # patch chunks, audit scratch files, and one-off workflows stay out of main.
+          git restore --source=$sourceRef --staged --worktree -- `
+            Cargo.toml Cargo.lock CHANGELOG.md README.md crates wix
+          if ($LASTEXITCODE -ne 0) { throw 'Could not overlay reviewed product source' }
+
+          git diff --cached --check
+          if ($LASTEXITCODE -ne 0) { throw 'Candidate patch failed whitespace validation' }
+
+          $staged = @(git diff --cached --name-only)
+          if ($staged.Count -eq 0) { throw 'Adaptive source produced no product changes' }
+          foreach ($path in $staged) {
+            if ($path -match '^\.github/' -or $path -match '^agent_docs/') {
+              throw "Control-only path leaked into release candidate: $path"
+            }
+          }
+
+          # The selected product paths must exactly match the reviewed source branch.
+          git diff --exit-code $sourceRef -- `
+            Cargo.toml Cargo.lock CHANGELOG.md README.md crates wix
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Candidate product tree differs from reviewed adaptive source'
+          }
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "feat: preserve smooth motion with adaptive compositor safety"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not create release candidate commit' }
+          $candidateSha = (git rev-parse HEAD).Trim()
+
+          "base_sha=$baseSha" >> $env:GITHUB_OUTPUT
+          "source_sha=$sourceSha" >> $env:GITHUB_OUTPUT
+          "candidate_sha=$candidateSha" >> $env:GITHUB_OUTPUT
+          Write-Host "Base:      $baseSha"
+          Write-Host "Reviewed:  $sourceSha"
+          Write-Host "Candidate: $candidateSha"
+
+      - name: Verify adaptive animation design invariants
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          @'
+          from pathlib import Path
+          import re
+
+          root = Path('.')
+          config = (root / 'crates/daemon/src/config.rs').read_text(encoding='utf-8')
+          transitions = (root / 'crates/daemon/src/transitions.rs').read_text(encoding='utf-8')
+          layout_apply = (root / 'crates/daemon/src/layout_apply.rs').read_text(encoding='utf-8')
+          worker = (root / 'crates/daemon/src/animation_worker.rs').read_text(encoding='utf-8')
+          placement = (root / 'crates/platform_win32/src/placement.rs').read_text(encoding='utf-8')
+          thumbnail = (root / 'crates/platform_win32/src/thumbnail.rs').read_text(encoding='utf-8')
+          tests = '\n'.join(
+              p.read_text(encoding='utf-8', errors='replace')
+              for p in (root / 'crates').rglob('*.rs')
+              if 'test' in p.name or '#[test]' in p.read_text(encoding='utf-8', errors='replace')
+          )
+          runtime = '\n'.join((config, transitions, layout_apply, worker, placement, thumbnail))
+          lower = runtime.lower()
+
+          assert 'compositor_safe_mode' in config
+          assert 'compositor_safe_mode: true' in config
+          assert 'SWP_NOSIZE' in placement
+          assert 'is_compositor_sensitive_class' in runtime
+          assert 'adaptive' in lower, 'adaptive policy is not present in runtime source'
+          assert any(token in runtime for token in (
+              'SendMessageTimeoutW', 'SendMessageTimeoutA', 'IsHungAppWindow',
+              'SMTO_ABORTIFHUNG', 'SMTO_NOTIMEOUTIFNOTHUNG'
+          )), 'no bounded responsiveness probe is present'
+          assert any(token in lower for token in (
+              'position_only', 'position-only', 'move_only', 'move-only'
+          )), 'position-only smooth path is not explicit'
+          assert any(token in lower for token in (
+              'ghost', 'thumbnail'
+          )), 'protected structural transition path is absent'
+          assert any(token in lower for token in (
+              'synchronous', 'sync frame', 'sync placement'
+          )), 'synchronous sensitive-window path is absent'
+
+          names = re.findall(r'fn\s+(test_[A-Za-z0-9_]*(?:adaptive|compositor|animation|geometry|ghost)[A-Za-z0-9_]*)', tests, re.I)
+          unique = sorted(set(names))
+          assert len(unique) >= 6, f'expected at least 6 relevant regression tests, found {len(unique)}: {unique}'
+          print('Adaptive compositor invariants verified')
+          print('Relevant regression tests:', len(unique))
+          for name in unique:
+              print(' -', name)
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { throw 'Adaptive design invariant validation failed' }
+
+      - name: Verify formatting and patch hygiene
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { throw 'cargo fmt check failed' }
+          git diff HEAD^ --check
+          if ($LASTEXITCODE -ne 0) { throw 'candidate diff check failed' }
+          if (git status --porcelain) { throw 'Release candidate checkout is unexpectedly dirty' }
+
+      - name: Run full locked tests for every target
+        run: cargo test --workspace --all-targets --locked
+
+      - name: Run Clippy for every target with warnings denied
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Check every Cargo target
+        run: cargo check --workspace --all-targets --locked
+
+      - name: Run optimized library and binary tests
+        run: cargo test --workspace --lib --bins --release --locked
+
+      - name: Stress animation and geometry regressions in release mode
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($iteration in 1..6) {
+            foreach ($filter in @(
+              'adaptive', 'compositor', 'animation', 'geometry_mismatch',
+              'ghost', 'scratchpad', 'floating'
+            )) {
+              cargo test --workspace --lib --bins --release --locked $filter -- --test-threads=1
+              if ($LASTEXITCODE -ne 0) {
+                throw "Regression filter ${filter}, iteration $iteration failed"
+              }
+            }
+          }
+
+      - name: Build optimized Windows binaries
+        run: cargo build --workspace --release --locked
+
+      - name: Verify Windows GUI executable subsystems
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          ./.github/verify-gui-subsystems.ps1 -RepoRoot (Get-Location).Path
+          if ($LASTEXITCODE -ne 0) { throw 'GUI subsystem validation failed' }
+
+      - name: Install cargo-wix
+        run: cargo install cargo-wix --version ^0.3 --locked
+
+      - name: Build and administratively validate MSI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $wixBin = @(
+            'C:\Program Files (x86)\WiX Toolset v3.14\bin',
+            'C:\Program Files (x86)\WiX Toolset v3.11\bin'
+          ) | Where-Object { Test-Path (Join-Path $_ 'candle.exe') } | Select-Object -First 1
+          if (-not $wixBin) { throw 'WiX Toolset v3 was not found' }
+
+          cargo wix -p leopardwm-daemon -I wix/main.wxs `
+            --target x86_64-pc-windows-msvc `
+            --no-build --nocapture `
+            --bin-path "$wixBin"
+          if ($LASTEXITCODE -ne 0) { throw 'cargo wix failed' }
+
+          $builtMsi = Get-ChildItem target/wix/*.msi | Select-Object -First 1
+          if (-not $builtMsi) { throw 'MSI output was not produced' }
+          $releaseMsi = "LeopardWM-$env:RELEASE_VERSION-x86_64.msi"
+          Copy-Item $builtMsi.FullName $releaseMsi -Force
+          if ((Get-Item $releaseMsi).Length -lt 1000000) {
+            throw 'MSI is unexpectedly small'
+          }
+
+          $adminRoot = Join-Path $env:RUNNER_TEMP 'adaptive-v7-msi-admin'
+          Remove-Item $adminRoot -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $adminRoot -Force | Out-Null
+          $adminLog = Join-Path $env:RUNNER_TEMP 'adaptive-v7-msi-admin.log'
+          $msiPath = (Resolve-Path $releaseMsi).Path
+          $arguments = @(
+            '/a', "`"$msiPath`"",
+            '/qn', "TARGETDIR=`"$adminRoot`"",
+            '/l*v', "`"$adminLog`""
+          )
+          $process = Start-Process msiexec.exe -ArgumentList $arguments -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            Get-Content $adminLog -Tail 160 -ErrorAction SilentlyContinue
+            throw "MSI administrative installation failed: $($process.ExitCode)"
+          }
+          foreach ($binary in @('leopardwm.exe', 'leopardwm-cli.exe', 'lwm.exe', 'leopardwm-watchdog.exe')) {
+            if (-not (Get-ChildItem $adminRoot -Recurse -Filter $binary -File | Select-Object -First 1)) {
+              throw "MSI administrative image is missing $binary"
+            }
+          }
+          "RELEASE_MSI=$releaseMsi" >> $env:GITHUB_ENV
+          "MSI_ADMIN_ROOT=$adminRoot" >> $env:GITHUB_ENV
+
+      - name: Package portable ZIP and checksums
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $binDir = @(
+            'target/x86_64-pc-windows-msvc/release',
+            'target/release'
+          ) | Where-Object { Test-Path (Join-Path $_ 'leopardwm.exe') } | Select-Object -First 1
+          if (-not $binDir) { throw 'Release binary directory was not found' }
+
+          $packageDir = "LeopardWM-$env:RELEASE_VERSION-x86_64-windows"
+          $releaseZip = "$packageDir.zip"
+          New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
+          $binaries = @('leopardwm.exe', 'leopardwm-cli.exe', 'lwm.exe', 'leopardwm-watchdog.exe')
+          foreach ($binary in $binaries) {
+            $source = Join-Path $binDir $binary
+            if (-not (Test-Path $source)) { throw "Missing release binary: $source" }
+            Copy-Item $source (Join-Path $packageDir $binary) -Force
+            Copy-Item $source $binary -Force
+          }
+          Copy-Item README.md, LICENSE $packageDir
+          Compress-Archive -Path $packageDir -DestinationPath $releaseZip -CompressionLevel Optimal -Force
+
+          $expanded = Join-Path $env:RUNNER_TEMP 'adaptive-v7-portable-check'
+          Remove-Item $expanded -Recurse -Force -ErrorAction SilentlyContinue
+          Expand-Archive -Path $releaseZip -DestinationPath $expanded -Force
+          foreach ($binary in $binaries) {
+            $zipBinary = Get-ChildItem $expanded -Recurse -Filter $binary -File | Select-Object -First 1
+            if (-not $zipBinary) { throw "Portable ZIP is missing $binary" }
+            $standaloneHash = (Get-FileHash -Algorithm SHA256 $binary).Hash
+            $zipHash = (Get-FileHash -Algorithm SHA256 $zipBinary.FullName).Hash
+            if ($zipHash -ne $standaloneHash) {
+              throw "Portable ZIP binary differs from standalone asset: $binary"
+            }
+          }
+
+          foreach ($binary in $binaries) {
+            $msiBinary = Get-ChildItem $env:MSI_ADMIN_ROOT -Recurse -Filter $binary -File | Select-Object -First 1
+            $standaloneHash = (Get-FileHash -Algorithm SHA256 $binary).Hash
+            $msiHash = (Get-FileHash -Algorithm SHA256 $msiBinary.FullName).Hash
+            if ($msiHash -ne $standaloneHash) {
+              throw "MSI binary differs from standalone asset: $binary"
+            }
+          }
+
+          $payloads = @($releaseZip, $env:RELEASE_MSI) + $binaries
+          $checksumLines = foreach ($asset in $payloads) {
+            $hash = (Get-FileHash -Algorithm SHA256 $asset).Hash.ToLowerInvariant()
+            "$hash *$asset"
+          }
+          $checksumLines | Set-Content -Encoding ascii checksums.txt
+          "RELEASE_ZIP=$releaseZip" >> $env:GITHUB_ENV
+          Get-Content checksums.txt
+
+      - name: Promote the exact tested candidate to main
+        shell: pwsh
+        env:
+          BASE_SHA: ${{ steps.candidate.outputs.base_sha }}
+          CANDIDATE_SHA: ${{ steps.candidate.outputs.candidate_sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $remoteLine = git ls-remote origin refs/heads/main
+          if ($LASTEXITCODE -ne 0 -or -not $remoteLine) { throw 'Could not resolve remote main' }
+          $remoteBefore = (($remoteLine -split '\s+')[0]).Trim()
+          if ($remoteBefore -ne $env:BASE_SHA) {
+            throw "main changed during validation: expected=$env:BASE_SHA actual=$remoteBefore"
+          }
+          git push origin "$env:CANDIDATE_SHA`:refs/heads/main"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not fast-forward tested candidate to main' }
+          $remoteAfterLine = git ls-remote origin refs/heads/main
+          $remoteAfter = (($remoteAfterLine -split '\s+')[0]).Trim()
+          if ($remoteAfter -ne $env:CANDIDATE_SHA) {
+            throw "Remote main identity mismatch: expected=$env:CANDIDATE_SHA actual=$remoteAfter"
+          }
+          Write-Host "Promoted tested candidate to main: $remoteAfter"
+
+      - name: Write release notes
+        shell: pwsh
+        env:
+          REVIEWED_SOURCE_SHA: ${{ steps.candidate.outputs.source_sha }}
+          CANDIDATE_SHA: ${{ steps.candidate.outputs.candidate_sha }}
+        run: |
+          @"
+          Personal independent-line prerelease from sehoon123/LeopardWM.
+
+          Adaptive smooth compositor design:
+          - preserves smooth per-frame horizontal motion when a frame is position-only
+          - uses SWP_NOSIZE so pure movement does not repeatedly enter application resize/swap-chain paths
+          - applies bounded responsiveness checks before synchronous intermediate placement of compositor-sensitive windows
+          - skips unsafe intermediate frames for hung sensitive applications rather than blocking the animation worker
+          - permits smooth size-changing structural transitions only when a real DWM-thumbnail/physical-cloak path protects the source HWND
+          - collapses only unprotected size-changing transitions to one exact landing
+          - keeps final synchronous geometry verification and retries required landing repairs after worker failure or timeout
+          - limits the synthetic 1px resize repair to the explicit legacy path
+
+          Reviewed adaptive source: $env:REVIEWED_SOURCE_SHA
+          Exact tested main commit: $env:CANDIDATE_SHA
+
+          Validation completed before promotion and publication:
+          - semantic architecture invariants and relevant-test-count gate
+          - full debug tests for all workspace targets
+          - Clippy for all targets with warnings denied
+          - all-target Cargo check
+          - optimized library and binary tests
+          - six repeated release-mode regression passes across adaptive, compositor, animation, geometry, ghost, scratchpad, and floating filters
+          - optimized Windows build and GUI subsystem verification
+          - MSI administrative installation and binary identity verification
+          - Portable ZIP extraction and binary identity verification
+          "@ | Set-Content -Encoding utf8 release-notes-v7.md
+
+      - name: Publish MSI, ZIP, binaries, and checksums
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_SHA: ${{ steps.candidate.outputs.candidate_sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          gh release create $env:RELEASE_TAG `
+            $env:RELEASE_ZIP `
+            $env:RELEASE_MSI `
+            leopardwm.exe `
+            leopardwm-cli.exe `
+            lwm.exe `
+            leopardwm-watchdog.exe `
+            checksums.txt `
+            --repo $env:GITHUB_REPOSITORY `
+            --target $env:CANDIDATE_SHA `
+            --title "LeopardWM $env:RELEASE_TAG — adaptive smooth compositor" `
+            --notes-file release-notes-v7.md `
+            --prerelease
+          if ($LASTEXITCODE -ne 0) { throw 'GitHub Release publication failed' }
+
+      - name: Independently re-download and verify the published release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_SHA: ${{ steps.candidate.outputs.candidate_sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git fetch origin "refs/tags/$env:RELEASE_TAG`:refs/tags/$env:RELEASE_TAG"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not fetch published tag' }
+          $tagSha = (git rev-list -n 1 $env:RELEASE_TAG).Trim()
+          if ($tagSha -ne $env:CANDIDATE_SHA) {
+            throw "Tag/source mismatch: tag=$tagSha source=$env:CANDIDATE_SHA"
+          }
+
+          $release = gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY `
+            --json tagName,isDraft,isPrerelease,targetCommitish,assets | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'Could not read published release' }
+          if ($release.tagName -ne $env:RELEASE_TAG -or $release.isDraft -or -not $release.isPrerelease) {
+            throw 'Published release metadata is invalid'
+          }
+          if ($release.targetCommitish -ne $env:CANDIDATE_SHA) {
+            throw "Release target mismatch: $($release.targetCommitish)"
+          }
+
+          $payloads = @(
+            (Split-Path $env:RELEASE_ZIP -Leaf),
+            (Split-Path $env:RELEASE_MSI -Leaf),
+            'leopardwm.exe',
+            'leopardwm-cli.exe',
+            'lwm.exe',
+            'leopardwm-watchdog.exe'
+          )
+          $expectedAssets = $payloads + @('checksums.txt')
+          $actualAssets = @($release.assets | ForEach-Object { $_.name })
+          foreach ($name in $expectedAssets) {
+            if ($name -notin $actualAssets) { throw "Published release is missing $name" }
+          }
+
+          $downloadDir = Join-Path $env:RUNNER_TEMP 'adaptive-v7-published-assets'
+          Remove-Item $downloadDir -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $downloadDir -Force | Out-Null
+          gh release download $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --dir $downloadDir
+          if ($LASTEXITCODE -ne 0) { throw 'Published assets could not be downloaded' }
+
+          $publishedChecksums = @{}
+          foreach ($line in Get-Content (Join-Path $downloadDir 'checksums.txt')) {
+            if ($line -notmatch '^([0-9a-fA-F]{64}) \*(.+)$') {
+              throw "Malformed checksum line: $line"
+            }
+            $publishedChecksums[$matches[2]] = $matches[1].ToLowerInvariant()
+          }
+          if ($publishedChecksums.Count -ne $payloads.Count) {
+            throw "Checksum entry count mismatch: expected=$($payloads.Count) actual=$($publishedChecksums.Count)"
+          }
+
+          $releaseApi = gh api "repos/$env:GITHUB_REPOSITORY/releases/tags/$env:RELEASE_TAG" | ConvertFrom-Json
+          $apiAssets = @{}
+          foreach ($asset in $releaseApi.assets) { $apiAssets[$asset.name] = $asset }
+
+          $verifiedAssets = @()
+          foreach ($name in $payloads) {
+            $path = Join-Path $downloadDir $name
+            if (-not (Test-Path $path -PathType Leaf)) { throw "Downloaded release is missing $name" }
+            $actualHash = (Get-FileHash -Algorithm SHA256 $path).Hash.ToLowerInvariant()
+            if (-not $publishedChecksums.ContainsKey($name)) { throw "checksums.txt is missing $name" }
+            if ($actualHash -ne $publishedChecksums[$name]) {
+              throw "Checksum mismatch for ${name}: expected=$($publishedChecksums[$name]) actual=$actualHash"
+            }
+            $apiDigest = [string]$apiAssets[$name].digest
+            if ($apiDigest -ne "sha256:$actualHash") {
+              throw "GitHub digest mismatch for ${name}: api=$apiDigest actual=sha256:$actualHash"
+            }
+            $verifiedAssets += [ordered]@{
+              name = $name
+              size = (Get-Item $path).Length
+              sha256 = $actualHash
+            }
+          }
+
+          $zipPath = Join-Path $downloadDir (Split-Path $env:RELEASE_ZIP -Leaf)
+          $zipRoot = Join-Path $env:RUNNER_TEMP 'adaptive-v7-published-zip'
+          Remove-Item $zipRoot -Recurse -Force -ErrorAction SilentlyContinue
+          Expand-Archive -Path $zipPath -DestinationPath $zipRoot -Force
+          foreach ($binary in @('leopardwm.exe', 'leopardwm-cli.exe', 'lwm.exe', 'leopardwm-watchdog.exe')) {
+            $inside = Get-ChildItem $zipRoot -Recurse -Filter $binary -File | Select-Object -First 1
+            $standalone = Join-Path $downloadDir $binary
+            if (-not $inside) { throw "Published ZIP is missing $binary" }
+            if ((Get-FileHash $inside.FullName -Algorithm SHA256).Hash -ne (Get-FileHash $standalone -Algorithm SHA256).Hash) {
+              throw "Published ZIP binary identity mismatch: $binary"
+            }
+          }
+
+          $msiPath = Join-Path $downloadDir (Split-Path $env:RELEASE_MSI -Leaf)
+          $adminRoot = Join-Path $env:RUNNER_TEMP 'adaptive-v7-published-msi'
+          Remove-Item $adminRoot -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $adminRoot -Force | Out-Null
+          $adminLog = Join-Path $env:RUNNER_TEMP 'adaptive-v7-published-msi.log'
+          $args = @('/a', "`"$msiPath`"", '/qn', "TARGETDIR=`"$adminRoot`"", '/l*v', "`"$adminLog`"")
+          $proc = Start-Process msiexec.exe -ArgumentList $args -Wait -PassThru
+          if ($proc.ExitCode -ne 0) {
+            Get-Content $adminLog -Tail 160 -ErrorAction SilentlyContinue
+            throw "Published MSI administrative installation failed: $($proc.ExitCode)"
+          }
+          foreach ($binary in @('leopardwm.exe', 'leopardwm-cli.exe', 'lwm.exe', 'leopardwm-watchdog.exe')) {
+            $inside = Get-ChildItem $adminRoot -Recurse -Filter $binary -File | Select-Object -First 1
+            $standalone = Join-Path $downloadDir $binary
+            if (-not $inside) { throw "Published MSI is missing $binary" }
+            if ((Get-FileHash $inside.FullName -Algorithm SHA256).Hash -ne (Get-FileHash $standalone -Algorithm SHA256).Hash) {
+              throw "Published MSI binary identity mismatch: $binary"
+            }
+          }
+
+          $report = [ordered]@{
+            verified_at_utc = [DateTime]::UtcNow.ToString('o')
+            repository = $env:GITHUB_REPOSITORY
+            tag = $env:RELEASE_TAG
+            candidate_sha = $env:CANDIDATE_SHA
+            tag_sha = $tagSha
+            main_sha = ((git ls-remote origin refs/heads/main) -split '\s+')[0]
+            draft = $release.isDraft
+            prerelease = $release.isPrerelease
+            assets = $verifiedAssets
+            zip_binary_identity_verified = $true
+            msi_administrative_install_verified = $true
+            msi_binary_identity_verified = $true
+          }
+          $report | ConvertTo-Json -Depth 8 | Set-Content -Encoding utf8 verification-report-v7.json
+          Get-Content verification-report-v7.json
+
+      - name: Stage verified release bundle
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $source = Join-Path $env:RUNNER_TEMP 'adaptive-v7-published-assets'
+          $bundle = Join-Path (Get-Location) 'verified-release-v7'
+          Remove-Item $bundle -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $bundle -Force | Out-Null
+          Copy-Item (Join-Path $source '*') $bundle -Force
+          Copy-Item verification-report-v7.json $bundle -Force
+
+      - name: Upload independently verified release bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: LeopardWM-v0.2.6-sehoon.7-published-verified
+          path: verified-release-v7/*
+          if-no-files-found: error
+          retention-days: 14
