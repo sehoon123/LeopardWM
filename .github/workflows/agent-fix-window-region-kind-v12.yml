@@ -1,4 +1,4 @@
-name: Fix window-region test contract v12
+name: Fix window-region Clippy findings v12
 
 on:
   push:
@@ -19,7 +19,7 @@ jobs:
           ref: agent/window-region-clipping-v12-source
           fetch-depth: 0
 
-      - name: Correct the outer-frame preservation expectation
+      - name: Collapse the two guarded recovery conditions
         shell: bash
         run: |
           python - <<'PY'
@@ -27,11 +27,47 @@ jobs:
 
           path = Path('crates/platform_win32/src/window_region.rs')
           text = path.read_text(encoding='utf-8')
-          old = '        assert_eq!(region, Rect::new(10, 110, 810, 1080));'
-          new = '        assert_eq!(region, Rect::new(0, 110, 820, 1090));'
-          if text.count(old) != 1:
-              raise SystemExit('unexpected vertical clipping test expectation')
-          path.write_text(text.replace(old, new), encoding='utf-8', newline='\n')
+
+          old_apply = '''        if has_owner_marker(hwnd) {
+              if state.identity == current_identity
+                  && actual_region_matches(hwnd, state.expected_region)
+              {
+                  if !clear_region(hwnd, false) {
+                      lock_states().insert(window_id, state);
+                      return RegionClipResult::Failed;
+                  }
+              }
+              remove_metadata(hwnd);
+          }'''
+          new_apply = '''        if has_owner_marker(hwnd) {
+              if state.identity == current_identity
+                  && actual_region_matches(hwnd, state.expected_region)
+                  && !clear_region(hwnd, false)
+              {
+                  lock_states().insert(window_id, state);
+                  return RegionClipResult::Failed;
+              }
+              remove_metadata(hwnd);
+          }'''
+
+          old_restore = '''    if actual_region_matches(hwnd, expected) {
+              if !clear_region(hwnd, redraw) {
+                  return false;
+              }
+          }'''
+          new_restore = '''    if actual_region_matches(hwnd, expected) && !clear_region(hwnd, redraw) {
+              return false;
+          }'''
+
+          for label, old, new in [
+              ('apply recovery', old_apply, new_apply),
+              ('restore recovery', old_restore, new_restore),
+          ]:
+              if text.count(old) != 1:
+                  raise SystemExit(f'unexpected {label} block')
+              text = text.replace(old, new)
+
+          path.write_text(text, encoding='utf-8', newline='\n')
           PY
           git diff --check
 
@@ -42,5 +78,5 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add crates/platform_win32/src/window_region.rs
-          git commit -m 'test: preserve unclipped outer frame at vertical bounds'
+          git commit -m 'style: satisfy clippy in window-region recovery'
           git push origin HEAD:refs/heads/agent/window-region-clipping-v12-source
