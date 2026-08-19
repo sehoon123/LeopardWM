@@ -1,0 +1,483 @@
+name: Verify and release SetWindowRgn clipping v10
+
+on:
+  push:
+    branches:
+      - agent/window-region-clipping-v10-control
+    paths:
+      - .github/workflows/agent-release-window-region-v10.yml
+      - .github/scripts/apply_window_region_clipping_v10.py
+      - .github/scripts/harden_window_region_clipping_v10.py
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: release-window-region-v10
+  cancel-in-progress: false
+
+env:
+  SOURCE_BRANCH: agent/window-region-clipping-v10-source
+  CONTROL_BRANCH: agent/window-region-clipping-v10-control
+  EXPECTED_MAIN_SHA: bfb2bb1409f39e29fa3530d3858fe6fab733d0c7
+  RELEASE_TAG: v0.2.6-sehoon.10
+  RELEASE_VERSION: 0.2.6-sehoon.10
+
+jobs:
+  verify-build-release:
+    runs-on: windows-latest
+    timeout-minutes: 150
+
+    steps:
+      - name: Check out control branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CONTROL_BRANCH }}
+          path: control
+          fetch-depth: 0
+
+      - name: Check out source branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_BRANCH }}
+          path: source
+          fetch-depth: 0
+
+      - name: Record workflow coordinates
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          path='agent_docs/window-region-v10-status.json'
+          payload=$(jq -n \
+            --arg state started \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --arg expected_main "$EXPECTED_MAIN_SHA" \
+            '{state:$state,run_id:$run_id,run_url:$run_url,expected_main:$expected_main}')
+          content=$(printf '%s\n' "$payload" | base64 -w0)
+          current=$(gh api "repos/$GITHUB_REPOSITORY/contents/$path?ref=$CONTROL_BRANCH" --jq .sha 2>/dev/null || true)
+          args=(--method PUT "repos/$GITHUB_REPOSITORY/contents/$path" -f message='ci: record window-region v10 run' -f content="$content" -f branch="$CONTROL_BRANCH")
+          if [[ -n "$current" ]]; then args+=(-f sha="$current"); fi
+          gh api "${args[@]}" >/dev/null
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Apply concise clipping patch
+        working-directory: source
+        run: |
+          python ../control/.github/scripts/apply_window_region_clipping_v10.py
+          python ../control/.github/scripts/harden_window_region_clipping_v10.py
+
+      - name: Format and constrain the patch surface
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo fmt --all
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { throw 'cargo fmt check failed' }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'git diff check failed' }
+
+          $allowed = @(
+            'crates/daemon/src/config.rs',
+            'crates/daemon/src/layout_apply.rs',
+            'crates/daemon/src/layout_apply_edge_tests.rs',
+            'crates/daemon/src/settings/html.rs',
+            'crates/daemon/src/settings/settings.html',
+            'crates/daemon/src/state.rs',
+            'crates/platform_win32/src/lib.rs',
+            'crates/platform_win32/src/placement.rs',
+            'crates/platform_win32/src/types.rs',
+            'crates/platform_win32/src/window_region.rs'
+          )
+          $changed = @(git status --short | ForEach-Object { $_.Substring(3) })
+          $unexpected = @($changed | Where-Object { $_ -notin $allowed })
+          if ($unexpected.Count -ne 0) {
+            throw "Unexpected changed files: $($unexpected -join ', ')"
+          }
+
+      - name: Verify source, fallback, and Settings contracts
+        working-directory: source
+        shell: pwsh
+        run: |
+          @'
+          from html.parser import HTMLParser
+          from pathlib import Path
+          import re
+
+          class IdCollector(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.ids = []
+              def handle_starttag(self, tag, attrs):
+                  for key, value in attrs:
+                      if key == 'id' and value:
+                          self.ids.append(value)
+
+          config = Path('crates/daemon/src/config.rs').read_text(encoding='utf-8')
+          layout = Path('crates/daemon/src/layout_apply.rs').read_text(encoding='utf-8')
+          region = Path('crates/platform_win32/src/window_region.rs').read_text(encoding='utf-8')
+          placement = Path('crates/platform_win32/src/placement.rs').read_text(encoding='utf-8')
+          settings = Path('crates/daemon/src/settings/settings.html').read_text(encoding='utf-8')
+
+          required = {
+              'clip/hide config enum': 'pub enum MonitorOverflowMode',
+              'clip default': 'monitor_overflow_mode: MonitorOverflowMode::Clip',
+              'capability fallback': 'can_clip_window_region',
+              'custom region protection': '!has_no_application_region(hwnd)',
+              'crash ownership marker': 'LeopardWM.RegionClip.v1',
+              'stale marker recovery': 'A SetWindowRgn region can outlive a crashed LeopardWM process',
+              'clip cache identity': 'last_placed_clip_bounds',
+              'platform clip cache': 'clip_bounds: HashMap<WindowId, Rect>',
+              'landing retry on clip failure': 'geometry_mismatches.extend(region_failures.iter().copied())',
+              'hide fallback': 'MonitorOverflowMode::Hide',
+              'settings selector': 'id="layout-monitor_overflow_mode"',
+              'settings clip option': 'value="clip"',
+              'settings hide option': 'value="hide"',
+              'settings load': "cfg.layout.monitor_overflow_mode || 'clip'",
+              'settings save': 'monitor_overflow_mode:',
+          }
+          combined = config + '\n' + layout + '\n' + region + '\n' + placement + '\n' + settings
+          missing = [name for name, marker in required.items() if marker not in combined]
+          if missing:
+              raise SystemExit('Missing contracts: ' + ', '.join(missing))
+
+          parser = IdCollector()
+          parser.feed(settings)
+          duplicates = sorted({value for value in parser.ids if parser.ids.count(value) > 1})
+          if duplicates:
+              raise SystemExit('Duplicate Settings ids: ' + ', '.join(duplicates))
+          for control in ('layout-centering_mode', 'layout-center_past_edges', 'layout-monitor_overflow_mode'):
+              if control not in parser.ids:
+                  raise SystemExit(f'Missing Settings control: {control}')
+
+          # Catch accidental truncation or malformed script blocks before WebView2.
+          scripts = re.findall(r'<script(?:\s[^>]*)?>(.*?)</script>', settings, flags=re.I | re.S)
+          if not scripts:
+              raise SystemExit('No Settings scripts found')
+          Path('target/settings-script-smoke.js').parent.mkdir(parents=True, exist_ok=True)
+          Path('target/settings-script-smoke.js').write_text(
+              '\n'.join(f'new Function({script!r});' for script in scripts),
+              encoding='utf-8',
+          )
+          print(f'Settings ids={len(parser.ids)}, script_blocks={len(scripts)}')
+          '@ | python -
+          node target/settings-script-smoke.js
+          if ($LASTEXITCODE -ne 0) { throw 'Settings JavaScript syntax check failed' }
+
+      - name: Run full locked test suite
+        working-directory: source
+        run: cargo test --workspace --all-targets --locked
+
+      - name: Run Clippy with warnings denied
+        working-directory: source
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Check every Cargo target
+        working-directory: source
+        run: cargo check --workspace --all-targets --locked
+
+      - name: Run optimized tests
+        working-directory: source
+        run: cargo test --workspace --lib --bins --tests --release --locked
+
+      - name: Stress clipping and prior geometry regressions
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          for ($i = 0; $i -lt 12; $i++) {
+            cargo test -p leopardwm-platform-win32 --release --locked window_region -- --test-threads=1
+            if ($LASTEXITCODE -ne 0) { throw "window-region iteration $i failed" }
+            cargo test -p leopardwm-daemon --bin leopardwm --release --locked edge_safety_audit_tests -- --test-threads=1
+            if ($LASTEXITCODE -ne 0) { throw "overflow-policy iteration $i failed" }
+          }
+          foreach ($filter in @('edge_centering', 'compositor', 'geometry_mismatch', 'scratchpad', 'floating')) {
+            for ($i = 0; $i -lt 4; $i++) {
+              cargo test --workspace --release --locked $filter -- --test-threads=1
+              if ($LASTEXITCODE -ne 0) { throw "$filter iteration $i failed" }
+            }
+          }
+
+      - name: Browser smoke-test Settings at minimum and default sizes
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $edgeCandidates = @(
+            "$env:ProgramFiles(x86)\Microsoft\Edge\Application\msedge.exe",
+            "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe"
+          )
+          $edge = $edgeCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $edge) { throw 'Microsoft Edge not found on Windows runner' }
+
+          $html = Get-Content -Raw -Encoding utf8 crates/daemon/src/settings/settings.html
+          $probe = @'
+          <script>
+          window.ipc = window.ipc || { postMessage() {} };
+          addEventListener('load', () => {
+            const required = ['layout-centering_mode','layout-center_past_edges','layout-monitor_overflow_mode'];
+            const missing = required.filter(id => !document.getElementById(id));
+            const overflow = document.documentElement.scrollWidth - document.documentElement.clientWidth;
+            document.body.dataset.smoke = JSON.stringify({ missing, overflow });
+          });
+          </script>
+          '@
+          $html = $html -replace '</body>', ($probe + '</body>')
+          $smoke = Join-Path (Get-Location) 'target/settings-smoke.html'
+          [IO.File]::WriteAllText($smoke, $html, [Text.UTF8Encoding]::new($false))
+          $uri = [Uri]$smoke
+
+          foreach ($size in @('640,420', '780,560')) {
+            $dump = Join-Path (Get-Location) ("target/settings-$($size.Replace(',','x')).html")
+            & $edge --headless=new --disable-gpu --no-sandbox --allow-file-access-from-files --virtual-time-budget=2500 --window-size=$size --dump-dom $uri.AbsoluteUri | Set-Content -Encoding utf8 $dump
+            if ($LASTEXITCODE -ne 0) { throw "Edge smoke failed at $size" }
+            $rendered = Get-Content -Raw -Encoding utf8 $dump
+            if ($rendered -notmatch 'data-smoke="\{&quot;missing&quot;:\[\],&quot;overflow&quot;:0\}"') {
+              throw "Settings controls missing or horizontal overflow detected at $size"
+            }
+          }
+
+      - name: Build optimized Windows binaries
+        working-directory: source
+        run: cargo build --workspace --release --locked
+
+      - name: Verify Windows GUI subsystems
+        working-directory: source
+        shell: pwsh
+        run: ./.github/verify-gui-subsystems.ps1 -RepoRoot (Get-Location).Path
+
+      - name: Install cargo-wix
+        run: cargo install cargo-wix --version ^0.3 --locked
+
+      - name: Build MSI installer
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo wix -p leopardwm-daemon -I wix/main.wxs --target x86_64-pc-windows-msvc --no-build --nocapture --bin-path 'C:\Program Files (x86)\WiX Toolset v3.14\bin'
+          if ($LASTEXITCODE -ne 0) { throw 'cargo wix failed' }
+          $built = Get-ChildItem target/wix/*.msi | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $built) { throw 'cargo wix produced no MSI' }
+          Copy-Item $built.FullName "LeopardWM-$env:RELEASE_VERSION-x86_64.msi"
+
+      - name: Verify local MSI administrative installation
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msi = (Resolve-Path "LeopardWM-$env:RELEASE_VERSION-x86_64.msi").Path
+          $admin = Join-Path (Get-Location) 'msi-admin-image'
+          New-Item -ItemType Directory -Path $admin -Force | Out-Null
+          $arguments = "/a `"$msi`" /qn TARGETDIR=`"$admin`""
+          $process = Start-Process "$env:SystemRoot\System32\msiexec.exe" -ArgumentList $arguments -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "MSI administrative install failed: $($process.ExitCode)" }
+
+          $binDir = @('target/x86_64-pc-windows-msvc/release', 'target/release') |
+            Where-Object { Test-Path (Join-Path $_ 'leopardwm.exe') } | Select-Object -First 1
+          foreach ($binary in @('leopardwm.exe','leopardwm-cli.exe','lwm.exe','leopardwm-watchdog.exe')) {
+            $installed = Get-ChildItem $admin -Recurse -Filter $binary | Select-Object -First 1
+            if (-not $installed) { throw "MSI missing $binary" }
+            if ((Get-FileHash $installed.FullName -Algorithm SHA256).Hash -ne (Get-FileHash (Join-Path $binDir $binary) -Algorithm SHA256).Hash) {
+              throw "MSI binary mismatch: $binary"
+            }
+          }
+
+      - name: Commit verified source and fast-forward main
+        id: source_commit
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add crates/daemon/src/config.rs crates/daemon/src/layout_apply.rs crates/daemon/src/layout_apply_edge_tests.rs crates/daemon/src/settings/html.rs crates/daemon/src/settings/settings.html crates/daemon/src/state.rs crates/platform_win32/src/lib.rs crates/platform_win32/src/placement.rs crates/platform_win32/src/types.rs crates/platform_win32/src/window_region.rs
+          git diff --cached --check
+          if ($LASTEXITCODE -ne 0) { throw 'staged diff check failed' }
+          git commit -m 'feat: clip tiled windows at monitor boundaries'
+          if ($LASTEXITCODE -ne 0) { throw 'source commit failed' }
+          $candidate = (git rev-parse HEAD).Trim()
+          git push origin HEAD:refs/heads/$env:SOURCE_BRANCH
+          if ($LASTEXITCODE -ne 0) { throw 'source branch push failed' }
+
+          $remoteMain = ((git ls-remote origin refs/heads/main) -split '\s+')[0]
+          if ($remoteMain -ne $env:EXPECTED_MAIN_SHA) {
+            throw "main changed during validation: expected=$env:EXPECTED_MAIN_SHA actual=$remoteMain"
+          }
+          git push origin HEAD:refs/heads/main
+          if ($LASTEXITCODE -ne 0) { throw 'main fast-forward failed' }
+          $verifiedMain = ((git ls-remote origin refs/heads/main) -split '\s+')[0]
+          if ($verifiedMain -ne $candidate) { throw "main identity mismatch: $verifiedMain" }
+          "sha=$candidate" >> $env:GITHUB_OUTPUT
+
+      - name: Package ZIP and standalone binaries
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $binDir = @('target/x86_64-pc-windows-msvc/release', 'target/release') |
+            Where-Object { Test-Path (Join-Path $_ 'leopardwm.exe') } | Select-Object -First 1
+          if (-not $binDir) { throw 'Release binary directory not found' }
+          $packageDir = "LeopardWM-$env:RELEASE_VERSION-x86_64-windows"
+          New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
+          foreach ($binary in @('leopardwm.exe','leopardwm-cli.exe','lwm.exe','leopardwm-watchdog.exe')) {
+            $source = Join-Path $binDir $binary
+            Copy-Item $source (Join-Path $packageDir $binary)
+            Copy-Item $source $binary
+          }
+          Copy-Item README.md, LICENSE, CHANGELOG.md $packageDir
+          7z a "$packageDir.zip" $packageDir | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw 'ZIP packaging failed' }
+
+      - name: Generate checksums and release notes
+        working-directory: source
+        shell: pwsh
+        run: |
+          $assets = @(
+            "LeopardWM-$env:RELEASE_VERSION-x86_64-windows.zip",
+            "LeopardWM-$env:RELEASE_VERSION-x86_64.msi",
+            'leopardwm.exe','leopardwm-cli.exe','lwm.exe','leopardwm-watchdog.exe'
+          )
+          $lines = foreach ($asset in $assets) {
+            "{0} *{1}" -f (Get-FileHash $asset -Algorithm SHA256).Hash.ToLowerInvariant(), $asset
+          }
+          $lines | Set-Content checksums.txt -Encoding ascii
+          @'
+          Personal-fork prerelease from `sehoon123/LeopardWM`.
+
+          Monitor-edge clipping:
+          - partially visible tiled columns keep their original scrolling geometry and are clipped to the owning monitor with SetWindowRgn
+          - both neighboring columns can remain visible as peeks around a centered 50% column without leaking into adjacent monitors
+          - application-defined window regions are never overwritten
+          - an HWND ownership marker recovers regions left by abnormal LeopardWM termination
+          - unsupported/protected HWNDs automatically use the stable whole-window hide/contain fallback
+          - `monitor_overflow_mode = "hide"` keeps the previous fallback available explicitly
+          - floating windows remain free to span monitors
+          - clipping-plan identity participates in both daemon and animation caches
+          - clip failures trigger the existing guarded exact re-apply and fallback path
+          - Settings GUI includes Clip and Hide modes and passes syntax, duplicate-ID, 640x420, and 780x560 browser smoke tests
+          '@ | Set-Content release-notes-v10.md -Encoding utf8
+
+      - name: Publish prerelease
+        working-directory: source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.source_commit.outputs.sha }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release already exists: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Tag already exists: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" \
+            "LeopardWM-$RELEASE_VERSION-x86_64-windows.zip" \
+            "LeopardWM-$RELEASE_VERSION-x86_64.msi" \
+            leopardwm.exe leopardwm-cli.exe lwm.exe leopardwm-watchdog.exe checksums.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$SOURCE_SHA" \
+            --title "LeopardWM $RELEASE_TAG — monitor-edge region clipping" \
+            --notes-file release-notes-v10.md \
+            --prerelease
+
+      - name: Independently verify published assets
+        working-directory: source
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.source_commit.outputs.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $verify = Join-Path (Get-Location) 'published-verification'
+          New-Item -ItemType Directory -Path $verify -Force | Out-Null
+          gh release download $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --dir $verify
+          if ($LASTEXITCODE -ne 0) { throw 'Release download failed' }
+
+          foreach ($line in Get-Content (Join-Path $verify 'checksums.txt')) {
+            if ($line -notmatch '^([0-9a-f]{64}) \*(.+)$') { throw "Invalid checksum line: $line" }
+            $path = Join-Path $verify $Matches[2]
+            if (-not (Test-Path $path)) { throw "Missing asset: $($Matches[2])" }
+            if ((Get-FileHash $path -Algorithm SHA256).Hash.ToLowerInvariant() -ne $Matches[1]) {
+              throw "Checksum mismatch: $($Matches[2])"
+            }
+          }
+
+          $zip = Join-Path $verify "LeopardWM-$env:RELEASE_VERSION-x86_64-windows.zip"
+          7z t $zip | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw 'ZIP CRC check failed' }
+          $extract = Join-Path $verify 'zip-extracted'
+          7z x $zip "-o$extract" -y | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw 'ZIP extraction failed' }
+
+          $msi = Join-Path $verify "LeopardWM-$env:RELEASE_VERSION-x86_64.msi"
+          $admin = Join-Path $verify 'msi-admin-image'
+          New-Item -ItemType Directory -Path $admin -Force | Out-Null
+          $arguments = "/a `"$msi`" /qn TARGETDIR=`"$admin`""
+          $process = Start-Process "$env:SystemRoot\System32\msiexec.exe" -ArgumentList $arguments -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Published MSI install failed: $($process.ExitCode)" }
+
+          foreach ($binary in @('leopardwm.exe','leopardwm-cli.exe','lwm.exe','leopardwm-watchdog.exe')) {
+            $standalone = Join-Path $verify $binary
+            $fromZip = Get-ChildItem $extract -Recurse -Filter $binary | Select-Object -First 1
+            $fromMsi = Get-ChildItem $admin -Recurse -Filter $binary | Select-Object -First 1
+            if (-not $fromZip -or -not $fromMsi) { throw "Packaged binary missing: $binary" }
+            $expected = (Get-FileHash $standalone -Algorithm SHA256).Hash
+            if ((Get-FileHash $fromZip.FullName -Algorithm SHA256).Hash -ne $expected) { throw "ZIP mismatch: $binary" }
+            if ((Get-FileHash $fromMsi.FullName -Algorithm SHA256).Hash -ne $expected) { throw "MSI mismatch: $binary" }
+          }
+
+          git fetch origin --tags --force
+          $tagSha = (git rev-list -n 1 $env:RELEASE_TAG).Trim()
+          $mainSha = ((git ls-remote origin refs/heads/main) -split '\s+')[0]
+          if ($tagSha -ne $env:SOURCE_SHA -or $mainSha -ne $env:SOURCE_SHA) {
+            throw "Source identity mismatch: tag=$tagSha main=$mainSha expected=$env:SOURCE_SHA"
+          }
+
+      - name: Publish success status
+        working-directory: source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.source_commit.outputs.sha }}
+        run: |
+          set -euo pipefail
+          path='agent_docs/window-region-v10-status.json'
+          zip_hash=$(sha256sum "LeopardWM-$RELEASE_VERSION-x86_64-windows.zip" | awk '{print $1}')
+          msi_hash=$(sha256sum "LeopardWM-$RELEASE_VERSION-x86_64.msi" | awk '{print $1}')
+          payload=$(jq -n \
+            --arg state success \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --arg tag "$RELEASE_TAG" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg zip_sha256 "$zip_hash" \
+            --arg msi_sha256 "$msi_hash" \
+            '{state:$state,run_id:$run_id,run_url:$run_url,tag:$tag,source_sha:$source_sha,zip_sha256:$zip_sha256,msi_sha256:$msi_sha256}')
+          content=$(printf '%s\n' "$payload" | base64 -w0)
+          current=$(gh api "repos/$GITHUB_REPOSITORY/contents/$path?ref=$CONTROL_BRANCH" --jq .sha)
+          gh api --method PUT "repos/$GITHUB_REPOSITORY/contents/$path" \
+            -f message='ci: record successful window-region v10 release' \
+            -f content="$content" -f branch="$CONTROL_BRANCH" -f sha="$current" >/dev/null
+
+      - name: Upload verified release bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: LeopardWM-v0.2.6-sehoon.10-verified
+          path: |
+            source/LeopardWM-0.2.6-sehoon.10-x86_64-windows.zip
+            source/LeopardWM-0.2.6-sehoon.10-x86_64.msi
+            source/checksums.txt
+            source/release-notes-v10.md
+          if-no-files-found: error
+          retention-days: 14
