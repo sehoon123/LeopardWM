@@ -1,0 +1,54 @@
+name: Fix centered short-strip focus bounds
+
+on:
+  push:
+    branches:
+      - agent/focus-scroll-modes-v12-control
+    paths:
+      - .github/workflows/agent-fix-focus-scroll-short-strip-v12.yml
+
+permissions:
+  contents: write
+
+jobs:
+  fix-control-files:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/focus-scroll-modes-v12-control
+          fetch-depth: 0
+
+      - name: Allow any focused column to center when the strip is shorter
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          patch = Path('.github/focus-v12/apply_focus_scroll_modes.py')
+          text = patch.read_text(encoding='utf-8')
+          old = '''        let first_active = self\\n            .columns\\n            .iter()\\n            .position(|column| self.is_column_active(column));\\n        let last_active = self\\n            .columns\\n            .iter()\\n            .rposition(|column| self.is_column_active(column));\\n\\n        let minimum = if first_active == Some(self.focused_column) {\\n            centered.min(normal.0)\\n        } else {\\n            normal.0\\n        };\\n        let maximum = if last_active == Some(self.focused_column) {\\n            centered.max(normal.1)\\n        } else {\\n            normal.1\\n        };\\n        (minimum, maximum)\\n'''
+          new = '''        // For a strip shorter than the viewport, a middle column can also\\n        // require edge overscroll to reach the center. Extend only as far as\\n        // this focus's exact centered target; arbitrary blank-space scrolling\\n        // remains impossible.\\n        (normal.0.min(centered), normal.1.max(centered))\\n'''
+          if text.count(old) != 1:
+              raise SystemExit('focus-bound block mismatch')
+          patch.write_text(text.replace(old, new), encoding='utf-8', newline='\n')
+
+          tests = Path('.github/focus-v12/focus_scroll_modes.rs')
+          text = tests.read_text(encoding='utf-8')
+          old = '        let expected_preview = (VIEWPORT.width - expected_focus) / 2;\n'
+          new = '''        let expected_preview = width.min((VIEWPORT.width - expected_focus) / 2);\n'''
+          if text.count(old) != 1:
+              raise SystemExit('center preview expectation mismatch')
+          tests.write_text(text.replace(old, new), encoding='utf-8', newline='\n')
+          PY
+          git diff --check
+
+      - name: Commit the corrected algorithm and test contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .github/focus-v12/apply_focus_scroll_modes.py .github/focus-v12/focus_scroll_modes.rs
+          git commit -m 'fix: center focused columns in short strips'
+          git push origin HEAD:refs/heads/agent/focus-scroll-modes-v12-control
