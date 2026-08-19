@@ -17,6 +17,15 @@ def replace_once(path: str, old: str, new: str) -> None:
     write(path, text.replace(old, new, 1))
 
 
+def remove_between(path: str, start: str, end: str) -> None:
+    text = read(path)
+    start_at = text.find(start)
+    end_at = text.find(end, start_at + len(start))
+    if start_at < 0 or end_at < 0:
+        raise RuntimeError(f"{path}: section markers not found")
+    write(path, text[:start_at] + text[end_at:])
+
+
 # ---------------------------------------------------------------------------
 # Win32 region ownership: GetWindowRgn returns ERROR when a valid window has no
 # region. NULLREGION means an explicitly empty region. The previous inversion
@@ -42,8 +51,8 @@ replace_once(
 ''',
     '''#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WindowRegionKind {
-    /// A valid window without an explicit region. GetWindowRgn reports ERROR
-    /// for this normal case; NULLREGION means an explicitly empty region.
+    /// ERROR means no region for this normal case. NULLREGION means an
+    /// explicitly empty region, not the absence of a region.
     NoRegion,
     Empty,
     Simple,
@@ -78,6 +87,15 @@ replace_once(
     matches!(current_region_kind(hwnd), Some(WindowRegionKind::NoRegion))
 }
 ''',
+)
+
+# The placement path performs the region operation once after the atomic HWND
+# batch. Keep all ownership checks in that transaction rather than retaining a
+# second, racy preflight query that doubles GDI work at every monitor edge.
+remove_between(
+    region_path,
+    "/// Whether an HWND can be safely clipped without replacing an application-owned\n",
+    "/// Install or update a LeopardWM-owned region. `redraw` should be false for an\n",
 )
 
 # Extend the existing test module with a real Win32 HWND test and exact
