@@ -1,12 +1,20 @@
-import { chromium } from 'playwright-core';
 import { pathToFileURL } from 'node:url';
 import path from 'node:path';
+
+const fs = await import('node:fs');
+const playwrightRoot = process.env.NODE_PATH
+  ? path.resolve(process.env.NODE_PATH)
+  : path.resolve(process.cwd(), 'settings-smoke/node_modules');
+const playwrightEntry = path.join(playwrightRoot, 'playwright-core', 'index.js');
+if (!fs.existsSync(playwrightEntry)) {
+  throw new Error(`playwright-core entry not found: ${playwrightEntry}`);
+}
+const { chromium } = await import(pathToFileURL(playwrightEntry).href);
 
 const edgeCandidates = [
   'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
   'C:/Program Files/Microsoft/Edge/Application/msedge.exe',
 ];
-const fs = await import('node:fs');
 const executablePath = edgeCandidates.find((candidate) => fs.existsSync(candidate));
 if (!executablePath) throw new Error('Microsoft Edge executable not found');
 
