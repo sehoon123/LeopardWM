@@ -1,0 +1,84 @@
+name: Diagnose Settings smoke v10
+
+on:
+  push:
+    branches: [agent/full-audit-v10-control]
+    paths:
+      - .github/workflows/agent-diagnose-settings-smoke-v10.yml
+      - .github/scripts/full_audit_v10/settings_smoke.py
+      - .github/scripts/full_audit_v10/verify_source.py
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  diagnose:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/full-audit-v10-control
+          path: control
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/full-audit-v10-source
+          path: source
+          fetch-depth: 0
+      - name: Reconstruct patch
+        working-directory: source
+        shell: pwsh
+        run: |
+          python ../control/.github/scripts/full_audit_v10/reconstruct_patch.py ../control/.github/patches/full-audit-v10 ../full-audit-v10.patch
+          git apply ../full-audit-v10.patch
+          python ../control/.github/scripts/full_audit_v10/verify_source.py
+          node --check ../settings-script-v10.js
+      - name: Generate and run smoke pages
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python ../control/.github/scripts/full_audit_v10/settings_smoke.py
+          $edge = @(
+            "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe",
+            "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe"
+          ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+          if (-not $edge) { throw 'Microsoft Edge was not found' }
+          $uri = ([System.Uri](Resolve-Path ../settings-smoke-v10.html).Path).AbsoluteUri
+          foreach ($size in @('640,420', '780,560')) {
+            $name = $size.Replace(',', 'x')
+            $output = & $edge --headless --disable-gpu --no-first-run --no-default-browser-check --window-size=$size --dump-dom $uri 2>&1
+            $dump = $output -join "`n"
+            $dump | Set-Content "../settings-smoke-$name.html"
+            $match = [regex]::Match($dump, '<pre id="settings-smoke-result">(?<result>[\s\S]*?)</pre>')
+            if ($match.Success) {
+              Write-Host "SMOKE $name`n$($match.Groups['result'].Value)"
+            } else {
+              Write-Host "SMOKE $name result element missing"
+            }
+          }
+      - name: Upload dumps
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: LeopardWM-settings-smoke-v10-diagnostics
+          path: |
+            settings-smoke-v10.html
+            settings-smoke-640x420.html
+            settings-smoke-780x560.html
+          if-no-files-found: error
+          retention-days: 2
+      - name: Record artifact
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+        run: |
+          set -euo pipefail
+          path='agent_docs/full-audit-v10-smoke-diagnostic.json'
+          payload=$(jq -n --arg run_id "$GITHUB_RUN_ID" --arg artifact_id "$ARTIFACT_ID" '{run_id:$run_id,artifact_id:$artifact_id}')
+          content=$(printf '%s\n' "$payload" | base64 -w0)
+          current=$(gh api "repos/$GITHUB_REPOSITORY/contents/$path?ref=agent/full-audit-v10-control" --jq .sha 2>/dev/null || true)
+          args=(--method PUT "repos/$GITHUB_REPOSITORY/contents/$path" -f message='ci: record Settings smoke diagnostics' -f content="$content" -f branch='agent/full-audit-v10-control')
+          if [[ -n "$current" ]]; then args+=(-f sha="$current"); fi
+          gh api "${args[@]}" >/dev/null
