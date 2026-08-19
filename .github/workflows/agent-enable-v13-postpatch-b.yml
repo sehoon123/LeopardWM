@@ -1,0 +1,40 @@
+name: Enable v13 allocation and preflight hardening
+
+on:
+  push:
+    branches:
+      - agent/window-region-clipping-v13-control
+    paths:
+      - .github/workflows/agent-enable-v13-postpatch-b.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch-workflow:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/window-region-clipping-v13-control
+          fetch-depth: 0
+      - name: Add the final optimization pass
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('.github/workflows/agent-verify-release-window-region-v13.yml')
+          text = path.read_text(encoding='utf-8')
+          old = "          python ../control/.github/v13/post_patch_v13.py\n          if ($LASTEXITCODE -ne 0) { throw 'post-patch hardening failed' }\n"
+          new = old + "          python ../control/.github/v13/post_patch_v13b.py\n          if ($LASTEXITCODE -ne 0) { throw 'post-patch optimization failed' }\n"
+          if text.count(old) != 1:
+              raise SystemExit('post-patch workflow marker mismatch')
+          path.write_text(text.replace(old, new), encoding='utf-8', newline='\n')
+          PY
+          git diff --check
+      - name: Commit and restart verification
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .github/workflows/agent-verify-release-window-region-v13.yml
+          git commit -m 'ci: run region preflight optimization before verification'
+          git push origin HEAD:agent/window-region-clipping-v13-control
