@@ -146,6 +146,111 @@ pub(crate) fn park_offscreen_avoiding_neighbors(
     }
 }
 
+fn upsert_region_clip(
+    clips: &mut Vec<leopardwm_platform_win32::WindowRegionClip>,
+    clip: leopardwm_platform_win32::WindowRegionClip,
+) {
+    if let Some(existing) = clips
+        .iter_mut()
+        .find(|existing| existing.window_id == clip.window_id)
+    {
+        *existing = clip;
+    } else {
+        clips.push(clip);
+    }
+}
+
+/// Apply the configured multi-monitor overflow policy to one owner monitor.
+/// `clip` preserves partial columns and emits a Win32 region plan; `hide` uses
+/// the existing whole-window fallback directly. Fully off-screen placements
+/// are always parked clear of every monitor.
+fn prepare_monitor_overflow(
+    placements: &mut [leopardwm_core_layout::WindowPlacement],
+    owner_id: leopardwm_platform_win32::MonitorId,
+    focused_column: Option<usize>,
+    mode: crate::config::MonitorOverflowModeConfig,
+    monitors: &std::collections::HashMap<
+        leopardwm_platform_win32::MonitorId,
+        leopardwm_platform_win32::MonitorInfo,
+    >,
+    monitor_rects: &[leopardwm_core_layout::Rect],
+    region_clips: &mut Vec<leopardwm_platform_win32::WindowRegionClip>,
+) {
+    use crate::config::MonitorOverflowModeConfig;
+    use leopardwm_core_layout::Visibility;
+
+    if mode == MonitorOverflowModeConfig::Hide {
+        park_offscreen_avoiding_neighbors(
+            placements,
+            owner_id,
+            focused_column,
+            monitors,
+            monitor_rects,
+        );
+        return;
+    }
+
+    let Some(owner) = monitors.get(&owner_id) else {
+        return;
+    };
+    let owner_rect = owner.rect;
+    for placement in placements {
+        if placement.column_index == usize::MAX {
+            continue;
+        }
+        let intersects_neighbor = monitors
+            .iter()
+            .filter(|(id, _)| **id != owner_id)
+            .any(|(_, monitor)| placement.rect.intersects(&monitor.rect));
+        if !intersects_neighbor {
+            continue;
+        }
+
+        if placement.visibility != Visibility::Visible {
+            placement.rect = offscreen_park_rect(placement.rect, owner_rect, monitor_rects);
+            continue;
+        }
+
+        let crosses_owner = placement.rect.x < owner_rect.x
+            || placement.rect.right() > owner_rect.right()
+            || placement.rect.y < owner_rect.y
+            || placement.rect.bottom() > owner_rect.bottom();
+        // Mirrored outputs can overlap in virtual coordinates. A tiled window
+        // wholly inside its owner is valid even if another monitor overlaps it.
+        if !crosses_owner {
+            continue;
+        }
+
+        let (fallback_rect, fallback_visibility) = if focused_column == Some(placement.column_index)
+        {
+            (
+                placement.rect.clamped_inside(owner.work_area),
+                Visibility::Visible,
+            )
+        } else {
+            let visibility = if placement.rect.x < owner_rect.x {
+                Visibility::OffScreenLeft
+            } else {
+                Visibility::OffScreenRight
+            };
+            (
+                offscreen_park_rect(placement.rect, owner_rect, monitor_rects),
+                visibility,
+            )
+        };
+
+        upsert_region_clip(
+            region_clips,
+            leopardwm_platform_win32::WindowRegionClip {
+                window_id: placement.window_id,
+                clip_bounds: owner_rect,
+                fallback_rect,
+                fallback_visibility,
+            },
+        );
+    }
+}
+
 /// Pick an off-screen rect for `window` that clears every monitor, tried along
 /// the owning monitor's edges in order (below, above, right, left) and picking
 /// the first that lands on no monitor. Falls back to the far sentinel only if
@@ -294,6 +399,7 @@ impl AppState {
             }
         }
         let mut all_placements = Vec::new();
+        let mut region_clips = Vec::new();
         let monitor_rects: Vec<_> = self.monitors.values().map(|monitor| monitor.rect).collect();
         let mut owner_ranges = Vec::with_capacity(self.monitors.len());
         for (monitor_id, ws_vec) in &self.workspaces {
@@ -326,12 +432,14 @@ impl AppState {
             Self::apply_transition_interpolation(transition, &mut all_placements);
         }
         for (owner_id, focused_column, start, end) in owner_ranges {
-            park_offscreen_avoiding_neighbors(
+            prepare_monitor_overflow(
                 &mut all_placements[start..end],
                 owner_id,
                 focused_column,
+                self.config.layout.monitor_overflow,
                 &self.monitors,
                 &monitor_rects,
+                &mut region_clips,
             );
         }
         // `apply_transition_interpolation` appends exiting windows. They are
@@ -341,12 +449,14 @@ impl AppState {
             if let Some((owner_id, _)) = self.find_window_workspace(placement.window_id) {
                 // Exiting windows are not the active focused column for
                 // this frame; never pin an old workspace back on-screen.
-                park_offscreen_avoiding_neighbors(
+                prepare_monitor_overflow(
                     std::slice::from_mut(placement),
                     owner_id,
                     None,
+                    self.config.layout.monitor_overflow,
                     &self.monitors,
                     &monitor_rects,
+                    &mut region_clips,
                 );
             }
         }
@@ -381,6 +491,7 @@ impl AppState {
         };
         let request = animation_worker::FrameRequest {
             placements: live_placements,
+            region_clips,
             ghost_updates,
             platform_config,
         };
@@ -497,7 +608,7 @@ impl AppState {
             }
         }
 
-        let mut all_placements = self.collect_apply_placements();
+        let (mut all_placements, region_clips) = self.collect_apply_placements();
 
         // Interpolate layout transitions (structural changes like move/expel).
         if let Some(ref transition) = self.layout_transition {
@@ -524,7 +635,10 @@ impl AppState {
         // serialize on the daemon mutex, leaving focus events draining for
         // seconds after the user stops pressing. Returning early lets the
         // event loop catch up at near-memory speed.
-        let placements_unchanged = self.placements_match_last_applied(&all_placements);
+        // Region ownership is verified for every clipped landing. Do not let
+        // an unchanged rectangle bypass recovery after an app replaces a region.
+        let placements_unchanged =
+            region_clips.is_empty() && self.placements_match_last_applied(&all_placements);
         // Tests that inject worker behavior need the worker to actually
         // run, so they opt out of the fast path.
         #[cfg(test)]
@@ -557,7 +671,7 @@ impl AppState {
         // timeout can re-arm the compositor repair for the next exact landing.
         let landing_repair_requested = self.post_animation_landing_pending;
         let timeout = self.layout_apply_timeout;
-        let (rx, worker_handle) = match self.spawn_apply_worker(all_placements) {
+        let (rx, worker_handle) = match self.spawn_apply_worker(all_placements, region_clips) {
             Ok(worker) => worker,
             Err(error) => {
                 self.last_placed_layout_rects.clear();
@@ -671,8 +785,14 @@ impl AppState {
     }
 
     /// Collect animated placements for every monitor's active workspace, with debug logging.
-    fn collect_apply_placements(&self) -> Vec<leopardwm_core_layout::WindowPlacement> {
+    fn collect_apply_placements(
+        &self,
+    ) -> (
+        Vec<leopardwm_core_layout::WindowPlacement>,
+        Vec<leopardwm_platform_win32::WindowRegionClip>,
+    ) {
         let mut all_placements = Vec::new();
+        let mut region_clips = Vec::new();
         // Reuse one monitor-rect snapshot for every owner monitor in this
         // batch instead of allocating it again per monitor.
         let monitor_rects: Vec<_> = self.monitors.values().map(|monitor| monitor.rect).collect();
@@ -686,12 +806,14 @@ impl AppState {
                     let mut placements = workspace.compute_placements_animated(viewport);
                     let focused_column = (*monitor_id == self.focused_monitor)
                         .then(|| workspace.focused_column_index());
-                    park_offscreen_avoiding_neighbors(
+                    prepare_monitor_overflow(
                         &mut placements,
                         *monitor_id,
                         focused_column,
+                        self.config.layout.monitor_overflow,
                         &self.monitors,
                         &monitor_rects,
+                        &mut region_clips,
                     );
                     debug!(
                         "Monitor {}: {} placements for viewport {}x{} (animating: {}, scroll: {:.1}, minimized: {})",
@@ -722,7 +844,7 @@ impl AppState {
             }
         }
 
-        all_placements
+        (all_placements, region_clips)
     }
 
     /// Fast-path check: every placement matches the last applied rect and the visible-set is unchanged.
@@ -781,6 +903,7 @@ impl AppState {
     fn spawn_apply_worker(
         &mut self,
         all_placements: Vec<leopardwm_core_layout::WindowPlacement>,
+        region_clips: Vec<leopardwm_platform_win32::WindowRegionClip>,
     ) -> Result<(
         std::sync::mpsc::Receiver<ApplyWorkerMsg>,
         std::thread::JoinHandle<()>,
@@ -859,8 +982,9 @@ impl AppState {
                     return;
                 }
                 let (result, width_violations, height_violations, geometry_mismatches) =
-                    match leopardwm_platform_win32::apply_placements(
+                    match leopardwm_platform_win32::apply_placements_with_regions(
                         &all_placements,
+                        &region_clips,
                         &platform_config,
                         None,
                         post_animation_nudge,

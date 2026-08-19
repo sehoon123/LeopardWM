@@ -102,3 +102,24 @@ mod tests {
         assert!(SETTINGS_HTML.contains("default_width_preset: defaultWidthPreset"));
     }
 }
+
+#[cfg(test)]
+mod monitor_overflow_settings_tests {
+    use super::SETTINGS_HTML;
+
+    #[test]
+    fn monitor_overflow_control_is_complete_and_round_trippable() {
+        for marker in [
+            "id=\"layout-monitor_overflow\"",
+            "value=\"clip\"",
+            "value=\"hide\"",
+            "cfg.layout.monitor_overflow || 'clip'",
+            "monitor_overflow: document.getElementById('layout-monitor_overflow').value",
+        ] {
+            assert!(
+                SETTINGS_HTML.contains(marker),
+                "missing Settings marker: {marker}"
+            );
+        }
+    }
+}

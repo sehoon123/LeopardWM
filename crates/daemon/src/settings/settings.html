@@ -964,6 +964,13 @@ input[type="range"]::-webkit-slider-thumb {
             <label class="toggle"><input type="checkbox" id="layout-center_past_edges"><span class="track"></span><span class="thumb"></span></label>
           </div>
           <div class="field">
+            <div class="field-info"><div class="field-label">Monitor overflow</div><div class="field-desc">Show partial neighboring columns without painting on another monitor</div></div>
+            <select id="layout-monitor_overflow">
+              <option value="clip">Clip at monitor edge</option>
+              <option value="hide">Hide whole window</option>
+            </select>
+          </div>
+          <div class="field">
             <div class="field-info"><div class="field-label">Default floating width</div><div class="field-desc">Initial manual floating-window width (logical px)</div></div>
             <input type="number" id="layout-default_floating_width" min="1">
           </div>
@@ -1561,6 +1568,7 @@ function init(cfg) {
   (cfg.layout.height_presets || [0.333,0.5,0.667]).forEach(function(v) { addPresetRow('height', v); });
   setCb('cb-layout-centering_mode', cfg.layout.centering_mode);
   setChecked('layout-center_past_edges', cfg.layout.center_past_edges);
+      document.getElementById('layout-monitor_overflow').value = cfg.layout.monitor_overflow || 'clip';
 
   setChecked('appearance-active_border', cfg.appearance.active_border);
   setVal('appearance-active_border_color', hexToInput(cfg.appearance.active_border_color));
@@ -2171,7 +2179,8 @@ function readConfig() {
       height_presets: readPresets('height'),
       default_width_preset: defaultWidthPreset,
       centering_mode: cbVal('cb-layout-centering_mode'),
-      center_past_edges: checked('layout-center_past_edges')
+      center_past_edges: checked('layout-center_past_edges'),
+          monitor_overflow: document.getElementById('layout-monitor_overflow').value
     },
     appearance: {
       active_border: checked('appearance-active_border'),

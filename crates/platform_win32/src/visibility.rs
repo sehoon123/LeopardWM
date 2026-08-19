@@ -31,6 +31,7 @@ pub fn is_move_offscreen_sentinel_rect(rect: &Rect) -> bool {
 /// Move a single window to the off-screen sentinel position.
 /// Used by workspace switching to hide inactive workspace windows.
 pub fn move_window_offscreen(window_id: WindowId) -> Result<(), Win32Error> {
+    let _ = crate::window_region::restore_window_region(window_id, false);
     let hwnd = window_id_to_hwnd(window_id)?;
     unsafe {
         if let Err(e) = SetWindowPos(
@@ -66,6 +67,7 @@ fn position_window_flags() -> windows::Win32::UI::WindowsAndMessaging::SET_WINDO
 /// synchronous so the window's rect is correct immediately (the async
 /// layout pass would otherwise leave it stale).
 pub fn position_window(window_id: WindowId, rect: Rect) -> Result<(), Win32Error> {
+    let _ = crate::window_region::restore_window_region(window_id, false);
     let hwnd = window_id_to_hwnd(window_id)?;
     unsafe {
         SetWindowPos(
@@ -165,6 +167,7 @@ fn restore_window_if_offscreen_to_work_area(
 /// Returns `Ok(true)` if the window was restored, `Ok(false)` if it was not at
 /// sentinel coordinates, and `Err` if restore operations failed.
 pub fn restore_window_moved_offscreen(window_id: WindowId) -> Result<bool, Win32Error> {
+    let _ = crate::window_region::restore_window_region(window_id, false);
     let primary = get_primary_monitor()?;
     restore_window_if_offscreen_to_work_area(window_id, &primary.work_area)
 }

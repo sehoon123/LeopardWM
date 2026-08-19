@@ -17,7 +17,7 @@ use windows::Win32::Graphics::Gdi::{
     CreateRectRgn, DeleteObject, EqualRgn, GetWindowRgn, SetWindowRgn, HGDIOBJ,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetPropW, GetClassNameW, GetWindowThreadProcessId, IsWindow, RemovePropW, SetPropW,
+    GetClassNameW, GetPropW, GetWindowThreadProcessId, IsWindow, RemovePropW, SetPropW,
 };
 
 const ERROR_REGION_KIND: i32 = 0;
@@ -75,9 +75,7 @@ fn lock_states() -> std::sync::MutexGuard<'static, HashMap<WindowId, RegionState
 }
 
 fn lock_commit() -> std::sync::MutexGuard<'static, ()> {
-    REGION_COMMIT
-        .lock()
-        .unwrap_or_else(recover_poisoned_mutex)
+    REGION_COMMIT.lock().unwrap_or_else(recover_poisoned_mutex)
 }
 
 fn identity(window_id: WindowId) -> Option<WindowIdentity> {
@@ -133,8 +131,7 @@ fn decode_coordinate(value: HANDLE) -> Option<i32> {
 }
 
 fn has_owner_marker(hwnd: HWND) -> bool {
-    usize_from_handle(unsafe { GetPropW(hwnd, w!("LeopardWM.RegionClip.v2.Owner")) })
-        == OWNER_MAGIC
+    usize_from_handle(unsafe { GetPropW(hwnd, w!("LeopardWM.RegionClip.v2.Owner")) }) == OWNER_MAGIC
 }
 
 fn remove_metadata(hwnd: HWND) {
@@ -191,8 +188,7 @@ fn read_metadata(hwnd: HWND) -> Option<Rect> {
     }
     let left = decode_coordinate(unsafe { GetPropW(hwnd, w!("LeopardWM.RegionClip.v2.Left")) })?;
     let top = decode_coordinate(unsafe { GetPropW(hwnd, w!("LeopardWM.RegionClip.v2.Top")) })?;
-    let right =
-        decode_coordinate(unsafe { GetPropW(hwnd, w!("LeopardWM.RegionClip.v2.Right")) })?;
+    let right = decode_coordinate(unsafe { GetPropW(hwnd, w!("LeopardWM.RegionClip.v2.Right")) })?;
     let bottom =
         decode_coordinate(unsafe { GetPropW(hwnd, w!("LeopardWM.RegionClip.v2.Bottom")) })?;
     if right <= left || bottom <= top {

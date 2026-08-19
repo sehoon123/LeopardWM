@@ -164,6 +164,10 @@ pub struct LayoutConfig {
     #[serde(default = "default_false")]
     pub center_past_edges: bool,
 
+    /// How tiled windows that cross an adjacent monitor boundary are handled.
+    #[serde(default)]
+    pub monitor_overflow: MonitorOverflowModeConfig,
+
     /// Width presets for cycling (fractions of usable viewport width).
     #[serde(default = "default_width_presets")]
     pub width_presets: Vec<f64>,
@@ -237,6 +241,7 @@ impl Default for LayoutConfig {
             remember_scratchpad_size: true,
             centering_mode: CenteringModeConfig::default(),
             center_past_edges: false,
+            monitor_overflow: MonitorOverflowModeConfig::default(),
             width_presets: default_width_presets(),
             default_width_preset: default_width_preset(),
             height_presets: default_height_presets(),
@@ -318,6 +323,19 @@ impl From<CenteringModeConfig> for CenteringMode {
             CenteringModeConfig::OnOverflow => CenteringMode::OnOverflow,
         }
     }
+}
+
+/// Multi-monitor overflow policy for tiled windows.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MonitorOverflowModeConfig {
+    /// Preserve partially visible neighboring columns and clip only the pixels
+    /// that would be painted on another monitor.
+    #[default]
+    Clip,
+    /// Conservative fallback: hide a tiled window as a whole when it would
+    /// intersect another monitor.
+    Hide,
 }
 
 /// Appearance-related configuration.
@@ -3060,5 +3078,32 @@ mod tests {
         assert_eq!(loaded.appearance.active_border_color, "FF0000");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod monitor_overflow_mode_tests {
+    use super::{Config, MonitorOverflowModeConfig};
+
+    #[test]
+    fn monitor_overflow_defaults_to_clip_for_existing_configs() {
+        let config: Config = toml::from_str("[layout]\ncentering_mode = \"center\"\n").unwrap();
+        assert_eq!(
+            config.layout.monitor_overflow,
+            MonitorOverflowModeConfig::Clip
+        );
+    }
+
+    #[test]
+    fn monitor_overflow_hide_round_trips() {
+        let mut config = Config::default();
+        config.layout.monitor_overflow = MonitorOverflowModeConfig::Hide;
+        let encoded = toml::to_string(&config).unwrap();
+        assert!(encoded.contains("monitor_overflow = \"hide\""));
+        let decoded: Config = toml::from_str(&encoded).unwrap();
+        assert_eq!(
+            decoded.layout.monitor_overflow,
+            MonitorOverflowModeConfig::Hide
+        );
     }
 }

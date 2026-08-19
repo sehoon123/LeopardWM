@@ -23,6 +23,7 @@ pub struct FrameRequest {
     /// Excludes any windows being driven via DWM thumbnail (those are in
     /// `ghost_updates`).
     pub placements: Vec<WindowPlacement>,
+    pub region_clips: Vec<leopardwm_platform_win32::WindowRegionClip>,
     /// Thumbnail destination-rect updates for windows being ghost-animated
     /// this frame. The worker calls `DwmUpdateThumbnailProperties` for
     /// each before `DwmFlush`, so live and ghost windows arrive on the
@@ -317,8 +318,9 @@ fn worker_loop(
                 // compositor-sensitive HWNDs, and omits already-hung sensitive
                 // targets until the bounded exact landing pass.
                 let (apply_result, width_violations, height_violations) =
-                    match leopardwm_platform_win32::apply_placements(
+                    match leopardwm_platform_win32::apply_placements_with_regions(
                         &request.placements,
+                        &request.region_clips,
                         &request.platform_config,
                         Some(&mut placement_cache),
                         false,
