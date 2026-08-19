@@ -1,0 +1,92 @@
+name: Switch v10 validation to the clean final source branch
+
+on:
+  push:
+    branches:
+      - agent/window-region-clipping-v10-control
+    paths:
+      - .github/workflows/agent-switch-window-region-v10-final-source.yml
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/window-region-clipping-v10-control
+          fetch-depth: 0
+
+      - name: Point the release gate at the clean final source branch
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('.github/workflows/agent-release-window-region-v10.yml')
+          text = path.read_text(encoding='utf-8')
+
+          old = '  SOURCE_BRANCH: agent/window-region-clipping-v10-source\n'
+          new = '  SOURCE_BRANCH: agent/window-region-clipping-v10-final-source\n'
+          if old in text:
+              text = text.replace(old, new, 1)
+          elif new not in text:
+              raise SystemExit('SOURCE_BRANCH anchor missing')
+
+          scripts = [
+              'apply_window_region_clipping_v10.py',
+              'harden_window_region_clipping_v10.py',
+              'finalize_window_region_clipping_v10.py',
+              'finalize_window_region_clipping_v10_part2.py',
+          ]
+          trigger_anchor = '      - .github/scripts/apply_window_region_clipping_v10.py\n'
+          call_anchor = '          python ../control/.github/scripts/apply_window_region_clipping_v10.py\n'
+          if trigger_anchor not in text or call_anchor not in text:
+              raise SystemExit('base script anchors missing')
+
+          trigger_lines = ''.join(f'      - .github/scripts/{name}\n' for name in scripts)
+          start = text.index(trigger_anchor)
+          end = start
+          while end < len(text) and text.startswith('      - .github/scripts/', end):
+              end = text.index('\n', end) + 1
+          text = text[:start] + trigger_lines + text[end:]
+
+          call_lines = ''.join(f'          python ../control/.github/scripts/{name}\n' for name in scripts)
+          start = text.index(call_anchor)
+          end = start
+          while end < len(text) and text.startswith('          python ../control/.github/scripts/', end):
+              end = text.index('\n', end) + 1
+          text = text[:start] + call_lines + text[end:]
+
+          allowed_anchor = "            'crates/platform_win32/src/window_region.rs'\n"
+          if "'crates/daemon/src/transitions.rs'" not in text:
+              if allowed_anchor not in text:
+                  raise SystemExit('allowed-files anchor missing')
+              text = text.replace(
+                  allowed_anchor,
+                  "            'crates/daemon/src/transitions.rs',\n" + allowed_anchor,
+                  1,
+              )
+
+          add_anchor = 'crates/daemon/src/settings/settings.html crates/daemon/src/state.rs '
+          if 'crates/daemon/src/transitions.rs crates/daemon/src/state.rs' not in text:
+              if add_anchor not in text:
+                  raise SystemExit('git-add anchor missing')
+              text = text.replace(
+                  add_anchor,
+                  'crates/daemon/src/settings/settings.html crates/daemon/src/transitions.rs crates/daemon/src/state.rs ',
+                  1,
+              )
+
+          path.write_text(text, encoding='utf-8', newline='\n')
+          PY
+          git diff --check
+
+      - name: Commit the final validation target
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add .github/workflows/agent-release-window-region-v10.yml
+          git commit -m 'ci: validate v10 from a clean final source branch'
+          git push origin HEAD:agent/window-region-clipping-v10-control
