@@ -1,6 +1,9 @@
 {
-  "state": "started",
+  "state": "success",
   "run_id": "32283051701",
   "run_url": "https://github.com/sehoon123/LeopardWM/actions/runs/32283051701",
-  "expected_main": "7960ef23199cf1f53e7de7cb765b5d0280d52fc5"
+  "tag": "v0.2.6-sehoon.11",
+  "source_sha": "1f5dc0b5b2e0364185f7025b06f1420d4f75ef2d",
+  "zip_sha256": "75a45265f4fda2d36a10dbe85fc404130d69d33269eff8ac6b23f4bbabfb460e",
+  "msi_sha256": "10a806bcfc39375adbdcdfdefdbb4515c9183b27a2b3409fa7bb2381a8d5194e"
 }
