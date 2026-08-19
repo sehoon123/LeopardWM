@@ -2,6 +2,12 @@ use crate::*;
 
 use crate::workspace::Workspace;
 
+#[derive(Debug, Clone, Copy)]
+struct FocusScrollTarget {
+    offset: f64,
+    allow_edge_overscroll: bool,
+}
+
 impl Workspace {
     fn column_x(&self, column_index: usize) -> i32 {
         self.column_x_with_minimized_handling(column_index, true)
@@ -9,34 +15,27 @@ impl Workspace {
 
     /// Compute the X position of a column, optionally skipping minimized columns.
     fn column_x_with_minimized_handling(&self, column_index: usize, skip_minimized: bool) -> i32 {
-        // Defensively clamp gaps to >= 0
         let gap = self.gap.max(0);
-
-        // Strip coordinates start at 0 — outer gaps are viewport padding,
-        // not part of the scrollable strip.
         let mut x = 0;
-        for (i, col) in self.columns.iter().enumerate() {
-            if i == column_index {
+        for (index, column) in self.columns.iter().enumerate() {
+            if index == column_index {
                 return x;
             }
-            // Skip fully-minimized columns when requested
-            if skip_minimized && !self.is_column_active(col) {
+            if skip_minimized && !self.is_column_active(column) {
                 continue;
             }
-            x = x.saturating_add(col.width).saturating_add(gap);
+            x = x.saturating_add(column.width).saturating_add(gap);
         }
         x
     }
 
-    /// Get the x-coordinate and width of the focused column.
     fn focused_column_bounds(&self) -> Option<(i32, i32)> {
-        self.columns.get(self.focused_column).map(|col| {
-            let x = self.column_x(self.focused_column);
-            (x, col.width)
-        })
+        self.columns
+            .get(self.focused_column)
+            .map(|column| (self.column_x(self.focused_column), column.width))
     }
 
-    /// The width of the visible strip area inside the viewport (viewport minus outer padding).
+    /// Width available to the scrolling strip after horizontal outer gaps.
     pub(crate) fn visible_width(&self, viewport_width: i32) -> i32 {
         viewport_width
             .saturating_sub(self.outer_gap_left.max(0))
@@ -44,92 +43,123 @@ impl Workspace {
             .max(0)
     }
 
-    /// Whether the focused column should be centered under the current
-    /// centering mode. `OnOverflow` centers only when the column is wider
-    /// than the visible area (it cannot fit otherwise).
-    fn should_center(&self, col_width: i32, vis_w: i32) -> bool {
+    fn should_center(&self, column_width: i32, visible_width: i32) -> bool {
         match self.centering_mode {
             CenteringMode::Center => true,
             CenteringMode::JustInView => false,
-            CenteringMode::OnOverflow => col_width > vis_w,
+            CenteringMode::OnOverflow => column_width > visible_width,
         }
     }
 
-    /// Valid scroll limits for the current focus. Normal scrolling stays in
-    /// `[0, max_scroll]`; `center_past_edges` extends only the edge containing
-    /// a column centered by the active mode or the explicit center command.
-    fn focused_scroll_bounds(&self, vis_w: i32) -> (f64, f64) {
-        let normal_max = (self.total_width() - vis_w).max(0) as f64;
-        if !self.center_past_edges {
-            return (0.0, normal_max);
-        }
-        let Some((col_x, col_width)) = self.focused_column_bounds() else {
-            return (0.0, normal_max);
-        };
-        let centered = col_x
-            .saturating_add(col_width / 2)
-            .saturating_sub(vis_w / 2) as f64;
-        // The explicit center command intentionally overrides JustInView. Once
-        // its animation lands, preserve that exact edge target; a structural
-        // change alters `centered`, so a stale old target stops qualifying.
-        let explicitly_centered = (self.scroll_offset - centered).abs() < 0.5;
-        if !self.should_center(col_width, vis_w) && !explicitly_centered {
-            return (0.0, normal_max);
-        }
-        let first_active = self
-            .columns
-            .iter()
-            .position(|column| self.is_column_active(column));
-        let last_active = self
-            .columns
-            .iter()
-            .rposition(|column| self.is_column_active(column));
-        let min_scroll = if first_active == Some(self.focused_column) {
-            centered.min(0.0)
-        } else {
-            0.0
-        };
-        let max_scroll = if last_active == Some(self.focused_column) {
-            centered.max(normal_max)
-        } else {
-            normal_max
-        };
-        (min_scroll, max_scroll)
+    fn centered_scroll_target(column_x: i32, column_width: i32, visible_width: i32) -> f64 {
+        f64::from(column_x) + f64::from(column_width.max(0)) / 2.0
+            - f64::from(visible_width.max(0)) / 2.0
     }
 
-    /// Ensure the focused column is visible in the viewport.
-    /// Adjusts scroll_offset according to the centering mode.
-    ///
-    /// Note: Negative gaps are treated as zero for calculation purposes.
-    pub fn ensure_focused_visible(&mut self, viewport_width: i32) {
-        if self.columns.is_empty() {
-            return;
+    /// Return the closest offset that fully exposes a fitting column. For an
+    /// oversized column, keep the viewport inside the column with the smallest
+    /// possible movement instead of snapping arbitrarily to either edge.
+    fn nearest_visible_scroll_target(
+        current: f64,
+        column_x: i32,
+        column_width: i32,
+        visible_width: i32,
+    ) -> f64 {
+        if visible_width <= 0 {
+            return 0.0;
         }
+        let current = if current.is_finite() { current } else { 0.0 };
+        let left = f64::from(column_x);
+        let width = f64::from(column_width.max(0));
+        let right = left + width;
+        let viewport = f64::from(visible_width);
 
-        let Some((col_x, col_width)) = self.focused_column_bounds() else {
-            return;
-        };
-
-        // Outer gaps are viewport padding — visible strip area is smaller.
-        let vis_w = self.visible_width(viewport_width);
-
-        if self.should_center(col_width, vis_w) {
-            let col_center = col_x.saturating_add(col_width / 2);
-            self.scroll_offset = (col_center.saturating_sub(vis_w / 2)) as f64;
+        let (minimum, maximum) = if width <= viewport {
+            // Every offset in this interval keeps the complete column visible.
+            (right - viewport, left)
         } else {
-            let scroll_left = self.scroll_offset.round() as i32;
-            let scroll_right = scroll_left.saturating_add(vis_w);
-            let col_right = col_x.saturating_add(col_width);
+            // The column cannot fit. Every offset in this interval keeps the
+            // complete viewport inside it, maximizing visible focused content.
+            (left, right - viewport)
+        };
+        current.clamp(minimum.min(maximum), minimum.max(maximum))
+    }
 
-            if col_x < scroll_left {
-                self.scroll_offset = col_x as f64;
-            } else if col_right > scroll_right {
-                self.scroll_offset = col_right.saturating_sub(vis_w) as f64;
+    fn focus_scroll_target(
+        &self,
+        current: f64,
+        column_x: i32,
+        column_width: i32,
+        visible_width: i32,
+    ) -> FocusScrollTarget {
+        if self.should_center(column_width, visible_width) {
+            FocusScrollTarget {
+                offset: Self::centered_scroll_target(column_x, column_width, visible_width),
+                allow_edge_overscroll: self.center_past_edges,
+            }
+        } else {
+            FocusScrollTarget {
+                offset: Self::nearest_visible_scroll_target(
+                    current,
+                    column_x,
+                    column_width,
+                    visible_width,
+                ),
+                allow_edge_overscroll: false,
             }
         }
+    }
 
-        let (min_scroll, max_scroll) = self.focused_scroll_bounds(vis_w);
-        self.scroll_offset = self.scroll_offset.clamp(min_scroll, max_scroll);
+    fn normal_scroll_bounds(&self, visible_width: i32) -> (f64, f64) {
+        let maximum = self.total_width().saturating_sub(visible_width).max(0);
+        (0.0, f64::from(maximum))
+    }
+
+    fn scroll_bounds_for_focus(
+        &self,
+        visible_width: i32,
+        allow_edge_overscroll: bool,
+    ) -> (f64, f64) {
+        let normal = self.normal_scroll_bounds(visible_width);
+        if !allow_edge_overscroll || !self.center_past_edges {
+            return normal;
+        }
+
+        let Some((column_x, column_width)) = self.focused_column_bounds() else {
+            return normal;
+        };
+        let centered = Self::centered_scroll_target(column_x, column_width, visible_width);
+        // For a strip shorter than the viewport, a middle column can also
+        // require edge overscroll to reach the center. Extend only as far as
+        // this focus's exact centered target; arbitrary blank-space scrolling
+        // remains impossible.
+        (normal.0.min(centered), normal.1.max(centered))
+    }
+
+    /// Bounds used by render-time repair. Explicit center-column commands are
+    /// preserved while their exact target still matches the current geometry.
+    fn focused_scroll_bounds(&self, visible_width: i32) -> (f64, f64) {
+        let Some((column_x, column_width)) = self.focused_column_bounds() else {
+            return self.normal_scroll_bounds(visible_width);
+        };
+        let centered = Self::centered_scroll_target(column_x, column_width, visible_width);
+        let explicitly_centered = (self.scroll_offset - centered).abs() < 0.5;
+        self.scroll_bounds_for_focus(
+            visible_width,
+            self.should_center(column_width, visible_width) || explicitly_centered,
+        )
+    }
+
+    /// Adjust the viewport according to the configured focus policy.
+    pub fn ensure_focused_visible(&mut self, viewport_width: i32) {
+        let Some((column_x, column_width)) = self.focused_column_bounds() else {
+            return;
+        };
+        let visible_width = self.visible_width(viewport_width);
+        let target =
+            self.focus_scroll_target(self.scroll_offset, column_x, column_width, visible_width);
+        let bounds = self.scroll_bounds_for_focus(visible_width, target.allow_edge_overscroll);
+        self.scroll_offset = target.offset.clamp(bounds.0, bounds.1);
     }
 
     /// Enforce the scroll bounds for the current content and focus.
@@ -513,8 +543,32 @@ impl Workspace {
         }
     }
 
-    /// Start an animated scroll to a target offset.
-    /// If an animation is already active, it will be cancelled and a new one started.
+    fn start_scroll_animation_to(
+        &mut self,
+        target: f64,
+        duration_ms: Option<u64>,
+        easing: Option<Easing>,
+    ) {
+        let target = if target.is_finite() { target } else { 0.0 };
+        let current = self.effective_scroll_offset();
+        let start = if current.is_finite() { current } else { 0.0 };
+        if (start - target).abs() < 0.5 {
+            self.scroll_offset = target;
+            self.active_animation = None;
+            return;
+        }
+
+        self.active_animation = Some(ScrollAnimation::new(
+            start,
+            target,
+            duration_ms.unwrap_or(self.scroll_duration_ms),
+            easing.unwrap_or(self.scroll_easing),
+        ));
+    }
+
+    /// Start an animated scroll to a target offset. Public callers retain the
+    /// current focus-aware bounds; focus navigation uses the more precise plan
+    /// produced by `focus_scroll_target`.
     pub fn start_scroll_animation(
         &mut self,
         target: f64,
@@ -522,29 +576,10 @@ impl Workspace {
         duration_ms: Option<u64>,
         easing: Option<Easing>,
     ) {
-        // Center mode may intentionally scroll past the strip edges so the
-        // first and last active columns can reach the viewport center. Manual
-        // scrolling remains clamped by `scroll_by`.
-        let vis_w = self.visible_width(viewport_width);
-        let (min_scroll, max_scroll) = self.focused_scroll_bounds(vis_w);
-        let clamped_target = target.clamp(min_scroll, max_scroll);
-
-        // Use current effective position as start (handles interrupting animations)
-        let start = self.effective_scroll_offset();
-
-        // If already at target, no animation needed
-        if (start - clamped_target).abs() < 0.5 {
-            self.scroll_offset = clamped_target;
-            self.active_animation = None;
-            return;
-        }
-
-        // Explicit args win; otherwise use this workspace's configured
-        // scroll params (set by the daemon from `[animation]`).
-        let duration = duration_ms.unwrap_or(self.scroll_duration_ms);
-        let ease = easing.unwrap_or(self.scroll_easing);
-
-        self.active_animation = Some(ScrollAnimation::new(start, clamped_target, duration, ease));
+        let visible_width = self.visible_width(viewport_width);
+        let bounds = self.focused_scroll_bounds(visible_width);
+        let target = if target.is_finite() { target } else { 0.0 };
+        self.start_scroll_animation_to(target.clamp(bounds.0, bounds.1), duration_ms, easing);
     }
 
     /// Advance the active animation by the given delta time in milliseconds.
@@ -580,100 +615,44 @@ impl Workspace {
         }
     }
 
-    /// Ensure the focused column is visible with animation.
-    /// Like `ensure_focused_visible` but animates the scroll instead of jumping.
-    /// Snaps instantly when `reduce_motion` is set.
+    /// Ensure the focused column is visible with animation. The same pure
+    /// target calculation is used by both animated and reduced-motion paths.
     pub fn ensure_focused_visible_animated(&mut self, viewport_width: i32) {
         if self.reduce_motion {
             self.stop_animation();
             self.ensure_focused_visible(viewport_width);
             return;
         }
-        if self.columns.is_empty() {
-            return;
-        }
 
-        let Some((col_x, col_width)) = self.focused_column_bounds() else {
+        let Some((column_x, column_width)) = self.focused_column_bounds() else {
             return;
         };
-
-        let vis_w = self.visible_width(viewport_width);
-
-        let target_offset = if self.should_center(col_width, vis_w) {
-            let col_center = col_x.saturating_add(col_width / 2);
-            (col_center.saturating_sub(vis_w / 2)) as f64
-        } else {
-            let current = self.effective_scroll_offset();
-            let scroll_left = current.round() as i32;
-            let scroll_right = scroll_left.saturating_add(vis_w);
-            let col_right = col_x.saturating_add(col_width);
-
-            if col_x < scroll_left {
-                col_x as f64
-            } else if col_right > scroll_right {
-                col_right.saturating_sub(vis_w) as f64
-            } else {
-                let max_scroll = (self.total_width() - vis_w).max(0) as f64;
-                if current < -0.5 {
-                    0.0
-                } else if current > max_scroll + 0.5 {
-                    max_scroll
-                } else {
-                    return;
-                }
-            }
-        };
-
-        self.start_scroll_animation(target_offset, viewport_width, None, None);
+        let visible_width = self.visible_width(viewport_width);
+        let target = self.focus_scroll_target(
+            self.effective_scroll_offset(),
+            column_x,
+            column_width,
+            visible_width,
+        );
+        let bounds = self.scroll_bounds_for_focus(visible_width, target.allow_edge_overscroll);
+        self.start_scroll_animation_to(target.offset.clamp(bounds.0, bounds.1), None, None);
     }
 
     /// Center the focused column in the viewport, regardless of centering mode.
-    /// When `center_past_edges` is true, first/last columns truly center with
-    /// empty space; otherwise the scroll is clamped to content boundaries.
     pub fn center_focused_column_animated(&mut self, viewport_width: i32) {
-        if self.columns.is_empty() {
-            return;
-        }
-
-        let Some((col_x, col_width)) = self.focused_column_bounds() else {
+        let Some((column_x, column_width)) = self.focused_column_bounds() else {
             return;
         };
+        let visible_width = self.visible_width(viewport_width);
+        let target = Self::centered_scroll_target(column_x, column_width, visible_width);
+        let bounds = self.scroll_bounds_for_focus(visible_width, true);
+        let target = target.clamp(bounds.0, bounds.1);
 
-        let vis_w = self.visible_width(viewport_width);
-        let col_center = col_x.saturating_add(col_width / 2);
-        let target = (col_center - vis_w / 2) as f64;
-
-        if self.center_past_edges {
-            // Unclamped — allow negative offsets and scrolling past the end
-            if self.reduce_motion {
-                self.stop_animation();
-                self.scroll_offset = target;
-                return;
-            }
-
-            let start = self.effective_scroll_offset();
-            if (start - target).abs() < 0.5 {
-                self.scroll_offset = target;
-                self.active_animation = None;
-                return;
-            }
-
-            self.active_animation = Some(ScrollAnimation::new(
-                start,
-                target,
-                self.scroll_duration_ms,
-                self.scroll_easing,
-            ));
+        if self.reduce_motion {
+            self.stop_animation();
+            self.scroll_offset = target;
         } else {
-            // Clamped — use the standard scroll animation path
-            if self.reduce_motion {
-                self.stop_animation();
-                let max_scroll = (self.total_width() - vis_w).max(0);
-                self.scroll_offset = target.clamp(0.0, max_scroll as f64);
-                return;
-            }
-
-            self.start_scroll_animation(target, viewport_width, None, None);
+            self.start_scroll_animation_to(target, None, None);
         }
     }
 }

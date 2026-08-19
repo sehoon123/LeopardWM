@@ -18,10 +18,12 @@ pub enum CenteringMode {
     /// Center the focused column in the viewport.
     #[default]
     Center,
-    /// Only scroll if the focused column would be outside the viewport.
+    /// Move by the minimum distance needed to fully expose a fitting column.
+    /// For an oversized column, keep the viewport inside it without an
+    /// unnecessary edge snap.
     JustInView,
-    /// Center only when the focused column is wider than the viewport (so it
-    /// cannot fit otherwise); behave like `JustInView` for columns that fit.
+    /// Behave like `JustInView` for fitting columns and center only when the
+    /// focused column is wider than the viewport.
     OnOverflow,
 }
 

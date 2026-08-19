@@ -1466,3 +1466,6 @@ mod monitor_isolation_tests {
 #[cfg(test)]
 #[path = "layout_apply_edge_tests.rs"]
 mod edge_safety_audit_tests;
+#[cfg(test)]
+#[path = "layout_apply_focus_modes.rs"]
+mod focus_mode_preview_tests;
