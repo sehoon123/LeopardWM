@@ -1,4 +1,12 @@
 from pathlib import Path
+import runpy
+
+# Apply the product-side popup fix before exercising the exact document that
+# will be compiled into the daemon and committed after the quality gate.
+runpy.run_path(
+    '../control/.github/scripts/full_audit_v10/fix_settings_popup.py',
+    run_name='__main__',
+)
 
 source = Path('crates/daemon/src/settings/settings.html').read_text(encoding='utf-8')
 source = source.replace(
