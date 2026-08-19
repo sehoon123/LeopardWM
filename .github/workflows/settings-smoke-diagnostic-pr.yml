@@ -35,7 +35,13 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           python ../control/.github/scripts/full_audit_v10/reconstruct_patch.py ../control/.github/patches/full-audit-v10 ../full-audit-v10.patch
+          git config core.autocrlf false
+          git reset --hard HEAD
+          git apply --check ../full-audit-v10.patch
+          if ($LASTEXITCODE -ne 0) { throw 'git apply check failed' }
           git apply ../full-audit-v10.patch
+          if ($LASTEXITCODE -ne 0) { throw 'git apply failed' }
+          cargo fmt --all
           python ../control/.github/scripts/full_audit_v10/verify_source.py
           node --check ../settings-script-v10.js
       - name: Run detailed Settings smoke tests
