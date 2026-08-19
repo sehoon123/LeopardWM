@@ -1,0 +1,67 @@
+name: Settings smoke diagnostic PR
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/settings-smoke-diagnostic-pr.yml
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out control files
+        uses: actions/checkout@v4
+        with:
+          repository: sehoon123/LeopardWM
+          ref: agent/full-audit-v10-control
+          path: control
+      - name: Check out clean source
+        uses: actions/checkout@v4
+        with:
+          repository: sehoon123/LeopardWM
+          ref: agent/full-audit-v10-source
+          path: source
+          fetch-depth: 0
+      - name: Reconstruct audited source
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python ../control/.github/scripts/full_audit_v10/reconstruct_patch.py ../control/.github/patches/full-audit-v10 ../full-audit-v10.patch
+          git apply ../full-audit-v10.patch
+          python ../control/.github/scripts/full_audit_v10/verify_source.py
+          node --check ../settings-script-v10.js
+      - name: Run detailed Settings smoke tests
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python ../control/.github/scripts/full_audit_v10/settings_smoke.py
+          $edge = @(
+            "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe",
+            "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe"
+          ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+          if (-not $edge) { throw 'Microsoft Edge was not found' }
+          $uri = ([System.Uri](Resolve-Path ../settings-smoke-v10.html).Path).AbsoluteUri
+          foreach ($size in @('640,420', '780,560')) {
+            $name = $size.Replace(',', 'x')
+            $output = & $edge --headless --disable-gpu --no-first-run --no-default-browser-check --window-size=$size --dump-dom $uri 2>&1
+            ($output -join "`n") | Set-Content "../settings-smoke-$name.html"
+          }
+          python ../control/.github/scripts/full_audit_v10/verify_settings_smoke.py ../settings-smoke-640x420.html ../settings-smoke-780x560.html
+      - name: Upload diagnostic dumps
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: settings-smoke-diagnostic-pr
+          path: |
+            settings-smoke-v10.html
+            settings-smoke-640x420.html
+            settings-smoke-780x560.html
+          if-no-files-found: warn
+          retention-days: 2
