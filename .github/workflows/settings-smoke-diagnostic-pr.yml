@@ -3,11 +3,13 @@ name: Settings smoke diagnostic PR
 on:
   pull_request:
     branches: [main]
-    paths:
-      - .github/workflows/settings-smoke-diagnostic-pr.yml
 
 permissions:
   contents: read
+
+env:
+  PATCH_GZIP_SHA256: 54e9e48ceeff31967d51a5db533d004285b37c46b3023f8f833f619b1a0b4207
+  PATCH_SHA256: 3f6cbf37a8ded9ce51824f8e5fdde5d21685923cdc63bd19f1b5e91670271953
 
 jobs:
   diagnose:
