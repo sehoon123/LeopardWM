@@ -8,6 +8,7 @@ EXPECTED_FILES = {
     'crates/cli/src/args.rs', 'crates/cli/src/config_cmds.rs', 'crates/cli/src/doctor.rs',
     'crates/core_layout/src/tests.rs', 'crates/core_layout/src/workspace/mod.rs',
     'crates/core_layout/src/workspace/operations.rs',
+    'crates/daemon/src/atomic_file.rs',
     'crates/daemon/src/command_handler.rs', 'crates/daemon/src/config.rs',
     'crates/daemon/src/event_handler.rs', 'crates/daemon/src/full_audit_tests.rs',
     'crates/daemon/src/helpers.rs', 'crates/daemon/src/ipc_server.rs',
@@ -29,7 +30,17 @@ EXPECTED_FILES = {
     'crates/watchdog/src/main.rs', 'dist/scoop/leopardwm.json', 'wix/main.wxs',
 }
 
-changed = set(subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines())
+# `git diff --name-only` omits new untracked files, which made the verifier
+# blind to exactly the modules it was intended to authenticate. Porcelain
+# status reports modifications, deletions, and additions in one stable format.
+changed = {
+    line[3:]
+    for line in subprocess.check_output(
+        ['git', 'status', '--porcelain=v1', '--untracked-files=all'],
+        text=True,
+    ).splitlines()
+    if len(line) >= 4
+}
 if changed != EXPECTED_FILES:
     raise SystemExit(
         f'Change-set mismatch; missing={sorted(EXPECTED_FILES - changed)}, '
