@@ -57,8 +57,8 @@ replace_section(
 replace_section(
     operations,
     '    /// Center the focused column in the viewport, regardless of centering mode.',
-    '}\n\n#[cfg(test)]\nmod edge_centering_tests',
-    '''    /// Center the focused column in the viewport, regardless of centering mode.\n    pub fn center_focused_column_animated(&mut self, viewport_width: i32) {\n        let Some((column_x, column_width)) = self.focused_column_bounds() else {\n            return;\n        };\n        let visible_width = self.visible_width(viewport_width);\n        let target = Self::centered_scroll_target(column_x, column_width, visible_width);\n        let bounds = self.scroll_bounds_for_focus(visible_width, true);\n        let target = target.clamp(bounds.0, bounds.1);\n\n        if self.reduce_motion {\n            self.stop_animation();\n            self.scroll_offset = target;\n        } else {\n            self.start_scroll_animation_to(target, None, None);\n        }\n    }\n}\n\n#[cfg(test)]\nmod edge_centering_tests''',
+    '#[cfg(test)]\nmod edge_centering_tests',
+    '''    /// Center the focused column in the viewport, regardless of centering mode.\n    pub fn center_focused_column_animated(&mut self, viewport_width: i32) {\n        let Some((column_x, column_width)) = self.focused_column_bounds() else {\n            return;\n        };\n        let visible_width = self.visible_width(viewport_width);\n        let target = Self::centered_scroll_target(column_x, column_width, visible_width);\n        let bounds = self.scroll_bounds_for_focus(visible_width, true);\n        let target = target.clamp(bounds.0, bounds.1);\n\n        if self.reduce_motion {\n            self.stop_animation();\n            self.scroll_offset = target;\n        } else {\n            self.start_scroll_animation_to(target, None, None);\n        }\n    }\n}\n\n''',
 )
 
 # Clarify public mode semantics without changing serialization or defaults.
