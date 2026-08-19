@@ -3,6 +3,7 @@ import base64
 import gzip
 import hashlib
 import os
+import subprocess
 
 parts_dir = Path('../control/.github/patches/full-audit-v10')
 parts = sorted(parts_dir.glob('part-*.b64'))
@@ -27,4 +28,16 @@ if patch_hash != os.environ['PATCH_SHA256']:
     raise SystemExit(f'Patch digest mismatch: {patch_hash}')
 
 Path('../full-audit-v10.patch').write_bytes(patch)
-print(f'Authenticated {len(patch):,}-byte patch')
+
+# actions/checkout can materialize CRLF on Windows before the workflow changes
+# core.autocrlf. The authenticated patch was generated from Git's LF blobs, so
+# force a fresh index-to-worktree checkout with conversion disabled. A later
+# reset --hard is then a no-op rather than preserving CRLF files that reject the
+# patch.
+subprocess.run(['git', 'config', 'core.autocrlf', 'false'], check=True)
+subprocess.run(
+    ['git', '-c', 'core.autocrlf=false', 'checkout-index', '--all', '--force'],
+    check=True,
+)
+
+print(f'Authenticated {len(patch):,}-byte patch and normalized the worktree')
