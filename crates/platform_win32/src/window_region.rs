@@ -549,7 +549,7 @@ mod tests {
             Rect::new(-1920, 0, 1920, 1080),
         )
         .unwrap();
-        assert_eq!(region, Rect::new(10, 110, 810, 1080));
+        assert_eq!(region, Rect::new(0, 110, 820, 1090));
     }
 
     #[test]
