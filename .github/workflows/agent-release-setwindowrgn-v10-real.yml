@@ -1,0 +1,277 @@
+name: Release real SetWindowRgn v10
+
+on:
+  push:
+    branches: [agent/setwindowrgn-v10-real-control]
+    paths:
+      - .github/workflows/agent-release-setwindowrgn-v10-real.yml
+      - agent_docs/setwindowrgn-v10-real-release-trigger
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: release-real-setwindowrgn-v10
+  cancel-in-progress: false
+
+env:
+  CONTROL_BRANCH: agent/setwindowrgn-v10-real-control
+  SOURCE_BRANCH: agent/setwindowrgn-v10-real-source
+  EXPECTED_MAIN_SHA: bfb2bb1409f39e29fa3530d3858fe6fab733d0c7
+  RELEASE_TAG: v0.2.6-sehoon.10
+  RELEASE_VERSION: 0.2.6-sehoon.10
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env:SOURCE_BRANCH }}
+          fetch-depth: 0
+      - name: Record release run
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          path='agent_docs/setwindowrgn-v10-real-release-status.json'
+          payload=$(jq -n --arg state started --arg run_id "$GITHUB_RUN_ID" --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" '{state:$state,run_id:$run_id,run_url:$run_url}')
+          content=$(printf '%s\n' "$payload" | base64 -w0)
+          current=$(gh api "repos/$GITHUB_REPOSITORY/contents/$path?ref=$CONTROL_BRANCH" --jq .sha 2>/dev/null || true)
+          args=(--method PUT "repos/$GITHUB_REPOSITORY/contents/$path" -f message='ci: record real v10 release run' -f content="$content" -f branch="$CONTROL_BRANCH")
+          if [[ -n "$current" ]]; then args+=(-f sha="$current"); fi
+          gh api "${args[@]}" >/dev/null
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Verify candidate and main identities
+        id: identity
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $source = (git rev-parse HEAD).Trim()
+          if ($source -eq $env:EXPECTED_MAIN_SHA) { throw 'candidate branch contains no product commit' }
+          $parent = (git rev-parse HEAD^).Trim()
+          if ($parent -ne $env:EXPECTED_MAIN_SHA) { throw "candidate is not a one-commit fast-forward: parent=$parent" }
+          $main = ((git ls-remote origin refs/heads/main) -split '\s+')[0]
+          if ($main -ne $env:EXPECTED_MAIN_SHA) { throw "main changed: expected=$env:EXPECTED_MAIN_SHA actual=$main" }
+          foreach ($path in @(
+            'crates/platform_win32/src/window_region.rs',
+            'crates/platform_win32/src/placement.rs',
+            'crates/daemon/src/layout_apply.rs',
+            'crates/daemon/src/settings/settings.html'
+          )) {
+            if (-not (Test-Path $path)) { throw "missing candidate file: $path" }
+          }
+          "sha=$source" >> $env:GITHUB_OUTPUT
+      - name: Verify formatting
+        run: cargo fmt --all -- --check
+      - name: Full debug tests
+        run: cargo test --workspace --all-targets --locked
+      - name: Clippy with warnings denied
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: All-target check
+        run: cargo check --workspace --all-targets --locked
+      - name: Release-mode tests
+        run: cargo test --workspace --lib --bins --tests --release --locked
+      - name: Stress region and established regressions
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($filter in @('window_region', 'monitor_overflow', 'monitor_isolation', 'compositor', 'geometry_mismatch', 'scratchpad', 'floating')) {
+            for ($i = 0; $i -lt 6; $i++) {
+              cargo test --workspace --release --locked $filter -- --test-threads=1
+              if ($LASTEXITCODE -ne 0) { throw "$filter iteration $i failed" }
+            }
+          }
+      - name: Exercise SetWindowRgn on a real top-level HWND
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Add-Type -AssemblyName System.Windows.Forms
+          Add-Type @'
+          using System;
+          using System.Runtime.InteropServices;
+          public static class RegionNative {
+            [DllImport("gdi32.dll")] public static extern IntPtr CreateRectRgn(int l, int t, int r, int b);
+            [DllImport("user32.dll")] public static extern int SetWindowRgn(IntPtr hwnd, IntPtr rgn, bool redraw);
+            [DllImport("user32.dll")] public static extern int GetWindowRgnBox(IntPtr hwnd, out RECT rect);
+            [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern bool SetProp(IntPtr hwnd, string name, IntPtr value);
+            [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr GetProp(IntPtr hwnd, string name);
+            [DllImport("user32.dll", CharSet=CharSet.Unicode)] public static extern IntPtr RemoveProp(IntPtr hwnd, string name);
+            [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+          }
+          '@
+          $form = New-Object System.Windows.Forms.Form
+          $form.ShowInTaskbar = $false
+          $form.Opacity = 0
+          $form.Width = 400
+          $form.Height = 300
+          $hwnd = $form.Handle
+          if ($hwnd -eq [IntPtr]::Zero) { throw 'failed to create test HWND' }
+          $region = [RegionNative]::CreateRectRgn(20, 0, 220, 300)
+          if ($region -eq [IntPtr]::Zero) { throw 'CreateRectRgn failed' }
+          if ([RegionNative]::SetWindowRgn($hwnd, $region, $false) -eq 0) { throw 'SetWindowRgn failed' }
+          $bounds = New-Object RegionNative+RECT
+          if ([RegionNative]::GetWindowRgnBox($hwnd, [ref]$bounds) -ne 2) { throw 'unexpected region kind' }
+          if ($bounds.Left -ne 20 -or $bounds.Right -ne 220) { throw 'region bounds mismatch' }
+          if (-not [RegionNative]::SetProp($hwnd, 'LeopardWM.RegionClip.Smoke', [IntPtr]42)) { throw 'SetProp failed' }
+          if ([RegionNative]::GetProp($hwnd, 'LeopardWM.RegionClip.Smoke') -ne [IntPtr]42) { throw 'GetProp mismatch' }
+          [void][RegionNative]::RemoveProp($hwnd, 'LeopardWM.RegionClip.Smoke')
+          if ([RegionNative]::SetWindowRgn($hwnd, [IntPtr]::Zero, $true) -eq 0) { throw 'region restore failed' }
+          if ([RegionNative]::GetWindowRgnBox($hwnd, [ref]$bounds) -ne 1) { throw 'window did not return to NULLREGION' }
+          $form.Dispose()
+      - name: Build optimized binaries
+        run: cargo build --workspace --release --locked
+      - name: Verify GUI subsystems
+        shell: pwsh
+        run: ./.github/verify-gui-subsystems.ps1 -RepoRoot (Get-Location).Path
+      - name: Install cargo-wix
+        run: cargo install cargo-wix --version ^0.3 --locked
+      - name: Build MSI
+        shell: pwsh
+        run: |
+          cargo wix -p leopardwm-daemon -I wix/main.wxs --target x86_64-pc-windows-msvc --no-build --nocapture --bin-path 'C:\Program Files (x86)\WiX Toolset v3.14\bin'
+          if ($LASTEXITCODE -ne 0) { throw 'cargo wix failed' }
+          $msi = Get-ChildItem target/wix/*.msi | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $msi) { throw 'MSI was not generated' }
+          Copy-Item $msi.FullName "LeopardWM-$env:RELEASE_VERSION-x86_64.msi"
+      - name: Verify MSI administrative installation
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msi = (Resolve-Path "LeopardWM-$env:RELEASE_VERSION-x86_64.msi").Path
+          $admin = Join-Path (Get-Location) 'msi-admin-image'
+          New-Item -ItemType Directory -Path $admin -Force | Out-Null
+          $args = "/a `"$msi`" /qn TARGETDIR=`"$admin`""
+          $p = Start-Process "$env:SystemRoot\System32\msiexec.exe" -ArgumentList $args -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "MSI administrative install failed: $($p.ExitCode)" }
+      - name: Fast-forward main to verified source
+        shell: pwsh
+        env:
+          SOURCE_SHA: ${{ steps.identity.outputs.sha }}
+        run: |
+          git push origin "$env:SOURCE_SHA`:refs/heads/main"
+          if ($LASTEXITCODE -ne 0) { throw 'main fast-forward failed' }
+          $main = ((git ls-remote origin refs/heads/main) -split '\s+')[0]
+          if ($main -ne $env:SOURCE_SHA) { throw "main identity mismatch: $main" }
+      - name: Package ZIP and standalone binaries
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $binDir = @('target/x86_64-pc-windows-msvc/release', 'target/release') | Where-Object { Test-Path (Join-Path $_ 'leopardwm.exe') } | Select-Object -First 1
+          if (-not $binDir) { throw 'release binary directory not found' }
+          $dir = "LeopardWM-$env:RELEASE_VERSION-x86_64-windows"
+          New-Item -ItemType Directory -Path $dir -Force | Out-Null
+          foreach ($binary in @('leopardwm.exe','leopardwm-cli.exe','lwm.exe','leopardwm-watchdog.exe')) {
+            Copy-Item (Join-Path $binDir $binary) (Join-Path $dir $binary)
+            Copy-Item (Join-Path $binDir $binary) $binary
+          }
+          Copy-Item README.md, LICENSE, CHANGELOG.md $dir
+          7z a "$dir.zip" $dir | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw 'ZIP packaging failed' }
+      - name: Checksums and release notes
+        shell: pwsh
+        run: |
+          $assets = @("LeopardWM-$env:RELEASE_VERSION-x86_64-windows.zip","LeopardWM-$env:RELEASE_VERSION-x86_64.msi",'leopardwm.exe','leopardwm-cli.exe','lwm.exe','leopardwm-watchdog.exe')
+          $lines = foreach ($asset in $assets) { "{0} *{1}" -f (Get-FileHash $asset -Algorithm SHA256).Hash.ToLowerInvariant(), $asset }
+          $lines | Set-Content checksums.txt -Encoding ascii
+          @'
+          First real SetWindowRgn monitor-clipping release from the personal LeopardWM line.
+
+          - Preserves partial left/right tiled previews inside the owning monitor.
+          - Clips only the pixels crossing a physical monitor boundary.
+          - Never overwrites an application-defined custom region.
+          - Tracks region ownership with recoverable HWND properties and verifies the current region before clearing it.
+          - Falls back to whole-window hide/contain behavior when region ownership or an API call is unsafe.
+          - Restores owned regions on normal layout changes, empty layouts, shutdown, panic recovery, and destroyed-window cleanup.
+          - Skips clipped-window DWM size-violation inference and compositor resize nudges.
+          - Adds the `monitor_overflow = "clip" | "hide"` setting and Settings GUI selector.
+          '@ | Set-Content release-notes-v10.md -Encoding utf8
+      - name: Publish prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.identity.outputs.sha }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then exit 1; fi
+          if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then exit 1; fi
+          gh release create "$RELEASE_TAG" \
+            "LeopardWM-$RELEASE_VERSION-x86_64-windows.zip" \
+            "LeopardWM-$RELEASE_VERSION-x86_64.msi" \
+            leopardwm.exe leopardwm-cli.exe lwm.exe leopardwm-watchdog.exe checksums.txt \
+            --repo "$GITHUB_REPOSITORY" --target "$SOURCE_SHA" \
+            --title "LeopardWM $RELEASE_TAG — monitor region clipping" \
+            --notes-file release-notes-v10.md --prerelease
+      - name: Independently verify published assets
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.identity.outputs.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $verify = Join-Path (Get-Location) 'published-verification'
+          New-Item -ItemType Directory -Path $verify -Force | Out-Null
+          gh release download $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --dir $verify
+          foreach ($line in Get-Content (Join-Path $verify 'checksums.txt')) {
+            if ($line -notmatch '^([0-9a-f]{64}) \*(.+)$') { throw "bad checksum line: $line" }
+            $path = Join-Path $verify $Matches[2]
+            if ((Get-FileHash $path -Algorithm SHA256).Hash.ToLowerInvariant() -ne $Matches[1]) { throw "checksum mismatch: $($Matches[2])" }
+          }
+          $zip = Join-Path $verify "LeopardWM-$env:RELEASE_VERSION-x86_64-windows.zip"
+          7z t $zip | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw 'published ZIP failed CRC test' }
+          $msi = Join-Path $verify "LeopardWM-$env:RELEASE_VERSION-x86_64.msi"
+          $admin = Join-Path $verify 'msi-admin-image'
+          New-Item -ItemType Directory -Path $admin -Force | Out-Null
+          $args = "/a `"$msi`" /qn TARGETDIR=`"$admin`""
+          $p = Start-Process "$env:SystemRoot\System32\msiexec.exe" -ArgumentList $args -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "published MSI install failed: $($p.ExitCode)" }
+          git fetch origin --tags --force
+          $tag = (git rev-list -n 1 $env:RELEASE_TAG).Trim()
+          $main = ((git ls-remote origin refs/heads/main) -split '\s+')[0]
+          if ($tag -ne $env:SOURCE_SHA -or $main -ne $env:SOURCE_SHA) { throw "source mismatch tag=$tag main=$main expected=$env:SOURCE_SHA" }
+      - name: Record success
+        if: success()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.identity.outputs.sha }}
+        run: |
+          set -euo pipefail
+          path='agent_docs/setwindowrgn-v10-real-release-status.json'
+          zip_hash=$(sha256sum "LeopardWM-$RELEASE_VERSION-x86_64-windows.zip" | awk '{print $1}')
+          msi_hash=$(sha256sum "LeopardWM-$RELEASE_VERSION-x86_64.msi" | awk '{print $1}')
+          payload=$(jq -n --arg state success --arg run_id "$GITHUB_RUN_ID" --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --arg tag "$RELEASE_TAG" --arg source_sha "$SOURCE_SHA" --arg zip_sha256 "$zip_hash" --arg msi_sha256 "$msi_hash" '{state:$state,run_id:$run_id,run_url:$run_url,tag:$tag,source_sha:$source_sha,zip_sha256:$zip_sha256,msi_sha256:$msi_sha256}')
+          content=$(printf '%s\n' "$payload" | base64 -w0)
+          current=$(gh api "repos/$GITHUB_REPOSITORY/contents/$path?ref=$CONTROL_BRANCH" --jq .sha)
+          gh api --method PUT "repos/$GITHUB_REPOSITORY/contents/$path" -f message='ci: record successful real v10 release' -f content="$content" -f branch="$CONTROL_BRANCH" -f sha="$current" >/dev/null
+      - name: Record failure
+        if: failure()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          path='agent_docs/setwindowrgn-v10-real-release-status.json'
+          payload=$(jq -n --arg state failure --arg run_id "$GITHUB_RUN_ID" --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" '{state:$state,run_id:$run_id,run_url:$run_url}')
+          content=$(printf '%s\n' "$payload" | base64 -w0)
+          current=$(gh api "repos/$GITHUB_REPOSITORY/contents/$path?ref=$CONTROL_BRANCH" --jq .sha 2>/dev/null || true)
+          args=(--method PUT "repos/$GITHUB_REPOSITORY/contents/$path" -f message='ci: record failed real v10 release' -f content="$content" -f branch="$CONTROL_BRANCH")
+          if [[ -n "$current" ]]; then args+=(-f sha="$current"); fi
+          gh api "${args[@]}" >/dev/null
+      - name: Upload verification bundle
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: LeopardWM-v0.2.6-sehoon.10-verified
+          path: |
+            LeopardWM-0.2.6-sehoon.10-x86_64-windows.zip
+            LeopardWM-0.2.6-sehoon.10-x86_64.msi
+            checksums.txt
+            release-notes-v10.md
+          retention-days: 14
