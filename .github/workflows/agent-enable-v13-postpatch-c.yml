@@ -1,0 +1,58 @@
+name: Enable v13 lifecycle hardening
+
+on:
+  push:
+    branches:
+      - agent/window-region-clipping-v13-control
+    paths:
+      - .github/workflows/agent-enable-v13-postpatch-c.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch-workflow:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/window-region-clipping-v13-control
+          fetch-depth: 0
+      - name: Add lifecycle hardening to the verification pipeline
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('.github/workflows/agent-verify-release-window-region-v13.yml')
+          text = path.read_text(encoding='utf-8')
+          old = "          python ../control/.github/v13/post_patch_v13b.py\n          if ($LASTEXITCODE -ne 0) { throw 'post-patch optimization failed' }\n"
+          new = old + "          python ../control/.github/v13/post_patch_v13c.py\n          if ($LASTEXITCODE -ne 0) { throw 'lifecycle hardening failed' }\n"
+          if text.count(old) != 1:
+              raise SystemExit('lifecycle workflow marker mismatch')
+          path.write_text(text.replace(old, new), encoding='utf-8', newline='\n')
+          PY
+          git diff --check
+      - name: Extend the exact product change set and contract checks
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('.github/workflows/agent-verify-release-window-region-v13.yml')
+          text = path.read_text(encoding='utf-8')
+          old = "            'crates/daemon/src/layout_apply_edge_tests.rs',\n            'crates/daemon/src/settings/html.rs',"
+          new = "            'crates/daemon/src/layout_apply_edge_tests.rs',\n            'crates/daemon/src/main.rs',\n            'crates/daemon/src/settings/html.rs',"
+          if text.count(old) != 1:
+              raise SystemExit('allowed-file marker mismatch')
+          text = text.replace(old, new)
+          old_contract = "              'empty-layout restore': 'restore_all_window_regions();',\n"
+          new_contract = old_contract + "              'startup crash recovery': 'leopardwm_platform_win32::restore_all_window_regions();',\n              'failed-position region cleanup': 'clear_regions_for_failed_positions(',\n              'dead-owner detection': 'HRESULT_INVALID_PARAMETER',\n"
+          if text.count(old_contract) != 1:
+              raise SystemExit('contract marker mismatch')
+          path.write_text(text.replace(old_contract, new_contract), encoding='utf-8', newline='\n')
+          PY
+          git diff --check
+      - name: Commit and restart the audited verification
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .github/workflows/agent-verify-release-window-region-v13.yml
+          git commit -m 'ci: verify startup and failed-placement region recovery'
+          git push origin HEAD:agent/window-region-clipping-v13-control
