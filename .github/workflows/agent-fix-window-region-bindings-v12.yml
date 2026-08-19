@@ -1,0 +1,87 @@
+name: Fix window-region Win32 bindings v12
+
+on:
+  push:
+    branches:
+      - agent/window-region-clipping-v12-control
+    paths:
+      - .github/workflows/agent-fix-window-region-bindings-v12.yml
+
+permissions:
+  contents: write
+
+jobs:
+  fix-source:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/window-region-clipping-v12-source
+          fetch-depth: 0
+
+      - name: Align with windows 0.62 bindings
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('crates/platform_win32/src/window_region.rs')
+          text = path.read_text(encoding='utf-8')
+
+          old_imports = '''use windows::Win32::Graphics::Gdi::{
+              CreateRectRgn, DeleteObject, EqualRgn, GetWindowRgn, HGDIOBJ,
+          };
+          use windows::Win32::UI::WindowsAndMessaging::{
+              GetClassNameW, GetPropW, GetWindowThreadProcessId, IsWindow, RemovePropW, SetPropW,
+              SetWindowRgn,
+          };'''
+          new_imports = '''use windows::Win32::Graphics::Gdi::{
+              CreateRectRgn, DeleteObject, EqualRgn, GetWindowRgn, SetWindowRgn, HGDIOBJ,
+          };
+          use windows::Win32::UI::WindowsAndMessaging::{
+              GetPropW, GetClassNameW, GetWindowThreadProcessId, IsWindow, RemovePropW, SetPropW,
+          };'''
+          if text.count(old_imports) != 1:
+              raise SystemExit('unexpected Win32 import block')
+          text = text.replace(old_imports, new_imports)
+
+          replacements = {
+              'handle_from_usize(OWNER_MAGIC),': 'Some(handle_from_usize(OWNER_MAGIC)),',
+              'encode_coordinate(rect.x),': 'Some(encode_coordinate(rect.x)),',
+              'encode_coordinate(rect.y),': 'Some(encode_coordinate(rect.y)),',
+              'encode_coordinate(rect.right()),': 'Some(encode_coordinate(rect.right())),',
+              'encode_coordinate(rect.bottom()),': 'Some(encode_coordinate(rect.bottom())),',
+          }
+          for old, new in replacements.items():
+              if text.count(old) != 1:
+                  raise SystemExit(f'unexpected SetPropW value: {old}')
+              text = text.replace(old, new)
+
+          old_create = '''fn create_region(rect: Rect) -> Option<windows::Win32::Graphics::Gdi::HRGN> {
+              unsafe { CreateRectRgn(rect.x, rect.y, rect.right(), rect.bottom()) }.ok()
+          }'''
+          new_create = '''fn create_region(rect: Rect) -> Option<windows::Win32::Graphics::Gdi::HRGN> {
+              let region = unsafe { CreateRectRgn(rect.x, rect.y, rect.right(), rect.bottom()) };
+              if region.0.is_null() {
+                  None
+              } else {
+                  Some(region)
+              }
+          }'''
+          if text.count(old_create) != 1:
+              raise SystemExit('unexpected CreateRectRgn wrapper')
+          text = text.replace(old_create, new_create)
+
+          path.write_text(text, encoding='utf-8', newline='\n')
+          PY
+          git diff --check
+
+      - name: Commit source correction
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add crates/platform_win32/src/window_region.rs
+          git commit -m 'fix: align window-region code with windows 0.62 bindings'
+          git push origin HEAD:refs/heads/agent/window-region-clipping-v12-source
