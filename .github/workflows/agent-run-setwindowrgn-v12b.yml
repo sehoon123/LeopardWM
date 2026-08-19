@@ -1,0 +1,64 @@
+name: Run verified SetWindowRgn v12b release
+
+on:
+  push:
+    branches:
+      - agent/setwindowrgn-v12-control
+    paths:
+      - .github/v12/**
+      - .github/workflows/agent-run-setwindowrgn-v12b.yml
+      - agent_docs/setwindowrgn-v12b-trigger
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: setwindowrgn-v12b-release
+  cancel-in-progress: false
+
+env:
+  CONTROL_BRANCH: agent/setwindowrgn-v12-control
+  SOURCE_BRANCH: agent/setwindowrgn-v12b-source
+  EXPECTED_MAIN_SHA: bfb2bb1409f39e29fa3530d3858fe6fab733d0c7
+  RELEASE_TAG: v0.2.6-sehoon.12
+  RELEASE_VERSION: 0.2.6-sehoon.12
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CONTROL_BRANCH }}
+          path: control
+          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_BRANCH }}
+          path: source
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Run fail-closed implementation, verification, and release pipeline
+        working-directory: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python ../control/.github/v12/run_pipeline.py
+      - name: Upload independently verified release bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: LeopardWM-v0.2.6-sehoon.12-verified
+          path: |
+            source/LeopardWM-0.2.6-sehoon.12-x86_64-windows.zip
+            source/LeopardWM-0.2.6-sehoon.12-x86_64.msi
+            source/checksums.txt
+            source/setwindowrgn-v12-audit.md
+            source/release-notes-v12.md
+            source/setwindowrgn-v12-verification.json
+            source/settings-640x420.png
+            source/settings-780x560.png
+          if-no-files-found: error
+          retention-days: 14
