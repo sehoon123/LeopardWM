@@ -1,15 +1,13 @@
+import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 import path from 'node:path';
 
 const fs = await import('node:fs');
-const playwrightRoot = process.env.NODE_PATH
+const nodeModules = process.env.NODE_PATH
   ? path.resolve(process.env.NODE_PATH)
   : path.resolve(process.cwd(), 'settings-smoke/node_modules');
-const playwrightEntry = path.join(playwrightRoot, 'playwright-core', 'index.js');
-if (!fs.existsSync(playwrightEntry)) {
-  throw new Error(`playwright-core entry not found: ${playwrightEntry}`);
-}
-const { chromium } = await import(pathToFileURL(playwrightEntry).href);
+const requireFromSmoke = createRequire(path.join(nodeModules, '..', 'package.json'));
+const { chromium } = requireFromSmoke('playwright-core');
 
 const edgeCandidates = [
   'C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe',
