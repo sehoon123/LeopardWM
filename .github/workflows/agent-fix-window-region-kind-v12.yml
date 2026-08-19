@@ -28,43 +28,50 @@ jobs:
           path = Path('crates/platform_win32/src/window_region.rs')
           text = path.read_text(encoding='utf-8')
 
-          old_apply = '''        if has_owner_marker(hwnd) {
-              if state.identity == current_identity
-                  && actual_region_matches(hwnd, state.expected_region)
-              {
-                  if !clear_region(hwnd, false) {
-                      lock_states().insert(window_id, state);
-                      return RegionClipResult::Failed;
-                  }
-              }
-              remove_metadata(hwnd);
-          }'''
-          new_apply = '''        if has_owner_marker(hwnd) {
-              if state.identity == current_identity
-                  && actual_region_matches(hwnd, state.expected_region)
-                  && !clear_region(hwnd, false)
-              {
-                  lock_states().insert(window_id, state);
-                  return RegionClipResult::Failed;
-              }
-              remove_metadata(hwnd);
-          }'''
+          old_apply = (
+              "        if has_owner_marker(hwnd) {\n"
+              "            if state.identity == current_identity\n"
+              "                && actual_region_matches(hwnd, state.expected_region)\n"
+              "            {\n"
+              "                if !clear_region(hwnd, false) {\n"
+              "                    lock_states().insert(window_id, state);\n"
+              "                    return RegionClipResult::Failed;\n"
+              "                }\n"
+              "            }\n"
+              "            remove_metadata(hwnd);\n"
+              "        }"
+          )
+          new_apply = (
+              "        if has_owner_marker(hwnd) {\n"
+              "            if state.identity == current_identity\n"
+              "                && actual_region_matches(hwnd, state.expected_region)\n"
+              "                && !clear_region(hwnd, false)\n"
+              "            {\n"
+              "                lock_states().insert(window_id, state);\n"
+              "                return RegionClipResult::Failed;\n"
+              "            }\n"
+              "            remove_metadata(hwnd);\n"
+              "        }"
+          )
+          old_restore = (
+              "    if actual_region_matches(hwnd, expected) {\n"
+              "        if !clear_region(hwnd, redraw) {\n"
+              "            return false;\n"
+              "        }\n"
+              "    }"
+          )
+          new_restore = (
+              "    if actual_region_matches(hwnd, expected) && !clear_region(hwnd, redraw) {\n"
+              "        return false;\n"
+              "    }"
+          )
 
-          old_restore = '''    if actual_region_matches(hwnd, expected) {
-              if !clear_region(hwnd, redraw) {
-                  return false;
-              }
-          }'''
-          new_restore = '''    if actual_region_matches(hwnd, expected) && !clear_region(hwnd, redraw) {
-              return false;
-          }'''
-
-          for label, old, new in [
+          for label, old, new in (
               ('apply recovery', old_apply, new_apply),
               ('restore recovery', old_restore, new_restore),
-          ]:
+          ):
               if text.count(old) != 1:
-                  raise SystemExit(f'unexpected {label} block')
+                  raise SystemExit(f'unexpected {label} block: {text.count(old)} matches')
               text = text.replace(old, new)
 
           path.write_text(text, encoding='utf-8', newline='\n')
