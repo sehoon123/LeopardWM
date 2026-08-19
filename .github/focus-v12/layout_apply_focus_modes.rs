@@ -42,6 +42,9 @@ fn workspace(widths: &[i32], mode: CenteringMode, focus: usize) -> Workspace {
 }
 
 fn visible_width(rect: Rect, viewport: Rect) -> i32 {
+    if !rect.intersects(&viewport) {
+        return 0;
+    }
     rect.right()
         .min(viewport.right())
         .saturating_sub(rect.x.max(viewport.x))
@@ -77,7 +80,13 @@ fn distribution(placements: &[WindowPlacement]) -> Vec<i32> {
     ordered.sort_by_key(|placement| placement.window_id);
     ordered
         .into_iter()
-        .map(|placement| visible_width(placement.rect, owner))
+        .map(|placement| {
+            if placement.visibility == Visibility::Visible {
+                visible_width(placement.rect, owner)
+            } else {
+                0
+            }
+        })
         .collect()
 }
 
