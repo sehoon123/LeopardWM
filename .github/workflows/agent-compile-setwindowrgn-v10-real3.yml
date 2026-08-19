@@ -1,0 +1,121 @@
+name: Compile real SetWindowRgn v10 candidate
+
+on:
+  push:
+    branches: [agent/setwindowrgn-v10-real-control]
+    paths:
+      - .github/real-v10/**
+      - .github/workflows/agent-compile-setwindowrgn-v10-real3.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: compile-real-setwindowrgn-v10
+  cancel-in-progress: false
+
+env:
+  CONTROL_BRANCH: agent/setwindowrgn-v10-real-control
+  SOURCE_BRANCH: agent/setwindowrgn-v10-real-source
+  BASE_SHA: bfb2bb1409f39e29fa3530d3858fe6fab733d0c7
+
+jobs:
+  compile:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CONTROL_BRANCH }}
+          path: control
+          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_BRANCH }}
+          path: source
+          fetch-depth: 0
+      - name: Record run
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          path='agent_docs/setwindowrgn-v10-real3-status.json'
+          payload=$(jq -n --arg state started --arg run_id "$GITHUB_RUN_ID" --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" '{state:$state,run_id:$run_id,run_url:$run_url}')
+          content=$(printf '%s\n' "$payload" | base64 -w0)
+          current=$(gh api "repos/$GITHUB_REPOSITORY/contents/$path?ref=$CONTROL_BRANCH" --jq .sha 2>/dev/null || true)
+          args=(--method PUT "repos/$GITHUB_REPOSITORY/contents/$path" -f message='ci: record real v10 compile run' -f content="$content" -f branch="$CONTROL_BRANCH")
+          if [[ -n "$current" ]]; then args+=(-f sha="$current"); fi
+          gh api "${args[@]}" >/dev/null
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Verify base and apply patch
+        working-directory: source
+        shell: pwsh
+        run: |
+          if ((git rev-parse HEAD).Trim() -ne $env:BASE_SHA) { throw 'source is not clean base' }
+          python ../control/.github/real-v10/apply.py
+          python ../control/.github/real-v10/fixup.py
+          python ../control/.github/real-v10/fixup_tests.py
+      - name: Format and patch hygiene
+        working-directory: source
+        shell: pwsh
+        run: |
+          cargo fmt --all
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { throw 'fmt failed' }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'diff check failed' }
+          git status --short
+      - name: Full debug tests
+        working-directory: source
+        run: cargo test --workspace --all-targets --locked
+      - name: Clippy
+        working-directory: source
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: All-target check
+        working-directory: source
+        run: cargo check --workspace --all-targets --locked
+      - name: Commit compiled candidate
+        id: commit
+        working-directory: source
+        shell: pwsh
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git diff --cached --check
+          git commit -m 'feat: clip tiled previews at monitor boundaries'
+          if ($LASTEXITCODE -ne 0) { throw 'commit failed' }
+          $sha = (git rev-parse HEAD).Trim()
+          git push origin HEAD:refs/heads/$env:SOURCE_BRANCH
+          if ($LASTEXITCODE -ne 0) { throw 'push failed' }
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+      - name: Record success
+        if: success()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.commit.outputs.sha }}
+        run: |
+          set -euo pipefail
+          path='agent_docs/setwindowrgn-v10-real3-status.json'
+          payload=$(jq -n --arg state compiled --arg run_id "$GITHUB_RUN_ID" --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --arg source_sha "$SOURCE_SHA" '{state:$state,run_id:$run_id,run_url:$run_url,source_sha:$source_sha}')
+          content=$(printf '%s\n' "$payload" | base64 -w0)
+          current=$(gh api "repos/$GITHUB_REPOSITORY/contents/$path?ref=$CONTROL_BRANCH" --jq .sha)
+          gh api --method PUT "repos/$GITHUB_REPOSITORY/contents/$path" -f message='ci: record compiled real v10 candidate' -f content="$content" -f branch="$CONTROL_BRANCH" -f sha="$current" >/dev/null
+      - name: Record failure
+        if: failure()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          path='agent_docs/setwindowrgn-v10-real3-status.json'
+          payload=$(jq -n --arg state failure --arg run_id "$GITHUB_RUN_ID" --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" '{state:$state,run_id:$run_id,run_url:$run_url}')
+          content=$(printf '%s\n' "$payload" | base64 -w0)
+          current=$(gh api "repos/$GITHUB_REPOSITORY/contents/$path?ref=$CONTROL_BRANCH" --jq .sha 2>/dev/null || true)
+          args=(--method PUT "repos/$GITHUB_REPOSITORY/contents/$path" -f message='ci: record failed real v10 compile' -f content="$content" -f branch="$CONTROL_BRANCH")
+          if [[ -n "$current" ]]; then args+=(-f sha="$current"); fi
+          gh api "${args[@]}" >/dev/null
