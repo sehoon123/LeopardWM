@@ -1,0 +1,318 @@
+name: Verify and release full audit v10
+
+on:
+  push:
+    branches: [agent/full-audit-v10-control]
+    paths:
+      - .github/workflows/agent-verify-release-full-audit-v10.yml
+      - .github/patches/full-audit-v10/**
+      - .github/scripts/full_audit_v10/**
+      - agent_docs/full-audit-v10-plan.md
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: verify-release-full-audit-v10
+  cancel-in-progress: false
+
+env:
+  SOURCE_BRANCH: agent/full-audit-v10-source
+  CONTROL_BRANCH: agent/full-audit-v10-control
+  EXPECTED_MAIN_SHA: bfb2bb1409f39e29fa3530d3858fe6fab733d0c7
+  RELEASE_TAG: v0.2.6-sehoon.10
+  RELEASE_VERSION: 0.2.6-sehoon.10
+  LEOPARDWM_RELEASE_TAG: v0.2.6-sehoon.10
+  PATCH_GZIP_SHA256: 54e9e48ceeff31967d51a5db533d004285b37c46b3023f8f833f619b1a0b4207
+  PATCH_SHA256: 3f6cbf37a8ded9ce51824f8e5fdde5d21685923cdc63bd19f1b5e91670271953
+
+jobs:
+  verify-build-release:
+    runs-on: windows-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CONTROL_BRANCH }}
+          path: control
+          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_BRANCH }}
+          path: source
+          fetch-depth: 0
+
+      - name: Record workflow coordinates
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          path='agent_docs/full-audit-v10-status.json'
+          payload=$(jq -n --arg state started --arg run_id "$GITHUB_RUN_ID" \
+            --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --arg expected_main "$EXPECTED_MAIN_SHA" \
+            '{state:$state,run_id:$run_id,run_url:$run_url,expected_main:$expected_main}')
+          content=$(printf '%s\n' "$payload" | base64 -w0)
+          current=$(gh api "repos/$GITHUB_REPOSITORY/contents/$path?ref=$CONTROL_BRANCH" --jq .sha 2>/dev/null || true)
+          args=(--method PUT "repos/$GITHUB_REPOSITORY/contents/$path" -f message='ci: record full-audit v10 run' -f content="$content" -f branch="$CONTROL_BRANCH")
+          if [[ -n "$current" ]]; then args+=(-f sha="$current"); fi
+          gh api "${args[@]}" >/dev/null
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Authenticate and apply audit patch
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python ../control/.github/scripts/full_audit_v10/reconstruct_patch.py
+          git config core.autocrlf false
+          git reset --hard HEAD
+          git apply --check ../full-audit-v10.patch
+          if ($LASTEXITCODE -ne 0) { throw 'git apply --check failed' }
+          git apply ../full-audit-v10.patch
+          if ($LASTEXITCODE -ne 0) { throw 'git apply failed' }
+
+      - name: Format and verify source contracts
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo fmt --all
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { throw 'cargo fmt check failed' }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'git diff check failed' }
+          python ../control/.github/scripts/full_audit_v10/verify_source.py
+          node --check ../settings-script-v10.js
+          if ($LASTEXITCODE -ne 0) { throw 'Settings JavaScript syntax check failed' }
+
+      - name: Smoke-test Settings GUI in Microsoft Edge
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python ../control/.github/scripts/full_audit_v10/settings_smoke.py
+          $edge = @(
+            "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe",
+            "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe"
+          ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+          if (-not $edge) { throw 'Microsoft Edge was not found on the Windows runner' }
+          $uri = ([System.Uri](Resolve-Path ../settings-smoke-v10.html).Path).AbsoluteUri
+          foreach ($size in @('640,420', '780,560')) {
+            $output = & $edge --headless --disable-gpu --no-first-run --no-default-browser-check --window-size=$size --dump-dom $uri 2>&1
+            if ($LASTEXITCODE -ne 0) { throw "Edge smoke test failed to launch at $size" }
+            $dump = $output -join "`n"
+            if ($dump -notmatch '<pre id="settings-smoke-result">PASS</pre>') {
+              $dump | Set-Content "../settings-smoke-failure-$($size.Replace(',', 'x')).html"
+              throw "Settings smoke test failed at $size"
+            }
+          }
+
+      - name: Run complete quality gate
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo test --workspace --all-targets --locked
+          if ($LASTEXITCODE -ne 0) { throw 'debug tests failed' }
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          if ($LASTEXITCODE -ne 0) { throw 'Clippy failed' }
+          cargo check --workspace --all-targets --locked
+          if ($LASTEXITCODE -ne 0) { throw 'all-target check failed' }
+          cargo test --workspace --lib --bins --tests --release --locked
+          if ($LASTEXITCODE -ne 0) { throw 'release tests failed' }
+
+      - name: Stress high-risk regressions
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          for ($iteration = 0; $iteration -lt 6; $iteration++) {
+            cargo test -p leopardwm-core-layout --test edge_centering --release --locked -- --test-threads=1
+            if ($LASTEXITCODE -ne 0) { throw "edge-centering iteration $iteration failed" }
+            cargo test -p leopardwm-daemon --bin leopardwm --release --locked edge_safety_audit_tests -- --test-threads=1
+            if ($LASTEXITCODE -ne 0) { throw "monitor-isolation iteration $iteration failed" }
+            cargo test -p leopardwm-daemon --bin leopardwm --release --locked full_audit -- --test-threads=1
+            if ($LASTEXITCODE -ne 0) { throw "full-audit iteration $iteration failed" }
+            cargo test -p leopardwm-daemon --bin leopardwm --release --locked settings -- --test-threads=1
+            if ($LASTEXITCODE -ne 0) { throw "settings iteration $iteration failed" }
+            cargo test -p leopardwm-daemon --bin leopardwm --release --locked update_check -- --test-threads=1
+            if ($LASTEXITCODE -ne 0) { throw "update-check iteration $iteration failed" }
+          }
+          foreach ($filter in @('compositor', 'geometry_mismatch', 'scratchpad', 'floating', 'ipc', 'security', 'maximized')) {
+            for ($iteration = 0; $iteration -lt 3; $iteration++) {
+              cargo test -p leopardwm-daemon --bin leopardwm --release --locked $filter -- --test-threads=1
+              if ($LASTEXITCODE -ne 0) { throw "$filter iteration $iteration failed" }
+            }
+          }
+
+      - name: Build optimized Windows binaries
+        working-directory: source
+        run: cargo build --workspace --release --locked
+      - name: Verify GUI executable subsystems
+        working-directory: source
+        shell: pwsh
+        run: ./.github/verify-gui-subsystems.ps1 -RepoRoot (Get-Location).Path
+      - name: Install cargo-wix
+        run: cargo install cargo-wix --version ^0.3 --locked
+
+      - name: Package ZIP, MSI, and verify local installer
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $binDir = @('target/x86_64-pc-windows-msvc/release', 'target/release') |
+            Where-Object { Test-Path (Join-Path $_ 'leopardwm.exe') } | Select-Object -First 1
+          if (-not $binDir) { throw 'Release binary directory not found' }
+          $packageDir = "LeopardWM-$env:RELEASE_VERSION-x86_64-windows"
+          New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
+          foreach ($binary in @('leopardwm.exe','leopardwm-cli.exe','lwm.exe','leopardwm-watchdog.exe')) {
+            $source = Join-Path $binDir $binary
+            if (-not (Test-Path $source)) { throw "Missing binary: $source" }
+            Copy-Item $source (Join-Path $packageDir $binary)
+            Copy-Item $source $binary
+          }
+          Copy-Item README.md, LICENSE, CHANGELOG.md $packageDir
+          7z a "$packageDir.zip" $packageDir | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw 'ZIP packaging failed' }
+
+          cargo wix -p leopardwm-daemon -I wix/main.wxs --target x86_64-pc-windows-msvc --no-build --nocapture --bin-path 'C:\Program Files (x86)\WiX Toolset v3.14\bin'
+          if ($LASTEXITCODE -ne 0) { throw 'cargo wix failed' }
+          $built = Get-ChildItem target/wix/*.msi | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $built) { throw 'cargo wix produced no MSI' }
+          Copy-Item $built.FullName "LeopardWM-$env:RELEASE_VERSION-x86_64.msi"
+
+          $msi = (Resolve-Path "LeopardWM-$env:RELEASE_VERSION-x86_64.msi").Path
+          $admin = Join-Path (Get-Location) 'msi-admin-image'
+          New-Item -ItemType Directory -Path $admin -Force | Out-Null
+          $arguments = "/a `"$msi`" /qn TARGETDIR=`"$admin`""
+          $process = Start-Process "$env:SystemRoot\System32\msiexec.exe" -ArgumentList $arguments -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "MSI administrative install failed: $($process.ExitCode)" }
+          foreach ($binary in @('leopardwm.exe','leopardwm-cli.exe','lwm.exe','leopardwm-watchdog.exe')) {
+            $installed = Get-ChildItem $admin -Recurse -Filter $binary | Select-Object -First 1
+            if (-not $installed) { throw "MSI is missing $binary" }
+            if ((Get-FileHash $installed.FullName -Algorithm SHA256).Hash -ne (Get-FileHash $binary -Algorithm SHA256).Hash) {
+              throw "MSI binary mismatch: $binary"
+            }
+          }
+
+      - name: Finalize manifest and audit report
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python ../control/.github/scripts/full_audit_v10/finalize_release.py
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { throw 'format changed during finalization' }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'final diff check failed' }
+          Get-Content dist/scoop/leopardwm.json | ConvertFrom-Json | Out-Null
+
+      - name: Commit verified source and fast-forward main
+        id: source_commit
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git diff --cached --check
+          if ($LASTEXITCODE -ne 0) { throw 'staged diff check failed' }
+          git commit -m 'fix: harden runtime, settings, IPC, and distribution'
+          if ($LASTEXITCODE -ne 0) { throw 'source commit failed' }
+          $candidate = (git rev-parse HEAD).Trim()
+          git push origin HEAD:refs/heads/$env:SOURCE_BRANCH
+          if ($LASTEXITCODE -ne 0) { throw 'source branch push failed' }
+          $remoteMain = ((git ls-remote origin refs/heads/main) -split '\s+')[0]
+          if ($remoteMain -ne $env:EXPECTED_MAIN_SHA) {
+            throw "main changed during audit: expected=$env:EXPECTED_MAIN_SHA actual=$remoteMain"
+          }
+          git push origin HEAD:refs/heads/main
+          if ($LASTEXITCODE -ne 0) { throw 'main fast-forward failed' }
+          $verifiedMain = ((git ls-remote origin refs/heads/main) -split '\s+')[0]
+          if ($verifiedMain -ne $candidate) { throw "main identity mismatch: $verifiedMain" }
+          "sha=$candidate" >> $env:GITHUB_OUTPUT
+
+      - name: Generate checksums and release notes
+        working-directory: source
+        shell: pwsh
+        run: |
+          $assets = @(
+            "LeopardWM-$env:RELEASE_VERSION-x86_64-windows.zip",
+            "LeopardWM-$env:RELEASE_VERSION-x86_64.msi",
+            'leopardwm.exe','leopardwm-cli.exe','lwm.exe','leopardwm-watchdog.exe',
+            'agent_docs/full-audit-v0.2.6-sehoon.10.md','dist/scoop/leopardwm.json'
+          )
+          $lines = foreach ($asset in $assets) {
+            "{0} *{1}" -f (Get-FileHash $asset -Algorithm SHA256).Hash.ToLowerInvariant(), $asset
+          }
+          $lines | Set-Content checksums.txt -Encoding ascii
+          Copy-Item ../control/.github/scripts/full_audit_v10/release_notes_v10.md release-notes-v10.md
+
+      - name: Publish prerelease
+        working-directory: source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.source_commit.outputs.sha }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then exit 1; fi
+          if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then exit 1; fi
+          gh release create "$RELEASE_TAG" \
+            "LeopardWM-$RELEASE_VERSION-x86_64-windows.zip" \
+            "LeopardWM-$RELEASE_VERSION-x86_64.msi" \
+            leopardwm.exe leopardwm-cli.exe lwm.exe leopardwm-watchdog.exe checksums.txt \
+            agent_docs/full-audit-v0.2.6-sehoon.10.md dist/scoop/leopardwm.json \
+            --repo "$GITHUB_REPOSITORY" --target "$SOURCE_SHA" \
+            --title "LeopardWM $RELEASE_TAG — full repository hardening" \
+            --notes-file release-notes-v10.md --prerelease
+
+      - name: Independently verify published release
+        working-directory: source
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.source_commit.outputs.sha }}
+        run: ../control/.github/scripts/full_audit_v10/verify_release.ps1
+
+      - name: Publish successful audit status
+        working-directory: source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.source_commit.outputs.sha }}
+        run: |
+          set -euo pipefail
+          path='agent_docs/full-audit-v10-status.json'
+          zip_hash=$(sha256sum "LeopardWM-$RELEASE_VERSION-x86_64-windows.zip" | awk '{print $1}')
+          msi_hash=$(sha256sum "LeopardWM-$RELEASE_VERSION-x86_64.msi" | awk '{print $1}')
+          payload=$(jq -n --arg state success --arg run_id "$GITHUB_RUN_ID" \
+            --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --arg tag "$RELEASE_TAG" --arg source_sha "$SOURCE_SHA" \
+            --arg zip_sha256 "$zip_hash" --arg msi_sha256 "$msi_hash" \
+            '{state:$state,run_id:$run_id,run_url:$run_url,tag:$tag,source_sha:$source_sha,zip_sha256:$zip_sha256,msi_sha256:$msi_sha256}')
+          content=$(printf '%s\n' "$payload" | base64 -w0)
+          current=$(gh api "repos/$GITHUB_REPOSITORY/contents/$path?ref=$CONTROL_BRANCH" --jq .sha)
+          gh api --method PUT "repos/$GITHUB_REPOSITORY/contents/$path" \
+            -f message='ci: record successful full-audit v10 release' \
+            -f content="$content" -f branch="$CONTROL_BRANCH" -f sha="$current" >/dev/null
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LeopardWM-v0.2.6-sehoon.10-verified
+          path: |
+            source/LeopardWM-0.2.6-sehoon.10-x86_64-windows.zip
+            source/LeopardWM-0.2.6-sehoon.10-x86_64.msi
+            source/checksums.txt
+            source/release-notes-v10.md
+            source/agent_docs/full-audit-v0.2.6-sehoon.10.md
+            source/dist/scoop/leopardwm.json
+          if-no-files-found: error
+          retention-days: 14
