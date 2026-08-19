@@ -101,5 +101,42 @@ if script.count(old_animation_call) != 1:
     raise RuntimeError('base integration script does not contain the expected animation call block')
 script = script.replace(old_animation_call, new_animation_call)
 
+old_cleanup = '''# Add destroy cleanup next to the existing recycled-handle cleanup.
+cleanup_count = 0
+for path in (ROOT / 'crates/daemon/src').rglob('*.rs'):
+    text = path.read_text(encoding='utf-8')
+    pattern = re.compile(
+        r'(leopardwm_platform_win32::clear_suspected_oversize\\(([^)]+)\\);)'
+    )
+    def add_cleanup(match: re.Match[str]) -> str:
+        nonlocal_cleanup[0] += 1
+        value = match.group(2)
+        return match.group(1) + f'\\n        leopardwm_platform_win32::forget_window_region({value});'
+    nonlocal_cleanup = [0]
+    updated = pattern.sub(add_cleanup, text)
+    if nonlocal_cleanup[0]:
+        path.write_text(updated, encoding='utf-8', newline='\\n')
+        cleanup_count += nonlocal_cleanup[0]
+if cleanup_count == 0:
+    raise RuntimeError('daemon: no destroyed-window cleanup site found')
+'''
+new_cleanup = '''# The existing destroy/unmanage path already calls clear_suspected_oversize.
+# Couple region bookkeeping to that platform cleanup primitive instead of
+# duplicating lifecycle calls in daemon event handling.
+placement = read(placement_path)
+cleanup_marker = "pub fn clear_suspected_oversize(window_id: WindowId) {\\n"
+if placement.count(cleanup_marker) != 1:
+    raise RuntimeError('placement.rs: clear_suspected_oversize marker mismatch')
+placement = placement.replace(
+    cleanup_marker,
+    cleanup_marker + "    crate::window_region::forget_window_region(window_id);\\n",
+    1,
+)
+write(placement_path, placement)
+'''
+if script.count(old_cleanup) != 1:
+    raise RuntimeError('base integration script does not contain the expected cleanup block')
+script = script.replace(old_cleanup, new_cleanup)
+
 compiled = compile(script, str(script_path), 'exec')
 exec(compiled, {'__name__': '__main__', '__file__': str(script_path)})
