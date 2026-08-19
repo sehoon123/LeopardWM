@@ -57,7 +57,9 @@ jobs:
               Write-Host "SMOKE $name result element missing"
             }
           }
+          python ../control/.github/scripts/full_audit_v10/verify_settings_smoke.py ../settings-smoke-640x420.html ../settings-smoke-780x560.html
       - name: Upload dumps
+        if: always()
         id: upload
         uses: actions/upload-artifact@v4
         with:
@@ -66,9 +68,10 @@ jobs:
             settings-smoke-v10.html
             settings-smoke-640x420.html
             settings-smoke-780x560.html
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 2
       - name: Record artifact
+        if: always() && steps.upload.outputs.artifact-id != ''
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
