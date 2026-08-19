@@ -1,0 +1,58 @@
+name: Monitor crash-safe region release
+
+on:
+  push:
+    branches:
+      - agent/window-region-clipping-v13-control
+    paths:
+      - .github/workflows/agent-monitor-window-region-v13.yml
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/window-region-clipping-v13-control
+          fetch-depth: 0
+      - name: Wait for verification workflow and publish diagnostic
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          target='Verify and release crash-safe window-region clipping'
+          current="$GITHUB_RUN_ID"
+          run_id=''
+          for _ in $(seq 1 180); do
+            run_id=$(gh run list --repo "$GITHUB_REPOSITORY" --branch agent/window-region-clipping-v13-control --limit 30 --json databaseId,name,status,conclusion \
+              --jq ".[] | select(.name == \"$target\" and (.databaseId|tostring) != \"$current\") | .databaseId" | head -n1)
+            if [[ -n "$run_id" ]]; then
+              status=$(gh run view "$run_id" --repo "$GITHUB_REPOSITORY" --json status --jq .status)
+              if [[ "$status" == completed ]]; then break; fi
+            fi
+            sleep 10
+          done
+          if [[ -z "$run_id" ]]; then
+            echo 'verification run not found' >&2
+            exit 1
+          fi
+          data=$(gh run view "$run_id" --repo "$GITHUB_REPOSITORY" --json status,conclusion,url,headSha)
+          conclusion=$(jq -r .conclusion <<<"$data")
+          mkdir -p agent_docs
+          if [[ "$conclusion" == success ]]; then
+            gh api "repos/$GITHUB_REPOSITORY/releases/tags/v0.2.6-sehoon.12" > agent_docs/window-region-v13-release.json
+            jq -n --argjson run "$data" --arg state success '{state:$state,run:$run}' > agent_docs/window-region-v13-diagnostic.json
+          else
+            gh run view "$run_id" --repo "$GITHUB_REPOSITORY" --log-failed > agent_docs/window-region-v13-failure.log || true
+            jq -n --argjson run "$data" --arg state failure '{state:$state,run:$run}' > agent_docs/window-region-v13-diagnostic.json
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add agent_docs/window-region-v13-*
+          git commit -m "ci: publish window-region v13 diagnostic ($conclusion)"
+          git push origin HEAD:agent/window-region-clipping-v13-control
