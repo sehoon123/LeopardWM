@@ -1,6 +1,5 @@
 {
-  "state": "started",
+  "state": "failure",
   "run_id": "32241589305",
-  "run_url": "https://github.com/sehoon123/LeopardWM/actions/runs/32241589305",
-  "expected_main": "bfb2bb1409f39e29fa3530d3858fe6fab733d0c7"
+  "run_url": "https://github.com/sehoon123/LeopardWM/actions/runs/32241589305"
 }
