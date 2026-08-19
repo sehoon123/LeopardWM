@@ -49,5 +49,29 @@ if script.count(old_save) != 1:
     raise RuntimeError('base integration script does not contain the expected save block')
 script = script.replace(old_save, new_save)
 
+old_animation = '''frame_pattern = re.compile(
+    r'(pub\\(crate\\) struct FrameRequest \\{\\n\\s*pub placements: Vec<leopardwm_core_layout::WindowPlacement>,\\n)'
+)
+animation, count = frame_pattern.subn(
+    r'\\1    pub region_clips: Vec<leopardwm_platform_win32::WindowRegionClip>,\\n',
+    animation,
+    count=1,
+)
+if count != 1:
+    raise RuntimeError('animation_worker.rs: FrameRequest marker mismatch')
+'''
+new_animation = '''frame_marker = "    pub placements: Vec<WindowPlacement>,\\n"
+if animation.count(frame_marker) != 1:
+    raise RuntimeError('animation_worker.rs: FrameRequest placements marker mismatch')
+animation = animation.replace(
+    frame_marker,
+    frame_marker + "    pub region_clips: Vec<leopardwm_platform_win32::WindowRegionClip>,\\n",
+    1,
+)
+'''
+if script.count(old_animation) != 1:
+    raise RuntimeError('base integration script does not contain the expected animation block')
+script = script.replace(old_animation, new_animation)
+
 compiled = compile(script, str(script_path), 'exec')
 exec(compiled, {'__name__': '__main__', '__file__': str(script_path)})
