@@ -1,0 +1,9 @@
+{
+  "state": "failure",
+  "run": {
+    "conclusion": "failure",
+    "headSha": "9ee153ba65ed06eb7509c9516a43425d70e08095",
+    "status": "completed",
+    "url": "https://github.com/sehoon123/LeopardWM/actions/runs/32239902531"
+  }
+}

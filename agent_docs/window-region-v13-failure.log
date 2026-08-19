@@ -1,0 +1,53 @@
+verify-build-release	Apply the audited implementation	﻿2026-08-19T09:57:17.5173644Z ##[group]Run $ErrorActionPreference = 'Stop'
+verify-build-release	Apply the audited implementation	2026-08-19T09:57:17.5174089Z ^[[36;1m$ErrorActionPreference = 'Stop'^[[0m
+verify-build-release	Apply the audited implementation	2026-08-19T09:57:17.5174606Z ^[[36;1mCopy-Item ../control/.github/v13/window_region_v4.rs crates/platform_win32/src/window_region.rs -Force^[[0m
+verify-build-release	Apply the audited implementation	2026-08-19T09:57:17.5175448Z ^[[36;1mGet-Content ../control/.github/v13/window_region_integration_tests.rs |^[[0m
+verify-build-release	Apply the audited implementation	2026-08-19T09:57:17.5175910Z ^[[36;1m  Add-Content crates/platform_win32/src/window_region.rs^[[0m
+verify-build-release	Apply the audited implementation	2026-08-19T09:57:17.5176321Z ^[[36;1mpython ../control/.github/v13/apply_window_region_v13.py^[[0m
+verify-build-release	Apply the audited implementation	2026-08-19T09:57:17.5176737Z ^[[36;1mif ($LASTEXITCODE -ne 0) { throw 'integration patch failed' }^[[0m
+verify-build-release	Apply the audited implementation	2026-08-19T09:57:17.5245516Z shell: C:\Program Files\PowerShell\7\pwsh.EXE -command ". '{0}'"
+verify-build-release	Apply the audited implementation	2026-08-19T09:57:17.5245870Z env:
+verify-build-release	Apply the audited implementation	2026-08-19T09:57:17.5246117Z   SOURCE_BRANCH: agent/window-region-clipping-v13-source
+verify-build-release	Apply the audited implementation	2026-08-19T09:57:17.5246491Z   CONTROL_BRANCH: agent/window-region-clipping-v13-control
+verify-build-release	Apply the audited implementation	2026-08-19T09:57:17.5246865Z   EXPECTED_MAIN_SHA: bfb2bb1409f39e29fa3530d3858fe6fab733d0c7
+verify-build-release	Apply the audited implementation	2026-08-19T09:57:17.5247211Z   RELEASE_TAG: v0.2.6-sehoon.12
+verify-build-release	Apply the audited implementation	2026-08-19T09:57:17.5247437Z   RELEASE_VERSION: 0.2.6-sehoon.12
+verify-build-release	Apply the audited implementation	2026-08-19T09:57:17.5247675Z   CARGO_HOME: C:\Users\runneradmin\.cargo
+verify-build-release	Apply the audited implementation	2026-08-19T09:57:17.5247931Z   CARGO_INCREMENTAL: 0
+verify-build-release	Apply the audited implementation	2026-08-19T09:57:17.5248124Z   CARGO_TERM_COLOR: always
+verify-build-release	Apply the audited implementation	2026-08-19T09:57:17.5248316Z ##[endgroup]
+verify-build-release	Apply the audited implementation	2026-08-19T09:57:18.7201524Z Traceback (most recent call last):
+verify-build-release	Apply the audited implementation	2026-08-19T09:57:18.7208867Z   File "D:\a\LeopardWM\LeopardWM\control\.github\v13\apply_window_region_v13.py", line 85, in <module>
+verify-build-release	Apply the audited implementation	2026-08-19T09:57:18.7210323Z     raise RuntimeError('settings.html: next Layout row not found')
+verify-build-release	Apply the audited implementation	2026-08-19T09:57:18.7300081Z RuntimeError: settings.html: next Layout row not found
+verify-build-release	Apply the audited implementation	2026-08-19T09:57:18.9549089Z ^[[31;1mException: ^[[0mD:\a\_temp\678cd283-326f-47c6-bbd5-5c07560dfe75.ps1:7^[[0m
+verify-build-release	Apply the audited implementation	2026-08-19T09:57:18.9550068Z ^[[31;1m^[[0m^[[36;1mLine |^[[0m
+verify-build-release	Apply the audited implementation	2026-08-19T09:57:18.9550988Z ^[[31;1m^[[0m^[[36;1m^[[36;1m   7 | ^[[0m if ($LASTEXITCODE -ne 0) { ^[[36;1mthrow 'integration patch failed'^[[0m }^[[0m
+verify-build-release	Apply the audited implementation	2026-08-19T09:57:18.9552218Z ^[[31;1m^[[0m^[[36;1m^[[36;1m^[[0m^[[36;1m^[[0m^[[36;1m     | ^[[31;1m                            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^[[0m
+verify-build-release	Apply the audited implementation	2026-08-19T09:57:18.9553604Z ^[[31;1m^[[0m^[[36;1m^[[36;1m^[[0m^[[36;1m^[[0m^[[36;1m^[[31;1m^[[31;1m^[[36;1m     | ^[[31;1mintegration patch failed^[[0m
+verify-build-release	Apply the audited implementation	2026-08-19T09:57:19.0105919Z ##[error]Process completed with exit code 1.
+verify-build-release	Publish failure status	﻿2026-08-19T09:57:19.0413373Z ##[group]Run set -euo pipefail
+verify-build-release	Publish failure status	2026-08-19T09:57:19.0413765Z ^[[36;1mset -euo pipefail^[[0m
+verify-build-release	Publish failure status	2026-08-19T09:57:19.0414059Z ^[[36;1mpath='agent_docs/window-region-v13-status.json'^[[0m
+verify-build-release	Publish failure status	2026-08-19T09:57:19.0414483Z ^[[36;1mpayload=$(jq -n --arg state failure --arg run_id "$GITHUB_RUN_ID" \^[[0m
+verify-build-release	Publish failure status	2026-08-19T09:57:19.0415034Z ^[[36;1m  --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \^[[0m
+verify-build-release	Publish failure status	2026-08-19T09:57:19.0415501Z ^[[36;1m  '{state:$state,run_id:$run_id,run_url:$run_url}')^[[0m
+verify-build-release	Publish failure status	2026-08-19T09:57:19.0415852Z ^[[36;1mcontent=$(printf '%s\n' "$payload" | base64 -w0)^[[0m
+verify-build-release	Publish failure status	2026-08-19T09:57:19.0416428Z ^[[36;1mcurrent=$(gh api "repos/$GITHUB_REPOSITORY/contents/$path?ref=$CONTROL_BRANCH" --jq .sha 2>/dev/null || true)^[[0m
+verify-build-release	Publish failure status	2026-08-19T09:57:19.0417382Z ^[[36;1margs=(--method PUT "repos/$GITHUB_REPOSITORY/contents/$path" -f message='ci: record failed crash-safe region release' -f content="$content" -f branch="$CONTROL_BRANCH")^[[0m
+verify-build-release	Publish failure status	2026-08-19T09:57:19.0418149Z ^[[36;1mif [[ -n "$current" ]]; then args+=(-f sha="$current"); fi^[[0m
+verify-build-release	Publish failure status	2026-08-19T09:57:19.0418505Z ^[[36;1mgh api "${args[@]}" >/dev/null^[[0m
+verify-build-release	Publish failure status	2026-08-19T09:57:19.0438363Z shell: C:\Program Files\Git\bin\bash.EXE --noprofile --norc -e -o pipefail {0}
+verify-build-release	Publish failure status	2026-08-19T09:57:19.0438754Z env:
+verify-build-release	Publish failure status	2026-08-19T09:57:19.0438995Z   SOURCE_BRANCH: agent/window-region-clipping-v13-source
+verify-build-release	Publish failure status	2026-08-19T09:57:19.0439384Z   CONTROL_BRANCH: agent/window-region-clipping-v13-control
+verify-build-release	Publish failure status	2026-08-19T09:57:19.0439765Z   EXPECTED_MAIN_SHA: bfb2bb1409f39e29fa3530d3858fe6fab733d0c7
+verify-build-release	Publish failure status	2026-08-19T09:57:19.0440088Z   RELEASE_TAG: v0.2.6-sehoon.12
+verify-build-release	Publish failure status	2026-08-19T09:57:19.0440314Z   RELEASE_VERSION: 0.2.6-sehoon.12
+verify-build-release	Publish failure status	2026-08-19T09:57:19.0440553Z   CARGO_HOME: C:\Users\runneradmin\.cargo
+verify-build-release	Publish failure status	2026-08-19T09:57:19.0440802Z   CARGO_INCREMENTAL: 0
+verify-build-release	Publish failure status	2026-08-19T09:57:19.0440994Z   CARGO_TERM_COLOR: always
+verify-build-release	Publish failure status	2026-08-19T09:57:19.0444610Z   GH_TOKEN: ***
+verify-build-release	Publish failure status	2026-08-19T09:57:19.0444966Z ##[endgroup]
+verify-build-release	Publish failure status	2026-08-19T09:57:20.6455258Z gh: is at 949195e186701d488ca9de3de83ba77b551fe1b7 but expected 4058f2530ac87f7aeccc052ad86c3ec72553a8fc (HTTP 409)
+verify-build-release	Publish failure status	2026-08-19T09:57:20.6569722Z ##[error]Process completed with exit code 1.
