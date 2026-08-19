@@ -1,0 +1,340 @@
+name: Verify and release hardened window-region clipping v12b
+
+on:
+  push:
+    branches:
+      - agent/window-region-clipping-v12-control
+    paths:
+      - .github/workflows/agent-verify-release-window-region-v12b.yml
+      - .github/v12/run_apply_window_region_v12.py
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: verify-release-window-region-v12b
+  cancel-in-progress: false
+
+env:
+  SOURCE_BRANCH: agent/window-region-clipping-v12-source
+  CONTROL_BRANCH: agent/window-region-clipping-v12-control
+  EXPECTED_MAIN_SHA: bfb2bb1409f39e29fa3530d3858fe6fab733d0c7
+  RELEASE_TAG: v0.2.6-sehoon.10
+  RELEASE_VERSION: 0.2.6-sehoon.10
+
+jobs:
+  verify-build-release:
+    runs-on: windows-latest
+    timeout-minutes: 150
+
+    steps:
+      - name: Check out control files
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CONTROL_BRANCH }}
+          path: control
+          fetch-depth: 0
+
+      - name: Check out source branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_BRANCH }}
+          path: source
+          fetch-depth: 0
+
+      - name: Record run
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          path='agent_docs/window-region-v12b-status.json'
+          payload=$(jq -n --arg state started --arg run_id "$GITHUB_RUN_ID" \
+            --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            '{state:$state,run_id:$run_id,run_url:$run_url}')
+          content=$(printf '%s\n' "$payload" | base64 -w0)
+          current=$(gh api "repos/$GITHUB_REPOSITORY/contents/$path?ref=$CONTROL_BRANCH" --jq .sha 2>/dev/null || true)
+          args=(--method PUT "repos/$GITHUB_REPOSITORY/contents/$path" -f message='ci: record v12b run' -f content="$content" -f branch="$CONTROL_BRANCH")
+          if [[ -n "$current" ]]; then args+=(-f sha="$current"); fi
+          gh api "${args[@]}" >/dev/null
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Apply integration patch
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $path = 'crates/platform_win32/src/window_region.rs'
+          $text = Get-Content -Raw -Encoding utf8 $path
+          $text = $text.Replace('CreateRectRgn, DeleteObject, EqualRgn, GetWindowRgn, HGDIOBJ,', 'CreateRectRgn, DeleteObject, EqualRgn, HGDIOBJ,')
+          $text = $text.Replace('GetClassNameW, GetPropW, GetWindowThreadProcessId, IsWindow, RemovePropW, SetPropW,', 'GetClassNameW, GetPropW, GetWindowRgn, GetWindowThreadProcessId, IsWindow, RemovePropW, SetPropW,')
+          [IO.File]::WriteAllText($path, $text, [Text.UTF8Encoding]::new($false))
+          python ../control/.github/v12/run_apply_window_region_v12.py
+          if ($LASTEXITCODE -ne 0) { throw 'integration patch failed' }
+
+      - name: Format and inspect diff
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo fmt --all
+          cargo fmt --all -- --check
+          git diff --check
+          $allowed = @(
+            'crates/daemon/src/animation_worker.rs',
+            'crates/daemon/src/config.rs',
+            'crates/daemon/src/layout_apply.rs',
+            'crates/daemon/src/settings/html.rs',
+            'crates/daemon/src/settings/settings.html',
+            'crates/platform_win32/src/lib.rs',
+            'crates/platform_win32/src/placement.rs',
+            'crates/platform_win32/src/visibility.rs',
+            'crates/platform_win32/src/window_region.rs'
+          )
+          $changed = @(git status --short | ForEach-Object { $_.Substring(3) })
+          $unexpected = @($changed | Where-Object { $_ -notin $allowed })
+          if ($unexpected.Count) { throw "Unexpected files: $($unexpected -join ', ')" }
+          git diff --stat
+
+      - name: Verify structural contracts
+        working-directory: source
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+          combined = '\n'.join(Path(path).read_text(encoding='utf-8') for path in [
+              'crates/platform_win32/src/window_region.rs',
+              'crates/platform_win32/src/placement.rs',
+              'crates/platform_win32/src/visibility.rs',
+              'crates/daemon/src/layout_apply.rs',
+              'crates/daemon/src/config.rs',
+              'crates/daemon/src/settings/settings.html',
+          ])
+          required = [
+              'LeopardWM.RegionClip.v2.Owner',
+              'actual_region_matches(hwnd, expected)',
+              'window_has_no_region(hwnd)',
+              'reconcile_window_regions(',
+              'apply_entry_region_clips(',
+              'MonitorOverflowModeConfig::Clip',
+              'MonitorOverflowModeConfig::Hide',
+              'id="layout-monitor_overflow"',
+              "cfg.layout.monitor_overflow || 'clip'",
+              "monitor_overflow: document.getElementById('layout-monitor_overflow').value",
+          ]
+          missing = [marker for marker in required if marker not in combined]
+          if missing: raise SystemExit('Missing contracts: ' + ', '.join(missing))
+          print('structural contracts: OK')
+          '@ | python -
+
+      - name: Compile all targets
+        working-directory: source
+        run: cargo check --workspace --all-targets --locked
+
+      - name: Run full tests
+        working-directory: source
+        run: cargo test --workspace --all-targets --locked
+
+      - name: Run Clippy
+        working-directory: source
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Run optimized tests
+        working-directory: source
+        run: cargo test --workspace --lib --bins --tests --release --locked
+
+      - name: Stress targeted regressions
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($filter in @('window_region', 'monitor_overflow', 'edge_centering', 'compositor', 'geometry_mismatch', 'scratchpad', 'floating')) {
+            for ($i = 0; $i -lt 5; $i++) {
+              cargo test --workspace --release --locked $filter -- --test-threads=1
+              if ($LASTEXITCODE -ne 0) { throw "$filter iteration $i failed" }
+            }
+          }
+
+      - name: Settings GUI smoke test
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Path settings-smoke -Force | Out-Null
+          Push-Location settings-smoke
+          npm init -y | Out-Null
+          npm install playwright-core@1.55.0 --no-audit --no-fund
+          Pop-Location
+          $env:NODE_PATH = (Resolve-Path 'settings-smoke/node_modules').Path
+          node ../control/.github/v12/settings_smoke.mjs crates/daemon/src/settings/settings.html settings-smoke/screenshots
+          if ($LASTEXITCODE -ne 0) { throw 'Settings smoke test failed' }
+
+      - name: Build release binaries
+        working-directory: source
+        run: cargo build --workspace --release --locked
+
+      - name: Verify GUI subsystems
+        working-directory: source
+        shell: pwsh
+        run: ./.github/verify-gui-subsystems.ps1 -RepoRoot (Get-Location).Path
+
+      - name: Install cargo-wix
+        run: cargo install cargo-wix --version ^0.3 --locked
+
+      - name: Build and verify MSI
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo wix -p leopardwm-daemon -I wix/main.wxs --target x86_64-pc-windows-msvc --no-build --nocapture --bin-path 'C:\Program Files (x86)\WiX Toolset v3.14\bin'
+          $built = Get-ChildItem target/wix/*.msi | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $built) { throw 'MSI not produced' }
+          Copy-Item $built.FullName "LeopardWM-$env:RELEASE_VERSION-x86_64.msi"
+          $admin = Join-Path (Get-Location) 'msi-admin-image'
+          New-Item -ItemType Directory -Path $admin -Force | Out-Null
+          $msi = (Resolve-Path "LeopardWM-$env:RELEASE_VERSION-x86_64.msi").Path
+          $args = "/a `"$msi`" /qn TARGETDIR=`"$admin`""
+          $process = Start-Process "$env:SystemRoot\System32\msiexec.exe" -ArgumentList $args -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "MSI verification failed: $($process.ExitCode)" }
+
+      - name: Commit and fast-forward main
+        id: source_commit
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add crates
+          git diff --cached --check
+          git commit -m 'feat: add recoverable monitor-edge window clipping'
+          $candidate = (git rev-parse HEAD).Trim()
+          git push origin HEAD:refs/heads/$env:SOURCE_BRANCH
+          $remoteMain = ((git ls-remote origin refs/heads/main) -split '\s+')[0]
+          if ($remoteMain -ne $env:EXPECTED_MAIN_SHA) { throw "main moved: $remoteMain" }
+          git push origin HEAD:refs/heads/main
+          $verified = ((git ls-remote origin refs/heads/main) -split '\s+')[0]
+          if ($verified -ne $candidate) { throw 'main identity mismatch' }
+          "sha=$candidate" >> $env:GITHUB_OUTPUT
+
+      - name: Package ZIP and checksums
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $binDir = @('target/x86_64-pc-windows-msvc/release', 'target/release') | Where-Object { Test-Path (Join-Path $_ 'leopardwm.exe') } | Select-Object -First 1
+          $package = "LeopardWM-$env:RELEASE_VERSION-x86_64-windows"
+          New-Item -ItemType Directory -Path $package -Force | Out-Null
+          foreach ($binary in @('leopardwm.exe','leopardwm-cli.exe','lwm.exe','leopardwm-watchdog.exe')) {
+            Copy-Item (Join-Path $binDir $binary) (Join-Path $package $binary)
+            Copy-Item (Join-Path $binDir $binary) $binary
+          }
+          Copy-Item README.md,LICENSE,CHANGELOG.md $package
+          7z a "$package.zip" $package | Out-Host
+          $assets = @("$package.zip", "LeopardWM-$env:RELEASE_VERSION-x86_64.msi", 'leopardwm.exe','leopardwm-cli.exe','lwm.exe','leopardwm-watchdog.exe')
+          $lines = foreach ($asset in $assets) { "{0} *{1}" -f (Get-FileHash $asset -Algorithm SHA256).Hash.ToLowerInvariant(), $asset }
+          $lines | Set-Content checksums.txt -Encoding ascii
+          @'
+          Hardened SetWindowRgn clipping for side-by-side and stacked monitors.
+
+          - partial neighboring tiled columns remain visible inside the owner output
+          - pixels outside the owner output are clipped with a LeopardWM-owned region
+          - custom application regions are never overwritten
+          - versioned HWND metadata and exact shape comparison protect crash recovery and app takeover
+          - clip failure falls back synchronously to safe whole-window placement
+          - `monitor_overflow = "hide"` remains available as the conservative fallback
+          - Settings GUI load/save and narrow-window rendering are verified
+          '@ | Set-Content release-notes-v10.md -Encoding utf8
+
+      - name: Publish release
+        working-directory: source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.source_commit.outputs.sha }}
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" \
+            "LeopardWM-$RELEASE_VERSION-x86_64-windows.zip" \
+            "LeopardWM-$RELEASE_VERSION-x86_64.msi" \
+            leopardwm.exe leopardwm-cli.exe lwm.exe leopardwm-watchdog.exe checksums.txt \
+            --repo "$GITHUB_REPOSITORY" --target "$SOURCE_SHA" \
+            --title "LeopardWM $RELEASE_TAG — hardened monitor clipping" \
+            --notes-file release-notes-v10.md --prerelease
+
+      - name: Verify published release
+        working-directory: source
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.source_commit.outputs.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $verify = Join-Path (Get-Location) 'published-verification'
+          New-Item -ItemType Directory -Path $verify -Force | Out-Null
+          gh release download $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --dir $verify
+          foreach ($line in Get-Content (Join-Path $verify 'checksums.txt')) {
+            if ($line -notmatch '^([0-9a-f]{64}) \*(.+)$') { throw "Bad checksum: $line" }
+            $path = Join-Path $verify $Matches[2]
+            if ((Get-FileHash $path -Algorithm SHA256).Hash.ToLowerInvariant() -ne $Matches[1]) { throw "Hash mismatch: $($Matches[2])" }
+          }
+          7z t (Join-Path $verify "LeopardWM-$env:RELEASE_VERSION-x86_64-windows.zip") | Out-Host
+          $admin = Join-Path $verify 'msi-admin'
+          New-Item -ItemType Directory -Path $admin -Force | Out-Null
+          $msi = Join-Path $verify "LeopardWM-$env:RELEASE_VERSION-x86_64.msi"
+          $args = "/a `"$msi`" /qn TARGETDIR=`"$admin`""
+          $process = Start-Process "$env:SystemRoot\System32\msiexec.exe" -ArgumentList $args -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw 'Published MSI failed' }
+          git fetch origin --tags --force
+          $tagSha = (git rev-list -n 1 $env:RELEASE_TAG).Trim()
+          $mainSha = ((git ls-remote origin refs/heads/main) -split '\s+')[0]
+          if ($tagSha -ne $env:SOURCE_SHA -or $mainSha -ne $env:SOURCE_SHA) { throw 'source identity mismatch' }
+
+      - name: Publish success status
+        working-directory: source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.source_commit.outputs.sha }}
+        run: |
+          set -euo pipefail
+          path='agent_docs/window-region-v12b-status.json'
+          zip_hash=$(sha256sum "LeopardWM-$RELEASE_VERSION-x86_64-windows.zip" | awk '{print $1}')
+          msi_hash=$(sha256sum "LeopardWM-$RELEASE_VERSION-x86_64.msi" | awk '{print $1}')
+          payload=$(jq -n --arg state success --arg run_id "$GITHUB_RUN_ID" --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --arg tag "$RELEASE_TAG" --arg source_sha "$SOURCE_SHA" --arg zip_sha256 "$zip_hash" --arg msi_sha256 "$msi_hash" '{state:$state,run_id:$run_id,run_url:$run_url,tag:$tag,source_sha:$source_sha,zip_sha256:$zip_sha256,msi_sha256:$msi_sha256}')
+          content=$(printf '%s\n' "$payload" | base64 -w0)
+          current=$(gh api "repos/$GITHUB_REPOSITORY/contents/$path?ref=$CONTROL_BRANCH" --jq .sha)
+          gh api --method PUT "repos/$GITHUB_REPOSITORY/contents/$path" -f message='ci: record successful v12b release' -f content="$content" -f branch="$CONTROL_BRANCH" -f sha="$current" >/dev/null
+
+      - name: Publish failure status
+        if: ${{ failure() }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          path='agent_docs/window-region-v12b-status.json'
+          payload=$(jq -n --arg state failure --arg run_id "$GITHUB_RUN_ID" --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" '{state:$state,run_id:$run_id,run_url:$run_url}')
+          content=$(printf '%s\n' "$payload" | base64 -w0)
+          current=$(gh api "repos/$GITHUB_REPOSITORY/contents/$path?ref=$CONTROL_BRANCH" --jq .sha 2>/dev/null || true)
+          args=(--method PUT "repos/$GITHUB_REPOSITORY/contents/$path" -f message='ci: record failed v12b release' -f content="$content" -f branch="$CONTROL_BRANCH")
+          if [[ -n "$current" ]]; then args+=(-f sha="$current"); fi
+          gh api "${args[@]}" >/dev/null
+
+      - name: Upload verified bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: LeopardWM-v0.2.6-sehoon.10-verified
+          path: |
+            source/LeopardWM-0.2.6-sehoon.10-x86_64-windows.zip
+            source/LeopardWM-0.2.6-sehoon.10-x86_64.msi
+            source/checksums.txt
+            source/release-notes-v10.md
+            source/settings-smoke/screenshots/*.png
+          if-no-files-found: error
+          retention-days: 14
