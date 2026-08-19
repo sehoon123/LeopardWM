@@ -1,0 +1,434 @@
+name: Verify and release generalized focus-scroll modes
+
+on:
+  push:
+    branches:
+      - agent/focus-scroll-modes-v12-control
+    paths:
+      - .github/workflows/agent-focus-scroll-modes-v12.yml
+      - .github/focus-v12/**
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: focus-scroll-modes-v12
+  cancel-in-progress: false
+
+env:
+  CONTROL_BRANCH: agent/focus-scroll-modes-v12-control
+  SOURCE_BRANCH: agent/focus-scroll-modes-v12-source
+  EXPECTED_MAIN_SHA: 1f5dc0b5b2e0364185f7025b06f1420d4f75ef2d
+  RELEASE_TAG: v0.2.6-sehoon.12
+  RELEASE_VERSION: 0.2.6-sehoon.12
+
+jobs:
+  verify-build-release:
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out control files
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CONTROL_BRANCH }}
+          path: control
+          fetch-depth: 0
+
+      - name: Check out product source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_BRANCH }}
+          path: source
+          fetch-depth: 0
+
+      - name: Record workflow run
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          path='agent_docs/focus-scroll-v12-status.json'
+          payload=$(jq -n \
+            --arg state started \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --arg expected_main "$EXPECTED_MAIN_SHA" \
+            '{state:$state,run_id:$run_id,run_url:$run_url,expected_main:$expected_main}')
+          content=$(printf '%s\n' "$payload" | base64 -w0)
+          current=$(gh api "repos/$GITHUB_REPOSITORY/contents/$path?ref=$CONTROL_BRANCH" --jq .sha 2>/dev/null || true)
+          args=(--method PUT "repos/$GITHUB_REPOSITORY/contents/$path" -f message='ci: record focus-scroll v12 run' -f content="$content" -f branch="$CONTROL_BRANCH")
+          if [[ -n "$current" ]]; then args+=(-f sha="$current"); fi
+          gh api "${args[@]}" >/dev/null
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Apply focused source changes
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          python ../control/.github/focus-v12/apply_focus_scroll_modes.py
+          Copy-Item ../control/.github/focus-v12/focus_scroll_modes.rs crates/core_layout/tests/focus_scroll_modes.rs
+          Copy-Item ../control/.github/focus-v12/layout_apply_focus_modes.rs crates/daemon/src/layout_apply_focus_modes.rs
+          @'
+          from pathlib import Path
+          path = Path('crates/daemon/src/layout_apply.rs')
+          text = path.read_text(encoding='utf-8')
+          marker = '\n#[cfg(test)]\n#[path = "layout_apply_focus_modes.rs"]\nmod focus_mode_preview_tests;\n'
+          if marker in text:
+              raise SystemExit('focus-mode test module already declared')
+          path.write_text(text.rstrip() + marker, encoding='utf-8', newline='\n')
+          '@ | python -
+
+      - name: Format and verify exact change set
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo fmt --all
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { throw 'cargo fmt check failed' }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'git diff check failed' }
+
+          $allowed = @(
+            'crates/core_layout/src/workspace/mod.rs',
+            'crates/core_layout/src/workspace/operations.rs',
+            'crates/core_layout/tests/focus_scroll_modes.rs',
+            'crates/daemon/src/layout_apply.rs',
+            'crates/daemon/src/layout_apply_focus_modes.rs'
+          )
+          $changed = @(git status --short | ForEach-Object { $_.Substring(3) })
+          $unexpected = @($changed | Where-Object { $_ -notin $allowed })
+          if ($unexpected.Count -ne 0) {
+            throw "Unexpected changed files: $($unexpected -join ', ')"
+          }
+
+      - name: Verify algorithm contracts
+        working-directory: source
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+          operations = Path('crates/core_layout/src/workspace/operations.rs').read_text(encoding='utf-8')
+          core_tests = Path('crates/core_layout/tests/focus_scroll_modes.rs').read_text(encoding='utf-8')
+          daemon_tests = Path('crates/daemon/src/layout_apply_focus_modes.rs').read_text(encoding='utf-8')
+          required = {
+              'single focus target': 'fn focus_scroll_target(',
+              'minimal fitting movement': 'fn nearest_visible_scroll_target(',
+              'oversized viewport containment': 'The column cannot fit.',
+              'shared animated target': 'self.focus_scroll_target(',
+              '50/100 focus contract': 'just_in_view_50_100_tracks_focus_without_losing_preview',
+              'oversized stability': 'just_in_view_does_not_edge_snap_an_oversized_column_already_in_view',
+              'mode matrix': 'exhaustive_mode_matrix_preserves_each_modes_invariants',
+              'multi-monitor preservation': 'clip_mode_never_mutates_visible_layout_geometry',
+          }
+          combined = operations + '\n' + core_tests + '\n' + daemon_tests
+          missing = [name for name, marker in required.items() if marker not in combined]
+          if missing:
+              raise SystemExit('Missing focus-scroll contracts: ' + ', '.join(missing))
+          print('focus-scroll contracts: OK')
+          '@ | python -
+
+      - name: Run focused mode tests first
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo test -p leopardwm-core-layout --test focus_scroll_modes --locked -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw 'core focus-scroll tests failed' }
+          cargo test -p leopardwm-daemon --bin leopardwm --locked focus_mode_preview_tests -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw 'multi-monitor focus-mode tests failed' }
+
+      - name: Run full locked test suite
+        working-directory: source
+        run: cargo test --workspace --all-targets --locked
+
+      - name: Run Clippy with warnings denied
+        working-directory: source
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Check every Cargo target
+        working-directory: source
+        run: cargo check --workspace --all-targets --locked
+
+      - name: Run optimized tests
+        working-directory: source
+        run: cargo test --workspace --lib --bins --tests --release --locked
+
+      - name: Stress focus and geometry regressions
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          for ($i = 0; $i -lt 6; $i++) {
+            cargo test -p leopardwm-core-layout --test focus_scroll_modes --release --locked -- --test-threads=1
+            if ($LASTEXITCODE -ne 0) { throw "focus mode stress iteration $i failed" }
+            cargo test -p leopardwm-daemon --bin leopardwm --release --locked focus_mode_preview_tests -- --test-threads=1
+            if ($LASTEXITCODE -ne 0) { throw "monitor clip stress iteration $i failed" }
+          }
+          foreach ($filter in @('window_region', 'compositor', 'geometry_mismatch', 'scratchpad', 'floating')) {
+            for ($i = 0; $i -lt 2; $i++) {
+              cargo test --workspace --release --locked $filter -- --test-threads=1
+              if ($LASTEXITCODE -ne 0) { throw "$filter stress iteration $i failed" }
+            }
+          }
+
+      - name: Build optimized Windows binaries
+        working-directory: source
+        run: cargo build --workspace --release --locked
+
+      - name: Verify Windows GUI subsystems
+        working-directory: source
+        shell: pwsh
+        run: ./.github/verify-gui-subsystems.ps1 -RepoRoot (Get-Location).Path
+
+      - name: Install cargo-wix
+        run: cargo install cargo-wix --version ^0.3 --locked
+
+      - name: Build MSI installer
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo wix -p leopardwm-daemon -I wix/main.wxs --target x86_64-pc-windows-msvc --no-build --nocapture --bin-path 'C:\Program Files (x86)\WiX Toolset v3.14\bin'
+          if ($LASTEXITCODE -ne 0) { throw 'cargo wix failed' }
+          $built = Get-ChildItem target/wix/*.msi | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $built) { throw 'cargo wix produced no MSI' }
+          Copy-Item $built.FullName "LeopardWM-$env:RELEASE_VERSION-x86_64.msi"
+
+      - name: Verify locally built MSI
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msi = (Resolve-Path "LeopardWM-$env:RELEASE_VERSION-x86_64.msi").Path
+          $admin = Join-Path (Get-Location) 'msi-admin-image'
+          New-Item -ItemType Directory -Path $admin -Force | Out-Null
+          $arguments = "/a `"$msi`" /qn TARGETDIR=`"$admin`""
+          $process = Start-Process "$env:SystemRoot\System32\msiexec.exe" -ArgumentList $arguments -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "MSI administrative install failed: $($process.ExitCode)" }
+          $binDir = @('target/x86_64-pc-windows-msvc/release', 'target/release') |
+            Where-Object { Test-Path (Join-Path $_ 'leopardwm.exe') } |
+            Select-Object -First 1
+          if (-not $binDir) { throw 'Release binary directory not found' }
+          foreach ($binary in @('leopardwm.exe', 'leopardwm-cli.exe', 'lwm.exe', 'leopardwm-watchdog.exe')) {
+            $installed = Get-ChildItem $admin -Recurse -Filter $binary | Select-Object -First 1
+            if (-not $installed) { throw "MSI is missing $binary" }
+            if ((Get-FileHash $installed.FullName -Algorithm SHA256).Hash -ne (Get-FileHash (Join-Path $binDir $binary) -Algorithm SHA256).Hash) {
+              throw "MSI binary mismatch: $binary"
+            }
+          }
+
+      - name: Commit verified source and fast-forward main
+        id: source_commit
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add crates/core_layout/src/workspace/mod.rs crates/core_layout/src/workspace/operations.rs crates/core_layout/tests/focus_scroll_modes.rs crates/daemon/src/layout_apply.rs crates/daemon/src/layout_apply_focus_modes.rs
+          git diff --cached --check
+          if ($LASTEXITCODE -ne 0) { throw 'staged diff check failed' }
+          git commit -m 'refactor: generalize focus scrolling across centering modes'
+          if ($LASTEXITCODE -ne 0) { throw 'source commit failed' }
+          $candidate = (git rev-parse HEAD).Trim()
+          git push origin HEAD:refs/heads/$env:SOURCE_BRANCH
+          if ($LASTEXITCODE -ne 0) { throw 'source branch push failed' }
+
+          $remoteMain = ((git ls-remote origin refs/heads/main) -split '\s+')[0]
+          if ($remoteMain -ne $env:EXPECTED_MAIN_SHA) {
+            throw "main changed during verification: expected=$env:EXPECTED_MAIN_SHA actual=$remoteMain"
+          }
+          git push origin HEAD:refs/heads/main
+          if ($LASTEXITCODE -ne 0) { throw 'main fast-forward failed' }
+          $verifiedMain = ((git ls-remote origin refs/heads/main) -split '\s+')[0]
+          if ($verifiedMain -ne $candidate) {
+            throw "main identity mismatch: candidate=$candidate main=$verifiedMain"
+          }
+          "sha=$candidate" >> $env:GITHUB_OUTPUT
+          Write-Host "Verified source commit: $candidate"
+
+      - name: Package ZIP and standalone binaries
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $binDir = @('target/x86_64-pc-windows-msvc/release', 'target/release') |
+            Where-Object { Test-Path (Join-Path $_ 'leopardwm.exe') } |
+            Select-Object -First 1
+          if (-not $binDir) { throw 'Release binary directory not found' }
+          $packageDir = "LeopardWM-$env:RELEASE_VERSION-x86_64-windows"
+          New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
+          foreach ($binary in @('leopardwm.exe', 'leopardwm-cli.exe', 'lwm.exe', 'leopardwm-watchdog.exe')) {
+            $source = Join-Path $binDir $binary
+            Copy-Item $source (Join-Path $packageDir $binary)
+            Copy-Item $source $binary
+          }
+          Copy-Item README.md, LICENSE, CHANGELOG.md $packageDir
+          7z a "$packageDir.zip" $packageDir | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw 'ZIP packaging failed' }
+
+      - name: Generate checksums and release notes
+        working-directory: source
+        shell: pwsh
+        run: |
+          $assets = @(
+            "LeopardWM-$env:RELEASE_VERSION-x86_64-windows.zip",
+            "LeopardWM-$env:RELEASE_VERSION-x86_64.msi",
+            'leopardwm.exe',
+            'leopardwm-cli.exe',
+            'lwm.exe',
+            'leopardwm-watchdog.exe'
+          )
+          $lines = foreach ($asset in $assets) {
+            "{0} *{1}" -f (Get-FileHash $asset -Algorithm SHA256).Hash.ToLowerInvariant(), $asset
+          }
+          $lines | Set-Content checksums.txt -Encoding ascii
+          @'
+          Personal-fork prerelease from `sehoon123/LeopardWM`.
+
+          Focus-scroll mode hardening:
+          - Center keeps symmetric previews for every fitting width and clips oversized focused columns evenly
+          - JustInView moves by the minimum distance needed to fully expose a fitting column
+          - JustInView keeps an already valid viewport inside an oversized column instead of snapping to an arbitrary edge
+          - OnOverflow behaves exactly like JustInView for widths up to the viewport and centers only oversized columns
+          - synchronous, animated, reduced-motion and interrupted-animation paths share one target algorithm
+          - clip-at-monitor-edge preserves the layout geometry produced by every centering mode
+          - exhaustive width/focus/start-position matrices and multi-monitor clipping tests are included
+          '@ | Set-Content release-notes-v12.md -Encoding utf8
+
+      - name: Publish prerelease
+        working-directory: source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.source_commit.outputs.sha }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release already exists: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Tag already exists: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" \
+            "LeopardWM-$RELEASE_VERSION-x86_64-windows.zip" \
+            "LeopardWM-$RELEASE_VERSION-x86_64.msi" \
+            leopardwm.exe leopardwm-cli.exe lwm.exe leopardwm-watchdog.exe checksums.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$SOURCE_SHA" \
+            --title "LeopardWM $RELEASE_TAG — generalized focus scrolling" \
+            --notes-file release-notes-v12.md \
+            --prerelease
+
+      - name: Independently verify published assets
+        working-directory: source
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.source_commit.outputs.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $verify = Join-Path (Get-Location) 'published-verification'
+          New-Item -ItemType Directory -Path $verify -Force | Out-Null
+          gh release download $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --dir $verify
+          if ($LASTEXITCODE -ne 0) { throw 'Release download failed' }
+          foreach ($line in Get-Content (Join-Path $verify 'checksums.txt')) {
+            if ($line -notmatch '^([0-9a-f]{64}) \*(.+)$') { throw "Invalid checksum line: $line" }
+            $path = Join-Path $verify $Matches[2]
+            if (-not (Test-Path $path)) { throw "Missing asset: $($Matches[2])" }
+            if ((Get-FileHash $path -Algorithm SHA256).Hash.ToLowerInvariant() -ne $Matches[1]) {
+              throw "Checksum mismatch: $($Matches[2])"
+            }
+          }
+          $zip = Join-Path $verify "LeopardWM-$env:RELEASE_VERSION-x86_64-windows.zip"
+          7z t $zip | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw 'Published ZIP CRC check failed' }
+          $extract = Join-Path $verify 'zip-extracted'
+          7z x $zip "-o$extract" -y | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw 'Published ZIP extraction failed' }
+          $msi = Join-Path $verify "LeopardWM-$env:RELEASE_VERSION-x86_64.msi"
+          $admin = Join-Path $verify 'msi-admin-image'
+          New-Item -ItemType Directory -Path $admin -Force | Out-Null
+          $arguments = "/a `"$msi`" /qn TARGETDIR=`"$admin`""
+          $process = Start-Process "$env:SystemRoot\System32\msiexec.exe" -ArgumentList $arguments -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Published MSI install failed: $($process.ExitCode)" }
+          foreach ($binary in @('leopardwm.exe', 'leopardwm-cli.exe', 'lwm.exe', 'leopardwm-watchdog.exe')) {
+            $standalone = Join-Path $verify $binary
+            $fromZip = Get-ChildItem $extract -Recurse -Filter $binary | Select-Object -First 1
+            $fromMsi = Get-ChildItem $admin -Recurse -Filter $binary | Select-Object -First 1
+            if (-not $fromZip -or -not $fromMsi) { throw "Packaged binary missing: $binary" }
+            $expected = (Get-FileHash $standalone -Algorithm SHA256).Hash
+            if ((Get-FileHash $fromZip.FullName -Algorithm SHA256).Hash -ne $expected) { throw "ZIP binary mismatch: $binary" }
+            if ((Get-FileHash $fromMsi.FullName -Algorithm SHA256).Hash -ne $expected) { throw "MSI binary mismatch: $binary" }
+          }
+          git fetch origin --tags --force
+          $tagSha = (git rev-list -n 1 $env:RELEASE_TAG).Trim()
+          $mainSha = ((git ls-remote origin refs/heads/main) -split '\s+')[0]
+          if ($tagSha -ne $env:SOURCE_SHA -or $mainSha -ne $env:SOURCE_SHA) {
+            throw "Source identity mismatch: tag=$tagSha main=$mainSha expected=$env:SOURCE_SHA"
+          }
+
+      - name: Publish success status
+        working-directory: source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.source_commit.outputs.sha }}
+        run: |
+          set -euo pipefail
+          path='agent_docs/focus-scroll-v12-status.json'
+          zip_hash=$(sha256sum "LeopardWM-$RELEASE_VERSION-x86_64-windows.zip" | awk '{print $1}')
+          msi_hash=$(sha256sum "LeopardWM-$RELEASE_VERSION-x86_64.msi" | awk '{print $1}')
+          payload=$(jq -n \
+            --arg state success \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --arg tag "$RELEASE_TAG" \
+            --arg source_sha "$SOURCE_SHA" \
+            --arg zip_sha256 "$zip_hash" \
+            --arg msi_sha256 "$msi_hash" \
+            '{state:$state,run_id:$run_id,run_url:$run_url,tag:$tag,source_sha:$source_sha,zip_sha256:$zip_sha256,msi_sha256:$msi_sha256}')
+          content=$(printf '%s\n' "$payload" | base64 -w0)
+          current=$(gh api "repos/$GITHUB_REPOSITORY/contents/$path?ref=$CONTROL_BRANCH" --jq .sha)
+          gh api --method PUT "repos/$GITHUB_REPOSITORY/contents/$path" \
+            -f message='ci: record successful focus-scroll v12 release' \
+            -f content="$content" -f branch="$CONTROL_BRANCH" -f sha="$current" >/dev/null
+
+      - name: Publish failure status
+        if: ${{ failure() }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          path='agent_docs/focus-scroll-v12-status.json'
+          payload=$(jq -n --arg state failure --arg run_id "$GITHUB_RUN_ID" \
+            --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            '{state:$state,run_id:$run_id,run_url:$run_url}')
+          content=$(printf '%s\n' "$payload" | base64 -w0)
+          current=$(gh api "repos/$GITHUB_REPOSITORY/contents/$path?ref=$CONTROL_BRANCH" --jq .sha 2>/dev/null || true)
+          args=(--method PUT "repos/$GITHUB_REPOSITORY/contents/$path" -f message='ci: record failed focus-scroll v12 release' -f content="$content" -f branch="$CONTROL_BRANCH")
+          if [[ -n "$current" ]]; then args+=(-f sha="$current"); fi
+          gh api "${args[@]}" >/dev/null
+
+      - name: Upload verified release bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: LeopardWM-v0.2.6-sehoon.12-verified
+          path: |
+            source/LeopardWM-0.2.6-sehoon.12-x86_64-windows.zip
+            source/LeopardWM-0.2.6-sehoon.12-x86_64.msi
+            source/checksums.txt
+            source/release-notes-v12.md
+          if-no-files-found: error
+          retention-days: 14
