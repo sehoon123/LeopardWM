@@ -1,0 +1,51 @@
+name: Finalize window-region v10 workflow
+
+on:
+  push:
+    branches:
+      - agent/window-region-clipping-v10-control
+    paths:
+      - .github/workflows/agent-update-window-region-v10-workflow.yml
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/window-region-clipping-v10-control
+          fetch-depth: 0
+      - name: Add final hardening pass
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('.github/workflows/agent-release-window-region-v10.yml')
+          text = path.read_text(encoding='utf-8')
+          trigger = '      - .github/scripts/harden_window_region_clipping_v10.py\n'
+          if '.github/scripts/finalize_window_region_clipping_v10.py' not in text:
+              if text.count(trigger) != 1:
+                  raise SystemExit('workflow trigger anchor missing')
+              text = text.replace(
+                  trigger,
+                  trigger + '      - .github/scripts/finalize_window_region_clipping_v10.py\n',
+              )
+          call = '          python ../control/.github/scripts/harden_window_region_clipping_v10.py\n'
+          if 'python ../control/.github/scripts/finalize_window_region_clipping_v10.py' not in text:
+              if text.count(call) != 1:
+                  raise SystemExit('workflow call anchor missing')
+              text = text.replace(
+                  call,
+                  call + '          python ../control/.github/scripts/finalize_window_region_clipping_v10.py\n',
+              )
+          path.write_text(text, encoding='utf-8', newline='\n')
+          PY
+      - name: Commit workflow update
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add .github/workflows/agent-release-window-region-v10.yml
+          git commit -m 'ci: include final region-ownership hardening'
+          git push origin HEAD:agent/window-region-clipping-v10-control
