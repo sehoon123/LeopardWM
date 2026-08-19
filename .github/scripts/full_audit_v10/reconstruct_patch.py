@@ -10,8 +10,13 @@ expected_names = [f'part-{index:02}.b64' for index in range(4)]
 if [part.name for part in parts] != expected_names:
     raise SystemExit(f'Unexpected patch parts: {[part.name for part in parts]}')
 
-encoded = ''.join(part.read_text(encoding='ascii').strip() for part in parts)
-compressed = base64.b64decode(encoded, validate=True)
+# Each repository file is an independently padded base64 block. Decode the
+# blocks separately, then concatenate the original gzip bytes. Concatenating
+# the encoded text first is invalid because padding may appear before EOF.
+compressed = b''.join(
+    base64.b64decode(part.read_text(encoding='ascii').strip(), validate=True)
+    for part in parts
+)
 compressed_hash = hashlib.sha256(compressed).hexdigest()
 if compressed_hash != os.environ['PATCH_GZIP_SHA256']:
     raise SystemExit(f'Compressed patch digest mismatch: {compressed_hash}')
