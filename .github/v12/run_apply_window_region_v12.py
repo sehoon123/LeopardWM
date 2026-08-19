@@ -73,5 +73,33 @@ if script.count(old_animation) != 1:
     raise RuntimeError('base integration script does not contain the expected animation block')
 script = script.replace(old_animation, new_animation)
 
+old_animation_call = '''animation = animation.replace(
+    ''' + "'''" + '''leopardwm_platform_win32::apply_placements(\\n                    &request.placements,\\n                    &request.platform_config,\\n''' + "'''" + ''',
+    ''' + "'''" + '''leopardwm_platform_win32::apply_placements_with_regions(\\n                    &request.placements,\\n                    &request.region_clips,\\n                    &request.platform_config,\\n''' + "'''" + ''',
+)
+if 'apply_placements_with_regions' not in animation:
+    raise RuntimeError('animation_worker.rs: placement call was not updated')
+'''
+new_animation_call = '''call_marker = "leopardwm_platform_win32::apply_placements("
+if animation.count(call_marker) != 1:
+    raise RuntimeError('animation_worker.rs: placement call marker mismatch')
+animation = animation.replace(
+    call_marker,
+    "leopardwm_platform_win32::apply_placements_with_regions(",
+    1,
+)
+argument_marker = "                        &request.placements,\\n"
+if animation.count(argument_marker) != 1:
+    raise RuntimeError('animation_worker.rs: placements argument marker mismatch')
+animation = animation.replace(
+    argument_marker,
+    argument_marker + "                        &request.region_clips,\\n",
+    1,
+)
+'''
+if script.count(old_animation_call) != 1:
+    raise RuntimeError('base integration script does not contain the expected animation call block')
+script = script.replace(old_animation_call, new_animation_call)
+
 compiled = compile(script, str(script_path), 'exec')
 exec(compiled, {'__name__': '__main__', '__file__': str(script_path)})
