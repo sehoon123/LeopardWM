@@ -14,11 +14,10 @@ use std::sync::{Mutex, OnceLock};
 use windows::core::w;
 use windows::Win32::Foundation::{HANDLE, HWND};
 use windows::Win32::Graphics::Gdi::{
-    CreateRectRgn, DeleteObject, EqualRgn, GetWindowRgn, HGDIOBJ,
+    CreateRectRgn, DeleteObject, EqualRgn, GetWindowRgn, SetWindowRgn, HGDIOBJ,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClassNameW, GetPropW, GetWindowThreadProcessId, IsWindow, RemovePropW, SetPropW,
-    SetWindowRgn,
+    GetPropW, GetClassNameW, GetWindowThreadProcessId, IsWindow, RemovePropW, SetPropW,
 };
 
 const ERROR_REGION_KIND: i32 = 0;
@@ -154,27 +153,27 @@ fn write_metadata(hwnd: HWND, rect: Rect) -> bool {
             SetPropW(
                 hwnd,
                 w!("LeopardWM.RegionClip.v2.Owner"),
-                handle_from_usize(OWNER_MAGIC),
+                Some(handle_from_usize(OWNER_MAGIC)),
             ),
             SetPropW(
                 hwnd,
                 w!("LeopardWM.RegionClip.v2.Left"),
-                encode_coordinate(rect.x),
+                Some(encode_coordinate(rect.x)),
             ),
             SetPropW(
                 hwnd,
                 w!("LeopardWM.RegionClip.v2.Top"),
-                encode_coordinate(rect.y),
+                Some(encode_coordinate(rect.y)),
             ),
             SetPropW(
                 hwnd,
                 w!("LeopardWM.RegionClip.v2.Right"),
-                encode_coordinate(rect.right()),
+                Some(encode_coordinate(rect.right())),
             ),
             SetPropW(
                 hwnd,
                 w!("LeopardWM.RegionClip.v2.Bottom"),
-                encode_coordinate(rect.bottom()),
+                Some(encode_coordinate(rect.bottom())),
             ),
         ]
     };
@@ -203,7 +202,12 @@ fn read_metadata(hwnd: HWND) -> Option<Rect> {
 }
 
 fn create_region(rect: Rect) -> Option<windows::Win32::Graphics::Gdi::HRGN> {
-    unsafe { CreateRectRgn(rect.x, rect.y, rect.right(), rect.bottom()) }.ok()
+    let region = unsafe { CreateRectRgn(rect.x, rect.y, rect.right(), rect.bottom()) };
+    if region.0.is_null() {
+        None
+    } else {
+        Some(region)
+    }
 }
 
 fn delete_region(region: windows::Win32::Graphics::Gdi::HRGN) {
