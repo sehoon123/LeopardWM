@@ -1,0 +1,62 @@
+name: Monitor final window-region v10 run
+
+on:
+  push:
+    branches:
+      - agent/window-region-clipping-v10-control
+    paths:
+      - .github/workflows/agent-monitor-window-region-v10-final.yml
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/window-region-clipping-v10-control
+          fetch-depth: 0
+      - name: Wait for latest final validation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          workflow='.github/workflows/agent-release-window-region-v10.yml'
+          run_id=''
+          for _ in $(seq 1 60); do
+            run_id=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow/runs?branch=agent/window-region-clipping-v10-control&per_page=5" --jq '.workflow_runs[0].id // empty')
+            if [[ -n "$run_id" ]]; then break; fi
+            sleep 5
+          done
+          [[ -n "$run_id" ]]
+          for _ in $(seq 1 150); do
+            status=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" --jq .status)
+            if [[ "$status" == completed ]]; then break; fi
+            sleep 10
+          done
+          run=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id")
+          jobs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?per_page=100")
+          conclusion=$(jq -r .conclusion <<<"$run")
+          failed=$(jq '[.jobs[].steps[] | select(.conclusion == "failure") | {name,number}]' <<<"$jobs")
+          job_id=$(jq -r '.jobs[0].id' <<<"$jobs")
+          log_tail=''
+          if [[ "$conclusion" != success ]]; then
+            gh api "repos/$GITHUB_REPOSITORY/actions/jobs/$job_id/logs" > logs.zip || true
+            if unzip -p logs.zip > logs.txt 2>/dev/null; then log_tail=$(tail -n 160 logs.txt); fi
+          fi
+          jq -n \
+            --arg run_id "$run_id" \
+            --arg status "$(jq -r .status <<<"$run")" \
+            --arg conclusion "$conclusion" \
+            --arg log_tail "$log_tail" \
+            --argjson failed_steps "$failed" \
+            '{run_id:$run_id,status:$status,conclusion:$conclusion,failed_steps:$failed_steps,log_tail:$log_tail}' \
+            > agent_docs/window-region-v10-final-monitor.json
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add agent_docs/window-region-v10-final-monitor.json
+          git commit -m 'ci: record final window-region v10 result'
+          git push origin HEAD:agent/window-region-clipping-v10-control
