@@ -1,0 +1,12 @@
+{
+  "run_id": "32218115827",
+  "status": "completed",
+  "conclusion": "failure",
+  "failed_steps": [
+    {
+      "name": "Apply concise clipping patch",
+      "number": 6
+    }
+  ],
+  "log_tail": ""
+}
