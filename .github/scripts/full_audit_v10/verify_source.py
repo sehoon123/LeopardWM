@@ -30,9 +30,7 @@ EXPECTED_FILES = {
     'crates/watchdog/src/main.rs', 'dist/scoop/leopardwm.json', 'wix/main.wxs',
 }
 
-# `git diff --name-only` omits new untracked files, which made the verifier
-# blind to exactly the modules it was intended to authenticate. Porcelain
-# status reports modifications, deletions, and additions in one stable format.
+# Porcelain status covers modifications, deletions, and untracked modules.
 changed = {
     line[3:]
     for line in subprocess.check_output(
@@ -85,11 +83,16 @@ forbidden = {
     'thumbnail handle leak': 'mem::forget(self)',
     'GetMessage bool collapse': 'GetMessageW(&mut msg, None, 0, 0).as_bool()',
     'animation worker startup panic': 'expect("Failed to spawn animation worker")',
-    'hidden update preference save': 'check_for_updates: window._initConfig.behavior.check_for_updates',
 }
 present = [name for name, marker in forbidden.items() if marker in corpus]
 if present:
     raise SystemExit('Forbidden stale patterns remain: ' + ', '.join(present))
+
+# The Rust contract test intentionally contains the old expression as a string
+# to assert its absence. Check the executable HTML instead of the entire corpus.
+hidden_update_save = 'check_for_updates: window._initConfig.behavior.check_for_updates'
+if hidden_update_save in settings:
+    raise SystemExit('Forbidden stale Settings save path remains')
 
 ids = re.findall(r'id="([^"]+)"', settings)
 duplicates = sorted({identifier for identifier in ids if ids.count(identifier) > 1})
