@@ -1,0 +1,71 @@
+name: Monitor current window-region v10 validation
+
+on:
+  push:
+    branches:
+      - agent/window-region-clipping-v10-control
+    paths:
+      - .github/workflows/agent-monitor-window-region-v10-release2.yml
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/window-region-clipping-v10-control
+          fetch-depth: 0
+
+      - name: Wait for the run recorded by the release workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          run_id=''
+          for _ in $(seq 1 90); do
+            git fetch origin agent/window-region-clipping-v10-control
+            git show origin/agent/window-region-clipping-v10-control:agent_docs/window-region-v10-status.json > status.json 2>/dev/null || true
+            run_id=$(jq -r '.run_id // empty' status.json 2>/dev/null || true)
+            if [[ -n "$run_id" ]]; then break; fi
+            sleep 5
+          done
+          [[ -n "$run_id" ]]
+
+          for _ in $(seq 1 180); do
+            run=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id")
+            status=$(jq -r .status <<<"$run")
+            if [[ "$status" == completed ]]; then break; fi
+            sleep 10
+          done
+
+          run=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id")
+          jobs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/jobs?per_page=100")
+          conclusion=$(jq -r .conclusion <<<"$run")
+          failed_steps=$(jq '[.jobs[].steps[] | select(.conclusion == "failure") | {name,number}]' <<<"$jobs")
+          job_id=$(jq -r '.jobs[0].id' <<<"$jobs")
+          log_tail=''
+          if [[ "$conclusion" != success ]]; then
+            gh api "repos/$GITHUB_REPOSITORY/actions/jobs/$job_id/logs" > job-logs.zip || true
+            if unzip -p job-logs.zip > job.log 2>/dev/null; then
+              log_tail=$(tail -n 240 job.log)
+            fi
+          fi
+
+          jq -n \
+            --arg run_id "$run_id" \
+            --arg status "$(jq -r .status <<<"$run")" \
+            --arg conclusion "$conclusion" \
+            --arg log_tail "$log_tail" \
+            --argjson failed_steps "$failed_steps" \
+            '{run_id:$run_id,status:$status,conclusion:$conclusion,failed_steps:$failed_steps,log_tail:$log_tail}' \
+            > agent_docs/window-region-v10-release2-result.json
+
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add agent_docs/window-region-v10-release2-result.json
+          git commit -m 'ci: record current window-region v10 validation result'
+          git push origin HEAD:agent/window-region-clipping-v10-control
