@@ -1,0 +1,33 @@
+name: Cancel v10 run before second hardening pass
+
+on:
+  push:
+    branches:
+      - agent/window-region-clipping-v10-control
+    paths:
+      - .github/workflows/agent-cancel-window-region-v10-final.yml
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  cancel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/window-region-clipping-v10-control
+      - name: Cancel latest in-progress v10 validation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          workflow='.github/workflows/agent-release-window-region-v10.yml'
+          run_id=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow/runs?branch=agent/window-region-clipping-v10-control&per_page=5" --jq '.workflow_runs[0].id // empty')
+          if [[ -n "$run_id" ]]; then
+            status=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" --jq .status)
+            if [[ "$status" != completed ]]; then
+              gh api --method POST "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/cancel"
+            fi
+          fi
