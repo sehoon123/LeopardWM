@@ -1,6 +1,6 @@
 {
-  "state": "failure",
-  "run_id": "32233389497",
-  "run_url": "https://github.com/sehoon123/LeopardWM/actions/runs/32233389497",
-  "diagnostic": "===== fmt.log =====\nerror: expected expression, found `==`\r\n   --> \\\\?\\D:\\a\\LeopardWM\\LeopardWM\\source\\crates\\platform_win32\\src\\window_region.rs:231:51\r\n    |\r\n231 |     unsafe { GetWindowRgnBox(hwnd, &mut bounds) } == NULL_REGION_KIND\r\n    |                                                   ^^ expected expression\r\n\r\nError writing files: failed to resolve mod `window_region`: cannot parse \\\\?\\D:\\a\\LeopardWM\\LeopardWM\\source\\crates\\platform_win32\\src\\window_region.rs"
+  "state": "started",
+  "run_id": "32233647741",
+  "run_url": "https://github.com/sehoon123/LeopardWM/actions/runs/32233647741",
+  "base_sha": "bfb2bb1409f39e29fa3530d3858fe6fab733d0c7"
 }
