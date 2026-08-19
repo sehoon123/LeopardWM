@@ -1,0 +1,67 @@
+name: Add second window-region v10 hardening pass
+
+on:
+  push:
+    branches:
+      - agent/window-region-clipping-v10-control
+    paths:
+      - .github/workflows/agent-update-window-region-v10-workflow-part2.yml
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/window-region-clipping-v10-control
+          fetch-depth: 0
+      - name: Update validation workflow
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('.github/workflows/agent-release-window-region-v10.yml')
+          text = path.read_text(encoding='utf-8')
+          trigger = '      - .github/scripts/finalize_window_region_clipping_v10.py\n'
+          if '.github/scripts/finalize_window_region_clipping_v10_part2.py' not in text:
+              if text.count(trigger) != 1:
+                  raise SystemExit('part2 trigger anchor missing')
+              text = text.replace(
+                  trigger,
+                  trigger + '      - .github/scripts/finalize_window_region_clipping_v10_part2.py\n',
+              )
+          call = '          python ../control/.github/scripts/finalize_window_region_clipping_v10.py\n'
+          if 'python ../control/.github/scripts/finalize_window_region_clipping_v10_part2.py' not in text:
+              if text.count(call) != 1:
+                  raise SystemExit('part2 call anchor missing')
+              text = text.replace(
+                  call,
+                  call + '          python ../control/.github/scripts/finalize_window_region_clipping_v10_part2.py\n',
+              )
+          allowed = "            'crates/platform_win32/src/window_region.rs'\n"
+          if "'crates/daemon/src/transitions.rs'" not in text:
+              if text.count(allowed) != 1:
+                  raise SystemExit('allowed-files anchor missing')
+              text = text.replace(
+                  allowed,
+                  "            'crates/daemon/src/transitions.rs',\n" + allowed,
+              )
+          git_add = 'crates/daemon/src/settings/settings.html crates/daemon/src/state.rs '
+          if 'crates/daemon/src/transitions.rs crates/daemon/src/state.rs' not in text:
+              if text.count(git_add) != 1:
+                  raise SystemExit('git-add anchor missing')
+              text = text.replace(
+                  git_add,
+                  'crates/daemon/src/settings/settings.html crates/daemon/src/transitions.rs crates/daemon/src/state.rs ',
+              )
+          path.write_text(text, encoding='utf-8', newline='\n')
+          PY
+      - name: Commit workflow update
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add .github/workflows/agent-release-window-region-v10.yml
+          git commit -m 'ci: include dynamic-region and ghost-edge hardening'
+          git push origin HEAD:agent/window-region-clipping-v10-control
