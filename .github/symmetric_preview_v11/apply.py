@@ -398,7 +398,17 @@ fn assert_clip_preview_distribution(column_width: i32, expected_preview: i32) {
             column_index: 2,
         },
     ];
-    let original = placements.clone();
+    let original: Vec<_> = placements
+        .iter()
+        .map(|placement| {
+            (
+                placement.window_id,
+                placement.rect,
+                placement.visibility,
+                placement.column_index,
+            )
+        })
+        .collect();
     let mut clips = Vec::new();
 
     prepare_monitor_overflow(
@@ -411,7 +421,18 @@ fn assert_clip_preview_distribution(column_width: i32, expected_preview: i32) {
         &mut clips,
     );
 
-    assert_eq!(placements, original);
+    let actual: Vec<_> = placements
+        .iter()
+        .map(|placement| {
+            (
+                placement.window_id,
+                placement.rect,
+                placement.visibility,
+                placement.column_index,
+            )
+        })
+        .collect();
+    assert_eq!(actual, original);
     assert!(placements
         .iter()
         .all(|placement| placement.visibility == Visibility::Visible));
