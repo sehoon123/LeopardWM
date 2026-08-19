@@ -1,0 +1,51 @@
+name: Inspect v10 patch anchors
+
+on:
+  push:
+    branches:
+      - agent/window-region-clipping-v10-control
+    paths:
+      - .github/workflows/agent-inspect-window-region-v10.yml
+
+permissions:
+  contents: write
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: bfb2bb1409f39e29fa3530d3858fe6fab733d0c7
+      - name: Extract compact source anchors
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          def around(path, needle, before=1000, after=1800):
+              text = Path(path).read_text(encoding='utf-8')
+              at = text.index(needle)
+              return f'===== {path}: {needle} =====\n' + text[max(0, at-before):at+after] + '\n'
+
+          parts = [
+              around('crates/daemon/src/settings/settings.html', 'layout-center_past_edges', 1800, 2600),
+              around('crates/daemon/src/settings/settings.html', "setChecked('layout-center_past_edges'", 1200, 1800),
+              around('crates/daemon/src/settings/settings.html', "center_past_edges: checked('layout-center_past_edges')", 1200, 1800),
+              around('crates/daemon/src/config.rs', 'pub struct LayoutConfig', 1400, 2800),
+              around('crates/daemon/src/config.rs', 'impl Default for LayoutConfig', 200, 1800),
+              around('crates/daemon/src/state.rs', 'last_placed_layout_rects', 1200, 1500),
+              around('crates/daemon/src/layout_apply.rs', 'fn collect_apply_placements', 800, 2000),
+              around('crates/daemon/src/layout_apply.rs', 'fn spawn_apply_worker', 600, 2200),
+          ]
+          Path('agent_docs/window-region-v10-anchors.txt').write_text('\n'.join(parts), encoding='utf-8')
+          PY
+      - name: Push anchors to control branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git checkout -B agent/window-region-clipping-v10-control origin/agent/window-region-clipping-v10-control
+          git add agent_docs/window-region-v10-anchors.txt
+          git commit -m 'ci: record v10 patch anchors'
+          git push origin HEAD:agent/window-region-clipping-v10-control
