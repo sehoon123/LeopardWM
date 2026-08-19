@@ -29,5 +29,25 @@ if script.count(old) != 1:
     raise RuntimeError('base integration script does not contain the expected Settings block')
 script = script.replace(old, new)
 
+old_save = '''save_marker = "center_past_edges: checked('layout-center_past_edges'),"
+if settings.count(save_marker) != 1:
+    raise RuntimeError('settings.html: center-past-edges save marker mismatch')
+settings = settings.replace(
+    save_marker,
+    save_marker + "\\n          monitor_overflow: document.getElementById('layout-monitor_overflow').value,",
+)
+'''
+new_save = '''save_marker = "center_past_edges: checked('layout-center_past_edges')"
+if settings.count(save_marker) != 1:
+    raise RuntimeError('settings.html: center-past-edges save marker mismatch')
+settings = settings.replace(
+    save_marker,
+    save_marker + ",\\n          monitor_overflow: document.getElementById('layout-monitor_overflow').value",
+)
+'''
+if script.count(old_save) != 1:
+    raise RuntimeError('base integration script does not contain the expected save block')
+script = script.replace(old_save, new_save)
+
 compiled = compile(script, str(script_path), 'exec')
 exec(compiled, {'__name__': '__main__', '__file__': str(script_path)})
