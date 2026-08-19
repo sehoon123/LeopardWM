@@ -1,4 +1,4 @@
-use leopardwm_core_layout::{CenteringMode, Rect, Workspace};
+use leopardwm_core_layout::{CenteringMode, Rect, WindowPlacement, Workspace};
 
 fn five_columns() -> Workspace {
     let mut workspace = Workspace::with_gaps(10, 10);
@@ -21,6 +21,25 @@ fn placement_center(workspace: &Workspace, window_id: u64) -> i32 {
         .find(|placement| placement.window_id == window_id)
         .unwrap();
     placement.rect.x + placement.rect.width / 2
+}
+
+fn visible_intersection_width(rect: Rect, viewport: Rect) -> i32 {
+    rect.right()
+        .min(viewport.right())
+        .saturating_sub(rect.x.max(viewport.x))
+        .max(0)
+}
+
+fn centered_three_columns(column_width: i32) -> Vec<WindowPlacement> {
+    let mut workspace = Workspace::with_gaps(0, 0);
+    for window_id in 1..=3 {
+        workspace.insert_window(window_id, Some(column_width)).unwrap();
+    }
+    workspace.set_centering_mode(CenteringMode::Center);
+    workspace.set_center_past_edges(true);
+    workspace.set_focus(1, 0).unwrap();
+    workspace.ensure_focused_visible(2000);
+    workspace.compute_placements(Rect::new(0, 0, 2000, 1000))
 }
 
 #[test]
@@ -89,4 +108,26 @@ fn edge_blank_space_is_opt_in_and_manual_scroll_remains_bounded() {
 
     workspace.scroll_by(-10_000.0, 1920);
     assert_eq!(workspace.scroll_offset(), 0.0);
+}
+
+#[test]
+fn centered_half_width_column_keeps_symmetric_quarter_previews() {
+    let viewport = Rect::new(0, 0, 2000, 1000);
+    let placements = centered_three_columns(1000);
+    let visible_widths: Vec<_> = placements
+        .iter()
+        .map(|placement| visible_intersection_width(placement.rect, viewport))
+        .collect();
+    assert_eq!(visible_widths, [500, 1000, 500]);
+}
+
+#[test]
+fn centered_three_quarter_width_column_keeps_symmetric_eighth_previews() {
+    let viewport = Rect::new(0, 0, 2000, 1000);
+    let placements = centered_three_columns(1500);
+    let visible_widths: Vec<_> = placements
+        .iter()
+        .map(|placement| visible_intersection_width(placement.rect, viewport))
+        .collect();
+    assert_eq!(visible_widths, [250, 1500, 250]);
 }
