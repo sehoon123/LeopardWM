@@ -67,19 +67,21 @@ smoke = r'''
       check(section && section.classList.contains('active'), 'section not active: ' + item.dataset.section);
     });
 
+    var rulesNav = document.querySelector('.nav-item[data-section="rules"]');
+    check(!!rulesNav, 'window-rules navigation item missing');
+    if (rulesNav) rulesNav.click();
+
     addRuleRow({
-      title_regex: 'Smoke', class: 'Chrome_WidgetWin_1', executable: 'msedge.exe',
-      float: true, width: 800, height: 600, column_width: 0.5,
-      workspace: 2, column: 1, maximized: false, sticky: false,
-      floating_corner: 'bottom_right'
+      match_title: 'Smoke', match_class: 'Chrome_WidgetWin_1',
+      match_executable: 'msedge.exe', action: 'float',
+      width: 800, height: 600, column_width: 0.5,
+      open_on_workspace: 2, open_in_column: 1,
+      open_maximized: false, sticky: false, corner_style: 'rounded'
     });
     var optionButton = document.querySelector('.rule-opts-btn');
     check(!!optionButton, 'window-rule options button missing');
     if (optionButton) optionButton.click();
-    var popup = document.querySelector('.rule-opts-popup.open, .rule-options.open, .rule-opts.open');
-    if (!popup && optionButton) {
-      popup = optionButton.parentElement.querySelector('[class*="popup"], [class*="options"]');
-    }
+    var popup = document.querySelector('.rule-opts.open .rule-opts-pop');
     check(!!popup, 'window-rule options popup missing');
     if (popup) {
       var rect = popup.getBoundingClientRect();
