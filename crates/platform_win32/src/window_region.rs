@@ -391,11 +391,10 @@ pub(crate) fn apply_window_region_clip(
         if has_owner_marker(hwnd) {
             if state.identity == current_identity
                 && actual_region_matches(hwnd, state.expected_region)
+                && !clear_region(hwnd, false)
             {
-                if !clear_region(hwnd, false) {
-                    lock_states().insert(window_id, state);
-                    return RegionClipResult::Failed;
-                }
+                lock_states().insert(window_id, state);
+                return RegionClipResult::Failed;
             }
             remove_metadata(hwnd);
         }
@@ -462,10 +461,8 @@ pub(crate) fn restore_window_region(window_id: WindowId, redraw: bool) -> bool {
         return true;
     };
 
-    if actual_region_matches(hwnd, expected) {
-        if !clear_region(hwnd, redraw) {
-            return false;
-        }
+    if actual_region_matches(hwnd, expected) && !clear_region(hwnd, redraw) {
+        return false;
     }
     remove_metadata(hwnd);
     lock_states().remove(&window_id);
