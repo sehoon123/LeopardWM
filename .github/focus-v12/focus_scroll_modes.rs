@@ -100,7 +100,7 @@ fn center_mode_preview_ratio_generalizes_across_widths() {
         workspace.ensure_focused_visible(VIEWPORT.width);
 
         let expected_focus = width.min(VIEWPORT.width);
-        let expected_preview = (VIEWPORT.width - expected_focus) / 2;
+        let expected_preview = width.min((VIEWPORT.width - expected_focus) / 2);
         assert_eq!(
             visible_widths(&workspace),
             vec![expected_preview, expected_focus, expected_preview]
