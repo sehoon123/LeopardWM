@@ -1,0 +1,193 @@
+name: Verify real SetWindowRgn v10
+
+on:
+  push:
+    branches:
+      - agent/setwindowrgn-v10-real-control
+    paths:
+      - .github/real-v10/**
+      - .github/workflows/agent-verify-setwindowrgn-v10-real.yml
+      - agent_docs/setwindowrgn-v10-real-trigger
+
+permissions:
+  contents: write
+
+concurrency:
+  group: verify-real-setwindowrgn-v10
+  cancel-in-progress: false
+
+env:
+  CONTROL_BRANCH: agent/setwindowrgn-v10-real-control
+  SOURCE_BRANCH: agent/setwindowrgn-v10-real-source
+  BASE_SHA: bfb2bb1409f39e29fa3530d3858fe6fab733d0c7
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    timeout-minutes: 100
+    steps:
+      - name: Check out control files
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CONTROL_BRANCH }}
+          path: control
+          fetch-depth: 0
+
+      - name: Check out clean product source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_BRANCH }}
+          path: source
+          fetch-depth: 0
+
+      - name: Record run
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          path='agent_docs/setwindowrgn-v10-real-status.json'
+          payload=$(jq -n --arg state started --arg run_id "$GITHUB_RUN_ID" --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" '{state:$state,run_id:$run_id,run_url:$run_url}')
+          content=$(printf '%s\n' "$payload" | base64 -w0)
+          current=$(gh api "repos/$GITHUB_REPOSITORY/contents/$path?ref=$CONTROL_BRANCH" --jq .sha 2>/dev/null || true)
+          args=(--method PUT "repos/$GITHUB_REPOSITORY/contents/$path" -f message='ci: record real v10 verification run' -f content="$content" -f branch="$CONTROL_BRANCH")
+          if [[ -n "$current" ]]; then args+=(-f sha="$current"); fi
+          gh api "${args[@]}" >/dev/null
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Verify clean base identity
+        working-directory: source
+        shell: pwsh
+        run: |
+          $actual = (git rev-parse HEAD).Trim()
+          if ($actual -ne $env:BASE_SHA) { throw "source branch is not clean base: $actual" }
+
+      - name: Apply patch
+        working-directory: source
+        run: python ../control/.github/real-v10/apply.py
+
+      - name: Format and inspect exact change set
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo fmt --all
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { throw 'cargo fmt check failed' }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'git diff check failed' }
+          git status --short
+
+      - name: Verify structural contracts
+        working-directory: source
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+          required = {
+            'crates/platform_win32/src/window_region.rs': [
+              'current_region_matches', 'recover_stale_marker', 'REGION_VERIFY_INTERVAL',
+              'restore_window_regions_not_in', 'signed_property_encoding_round_trips_virtual_desktop_coordinates'
+            ],
+            'crates/platform_win32/src/placement.rs': [
+              'prepare_region_clipped_placements', 'active_region_ids',
+              'region_clipped_ids.contains', 'restore_all_window_regions'
+            ],
+            'crates/daemon/src/config.rs': ['MonitorOverflowConfig', 'monitor_overflow'],
+            'crates/daemon/src/layout_apply.rs': ['upsert_region_clip', 'WindowRegionClipSpec', 'region_clips'],
+            'crates/daemon/src/settings/settings.html': ['layout-monitor_overflow', 'Clip at monitor edge', 'Hide whole window'],
+          }
+          for path, markers in required.items():
+            text = Path(path).read_text(encoding='utf-8')
+            missing = [m for m in markers if m not in text]
+            if missing:
+              raise SystemExit(f'{path}: missing {missing}')
+          print('structural contracts: OK')
+          '@ | python -
+
+      - name: Run full locked test suite
+        working-directory: source
+        run: cargo test --workspace --all-targets --locked
+
+      - name: Run Clippy with warnings denied
+        working-directory: source
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Check every Cargo target
+        working-directory: source
+        run: cargo check --workspace --all-targets --locked
+
+      - name: Run release-mode tests
+        working-directory: source
+        run: cargo test --workspace --lib --bins --tests --release --locked
+
+      - name: Stress region and existing geometry tests
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($filter in @('window_region', 'monitor_overflow', 'monitor_isolation', 'compositor', 'geometry_mismatch', 'scratchpad', 'floating')) {
+            for ($i = 0; $i -lt 4; $i++) {
+              cargo test --workspace --release --locked $filter -- --test-threads=1
+              if ($LASTEXITCODE -ne 0) { throw "$filter iteration $i failed" }
+            }
+          }
+
+      - name: Build optimized Windows binaries
+        working-directory: source
+        run: cargo build --workspace --release --locked
+
+      - name: Verify Windows GUI subsystems
+        working-directory: source
+        shell: pwsh
+        run: ./.github/verify-gui-subsystems.ps1 -RepoRoot (Get-Location).Path
+
+      - name: Commit verified source branch
+        id: commit
+        working-directory: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git diff --cached --check
+          git commit -m 'feat: clip tiled previews at monitor boundaries'
+          if ($LASTEXITCODE -ne 0) { throw 'source commit failed' }
+          $sha = (git rev-parse HEAD).Trim()
+          git push origin HEAD:refs/heads/$env:SOURCE_BRANCH
+          if ($LASTEXITCODE -ne 0) { throw 'source push failed' }
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+
+      - name: Record success
+        if: success()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.commit.outputs.sha }}
+        run: |
+          set -euo pipefail
+          path='agent_docs/setwindowrgn-v10-real-status.json'
+          payload=$(jq -n --arg state verified --arg run_id "$GITHUB_RUN_ID" --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --arg source_sha "$SOURCE_SHA" '{state:$state,run_id:$run_id,run_url:$run_url,source_sha:$source_sha}')
+          content=$(printf '%s\n' "$payload" | base64 -w0)
+          current=$(gh api "repos/$GITHUB_REPOSITORY/contents/$path?ref=$CONTROL_BRANCH" --jq .sha)
+          gh api --method PUT "repos/$GITHUB_REPOSITORY/contents/$path" -f message='ci: record verified real v10 source' -f content="$content" -f branch="$CONTROL_BRANCH" -f sha="$current" >/dev/null
+
+      - name: Record failure
+        if: failure()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          path='agent_docs/setwindowrgn-v10-real-status.json'
+          payload=$(jq -n --arg state failure --arg run_id "$GITHUB_RUN_ID" --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" '{state:$state,run_id:$run_id,run_url:$run_url}')
+          content=$(printf '%s\n' "$payload" | base64 -w0)
+          current=$(gh api "repos/$GITHUB_REPOSITORY/contents/$path?ref=$CONTROL_BRANCH" --jq .sha 2>/dev/null || true)
+          args=(--method PUT "repos/$GITHUB_REPOSITORY/contents/$path" -f message='ci: record failed real v10 verification' -f content="$content" -f branch="$CONTROL_BRANCH")
+          if [[ -n "$current" ]]; then args+=(-f sha="$current"); fi
+          gh api "${args[@]}" >/dev/null
