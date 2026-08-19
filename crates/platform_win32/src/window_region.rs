@@ -222,7 +222,7 @@ fn current_region_kind(hwnd: HWND) -> i32 {
     };
     let kind = unsafe { GetWindowRgn(hwnd, region) };
     delete_region(region);
-    kind
+    kind.0
 }
 
 fn actual_region_matches(hwnd: HWND, expected: Rect) -> bool {
@@ -230,7 +230,7 @@ fn actual_region_matches(hwnd: HWND, expected: Rect) -> bool {
         return false;
     };
     let kind = unsafe { GetWindowRgn(hwnd, actual) };
-    if kind <= NULL_REGION_KIND {
+    if kind.0 <= NULL_REGION_KIND {
         delete_region(actual);
         return false;
     }
