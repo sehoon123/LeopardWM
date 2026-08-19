@@ -1,0 +1,79 @@
+name: Fix focus-scroll monitor preview accounting
+
+on:
+  push:
+    branches:
+      - agent/focus-scroll-modes-v12-control
+    paths:
+      - .github/workflows/agent-fix-focus-scroll-daemon-test-v12.yml
+
+permissions:
+  contents: write
+
+jobs:
+  fix-control-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/focus-scroll-modes-v12-control
+          fetch-depth: 0
+
+      - name: Exclude vertically parked and non-visible placements
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('.github/focus-v12/layout_apply_focus_modes.rs')
+          text = path.read_text(encoding='utf-8')
+          old = '''fn visible_width(rect: Rect, viewport: Rect) -> i32 {
+              rect.right()
+                  .min(viewport.right())
+                  .saturating_sub(rect.x.max(viewport.x))
+                  .max(0)
+          }
+          '''
+          new = '''fn visible_width(rect: Rect, viewport: Rect) -> i32 {
+              if !rect.intersects(&viewport) {
+                  return 0;
+              }
+              rect.right()
+                  .min(viewport.right())
+                  .saturating_sub(rect.x.max(viewport.x))
+                  .max(0)
+          }
+          '''
+          if text.count(old) != 1:
+              raise SystemExit('visible-width helper mismatch')
+          text = text.replace(old, new)
+
+          old = '''        .map(|placement| visible_width(placement.rect, owner))
+                  .collect()
+          }
+          '''
+          new = '''        .map(|placement| {
+                      if placement.visibility == Visibility::Visible {
+                          visible_width(placement.rect, owner)
+                      } else {
+                          0
+                      }
+                  })
+                  .collect()
+          }
+          '''
+          if text.count(old) != 1:
+              raise SystemExit('distribution helper mismatch')
+          path.write_text(text.replace(old, new), encoding='utf-8', newline='\n')
+          PY
+          git diff --check
+
+      - name: Commit corrected test geometry
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .github/focus-v12/layout_apply_focus_modes.rs
+          git commit -m 'test: account for off-screen monitor parking'
+          git push origin HEAD:refs/heads/agent/focus-scroll-modes-v12-control
