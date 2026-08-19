@@ -3,8 +3,8 @@
 use crate::types::{AnimationPlacementPolicy, PlatformConfig, Win32Error};
 use crate::window_id_to_hwnd;
 use crate::window_region::{
-    apply_window_region_clip, can_clip_window_region, reconcile_window_regions,
-    restore_all_window_regions, restore_window_region, WindowRegionClip,
+    apply_window_region_clip, reconcile_window_regions, restore_all_window_regions,
+    restore_window_region, WindowRegionClip,
 };
 use leopardwm_core_layout::{Rect, Visibility, WindowId, WindowPlacement};
 use std::collections::{HashMap, HashSet};
@@ -756,18 +756,7 @@ fn build_defer_entries(
         let region_clip = region_clips
             .iter()
             .find(|clip| clip.window_id == requested.window_id);
-        let clip_supported =
-            region_clip.is_some_and(|_| can_clip_window_region(requested.window_id));
-        let placement = if let Some(clip) = region_clip.filter(|_| !clip_supported) {
-            WindowPlacement {
-                window_id: requested.window_id,
-                rect: clip.fallback_rect,
-                visibility: clip.fallback_visibility,
-                column_index: requested.column_index,
-            }
-        } else {
-            requested.clone()
-        };
+        let placement = requested.clone();
         let previous = cache
             .as_ref()
             .and_then(|cache| cache.positions.get(&placement.window_id).copied());
@@ -836,9 +825,7 @@ fn build_defer_entries(
                 visibility: placement.visibility,
                 flags,
                 column_index: placement.column_index,
-                region_clip_bounds: region_clip
-                    .filter(|_| clip_supported)
-                    .map(|clip| clip.clip_bounds),
+                region_clip_bounds: region_clip.map(|clip| clip.clip_bounds),
                 fallback_rect: region_clip.map(|clip| clip.fallback_rect),
                 fallback_visibility: region_clip.map(|clip| clip.fallback_visibility),
             });
@@ -864,9 +851,7 @@ fn build_defer_entries(
                 visibility: placement.visibility,
                 flags,
                 column_index: placement.column_index,
-                region_clip_bounds: region_clip
-                    .filter(|_| clip_supported)
-                    .map(|clip| clip.clip_bounds),
+                region_clip_bounds: region_clip.map(|clip| clip.clip_bounds),
                 fallback_rect: region_clip.map(|clip| clip.fallback_rect),
                 fallback_visibility: region_clip.map(|clip| clip.fallback_visibility),
             });

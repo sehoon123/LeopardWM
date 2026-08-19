@@ -1,4 +1,5 @@
-use super::park_offscreen_avoiding_neighbors;
+use super::{park_offscreen_avoiding_neighbors, prepare_monitor_overflow};
+use crate::config::MonitorOverflowModeConfig;
 use leopardwm_core_layout::{Rect, Visibility, WindowPlacement};
 use leopardwm_platform_win32::{MonitorId, MonitorInfo};
 use std::collections::HashMap;
@@ -210,4 +211,96 @@ fn horizontal_isolation_matrix_never_leaks_tiled_windows() {
             }
         }
     }
+}
+
+fn visible_width(rect: Rect, viewport: Rect) -> i32 {
+    rect.right().min(viewport.right()) - rect.x.max(viewport.x)
+}
+
+fn assert_clip_preview_distribution(column_width: i32, expected_preview: i32) {
+    // The owner is the rightmost physical monitor. The left preview intersects
+    // monitor 1 and needs a region; the right preview extends only into empty
+    // virtual-desktop space and must remain visible without a region.
+    let monitors = side_by_side_monitors();
+    let owner = monitors[&2].rect;
+    let monitor_rects: Vec<_> = monitors.values().map(|monitor| monitor.rect).collect();
+    let focused_x = owner.x + expected_preview;
+    let mut placements = vec![
+        WindowPlacement {
+            window_id: 20,
+            rect: Rect::new(focused_x - column_width, 0, column_width, 800),
+            visibility: Visibility::Visible,
+            column_index: 0,
+        },
+        WindowPlacement {
+            window_id: 21,
+            rect: Rect::new(focused_x, 0, column_width, 800),
+            visibility: Visibility::Visible,
+            column_index: 1,
+        },
+        WindowPlacement {
+            window_id: 22,
+            rect: Rect::new(focused_x + column_width, 0, column_width, 800),
+            visibility: Visibility::Visible,
+            column_index: 2,
+        },
+    ];
+    let original: Vec<_> = placements
+        .iter()
+        .map(|placement| {
+            (
+                placement.window_id,
+                placement.rect,
+                placement.visibility,
+                placement.column_index,
+            )
+        })
+        .collect();
+    let mut clips = Vec::new();
+
+    prepare_monitor_overflow(
+        &mut placements,
+        2,
+        Some(1),
+        MonitorOverflowModeConfig::Clip,
+        &monitors,
+        &monitor_rects,
+        &mut clips,
+    );
+
+    let actual: Vec<_> = placements
+        .iter()
+        .map(|placement| {
+            (
+                placement.window_id,
+                placement.rect,
+                placement.visibility,
+                placement.column_index,
+            )
+        })
+        .collect();
+    assert_eq!(actual, original);
+    assert!(placements
+        .iter()
+        .all(|placement| placement.visibility == Visibility::Visible));
+    assert_eq!(
+        placements
+            .iter()
+            .map(|placement| visible_width(placement.rect, owner))
+            .collect::<Vec<_>>(),
+        vec![expected_preview, column_width, expected_preview]
+    );
+    assert_eq!(clips.len(), 1);
+    assert_eq!(clips[0].window_id, 20);
+    assert_eq!(clips[0].clip_bounds, owner);
+}
+
+#[test]
+fn clip_mode_preserves_25_50_25_on_a_rightmost_monitor() {
+    assert_clip_preview_distribution(960, 480);
+}
+
+#[test]
+fn clip_mode_preserves_12_5_75_12_5_on_a_rightmost_monitor() {
+    assert_clip_preview_distribution(1440, 240);
 }

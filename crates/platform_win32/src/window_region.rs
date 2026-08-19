@@ -22,6 +22,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 const ERROR_REGION_KIND: i32 = 0;
 const NULL_REGION_KIND: i32 = 1;
+const SIMPLE_REGION_KIND: i32 = 2;
+const COMPLEX_REGION_KIND: i32 = 3;
 const OWNER_MAGIC: usize = 0x4c57_4d32; // "LWM2"
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -212,13 +214,31 @@ fn delete_region(region: windows::Win32::Graphics::Gdi::HRGN) {
     }
 }
 
-fn current_region_kind(hwnd: HWND) -> i32 {
-    let Some(region) = create_region(Rect::new(0, 0, 1, 1)) else {
-        return ERROR_REGION_KIND;
-    };
-    let kind = unsafe { GetWindowRgn(hwnd, region) };
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowRegionKind {
+    /// ERROR means no region for this normal case. NULLREGION means an
+    /// explicitly empty region, not the absence of a region.
+    NoRegion,
+    Empty,
+    Simple,
+    Complex,
+}
+
+fn classify_window_region_kind(raw: i32) -> Option<WindowRegionKind> {
+    match raw {
+        ERROR_REGION_KIND => Some(WindowRegionKind::NoRegion),
+        NULL_REGION_KIND => Some(WindowRegionKind::Empty),
+        SIMPLE_REGION_KIND => Some(WindowRegionKind::Simple),
+        COMPLEX_REGION_KIND => Some(WindowRegionKind::Complex),
+        _ => None,
+    }
+}
+
+fn current_region_kind(hwnd: HWND) -> Option<WindowRegionKind> {
+    let region = create_region(Rect::new(0, 0, 1, 1))?;
+    let raw = unsafe { GetWindowRgn(hwnd, region) }.0;
     delete_region(region);
-    kind.0
+    classify_window_region_kind(raw)
 }
 
 fn actual_region_matches(hwnd: HWND, expected: Rect) -> bool {
@@ -263,7 +283,7 @@ fn recover_stale_metadata(hwnd: HWND, redraw: bool) -> bool {
 }
 
 fn window_has_no_region(hwnd: HWND) -> bool {
-    current_region_kind(hwnd) == NULL_REGION_KIND
+    matches!(current_region_kind(hwnd), Some(WindowRegionKind::NoRegion))
 }
 
 /// Compute the HWND-local region that exposes only the portion of the visible
@@ -316,40 +336,6 @@ pub(crate) fn relative_clip_region(
         return None;
     }
     Some(Rect::new(left, top, right - left, bottom - top))
-}
-
-/// Whether an HWND can be safely clipped without replacing an application-owned
-/// custom region. Unsupported windows are deliberately re-probed on later
-/// frames so an application that removes its temporary region can recover.
-pub(crate) fn can_clip_window_region(window_id: WindowId) -> bool {
-    let _commit = lock_commit();
-    let Some(current_identity) = identity(window_id) else {
-        lock_states().remove(&window_id);
-        return false;
-    };
-    let Ok(hwnd) = window_id_to_hwnd(window_id) else {
-        return false;
-    };
-
-    if let Some(state) = lock_states().get(&window_id).cloned() {
-        if state.identity == current_identity
-            && has_owner_marker(hwnd)
-            && actual_region_matches(hwnd, state.expected_region)
-        {
-            return true;
-        }
-        lock_states().remove(&window_id);
-        // The application may have replaced our region. Remove only our
-        // metadata; do not clear a region whose shape no longer matches.
-        if has_owner_marker(hwnd) {
-            remove_metadata(hwnd);
-        }
-    }
-
-    if !recover_stale_metadata(hwnd, false) {
-        return false;
-    }
-    window_has_no_region(hwnd)
 }
 
 /// Install or update a LeopardWM-owned region. `redraw` should be false for an
@@ -502,8 +488,128 @@ pub fn forget_window_region(window_id: WindowId) {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_coordinate, encode_coordinate, relative_clip_region};
+    use super::{
+        apply_window_region_clip, classify_window_region_kind, decode_coordinate,
+        encode_coordinate, relative_clip_region, restore_window_region, window_has_no_region,
+        WindowRegionKind, ERROR_REGION_KIND,
+    };
     use leopardwm_core_layout::Rect;
+    use std::sync::OnceLock;
+    use windows::core::w;
+    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassExW, WINDOW_EX_STYLE,
+        WNDCLASSEXW, WS_OVERLAPPED,
+    };
+
+    unsafe extern "system" fn test_wndproc(
+        hwnd: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+    }
+
+    fn test_window() -> HWND {
+        static REGISTERED: OnceLock<()> = OnceLock::new();
+        let instance = unsafe { GetModuleHandleW(None).unwrap() };
+        REGISTERED.get_or_init(|| {
+            let class = WNDCLASSEXW {
+                cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+                lpfnWndProc: Some(test_wndproc),
+                hInstance: instance.into(),
+                lpszClassName: w!("LeopardWMPreviewRegionTest"),
+                ..Default::default()
+            };
+            assert_ne!(unsafe { RegisterClassExW(&class) }, 0);
+        });
+        unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("LeopardWMPreviewRegionTest"),
+                w!(""),
+                WS_OVERLAPPED,
+                0,
+                0,
+                1000,
+                800,
+                None,
+                None,
+                Some(instance.into()),
+                None,
+            )
+            .unwrap()
+        }
+    }
+
+    fn window_id(hwnd: HWND) -> u64 {
+        hwnd.0 as usize as u64
+    }
+
+    struct TestWindow(HWND);
+
+    impl TestWindow {
+        fn new() -> Self {
+            Self(test_window())
+        }
+    }
+
+    impl Drop for TestWindow {
+        fn drop(&mut self) {
+            let _ = restore_window_region(window_id(self.0), false);
+            unsafe {
+                let _ = DestroyWindow(self.0);
+            }
+        }
+    }
+
+    #[test]
+    fn get_window_rgn_error_is_the_normal_unowned_state() {
+        assert_eq!(
+            classify_window_region_kind(ERROR_REGION_KIND),
+            Some(WindowRegionKind::NoRegion)
+        );
+
+        let window = TestWindow::new();
+        let id = window_id(window.0);
+        assert!(window_has_no_region(window.0));
+
+        let result = apply_window_region_clip(
+            id,
+            Rect::new(0, 0, 1000, 800),
+            Rect::new(0, 0, 1000, 800),
+            Rect::new(0, 0, 250, 800),
+            false,
+        );
+        assert!(result.succeeded());
+        assert!(restore_window_region(id, false));
+        assert!(window_has_no_region(window.0));
+    }
+
+    #[test]
+    fn centered_preview_regions_are_symmetric() {
+        let viewport = Rect::new(0, 0, 1000, 800);
+        for (column_width, preview_width) in [(500, 250), (750, 125)] {
+            let left = Rect::new(preview_width - column_width, 0, column_width, 800);
+            let right = Rect::new(1000 - preview_width, 0, column_width, 800);
+
+            assert_eq!(
+                relative_clip_region(left, left, viewport),
+                Some(Rect::new(
+                    column_width - preview_width,
+                    0,
+                    preview_width,
+                    800,
+                ))
+            );
+            assert_eq!(
+                relative_clip_region(right, right, viewport),
+                Some(Rect::new(0, 0, preview_width, 800))
+            );
+        }
+    }
 
     #[test]
     fn coordinate_property_encoding_round_trips_extremes() {

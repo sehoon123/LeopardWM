@@ -1,4 +1,4 @@
-use leopardwm_core_layout::{CenteringMode, Rect, Workspace};
+use leopardwm_core_layout::{CenteringMode, Rect, Visibility, Workspace};
 
 fn five_columns() -> Workspace {
     let mut workspace = Workspace::with_gaps(10, 10);
@@ -89,4 +89,47 @@ fn edge_blank_space_is_opt_in_and_manual_scroll_remains_bounded() {
 
     workspace.scroll_by(-10_000.0, 1920);
     assert_eq!(workspace.scroll_offset(), 0.0);
+}
+
+fn assert_symmetric_preview(column_width: i32, expected_preview: i32) {
+    let viewport = Rect::new(0, 0, 1000, 800);
+    let mut workspace = Workspace::with_gaps(0, 0);
+    for window_id in 1..=3 {
+        workspace
+            .insert_window(window_id, Some(column_width))
+            .unwrap();
+    }
+    workspace.set_centering_mode(CenteringMode::Center);
+    workspace.set_center_past_edges(true);
+    workspace.set_focus(1, 0).unwrap();
+    workspace.ensure_focused_visible(viewport.width);
+
+    let mut placements = workspace.compute_placements(viewport);
+    placements.sort_by_key(|placement| placement.window_id);
+    assert_eq!(placements.len(), 3);
+    assert!(placements
+        .iter()
+        .all(|placement| placement.visibility == Visibility::Visible));
+
+    let visible_widths: Vec<i32> = placements
+        .iter()
+        .map(|placement| {
+            placement.rect.right().min(viewport.right()) - placement.rect.x.max(viewport.x)
+        })
+        .collect();
+    assert_eq!(
+        visible_widths,
+        vec![expected_preview, column_width, expected_preview]
+    );
+    assert_eq!(placements[1].rect.x + column_width / 2, viewport.width / 2);
+}
+
+#[test]
+fn centered_half_width_columns_show_25_50_25() {
+    assert_symmetric_preview(500, 250);
+}
+
+#[test]
+fn centered_three_quarter_width_columns_show_12_5_75_12_5() {
+    assert_symmetric_preview(750, 125);
 }
