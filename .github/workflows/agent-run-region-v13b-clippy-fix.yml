@@ -1,0 +1,32 @@
+name: Run atomic-region generator cleanup
+
+on:
+  push:
+    branches:
+      - agent/region-atomic-v13b-control
+    paths:
+      - .github/workflows/agent-run-region-v13b-clippy-fix.yml
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/region-atomic-v13b-control
+          fetch-depth: 0
+      - run: python .github/region-v13b/fix_clippy_generator.py
+      - run: python -m py_compile .github/region-v13b/apply_atomic_region.py
+      - run: git diff --check
+      - name: Commit generator fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .github/region-v13b/apply_atomic_region.py
+          git commit -m 'fix: keep atomic-region production target warning-free'
+          git push origin HEAD:refs/heads/agent/region-atomic-v13b-control
