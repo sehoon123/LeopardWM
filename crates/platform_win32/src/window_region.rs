@@ -9,18 +9,23 @@
 use crate::{recover_poisoned_mutex, window_id_to_hwnd};
 use leopardwm_core_layout::{Rect, Visibility, WindowId};
 use std::collections::{HashMap, HashSet};
+#[cfg(test)]
 use std::ffi::c_void;
 use std::sync::{Mutex, OnceLock};
 use windows::core::w;
-use windows::Win32::Foundation::{HANDLE, HWND, RECT};
+#[cfg(test)]
+use windows::Win32::Foundation::RECT;
+use windows::Win32::Foundation::{HANDLE, HWND};
+#[cfg(test)]
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::Graphics::Gdi::{
     CreateRectRgn, DeleteObject, EqualRgn, GetWindowRgn, SetWindowRgn, HGDIOBJ,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClassNameW, GetPropW, GetWindowRect, GetWindowThreadProcessId, IsWindow, RemovePropW,
-    SetPropW,
+    GetClassNameW, GetPropW, GetWindowThreadProcessId, IsWindow, RemovePropW,
 };
+#[cfg(test)]
+use windows::Win32::UI::WindowsAndMessaging::{GetWindowRect, SetPropW};
 
 const ERROR_REGION_KIND: i32 = 0;
 const NULL_REGION_KIND: i32 = 1;
@@ -40,6 +45,7 @@ pub struct WindowRegionClip {
     pub fallback_visibility: Visibility,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RegionClipResult {
     Applied,
@@ -48,6 +54,7 @@ pub(crate) enum RegionClipResult {
     Failed,
 }
 
+#[cfg(test)]
 impl RegionClipResult {
     pub(crate) fn succeeded(self) -> bool {
         matches!(self, Self::Applied | Self::Unchanged)
@@ -111,6 +118,7 @@ fn is_same_window(window_id: WindowId, expected: &WindowIdentity) -> bool {
     identity(window_id).as_ref() == Some(expected)
 }
 
+#[cfg(test)]
 fn handle_from_usize(value: usize) -> HANDLE {
     HANDLE(value as *mut c_void)
 }
@@ -119,6 +127,7 @@ fn usize_from_handle(value: HANDLE) -> usize {
     value.0 as usize
 }
 
+#[cfg(test)]
 fn encode_coordinate(value: i32) -> HANDLE {
     // Bias into 1..=2^32 so zero remains reserved for a missing property.
     let biased = (i64::from(value) - i64::from(i32::MIN) + 1) as u64;
@@ -148,6 +157,7 @@ fn remove_metadata(hwnd: HWND) {
     }
 }
 
+#[cfg(test)]
 fn write_metadata(hwnd: HWND, rect: Rect) -> bool {
     // Publish coordinates first and the owner marker last. Another process can
     // observe either a complete record or no record, never a partial rectangle.
@@ -244,6 +254,7 @@ fn classify_window_region_kind(raw: i32) -> Option<WindowRegionKind> {
     }
 }
 
+#[cfg(test)]
 fn current_region_kind(hwnd: HWND) -> Option<WindowRegionKind> {
     let region = create_region(Rect::new(0, 0, 1, 1))?;
     let raw = unsafe { GetWindowRgn(hwnd, region) }.0;
@@ -283,12 +294,14 @@ fn window_has_no_region(hwnd: HWND) -> bool {
     matches!(current_region_kind(hwnd), Some(WindowRegionKind::NoRegion))
 }
 
+#[cfg(test)]
 fn rect_from_win32(rect: RECT) -> Option<Rect> {
     let width = rect.right.saturating_sub(rect.left);
     let height = rect.bottom.saturating_sub(rect.top);
     (width > 0 && height > 0).then(|| Rect::new(rect.left, rect.top, width, height))
 }
 
+#[cfg(test)]
 fn current_window_geometry(hwnd: HWND) -> Option<(Rect, Rect)> {
     let mut outer = RECT::default();
     unsafe { GetWindowRect(hwnd, &mut outer) }.ok()?;
@@ -312,6 +325,7 @@ fn current_window_geometry(hwnd: HWND) -> Option<(Rect, Rect)> {
     Some((outer, visible))
 }
 
+#[cfg(test)]
 fn intersect_regions(left: Rect, right: Rect) -> Rect {
     let x = left.x.max(right.x);
     let y = left.y.max(right.y);
@@ -325,6 +339,7 @@ fn intersect_regions(left: Rect, right: Rect) -> Rect {
     )
 }
 
+#[cfg(test)]
 fn allowed_region(outer_rect: Rect, visible_rect: Rect, clip_bounds: Rect) -> Rect {
     relative_clip_region(outer_rect, visible_rect, clip_bounds)
         .unwrap_or_else(|| Rect::new(0, 0, 0, 0))
@@ -333,6 +348,7 @@ fn allowed_region(outer_rect: Rect, visible_rect: Rect, clip_bounds: Rect) -> Re
 /// Local shape that is safe at both the old and target HWND positions. Since a
 /// monitor rectangle is convex, the same bridge is also safe during any DWM
 /// interpolation between those endpoints.
+#[cfg(test)]
 pub(crate) fn bridge_clip_region(
     current_outer: Rect,
     current_visible: Rect,
@@ -346,6 +362,7 @@ pub(crate) fn bridge_clip_region(
     )
 }
 
+#[cfg(test)]
 fn install_owned_region_locked(
     window_id: WindowId,
     hwnd: HWND,
@@ -376,6 +393,7 @@ fn install_owned_region_locked(
     RegionClipResult::Applied
 }
 
+#[cfg(test)]
 fn owned_region_for_identity(
     window_id: WindowId,
     hwnd: HWND,
@@ -411,6 +429,7 @@ fn owned_region_for_identity(
 }
 
 /// Install a restrictive bridge before the HWND is uncloaked or moved.
+#[cfg(test)]
 pub(crate) fn prepare_window_region_clip(
     window_id: WindowId,
     target_outer: Rect,
@@ -463,6 +482,7 @@ pub(crate) fn has_owned_window_region(window_id: WindowId) -> bool {
 /// Compute the HWND-local region that exposes only the portion of the visible
 /// DWM frame inside `clip_bounds`. Unclipped edges retain their outer frame and
 /// shadow; only an edge that actually crosses the output boundary is cut.
+#[cfg(test)]
 pub(crate) fn relative_clip_region(
     outer_rect: Rect,
     visible_rect: Rect,
@@ -514,6 +534,7 @@ pub(crate) fn relative_clip_region(
 
 /// Install or update a LeopardWM-owned region. `redraw` should be false for an
 /// intermediate animation frame and true for the exact landing pass.
+#[cfg(test)]
 pub(crate) fn apply_window_region_clip(
     window_id: WindowId,
     outer_rect: Rect,
