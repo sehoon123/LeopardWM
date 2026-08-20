@@ -380,7 +380,14 @@ start, end = function_span(
     text,
     'fn recover_stale_metadata(hwnd: HWND, redraw: bool) -> bool',
 )
-text = text[:start] + text[end:]
+doc_start = text.rfind(
+    '/// Remove metadata left by another LeopardWM instance.',
+    0,
+    start,
+)
+if doc_start < 0:
+    raise RuntimeError('window_region.rs: stale-recovery doc comment not found')
+text = text[:doc_start] + text[end:]
 no_region = 'fn window_has_no_region(hwnd: HWND) -> bool {'
 if text.count(no_region) != 1:
     raise RuntimeError('window_region.rs: no-region helper mismatch')
