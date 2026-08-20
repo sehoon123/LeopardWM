@@ -535,9 +535,14 @@ pub(crate) fn apply_window_region_clip(
         Ok(region) => region,
         Err(result) => return result,
     };
-    if current_owned == Some(target_region) && actual_region_matches(hwnd, target_region) {
+    if current_owned == Some(target_region) && actual_region_matches(hwnd, target_region) && !redraw
+    {
         return RegionClipResult::Unchanged;
     }
+    // prepare_window_region_clip installs its bridge without repainting.
+    // When that bridge already equals the final shape, the exact landing
+    // must still re-commit the HRGN with bRedraw=TRUE. Otherwise modern
+    // compositor-backed windows can retain a stale gray backing surface.
 
     // Replace the bridge directly. Clearing first creates an unbounded
     // rectangular DWM frame between the two SetWindowRgn calls.
@@ -719,6 +724,23 @@ mod tests {
         assert!(window_has_no_region(window.0));
     }
 
+    #[test]
+    fn exact_landing_recommits_an_unchanged_region_for_redraw() {
+        let window = TestWindow::new();
+        let id = window_id(window.0);
+        let outer = Rect::new(0, 0, 1000, 800);
+        let clip = Rect::new(0, 0, 250, 800);
+
+        assert_eq!(
+            apply_window_region_clip(id, outer, outer, clip, false),
+            super::RegionClipResult::Applied
+        );
+        assert_eq!(
+            apply_window_region_clip(id, outer, outer, clip, true),
+            super::RegionClipResult::Applied
+        );
+        assert!(actual_region_matches(window.0, Rect::new(0, 0, 250, 800)));
+    }
     #[test]
     fn centered_preview_regions_are_symmetric() {
         let viewport = Rect::new(0, 0, 1000, 800);
