@@ -314,7 +314,7 @@ mod atomic_region_transaction_tests {
     fn landing_consumes_the_deferred_region_redraw() {
         let window = TestWindow::new();
         let window_id = id(window.0);
-        let outer = Rect::new(250, 0, 750, 800);
+        let outer = Rect::new(750, 0, 750, 800);
         let owner = Rect::new(1000, 0, 1000, 800);
 
         assert!(apply_window_region_clip(window_id, outer, outer, owner, false).succeeded());
@@ -460,8 +460,11 @@ replace_once(
     '''    // Install target-local HRGNs before moving clipped windows. This prevents
     // the target frame from ever being composed unbounded on a neighbour.
     let mut failed_window_ids = HashSet::new();
-    let mut region_fallbacks =
-        prepare_entry_region_clips(&mut entries, &mut failed_window_ids);
+    let mut region_fallbacks = prepare_entry_region_clips(
+        &mut entries,
+        &mut failed_window_ids,
+        animation_frame,
+    );
 
     let (applied, position_failures) = position_entries(&entries);
     failed_window_ids.extend(position_failures);
@@ -474,7 +477,17 @@ replace_once(
     // Reveal only after both geometry and any region/fallback transaction have
     // committed. Off-screen-to-visible transitions therefore cannot flash an
     // unclipped gray surface on an adjacent monitor.
+    let has_region_transaction = entries
+        .iter()
+        .any(|entry| entry.region_clip_bounds.is_some());
     uncloak_becoming_visible(&entries);
+    if !animation_frame && has_region_transaction {
+        // One compositor barrier per landing, never per animation frame. This
+        // makes the committed HRGN/geometry pair authoritative before return.
+        unsafe {
+            let _ = DwmFlush();
+        }
+    }
 ''',
 )
 
@@ -533,6 +546,7 @@ fn apply_entry_fallback(entry: &mut DeferEntry, animation_frame: bool) -> bool {
 fn prepare_entry_region_clips(
     entries: &mut [DeferEntry],
     failed_window_ids: &mut HashSet<u64>,
+    animation_frame: bool,
 ) -> u32 {
     let mut fallback_count = 0;
     for entry in entries {
@@ -554,7 +568,7 @@ fn prepare_entry_region_clips(
 
         let _ = restore_window_region(entry.window_id, false);
         fallback_count += 1;
-        if !configure_entry_fallback(entry, true) {
+        if !configure_entry_fallback(entry, animation_frame) {
             failed_window_ids.insert(entry.window_id);
         }
     }
