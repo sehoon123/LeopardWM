@@ -136,15 +136,21 @@ replace_function(
 )
 
 # An empty region is a valid temporary bridge for an opposite-edge jump.
-replace_once(
-    REGION,
-    '''    if right <= left || bottom <= top {
+# Both `read_metadata` and `relative_clip_region` intentionally accept
+# zero-area rectangles: the former recovers an empty bridge after a
+# crash, while the latter represents a safe fully-clipped transition.
+text = read(REGION)
+old_guard = '''    if right <= left || bottom <= top {
         return None;
-    }''',
-    '''    if right < left || bottom < top {
+    }'''
+new_guard = '''    if right < left || bottom < top {
         return None;
-    }''',
-)
+    }'''
+if text.count(old_guard) != 2:
+    raise RuntimeError(
+        f'{REGION}: expected two empty-region guards, found {text.count(old_guard)}'
+    )
+write(REGION, text.replace(old_guard, new_guard))
 
 replace_function(
     REGION,
