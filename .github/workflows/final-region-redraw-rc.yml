@@ -1,0 +1,307 @@
+name: Final region redraw RC
+
+on:
+  push:
+    branches:
+      - fix/final-region-redraw-v14
+    paths:
+      - .github/workflows/final-region-redraw-rc.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: final-region-redraw-v14
+  cancel-in-progress: false
+
+env:
+  SOURCE_BRANCH: fix/final-region-redraw-v14
+  RELEASE_TAG: v0.2.6-sehoon.14-rc1
+  RELEASE_VERSION: 0.2.6-sehoon.14-rc1
+
+jobs:
+  patch-verify-release:
+    runs-on: windows-latest
+    steps:
+      - name: Check out release-candidate branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: fix/final-region-redraw-v14
+          fetch-depth: 0
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Patch exact-landing region redraw and regression test
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+
+          path = Path("crates/platform_win32/src/window_region.rs")
+          text = path.read_text(encoding="utf-8")
+
+          old = """    if current_owned == Some(target_region) && actual_region_matches(hwnd, target_region) {
+              return RegionClipResult::Unchanged;
+          }
+
+          // Replace the bridge directly. Clearing first creates an unbounded
+          """
+          new = """    if current_owned == Some(target_region) && actual_region_matches(hwnd, target_region) {
+              if !redraw {
+                  return RegionClipResult::Unchanged;
+              }
+              // prepare_window_region_clip installs its bridge without repainting.
+              // When that bridge already equals the final shape, the exact landing
+              // must still re-commit the HRGN with bRedraw=TRUE. Otherwise modern
+              // compositor-backed windows can retain a stale gray backing surface.
+          }
+
+          // Replace the bridge directly. Clearing first creates an unbounded
+          """
+          if old in text:
+              text = text.replace(old, new, 1)
+          elif new not in text:
+              raise SystemExit("exact apply_window_region_clip block was not found")
+
+          test_name = "fn exact_landing_recommits_an_unchanged_region_for_redraw()"
+          if test_name not in text:
+              marker = """    #[test]
+              fn centered_preview_regions_are_symmetric() {
+          """
+              regression = """    #[test]
+              fn exact_landing_recommits_an_unchanged_region_for_redraw() {
+                  let window = TestWindow::new();
+                  let id = window_id(window.0);
+                  let outer = Rect::new(0, 0, 1000, 800);
+                  let clip = Rect::new(0, 0, 250, 800);
+
+                  assert_eq!(
+                      apply_window_region_clip(id, outer, outer, clip, false),
+                      super::RegionClipResult::Applied
+                  );
+                  assert_eq!(
+                      apply_window_region_clip(id, outer, outer, clip, true),
+                      super::RegionClipResult::Applied
+                  );
+                  assert!(actual_region_matches(window.0, Rect::new(0, 0, 250, 800)));
+              }
+
+          """
+              if marker not in text:
+                  raise SystemExit("regression-test insertion marker was not found")
+              text = text.replace(marker, regression + marker, 1)
+
+          with path.open("w", encoding="utf-8", newline="\n") as handle:
+              handle.write(text)
+          print("exact-landing redraw patch applied")
+          '@ | python -
+
+      - name: Format and validate the exact diff
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo fmt --all
+          cargo fmt --all -- --check
+          if ($LASTEXITCODE -ne 0) { throw 'cargo fmt check failed' }
+          git diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'git diff check failed' }
+          $changed = @(git status --short | ForEach-Object { $_.Substring(3) })
+          if ($changed.Count -ne 1 -or $changed[0] -ne 'crates/platform_win32/src/window_region.rs') {
+            throw "Unexpected changed files: $($changed -join ', ')"
+          }
+
+      - name: Run exact-landing redraw regression first
+        run: cargo test -p leopardwm-platform-win32 exact_landing_recommits_an_unchanged_region_for_redraw --locked -- --test-threads=1
+
+      - name: Run focused window-region tests
+        run: cargo test -p leopardwm-platform-win32 window_region --locked -- --test-threads=1
+
+      - name: Run full locked test suite
+        run: cargo test --workspace --all-targets --locked
+
+      - name: Run Clippy with warnings denied
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Check every Cargo target
+        run: cargo check --workspace --all-targets --locked
+
+      - name: Build optimized Windows binaries
+        run: cargo build --workspace --release --locked
+
+      - name: Verify Windows GUI subsystems
+        shell: pwsh
+        run: ./.github/verify-gui-subsystems.ps1 -RepoRoot (Get-Location).Path
+
+      - name: Install cargo-wix
+        run: cargo install cargo-wix --version ^0.3 --locked
+
+      - name: Build MSI installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cargo wix -p leopardwm-daemon -I wix/main.wxs --target x86_64-pc-windows-msvc --no-build --nocapture --bin-path 'C:\Program Files (x86)\WiX Toolset v3.14\bin'
+          if ($LASTEXITCODE -ne 0) { throw 'cargo wix failed' }
+          $built = Get-ChildItem target/wix/*.msi | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+          if (-not $built) { throw 'cargo wix produced no MSI' }
+          Copy-Item $built.FullName "LeopardWM-$env:RELEASE_VERSION-x86_64.msi"
+
+      - name: Verify locally built MSI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msi = (Resolve-Path "LeopardWM-$env:RELEASE_VERSION-x86_64.msi").Path
+          $admin = Join-Path (Get-Location) 'msi-admin-image'
+          New-Item -ItemType Directory -Path $admin -Force | Out-Null
+          $arguments = "/a `"$msi`" /qn TARGETDIR=`"$admin`""
+          $process = Start-Process "$env:SystemRoot\System32\msiexec.exe" -ArgumentList $arguments -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "MSI administrative install failed: $($process.ExitCode)" }
+          $binDir = @('target/x86_64-pc-windows-msvc/release', 'target/release') |
+            Where-Object { Test-Path (Join-Path $_ 'leopardwm.exe') } |
+            Select-Object -First 1
+          if (-not $binDir) { throw 'Release binary directory not found' }
+          foreach ($binary in @('leopardwm.exe', 'leopardwm-cli.exe', 'lwm.exe', 'leopardwm-watchdog.exe')) {
+            $installed = Get-ChildItem $admin -Recurse -Filter $binary | Select-Object -First 1
+            if (-not $installed) { throw "MSI is missing $binary" }
+            if ((Get-FileHash $installed.FullName -Algorithm SHA256).Hash -ne (Get-FileHash (Join-Path $binDir $binary) -Algorithm SHA256).Hash) {
+              throw "MSI binary mismatch: $binary"
+            }
+          }
+
+      - name: Package ZIP and standalone binaries
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $binDir = @('target/x86_64-pc-windows-msvc/release', 'target/release') |
+            Where-Object { Test-Path (Join-Path $_ 'leopardwm.exe') } |
+            Select-Object -First 1
+          if (-not $binDir) { throw 'Release binary directory not found' }
+          $packageDir = "LeopardWM-$env:RELEASE_VERSION-x86_64-windows"
+          New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
+          foreach ($binary in @('leopardwm.exe', 'leopardwm-cli.exe', 'lwm.exe', 'leopardwm-watchdog.exe')) {
+            $source = Join-Path $binDir $binary
+            Copy-Item $source (Join-Path $packageDir $binary)
+            Copy-Item $source $binary
+          }
+          Copy-Item README.md, LICENSE, CHANGELOG.md $packageDir
+          7z a "$packageDir.zip" $packageDir | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw 'ZIP packaging failed' }
+
+      - name: Generate checksums and RC notes
+        shell: pwsh
+        run: |
+          $assets = @(
+            "LeopardWM-$env:RELEASE_VERSION-x86_64-windows.zip",
+            "LeopardWM-$env:RELEASE_VERSION-x86_64.msi",
+            'leopardwm.exe',
+            'leopardwm-cli.exe',
+            'lwm.exe',
+            'leopardwm-watchdog.exe'
+          )
+          $lines = foreach ($asset in $assets) {
+            "{0} *{1}" -f (Get-FileHash $asset -Algorithm SHA256).Hash.ToLowerInvariant(), $asset
+          }
+          $lines | Set-Content checksums.txt -Encoding ascii
+          @'
+          Diagnostic prerelease for real-hardware validation. It is intentionally not merged to main.
+
+          Exact-landing redraw change:
+          - intermediate region commits still use bRedraw=FALSE
+          - when the bridge already equals the final HRGN, the synchronous landing now reapplies that same HRGN with bRedraw=TRUE
+          - this closes the previous early-return path that could leave a stale gray compositor backing surface
+          - includes a regression test proving the identical region is recommitted on the redraw landing
+
+          Validation focus: Windows File Explorer, Windows Notepad, WinUI/DirectComposition windows, and classic Win32 windows at both left and right monitor edges.
+          '@ | Set-Content release-notes-v14-rc1.md -Encoding utf8
+
+      - name: Commit verified source to RC branch
+        id: source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add crates/platform_win32/src/window_region.rs
+          git diff --cached --check
+          if ($LASTEXITCODE -ne 0) { throw 'staged diff check failed' }
+          git commit -m 'fix: redraw unchanged clip region on exact landing'
+          if ($LASTEXITCODE -ne 0) { throw 'source commit failed' }
+          $candidate = (git rev-parse HEAD).Trim()
+          git push origin HEAD:refs/heads/$env:SOURCE_BRANCH
+          if ($LASTEXITCODE -ne 0) { throw 'RC branch push failed' }
+          "sha=$candidate" >> $env:GITHUB_OUTPUT
+          Write-Host "Verified RC source commit: $candidate"
+
+      - name: Publish diagnostic prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          set -euo pipefail
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release already exists: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "Tag already exists: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          gh release create "$RELEASE_TAG" \
+            "LeopardWM-$RELEASE_VERSION-x86_64-windows.zip" \
+            "LeopardWM-$RELEASE_VERSION-x86_64.msi" \
+            leopardwm.exe leopardwm-cli.exe lwm.exe leopardwm-watchdog.exe checksums.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$SOURCE_SHA" \
+            --title "LeopardWM $RELEASE_TAG - exact landing redraw RC" \
+            --notes-file release-notes-v14-rc1.md \
+            --prerelease
+
+      - name: Independently verify published assets and source identity
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $verify = Join-Path (Get-Location) 'published-verification'
+          New-Item -ItemType Directory -Path $verify -Force | Out-Null
+          gh release download $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --dir $verify
+          if ($LASTEXITCODE -ne 0) { throw 'Release download failed' }
+          foreach ($line in Get-Content (Join-Path $verify 'checksums.txt')) {
+            if ($line -notmatch '^([0-9a-f]{64}) \*(.+)$') { throw "Invalid checksum line: $line" }
+            $path = Join-Path $verify $Matches[2]
+            if (-not (Test-Path $path)) { throw "Missing asset: $($Matches[2])" }
+            if ((Get-FileHash $path -Algorithm SHA256).Hash.ToLowerInvariant() -ne $Matches[1]) {
+              throw "Checksum mismatch: $($Matches[2])"
+            }
+          }
+          $zip = Join-Path $verify "LeopardWM-$env:RELEASE_VERSION-x86_64-windows.zip"
+          7z t $zip | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw 'Published ZIP CRC check failed' }
+          $extract = Join-Path $verify 'zip-extracted'
+          7z x $zip "-o$extract" -y | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw 'Published ZIP extraction failed' }
+          $msi = Join-Path $verify "LeopardWM-$env:RELEASE_VERSION-x86_64.msi"
+          $admin = Join-Path $verify 'msi-admin-image'
+          New-Item -ItemType Directory -Path $admin -Force | Out-Null
+          $arguments = "/a `"$msi`" /qn TARGETDIR=`"$admin`""
+          $process = Start-Process "$env:SystemRoot\System32\msiexec.exe" -ArgumentList $arguments -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "Published MSI install failed: $($process.ExitCode)" }
+          foreach ($binary in @('leopardwm.exe', 'leopardwm-cli.exe', 'lwm.exe', 'leopardwm-watchdog.exe')) {
+            $standalone = Join-Path $verify $binary
+            $fromZip = Get-ChildItem $extract -Recurse -Filter $binary | Select-Object -First 1
+            $fromMsi = Get-ChildItem $admin -Recurse -Filter $binary | Select-Object -First 1
+            if (-not $fromZip -or -not $fromMsi) { throw "Packaged binary missing: $binary" }
+            $expected = (Get-FileHash $standalone -Algorithm SHA256).Hash
+            if ((Get-FileHash $fromZip.FullName -Algorithm SHA256).Hash -ne $expected) { throw "ZIP binary mismatch: $binary" }
+            if ((Get-FileHash $fromMsi.FullName -Algorithm SHA256).Hash -ne $expected) { throw "MSI binary mismatch: $binary" }
+          }
+          git fetch origin --tags --force
+          $tagSha = (git rev-list -n 1 $env:RELEASE_TAG).Trim()
+          $branchSha = ((git ls-remote origin "refs/heads/$env:SOURCE_BRANCH") -split '\s+')[0]
+          if ($tagSha -ne $env:SOURCE_SHA -or $branchSha -ne $env:SOURCE_SHA) {
+            throw "Source identity mismatch: tag=$tagSha branch=$branchSha expected=$env:SOURCE_SHA"
+          }
