@@ -1,0 +1,47 @@
+name: Align atomic clipping contract marker
+
+on:
+  push:
+    branches:
+      - agent/region-atomic-v13b-control
+    paths:
+      - .github/workflows/agent-fix-region-v13b-contract.yml
+
+permissions:
+  contents: write
+
+jobs:
+  fix-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/region-atomic-v13b-control
+          fetch-depth: 0
+
+      - name: Make the post-move contract explicit
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('.github/region-v13b/apply_atomic_region.py')
+          text = path.read_text(encoding='utf-8')
+          old = '// A window becoming fully contained keeps its old restrictive region until'
+          new = '// Regions on windows becoming fully contained keep their old restrictive region until'
+          if text.count(old) != 1:
+              raise SystemExit(f'expected one post-move comment, found {text.count(old)}')
+          path.write_text(text.replace(old, new), encoding='utf-8', newline='\n')
+          PY
+          python -m py_compile .github/region-v13b/apply_atomic_region.py
+          git diff --check
+
+      - name: Commit corrected contract wording
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .github/region-v13b/apply_atomic_region.py
+          git commit -m 'fix: make post-move region contract explicit'
+          git push origin HEAD:refs/heads/agent/region-atomic-v13b-control
