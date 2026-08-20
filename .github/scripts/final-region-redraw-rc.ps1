@@ -29,15 +29,16 @@ $old = @'
 '@
 $old = $old.Replace("`r`n", "`n")
 $new = @'
-    if current_owned == Some(target_region) && actual_region_matches(hwnd, target_region) {
-        if !redraw {
-            return RegionClipResult::Unchanged;
-        }
-        // prepare_window_region_clip installs its bridge without repainting.
-        // When that bridge already equals the final shape, the exact landing
-        // must still re-commit the HRGN with bRedraw=TRUE. Otherwise modern
-        // compositor-backed windows can retain a stale gray backing surface.
+    if current_owned == Some(target_region)
+        && actual_region_matches(hwnd, target_region)
+        && !redraw
+    {
+        return RegionClipResult::Unchanged;
     }
+    // prepare_window_region_clip installs its bridge without repainting.
+    // When that bridge already equals the final shape, the exact landing
+    // must still re-commit the HRGN with bRedraw=TRUE. Otherwise modern
+    // compositor-backed windows can retain a stale gray backing surface.
 
     // Replace the bridge directly. Clearing first creates an unbounded
 '@
