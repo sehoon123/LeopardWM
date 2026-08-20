@@ -8,6 +8,7 @@ on:
       - .github/workflows/dwm-preview-proxy-v15-rc2.yml
       - .github/dwm-v15/apply_dwm_preview_proxy_v15.py
       - .github/dwm-v15/harden_dwm_preview_proxy_v15.py
+      - .github/dwm-v15/cleanup_legacy_region_v15.py
 
 permissions:
   contents: write
@@ -86,11 +87,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'git diff check failed' }
           $allowed = @(
             'crates/platform_win32/src/placement.rs',
-            'crates/platform_win32/src/thumbnail.rs'
+            'crates/platform_win32/src/thumbnail.rs',
+            'crates/platform_win32/src/window_region.rs'
           )
           $changed = @(git status --short | ForEach-Object { $_.Substring(3) })
           $unexpected = @($changed | Where-Object { $_ -notin $allowed })
-          if ($changed.Count -ne 2 -or $unexpected.Count -ne 0) {
+          if ($changed.Count -ne 3 -or $unexpected.Count -ne 0) {
             throw "Unexpected changed files: $($changed -join ', ')"
           }
 
@@ -102,7 +104,8 @@ jobs:
           from pathlib import Path
           placement = Path('crates/platform_win32/src/placement.rs').read_text(encoding='utf-8')
           thumbnail = Path('crates/platform_win32/src/thumbnail.rs').read_text(encoding='utf-8')
-          combined = placement + '\n' + thumbnail
+          region = Path('crates/platform_win32/src/window_region.rs').read_text(encoding='utf-8')
+          combined = placement + '\n' + thumbnail + '\n' + region
           required = {
               'DWM source crop': 'DWM_TNP_RECTSOURCE',
               'real source parking': 'preview_source: true',
@@ -114,6 +117,7 @@ jobs:
               'Explorer support': 'class == "CabinetWClass"',
               'Notepad support': 'class == "Notepad"',
               'no per-frame flush': 'existing animation frames do not',
+              'region backend test-only': '#[cfg(test)]\npub(crate) fn apply_window_region_clip(',
           }
           missing = [name for name, marker in required.items() if marker not in combined]
           forbidden = [
@@ -224,7 +228,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add crates/platform_win32/src/placement.rs crates/platform_win32/src/thumbnail.rs
+          git add crates/platform_win32/src/placement.rs crates/platform_win32/src/thumbnail.rs crates/platform_win32/src/window_region.rs
           git diff --cached --check
           if ($LASTEXITCODE -ne 0) { throw 'staged diff check failed' }
           git commit -m 'fix: proxy monitor-edge previews through DWM thumbnails'
@@ -270,6 +274,7 @@ jobs:
           - existing previews avoid a per-animation-frame DwmFlush stall
           - failed source moves retain older safety state and never publish a thumbnail
           - Explorer, modern Notepad, WinUI and DirectComposition windows no longer rely on foreign-HWND region clipping
+          - the retired SetWindowRgn apply backend remains compiled only for tests and stale-state recovery
 
           The RC remains off main until Explorer and Notepad are verified on physical multi-monitor hardware.
           '@ | Set-Content release-notes-v15-rc2.md -Encoding utf8
