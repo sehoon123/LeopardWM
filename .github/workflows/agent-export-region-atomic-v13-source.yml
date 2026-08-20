@@ -1,0 +1,51 @@
+name: Export region-atomic v13 base source
+
+on:
+  push:
+    branches:
+      - agent/region-atomic-v13-control
+    paths:
+      - .github/workflows/agent-export-region-atomic-v13-source.yml
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 23e5147a9bd6c99b9651ba8974f02ea9e52e25c2
+          fetch-depth: 0
+      - name: Archive exact base source
+        run: git archive --format=zip --output=LeopardWM-region-atomic-v13-base.zip HEAD
+      - name: Upload source archive
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: LeopardWM-region-atomic-v13-base
+          path: LeopardWM-region-atomic-v13-base.zip
+          if-no-files-found: error
+          retention-days: 2
+      - name: Record artifact coordinates
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_ID: ${{ steps.upload.outputs.artifact-id }}
+          ARTIFACT_DIGEST: ${{ steps.upload.outputs.artifact-digest }}
+        run: |
+          set -euo pipefail
+          path='agent_docs/region-atomic-v13-export.json'
+          payload=$(jq -n \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg artifact_id "$ARTIFACT_ID" \
+            --arg artifact_digest "$ARTIFACT_DIGEST" \
+            --arg source_sha '23e5147a9bd6c99b9651ba8974f02ea9e52e25c2' \
+            '{run_id:$run_id,artifact_id:$artifact_id,artifact_digest:$artifact_digest,source_sha:$source_sha}')
+          content=$(printf '%s\n' "$payload" | base64 -w0)
+          gh api --method PUT "repos/$GITHUB_REPOSITORY/contents/$path" \
+            -f message='ci: record v13 source export' \
+            -f content="$content" \
+            -f branch='agent/region-atomic-v13-control' >/dev/null
