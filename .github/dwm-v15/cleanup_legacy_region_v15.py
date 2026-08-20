@@ -1,6 +1,7 @@
 from pathlib import Path
 
 ROOT = Path('.')
+PLACEMENT = ROOT / 'crates/platform_win32/src/placement.rs'
 THUMBNAIL = ROOT / 'crates/platform_win32/src/thumbnail.rs'
 REGION = ROOT / 'crates/platform_win32/src/window_region.rs'
 
@@ -20,6 +21,19 @@ def replace_once(path: Path, old: str, new: str) -> None:
         raise RuntimeError(f'{path}: expected one occurrence, found {count}: {old[:120]!r}')
     write(path, text.replace(old, new, 1))
 
+
+# The removed SetWindowRgn commit helper had a three-line Rustdoc comment.
+# Remove the comment with the function so it cannot attach to the following
+# preview-source helper and fail Clippy's empty-line-after-doc-comments lint.
+replace_once(
+    PLACEMENT,
+    '''/// Commit requested regions after the HWND batch lands. A rare ownership or
+/// Win32 failure is converted immediately to the precomputed safe fallback so
+/// no frame is allowed to leak into a neighboring monitor.
+
+''',
+    '',
+)
 
 # Modern Notepad is a compositor-sensitive WinUI window. The production
 # predicate was intentionally extended by the proxy patch; keep its frozen
