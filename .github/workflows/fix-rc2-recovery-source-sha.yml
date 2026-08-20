@@ -1,0 +1,39 @@
+name: Align RC2 recovery source identity
+
+on:
+  push:
+    branches:
+      - control/dwm-preview-proxy-v15
+    paths:
+      - .github/workflows/fix-rc2-recovery-source-sha.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: control/dwm-preview-proxy-v15
+          fetch-depth: 0
+      - name: Patch only the verified source SHA
+        shell: bash
+        run: |
+          set -euo pipefail
+          file=.github/workflows/recover-dwm-preview-rc2-release.yml
+          old=84ae06f27667532fde59fc7975f8343109899a0b
+          new=c22a3e3c14a4784f367c5797a05688420d486cf3
+          test "$(grep -c "$old" "$file")" -eq 1
+          sed -i "s/$old/$new/" "$file"
+          git diff --check
+      - name: Commit corrected recovery identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .github/workflows/recover-dwm-preview-rc2-release.yml
+          git commit -m 'ci: use the actual verified RC2 source commit'
+          git push origin HEAD:refs/heads/control/dwm-preview-proxy-v15
