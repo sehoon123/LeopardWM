@@ -267,6 +267,8 @@ fn preview_commit_needs_flush(
     new_preview_count: usize,
     committed_preview_count: usize,
 ) -> bool {
+    // existing animation frames do not block on DwmFlush; only activation and
+    // the exact landing synchronize with the compositor.
     new_preview_count > 0 || (!animation_frame && committed_preview_count > 0)
 }
 
