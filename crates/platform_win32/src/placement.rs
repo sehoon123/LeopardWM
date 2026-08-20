@@ -3,8 +3,8 @@
 use crate::types::{AnimationPlacementPolicy, PlatformConfig, Win32Error};
 use crate::window_id_to_hwnd;
 use crate::window_region::{
-    apply_window_region_clip, reconcile_window_regions, restore_all_window_regions,
-    restore_window_region, WindowRegionClip,
+    apply_window_region_clip, has_owned_window_region, prepare_window_region_clip,
+    reconcile_window_regions, restore_all_window_regions, restore_window_region, WindowRegionClip,
 };
 use leopardwm_core_layout::{Rect, Visibility, WindowId, WindowPlacement};
 use std::collections::{HashMap, HashSet};
@@ -500,9 +500,6 @@ pub fn apply_placements_with_regions(
         .iter()
         .map(|placement| placement.window_id)
         .collect();
-    let clipped_window_ids: HashSet<WindowId> =
-        region_clips.iter().map(|clip| clip.window_id).collect();
-    reconcile_window_regions(&managed_window_ids, &clipped_window_ids, !animation_frame);
 
     // Prepare all window entries — visible and off-screen alike.
     // All windows get full position + size with border inset adjustment.
@@ -527,20 +524,35 @@ pub fn apply_placements_with_regions(
         high_contrast,
     );
 
-    // Uncloak windows that are becoming visible BEFORE positioning,
-    // so DWM starts compositing them at the correct location on this frame.
-    // Also remove from the tracking set — the post-positioning block will
-    // re-add if the window ends up off-screen on this frame.
-    //
-    // Routed through `apply_cloak_state` so a window that's also in
-    // `GHOST_CLOAKED` (e.g. scrolling off-screen → on-screen with ghost
-    // animation in flight) stays cloaked until the ghost path also
-    // releases it.
+    // Restrict first, then reveal and move. This removes the frame in which
+    // DWM could previously display a gray rectangular backing surface outside
+    // the owner monitor before SetWindowRgn was committed.
+    let mut failed_window_ids = HashSet::new();
+    let pre_fallbacks =
+        prepare_entry_region_clips(&mut entries, &mut failed_window_ids, animation_frame);
+
     uncloak_becoming_visible(&entries);
 
-    let (applied, mut failed_window_ids) = position_entries(&entries);
-    let region_fallbacks =
+    let (applied, position_failures) = position_entries(&entries);
+    failed_window_ids.extend(position_failures);
+    let post_fallbacks =
         apply_entry_region_clips(&mut entries, &mut failed_window_ids, animation_frame);
+
+    let mut active_clipped_window_ids: HashSet<WindowId> =
+        region_clips.iter().map(|clip| clip.window_id).collect();
+    for entry in &entries {
+        if entry.region_clip_bounds.is_none() {
+            active_clipped_window_ids.remove(&entry.window_id);
+        }
+    }
+    // Regions on windows becoming fully contained keep their old restrictive region until
+    // the move completes; only then is the region removed.
+    reconcile_window_regions(
+        &managed_window_ids,
+        &active_clipped_window_ids,
+        !animation_frame,
+    );
+    let region_fallbacks = pre_fallbacks + post_fallbacks;
 
     // Detect size violations by comparing the DWM extended frame bounds
     // (the window's actual visible content area) against the layout rect the
@@ -786,11 +798,23 @@ fn build_defer_entries(
             }
         }
 
+        let region_managed = region_clip.is_some() || has_owned_window_region(placement.window_id);
         let dispatch = if animation_frame {
-            let sensitive = policy == AnimationPlacementPolicy::AdaptiveCompositorSafe
-                && cached_compositor_sensitive(hwnd, placement.window_id, cache.as_deref_mut());
+            let sensitive = region_managed
+                || (policy == AnimationPlacementPolicy::AdaptiveCompositorSafe
+                    && cached_compositor_sensitive(
+                        hwnd,
+                        placement.window_id,
+                        cache.as_deref_mut(),
+                    ));
             let hung = sensitive && unsafe { IsHungAppWindow(hwnd).as_bool() };
-            animation_dispatch_mode(policy, sensitive, hung)
+            if region_managed && !hung {
+                // Keep SetWindowRgn and SetWindowPos ordered only for boundary
+                // HWNDs. The normal in-monitor animation path remains async.
+                AnimationDispatchMode::Synchronous
+            } else {
+                animation_dispatch_mode(policy, sensitive, hung)
+            }
         } else {
             AnimationDispatchMode::Synchronous
         };
@@ -861,7 +885,7 @@ fn build_defer_entries(
     (entries, skipped)
 }
 
-fn set_entry_to_fallback(entry: &mut DeferEntry, animation_frame: bool) -> bool {
+fn configure_entry_fallback(entry: &mut DeferEntry, animation_frame: bool) -> bool {
     let (Some(rect), Some(visibility)) = (entry.fallback_rect, entry.fallback_visibility) else {
         return false;
     };
@@ -883,6 +907,13 @@ fn set_entry_to_fallback(entry: &mut DeferEntry, animation_frame: bool) -> bool 
         entry.h = 0;
         entry.flags = SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE;
     }
+    true
+}
+
+fn set_entry_to_fallback(entry: &mut DeferEntry, animation_frame: bool) -> bool {
+    if !configure_entry_fallback(entry, animation_frame) {
+        return false;
+    }
     unsafe {
         SetWindowPos(
             entry.hwnd,
@@ -895,6 +926,38 @@ fn set_entry_to_fallback(entry: &mut DeferEntry, animation_frame: bool) -> bool 
         )
         .is_ok()
     }
+}
+
+/// Install a bridge before uncloaking or moving. Unsupported application-owned
+/// regions use the existing safe whole-window fallback before presentation.
+fn prepare_entry_region_clips(
+    entries: &mut [DeferEntry],
+    failed_window_ids: &mut HashSet<u64>,
+    animation_frame: bool,
+) -> u32 {
+    let mut fallback_count = 0;
+    for entry in entries {
+        let Some(clip_bounds) = entry.region_clip_bounds else {
+            continue;
+        };
+        let target_outer = Rect::new(entry.x, entry.y, entry.w.max(1), entry.h.max(1));
+        let result = prepare_window_region_clip(
+            entry.window_id,
+            target_outer,
+            entry.layout_rect,
+            clip_bounds,
+        );
+        if result.succeeded() {
+            continue;
+        }
+
+        let _ = restore_window_region(entry.window_id, false);
+        fallback_count += 1;
+        if !configure_entry_fallback(entry, animation_frame) {
+            failed_window_ids.insert(entry.window_id);
+        }
+    }
+    fallback_count
 }
 
 /// Commit requested regions after the HWND batch lands. A rare ownership or

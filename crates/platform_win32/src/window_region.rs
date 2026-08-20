@@ -12,12 +12,14 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::{Mutex, OnceLock};
 use windows::core::w;
-use windows::Win32::Foundation::{HANDLE, HWND};
+use windows::Win32::Foundation::{HANDLE, HWND, RECT};
+use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows::Win32::Graphics::Gdi::{
     CreateRectRgn, DeleteObject, EqualRgn, GetWindowRgn, SetWindowRgn, HGDIOBJ,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClassNameW, GetPropW, GetWindowThreadProcessId, IsWindow, RemovePropW, SetPropW,
+    GetClassNameW, GetPropW, GetWindowRect, GetWindowThreadProcessId, IsWindow, RemovePropW,
+    SetPropW,
 };
 
 const ERROR_REGION_KIND: i32 = 0;
@@ -147,13 +149,10 @@ fn remove_metadata(hwnd: HWND) {
 }
 
 fn write_metadata(hwnd: HWND, rect: Rect) -> bool {
-    let values = unsafe {
+    // Publish coordinates first and the owner marker last. Another process can
+    // observe either a complete record or no record, never a partial rectangle.
+    let payload = unsafe {
         [
-            SetPropW(
-                hwnd,
-                w!("LeopardWM.RegionClip.v2.Owner"),
-                Some(handle_from_usize(OWNER_MAGIC)),
-            ),
             SetPropW(
                 hwnd,
                 w!("LeopardWM.RegionClip.v2.Left"),
@@ -176,12 +175,23 @@ fn write_metadata(hwnd: HWND, rect: Rect) -> bool {
             ),
         ]
     };
-    if values.into_iter().all(|result| result.is_ok()) {
-        true
-    } else {
+    if payload.into_iter().any(|result| result.is_err()) {
         remove_metadata(hwnd);
-        false
+        return false;
     }
+    if unsafe {
+        SetPropW(
+            hwnd,
+            w!("LeopardWM.RegionClip.v2.Owner"),
+            Some(handle_from_usize(OWNER_MAGIC)),
+        )
+    }
+    .is_err()
+    {
+        remove_metadata(hwnd);
+        return false;
+    }
+    true
 }
 
 fn read_metadata(hwnd: HWND) -> Option<Rect> {
@@ -193,7 +203,7 @@ fn read_metadata(hwnd: HWND) -> Option<Rect> {
     let right = decode_coordinate(unsafe { GetPropW(hwnd, w!("LeopardWM.RegionClip.v2.Right")) })?;
     let bottom =
         decode_coordinate(unsafe { GetPropW(hwnd, w!("LeopardWM.RegionClip.v2.Bottom")) })?;
-    if right <= left || bottom <= top {
+    if right < left || bottom < top {
         return None;
     }
     Some(Rect::new(left, top, right - left, bottom - top))
@@ -245,8 +255,12 @@ fn actual_region_matches(hwnd: HWND, expected: Rect) -> bool {
     let Some(actual) = create_region(Rect::new(0, 0, 1, 1)) else {
         return false;
     };
-    let kind = unsafe { GetWindowRgn(hwnd, actual) };
-    if kind.0 <= NULL_REGION_KIND {
+    let raw = unsafe { GetWindowRgn(hwnd, actual) }.0;
+    let Some(kind) = classify_window_region_kind(raw) else {
+        delete_region(actual);
+        return false;
+    };
+    if kind == WindowRegionKind::NoRegion {
         delete_region(actual);
         return false;
     }
@@ -264,26 +278,186 @@ fn clear_region(hwnd: HWND, redraw: bool) -> bool {
     unsafe { SetWindowRgn(hwnd, None, redraw) != 0 }
 }
 
-/// Remove metadata left by another LeopardWM instance. The actual window region
-/// is cleared only when it exactly matches the rectangle encoded in the HWND
-/// properties; an application-owned replacement is never removed.
-fn recover_stale_metadata(hwnd: HWND, redraw: bool) -> bool {
-    if !has_owner_marker(hwnd) {
-        return true;
-    }
-    let expected = read_metadata(hwnd);
-    let recovered = match expected {
-        Some(rect) if actual_region_matches(hwnd, rect) => clear_region(hwnd, redraw),
-        _ => true,
-    };
-    if recovered {
-        remove_metadata(hwnd);
-    }
-    recovered
-}
-
+#[cfg(test)]
 fn window_has_no_region(hwnd: HWND) -> bool {
     matches!(current_region_kind(hwnd), Some(WindowRegionKind::NoRegion))
+}
+
+fn rect_from_win32(rect: RECT) -> Option<Rect> {
+    let width = rect.right.saturating_sub(rect.left);
+    let height = rect.bottom.saturating_sub(rect.top);
+    (width > 0 && height > 0).then(|| Rect::new(rect.left, rect.top, width, height))
+}
+
+fn current_window_geometry(hwnd: HWND) -> Option<(Rect, Rect)> {
+    let mut outer = RECT::default();
+    unsafe { GetWindowRect(hwnd, &mut outer) }.ok()?;
+    let outer = rect_from_win32(outer)?;
+
+    let mut visible = RECT::default();
+    let visible = if unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            &mut visible as *mut _ as _,
+            std::mem::size_of::<RECT>() as u32,
+        )
+    }
+    .is_ok()
+    {
+        rect_from_win32(visible).unwrap_or(outer)
+    } else {
+        outer
+    };
+    Some((outer, visible))
+}
+
+fn intersect_regions(left: Rect, right: Rect) -> Rect {
+    let x = left.x.max(right.x);
+    let y = left.y.max(right.y);
+    let right_edge = left.right().min(right.right());
+    let bottom_edge = left.bottom().min(right.bottom());
+    Rect::new(
+        x,
+        y,
+        right_edge.saturating_sub(x).max(0),
+        bottom_edge.saturating_sub(y).max(0),
+    )
+}
+
+fn allowed_region(outer_rect: Rect, visible_rect: Rect, clip_bounds: Rect) -> Rect {
+    relative_clip_region(outer_rect, visible_rect, clip_bounds)
+        .unwrap_or_else(|| Rect::new(0, 0, 0, 0))
+}
+
+/// Local shape that is safe at both the old and target HWND positions. Since a
+/// monitor rectangle is convex, the same bridge is also safe during any DWM
+/// interpolation between those endpoints.
+pub(crate) fn bridge_clip_region(
+    current_outer: Rect,
+    current_visible: Rect,
+    target_outer: Rect,
+    target_visible: Rect,
+    clip_bounds: Rect,
+) -> Rect {
+    intersect_regions(
+        allowed_region(current_outer, current_visible, clip_bounds),
+        allowed_region(target_outer, target_visible, clip_bounds),
+    )
+}
+
+fn install_owned_region_locked(
+    window_id: WindowId,
+    hwnd: HWND,
+    identity: WindowIdentity,
+    expected_region: Rect,
+    redraw: bool,
+) -> RegionClipResult {
+    let Some(region) = create_region(expected_region) else {
+        return RegionClipResult::Failed;
+    };
+    if unsafe { SetWindowRgn(hwnd, Some(region), redraw) } == 0 {
+        delete_region(region);
+        return RegionClipResult::Failed;
+    }
+    // Windows owns HRGN after a successful SetWindowRgn call.
+    if !write_metadata(hwnd, expected_region) {
+        // In-process state remains authoritative, allowing normal cleanup even
+        // when HWND property storage was temporarily unavailable.
+        remove_metadata(hwnd);
+    }
+    lock_states().insert(
+        window_id,
+        RegionState {
+            identity,
+            expected_region,
+        },
+    );
+    RegionClipResult::Applied
+}
+
+fn owned_region_for_identity(
+    window_id: WindowId,
+    hwnd: HWND,
+    identity: &WindowIdentity,
+) -> Result<Option<Rect>, RegionClipResult> {
+    if let Some(state) = lock_states().get(&window_id).cloned() {
+        if state.identity == *identity && actual_region_matches(hwnd, state.expected_region) {
+            return Ok(Some(state.expected_region));
+        }
+        lock_states().remove(&window_id);
+        if state.identity == *identity && has_owner_marker(hwnd) {
+            // Application takeover: discard only our marker, never its shape.
+            remove_metadata(hwnd);
+            return Err(RegionClipResult::Unsupported);
+        }
+    }
+
+    if has_owner_marker(hwnd) {
+        if let Some(expected) = read_metadata(hwnd) {
+            if actual_region_matches(hwnd, expected) {
+                return Ok(Some(expected));
+            }
+        }
+        remove_metadata(hwnd);
+        return Err(RegionClipResult::Unsupported);
+    }
+
+    match current_region_kind(hwnd) {
+        Some(WindowRegionKind::NoRegion) => Ok(None),
+        Some(_) => Err(RegionClipResult::Unsupported),
+        None => Err(RegionClipResult::Failed),
+    }
+}
+
+/// Install a restrictive bridge before the HWND is uncloaked or moved.
+pub(crate) fn prepare_window_region_clip(
+    window_id: WindowId,
+    target_outer: Rect,
+    target_visible: Rect,
+    clip_bounds: Rect,
+) -> RegionClipResult {
+    let target_region = allowed_region(target_outer, target_visible, clip_bounds);
+    let _commit = lock_commit();
+    let Some(current_identity) = identity(window_id) else {
+        lock_states().remove(&window_id);
+        return RegionClipResult::Failed;
+    };
+    let Ok(hwnd) = window_id_to_hwnd(window_id) else {
+        return RegionClipResult::Failed;
+    };
+
+    let current_owned = match owned_region_for_identity(window_id, hwnd, &current_identity) {
+        Ok(region) => region,
+        Err(result) => return result,
+    };
+    let bridge = if let Some(region) = current_owned {
+        intersect_regions(region, target_region)
+    } else {
+        let Some((current_outer, current_visible)) = current_window_geometry(hwnd) else {
+            return RegionClipResult::Failed;
+        };
+        bridge_clip_region(
+            current_outer,
+            current_visible,
+            target_outer,
+            target_visible,
+            clip_bounds,
+        )
+    };
+    if current_owned == Some(bridge) && actual_region_matches(hwnd, bridge) {
+        return RegionClipResult::Unchanged;
+    }
+    install_owned_region_locked(window_id, hwnd, current_identity, bridge, false)
+}
+
+pub(crate) fn has_owned_window_region(window_id: WindowId) -> bool {
+    if lock_states().contains_key(&window_id) {
+        return true;
+    }
+    window_id_to_hwnd(window_id)
+        .ok()
+        .is_some_and(has_owner_marker)
 }
 
 /// Compute the HWND-local region that exposes only the portion of the visible
@@ -332,7 +506,7 @@ pub(crate) fn relative_clip_region(
             .saturating_sub(outer_rect.y)
             .clamp(top, outer_height)
     };
-    if right <= left || bottom <= top {
+    if right < left || bottom < top {
         return None;
     }
     Some(Rect::new(left, top, right - left, bottom - top))
@@ -347,10 +521,7 @@ pub(crate) fn apply_window_region_clip(
     clip_bounds: Rect,
     redraw: bool,
 ) -> RegionClipResult {
-    let Some(expected_region) = relative_clip_region(outer_rect, visible_rect, clip_bounds) else {
-        return RegionClipResult::Unsupported;
-    };
-
+    let target_region = allowed_region(outer_rect, visible_rect, clip_bounds);
     let _commit = lock_commit();
     let Some(current_identity) = identity(window_id) else {
         lock_states().remove(&window_id);
@@ -360,58 +531,17 @@ pub(crate) fn apply_window_region_clip(
         return RegionClipResult::Failed;
     };
 
-    if let Some(state) = lock_states().get(&window_id).cloned() {
-        if state.identity == current_identity
-            && state.expected_region == expected_region
-            && has_owner_marker(hwnd)
-            && actual_region_matches(hwnd, expected_region)
-        {
-            return RegionClipResult::Unchanged;
-        }
-
-        lock_states().remove(&window_id);
-        if has_owner_marker(hwnd) {
-            if state.identity == current_identity
-                && actual_region_matches(hwnd, state.expected_region)
-                && !clear_region(hwnd, false)
-            {
-                lock_states().insert(window_id, state);
-                return RegionClipResult::Failed;
-            }
-            remove_metadata(hwnd);
-        }
-    }
-
-    if !recover_stale_metadata(hwnd, false) {
-        return RegionClipResult::Failed;
-    }
-    // Re-check immediately before ownership transfer to minimize the race with
-    // an application installing its own region.
-    if !window_has_no_region(hwnd) {
-        return RegionClipResult::Unsupported;
-    }
-    if !write_metadata(hwnd, expected_region) {
-        return RegionClipResult::Failed;
-    }
-    let Some(region) = create_region(expected_region) else {
-        remove_metadata(hwnd);
-        return RegionClipResult::Failed;
+    let current_owned = match owned_region_for_identity(window_id, hwnd, &current_identity) {
+        Ok(region) => region,
+        Err(result) => return result,
     };
-
-    if unsafe { SetWindowRgn(hwnd, Some(region), redraw) } == 0 {
-        delete_region(region);
-        remove_metadata(hwnd);
-        return RegionClipResult::Failed;
+    if current_owned == Some(target_region) && actual_region_matches(hwnd, target_region) {
+        return RegionClipResult::Unchanged;
     }
-    // On success Windows owns `region`; deleting it would invalidate the shape.
-    lock_states().insert(
-        window_id,
-        RegionState {
-            identity: current_identity,
-            expected_region,
-        },
-    );
-    RegionClipResult::Applied
+
+    // Replace the bridge directly. Clearing first creates an unbounded
+    // rectangular DWM frame between the two SetWindowRgn calls.
+    install_owned_region_locked(window_id, hwnd, current_identity, target_region, redraw)
 }
 
 /// Restore a window only when its current region is still the exact region
@@ -489,9 +619,10 @@ pub fn forget_window_region(window_id: WindowId) {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_window_region_clip, classify_window_region_kind, decode_coordinate,
-        encode_coordinate, relative_clip_region, restore_window_region, window_has_no_region,
-        WindowRegionKind, ERROR_REGION_KIND,
+        actual_region_matches, apply_window_region_clip, bridge_clip_region,
+        classify_window_region_kind, decode_coordinate, encode_coordinate,
+        prepare_window_region_clip, relative_clip_region, restore_window_region,
+        window_has_no_region, WindowRegionKind, ERROR_REGION_KIND,
     };
     use leopardwm_core_layout::Rect;
     use std::sync::OnceLock;
@@ -499,8 +630,8 @@ mod tests {
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::WindowsAndMessaging::{
-        CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassExW, WINDOW_EX_STYLE,
-        WNDCLASSEXW, WS_OVERLAPPED,
+        CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassExW, SetWindowPos,
+        SWP_NOACTIVATE, SWP_NOZORDER, WINDOW_EX_STYLE, WNDCLASSEXW, WS_OVERLAPPED,
     };
 
     unsafe extern "system" fn test_wndproc(
@@ -670,5 +801,107 @@ mod tests {
             Rect::new(0, 0, 1920, 1080),
         )
         .is_none());
+    }
+
+    fn screen_region(outer: Rect, local: Rect) -> Rect {
+        Rect::new(
+            outer.x.saturating_add(local.x),
+            outer.y.saturating_add(local.y),
+            local.width,
+            local.height,
+        )
+    }
+
+    fn position_test_window(hwnd: HWND, rect: Rect) {
+        unsafe {
+            SetWindowPos(
+                hwnd,
+                None,
+                rect.x,
+                rect.y,
+                rect.width,
+                rect.height,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn bridge_is_safe_at_endpoints_and_intermediate_positions() {
+        let owner = Rect::new(1000, 0, 1000, 800);
+        for width in [250, 500, 750, 1000, 1250] {
+            for old_x in (250..=2250).step_by(125) {
+                for new_x in (250..=2250).step_by(125) {
+                    let old = Rect::new(old_x, 0, width, 800);
+                    let new = Rect::new(new_x, 0, width, 800);
+                    let bridge = bridge_clip_region(old, old, new, new, owner);
+                    for step in 0..=8 {
+                        let x = old_x + (new_x - old_x) * step / 8;
+                        let translated = screen_region(Rect::new(x, 0, width, 800), bridge);
+                        if bridge.width > 0 && bridge.height > 0 {
+                            assert!(translated.x >= owner.x);
+                            assert!(translated.right() <= owner.right());
+                            assert!(translated.y >= owner.y);
+                            assert!(translated.bottom() <= owner.bottom());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn seventy_five_percent_preview_masks_the_negative_monitor_half() {
+        let owner = Rect::new(1000, 0, 1000, 800);
+        let old = Rect::new(1000, 0, 750, 800);
+        let target = Rect::new(500, 0, 750, 800);
+        let bridge = bridge_clip_region(old, old, target, target, owner);
+        assert_eq!(bridge, Rect::new(500, 0, 250, 800));
+        let target_screen = screen_region(target, bridge);
+        assert_eq!(target_screen, Rect::new(1000, 0, 250, 800));
+        assert!(!target_screen.intersects(&Rect::new(0, 0, 1000, 800)));
+    }
+
+    #[test]
+    fn opposite_edge_jump_uses_an_empty_safe_bridge() {
+        let owner = Rect::new(1000, 0, 1000, 800);
+        let left = Rect::new(500, 0, 750, 800);
+        let right = Rect::new(1750, 0, 750, 800);
+        assert_eq!(bridge_clip_region(left, left, right, right, owner).width, 0);
+    }
+
+    #[test]
+    fn outward_move_restricts_before_positioning() {
+        let window = TestWindow::new();
+        let id = window_id(window.0);
+        let owner = Rect::new(0, 0, 1000, 800);
+        let current = Rect::new(-250, 0, 750, 800);
+        let target = Rect::new(-500, 0, 750, 800);
+        position_test_window(window.0, current);
+        assert!(apply_window_region_clip(id, current, current, owner, false).succeeded());
+        assert!(actual_region_matches(window.0, Rect::new(250, 0, 500, 800)));
+
+        assert!(prepare_window_region_clip(id, target, target, owner).succeeded());
+        assert!(actual_region_matches(window.0, Rect::new(500, 0, 250, 800)));
+    }
+
+    #[test]
+    fn inward_move_expands_only_after_positioning() {
+        let window = TestWindow::new();
+        let id = window_id(window.0);
+        let owner = Rect::new(0, 0, 1000, 800);
+        let current = Rect::new(-500, 0, 750, 800);
+        let target = Rect::new(-250, 0, 750, 800);
+        position_test_window(window.0, current);
+        assert!(apply_window_region_clip(id, current, current, owner, false).succeeded());
+        assert!(actual_region_matches(window.0, Rect::new(500, 0, 250, 800)));
+
+        assert!(prepare_window_region_clip(id, target, target, owner).succeeded());
+        assert!(actual_region_matches(window.0, Rect::new(500, 0, 250, 800)));
+
+        position_test_window(window.0, target);
+        assert!(apply_window_region_clip(id, target, target, owner, false).succeeded());
+        assert!(actual_region_matches(window.0, Rect::new(250, 0, 500, 800)));
     }
 }
