@@ -1,5 +1,9 @@
 name: CI
 on: [push, pull_request]
+
+permissions:
+  contents: read
+
 jobs:
   check:
     runs-on: windows-latest
@@ -12,3 +16,24 @@ jobs:
         run: ./.github/verify-gui-subsystems.ps1
       - run: cargo test --all
       - run: cargo clippy --all -- -D warnings
+
+  final-region-redraw-rc:
+    if: ${{ github.event_name == 'push' && github.ref_name == 'fix/final-region-redraw-v14' }}
+    permissions:
+      contents: write
+    runs-on: windows-latest
+    steps:
+      - name: Check out RC branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: fix/final-region-redraw-v14
+          fetch-depth: 0
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          components: rustfmt, clippy
+      - name: Patch, verify, package, and publish diagnostic RC
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./.github/scripts/final-region-redraw-rc.ps1
