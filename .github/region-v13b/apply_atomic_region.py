@@ -595,7 +595,7 @@ new_order = '''    // Restrict first, then reveal and move. This removes the fra
             active_clipped_window_ids.remove(&entry.window_id);
         }
     }
-    // A window becoming fully contained keeps its old restrictive region until
+    // Regions on windows becoming fully contained keep their old restrictive region until
     // the move completes; only then is the region removed.
     reconcile_window_regions(
         &managed_window_ids,
