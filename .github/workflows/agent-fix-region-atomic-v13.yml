@@ -1,0 +1,64 @@
+name: Fix atomic clipping patch v13
+
+on:
+  push:
+    branches:
+      - agent/region-atomic-v13-control
+    paths:
+      - .github/workflows/agent-fix-region-atomic-v13.yml
+
+permissions:
+  contents: write
+
+jobs:
+  fix-control-patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/region-atomic-v13-control
+          fetch-depth: 0
+
+      - name: Correct landing geometry and preserve fallback phase semantics
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('.github/region-v13/apply_atomic_region.py')
+          text = path.read_text(encoding='utf-8')
+
+          replacements = {
+              '''        let outer = Rect::new(250, 0, 750, 800);\n        let owner = Rect::new(1000, 0, 1000, 800);\n''':
+                  '''        let outer = Rect::new(750, 0, 750, 800);\n        let owner = Rect::new(1000, 0, 1000, 800);\n''',
+              '''    let mut region_fallbacks =\n        prepare_entry_region_clips(&mut entries, &mut failed_window_ids);\n''':
+                  '''    let mut region_fallbacks = prepare_entry_region_clips(\n        &mut entries,\n        &mut failed_window_ids,\n        animation_frame,\n    );\n''',
+              '''fn prepare_entry_region_clips(\n    entries: &mut [DeferEntry],\n    failed_window_ids: &mut HashSet<u64>,\n) -> u32 {\n''':
+                  '''fn prepare_entry_region_clips(\n    entries: &mut [DeferEntry],\n    failed_window_ids: &mut HashSet<u64>,\n    animation_frame: bool,\n) -> u32 {\n''',
+              '''        if !configure_entry_fallback(entry, true) {\n            failed_window_ids.insert(entry.window_id);\n        }\n''':
+                  '''        if !configure_entry_fallback(entry, animation_frame) {\n            failed_window_ids.insert(entry.window_id);\n        }\n''',
+          }
+          for old, new in replacements.items():
+              if text.count(old) != 1:
+                  raise SystemExit(f'expected one atomic patch marker: {old[:100]!r}')
+              text = text.replace(old, new)
+
+          old = '''    // Reveal only after both geometry and any region/fallback transaction have\n    // committed. Off-screen-to-visible transitions therefore cannot flash an\n    // unclipped gray surface on an adjacent monitor.\n    uncloak_becoming_visible(&entries);\n'''
+          new = '''    // Reveal only after both geometry and any region/fallback transaction have\n    // committed. Off-screen-to-visible transitions therefore cannot flash an\n    // unclipped gray surface on an adjacent monitor.\n    let has_region_transaction = entries\n        .iter()\n        .any(|entry| entry.region_clip_bounds.is_some());\n    uncloak_becoming_visible(&entries);\n    if !animation_frame && has_region_transaction {\n        // One compositor barrier per landing, never per animation frame. This\n        // makes the committed HRGN/geometry pair authoritative before return.\n        unsafe {\n            let _ = DwmFlush();\n        }\n    }\n'''
+          if text.count(old) != 1:
+              raise SystemExit('uncloak transaction marker mismatch')
+          text = text.replace(old, new)
+
+          path.write_text(text, encoding='utf-8', newline='\n')
+          PY
+          git diff --check
+
+      - name: Commit corrected atomic patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .github/region-v13/apply_atomic_region.py
+          git commit -m 'fix: preserve atomic clipping through landing fallback'
+          git push origin HEAD:refs/heads/agent/region-atomic-v13-control
