@@ -1,0 +1,64 @@
+name: Fix orphaned window-region doc comment
+
+on:
+  push:
+    branches:
+      - agent/region-atomic-v13b-control
+    paths:
+      - .github/workflows/agent-fix-region-v13b-orphan-doc.yml
+
+permissions:
+  contents: write
+
+jobs:
+  fix-generator:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/region-atomic-v13b-control
+          fetch-depth: 0
+
+      - name: Remove the documented function as one unit
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('.github/region-v13b/apply_atomic_region.py')
+          text = path.read_text(encoding='utf-8')
+          old = '''start, end = function_span(
+              text,
+              'fn recover_stale_metadata(hwnd: HWND, redraw: bool) -> bool',
+          )
+          text = text[:start] + text[end:]
+          '''
+          new = '''start, end = function_span(
+              text,
+              'fn recover_stale_metadata(hwnd: HWND, redraw: bool) -> bool',
+          )
+          doc_start = text.rfind(
+              '/// Remove metadata left by another LeopardWM instance.',
+              0,
+              start,
+          )
+          if doc_start < 0:
+              raise RuntimeError('window_region.rs: stale-recovery doc comment not found')
+          text = text[:doc_start] + text[end:]
+          '''
+          if text.count(old) != 1:
+              raise SystemExit(f'expected one stale-recovery cleanup block, found {text.count(old)}')
+          path.write_text(text.replace(old, new), encoding='utf-8', newline='\n')
+          PY
+          python -m py_compile .github/region-v13b/apply_atomic_region.py
+          git diff --check
+
+      - name: Commit the focused generator fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .github/region-v13b/apply_atomic_region.py
+          git commit -m 'fix: remove stale-region docs with their function'
+          git push origin HEAD:refs/heads/agent/region-atomic-v13b-control
