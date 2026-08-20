@@ -1,0 +1,213 @@
+name: Recover and verify DWM preview RC2 release
+
+on:
+  push:
+    branches:
+      - control/dwm-preview-proxy-v15
+    paths:
+      - .github/workflows/recover-dwm-preview-rc2-release.yml
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: recover-dwm-preview-rc2-release
+  cancel-in-progress: true
+
+env:
+  TAG: v0.2.6-sehoon.15-rc2
+  EXPECTED_SOURCE_SHA: 84ae06f27667532fde59fc7975f8343109899a0b
+  SOURCE_RUN_ID: "32365442969"
+  ARTIFACT_NAME: LeopardWM-v0.2.6-sehoon.15-rc2-verified
+  ZIP_NAME: LeopardWM-0.2.6-sehoon.15-rc2-x86_64-windows.zip
+  MSI_NAME: LeopardWM-0.2.6-sehoon.15-rc2-x86_64.msi
+  CONTROL_BRANCH: control/dwm-preview-proxy-v15
+
+jobs:
+  recover-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out control branch and fetch the existing tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CONTROL_BRANCH }}
+          fetch-depth: 0
+
+      - name: Verify immutable source tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch origin "refs/tags/$TAG:refs/tags/$TAG" --force
+          actual=$(git rev-list -n 1 "$TAG")
+          if [[ "$actual" != "$EXPECTED_SOURCE_SHA" ]]; then
+            echo "Tag source mismatch: expected=$EXPECTED_SOURCE_SHA actual=$actual" >&2
+            exit 1
+          fi
+
+      - name: Restore the independently verified build artifact
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          rm -rf restored publish
+          mkdir -p restored publish
+          gh run download "$SOURCE_RUN_ID" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name "$ARTIFACT_NAME" \
+            --dir restored
+
+          zip_path=$(find restored -type f -name "$ZIP_NAME" -print -quit)
+          msi_path=$(find restored -type f -name "$MSI_NAME" -print -quit)
+          checksum_path=$(find restored -type f -name checksums.txt -print -quit)
+          notes_path=$(find restored -type f -name release-notes-v15-rc2.md -print -quit)
+          test -n "$zip_path" && test -n "$msi_path" && test -n "$checksum_path" && test -n "$notes_path"
+
+          cp "$zip_path" "publish/$ZIP_NAME"
+          cp "$msi_path" "publish/$MSI_NAME"
+          tr -d '\r' < "$checksum_path" > publish/checksums.txt
+          cp "$notes_path" publish/release-notes-v15-rc2.md
+
+          cd publish
+          sha256sum -c checksums.txt
+          unzip -t "$ZIP_NAME" >/dev/null
+          msi_magic=$(od -An -tx1 -N8 "$MSI_NAME" | tr -d ' \n')
+          test "$msi_magic" = d0cf11e0a1b11ae1
+
+      - name: Create or repair the public prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          title="LeopardWM $TAG — DWM monitor preview proxy"
+          notes=$(cat publish/release-notes-v15-rc2.md)
+
+          release_id=$(
+            gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+              | jq -r --arg tag "$TAG" '.[] | select(.tag_name == $tag) | .id' \
+              | head -n 1
+          )
+
+          if [[ -n "$release_id" ]]; then
+            gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" \
+              -f name="$title" \
+              -f body="$notes" \
+              -F draft=false \
+              -F prerelease=true >/dev/null
+          else
+            gh api --method POST "repos/$GITHUB_REPOSITORY/releases" \
+              -f tag_name="$TAG" \
+              -f target_commitish="$EXPECTED_SOURCE_SHA" \
+              -f name="$title" \
+              -f body="$notes" \
+              -F draft=false \
+              -F prerelease=true >/dev/null
+          fi
+
+          gh release upload "$TAG" \
+            "publish/$ZIP_NAME" \
+            "publish/$MSI_NAME" \
+            publish/checksums.txt \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
+
+      - name: Verify release object, assets, checksums, and public access
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          release_json=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG")
+          jq -e '.draft == false and .prerelease == true' <<<"$release_json" >/dev/null
+          for asset in "$ZIP_NAME" "$MSI_NAME" checksums.txt; do
+            jq -e --arg asset "$asset" '.assets | any(.name == $asset)' <<<"$release_json" >/dev/null
+          done
+
+          rm -rf downloaded
+          mkdir downloaded
+          gh release download "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "$ZIP_NAME" \
+            --pattern "$MSI_NAME" \
+            --pattern checksums.txt \
+            --dir downloaded
+          cd downloaded
+          tr -d '\r' < checksums.txt > checksums.normalized.txt
+          sha256sum -c checksums.normalized.txt
+          unzip -t "$ZIP_NAME" >/dev/null
+          cd ..
+
+          # No Authorization header: these checks reproduce a normal public visitor.
+          release_url="https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"
+          zip_url="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/$ZIP_NAME"
+          msi_url="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/$MSI_NAME"
+          curl --fail --silent --show-error --location --retry 3 --output /dev/null "$release_url"
+          curl --fail --silent --show-error --location --retry 3 --range 0-0 --output /dev/null "$zip_url"
+          curl --fail --silent --show-error --location --retry 3 --range 0-0 --output /dev/null "$msi_url"
+
+      - name: Upload recovered release evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: LeopardWM-v0.2.6-sehoon.15-rc2-release-recovery
+          path: |
+            publish/LeopardWM-0.2.6-sehoon.15-rc2-x86_64-windows.zip
+            publish/LeopardWM-0.2.6-sehoon.15-rc2-x86_64.msi
+            publish/checksums.txt
+            publish/release-notes-v15-rc2.md
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Record current verified public state
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          path='agent_docs/dwm-preview-v15-rc2-current.json'
+          zip_hash=$(sha256sum "publish/$ZIP_NAME" | awk '{print $1}')
+          msi_hash=$(sha256sum "publish/$MSI_NAME" | awk '{print $1}')
+          release_url="https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"
+          zip_url="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/$ZIP_NAME"
+          msi_url="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/$MSI_NAME"
+          payload=$(jq -n \
+            --arg state success \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --arg tag "$TAG" \
+            --arg source_sha "$EXPECTED_SOURCE_SHA" \
+            --arg release_url "$release_url" \
+            --arg zip_name "$ZIP_NAME" \
+            --arg zip_url "$zip_url" \
+            --arg zip_sha256 "$zip_hash" \
+            --arg msi_name "$MSI_NAME" \
+            --arg msi_url "$msi_url" \
+            --arg msi_sha256 "$msi_hash" \
+            '{state:$state,run_id:$run_id,run_url:$run_url,tag:$tag,source_sha:$source_sha,release_url:$release_url,zip:{name:$zip_name,url:$zip_url,sha256:$zip_sha256},msi:{name:$msi_name,url:$msi_url,sha256:$msi_sha256},public_access_verified:true}')
+          content=$(printf '%s\n' "$payload" | base64 -w0)
+          current=$(gh api "repos/$GITHUB_REPOSITORY/contents/$path?ref=$CONTROL_BRANCH" --jq .sha 2>/dev/null || true)
+          args=(--method PUT "repos/$GITHUB_REPOSITORY/contents/$path" -f message='ci: record verified public RC2 release' -f content="$content" -f branch="$CONTROL_BRANCH")
+          if [[ -n "$current" ]]; then args+=(-f sha="$current"); fi
+          gh api "${args[@]}" >/dev/null
+
+      - name: Record recovery failure
+        if: ${{ failure() }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          path='agent_docs/dwm-preview-v15-rc2-current.json'
+          payload=$(jq -n \
+            --arg state failure \
+            --arg run_id "$GITHUB_RUN_ID" \
+            --arg run_url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            '{state:$state,run_id:$run_id,run_url:$run_url,public_access_verified:false}')
+          content=$(printf '%s\n' "$payload" | base64 -w0)
+          current=$(gh api "repos/$GITHUB_REPOSITORY/contents/$path?ref=$CONTROL_BRANCH" --jq .sha 2>/dev/null || true)
+          args=(--method PUT "repos/$GITHUB_REPOSITORY/contents/$path" -f message='ci: record failed RC2 release recovery' -f content="$content" -f branch="$CONTROL_BRANCH")
+          if [[ -n "$current" ]]; then args+=(-f sha="$current"); fi
+          gh api "${args[@]}" >/dev/null
