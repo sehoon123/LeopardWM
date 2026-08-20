@@ -1,0 +1,65 @@
+name: Fix atomic-region patch script
+
+on:
+  push:
+    branches:
+      - agent/region-atomic-v13b-control
+    paths:
+      - .github/workflows/agent-fix-region-v13b-script.yml
+
+permissions:
+  contents: write
+
+jobs:
+  fix-script:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/region-atomic-v13b-control
+          fetch-depth: 0
+
+      - name: Accept both empty-region guards deliberately
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('.github/region-v13b/apply_atomic_region.py')
+          text = path.read_text(encoding='utf-8')
+          old = '''# An empty region is a valid temporary bridge for an opposite-edge jump.
+          replace_once(
+              REGION,
+              ''' + "'''" + '''    if right <= left || bottom <= top {\n        return None;\n    }''' + "'''" + ''',
+              ''' + "'''" + '''    if right < left || bottom < top {\n        return None;\n    }''' + "'''" + ''',
+          )
+          '''
+          new = '''# An empty region is a valid temporary bridge for an opposite-edge jump.
+          # Both `read_metadata` and `relative_clip_region` intentionally accept
+          # zero-area rectangles: the former recovers an empty bridge after a
+          # crash, while the latter represents a safe fully-clipped transition.
+          text = read(REGION)
+          old_guard = ''' + "'''" + '''    if right <= left || bottom <= top {\n        return None;\n    }''' + "'''" + '''
+          new_guard = ''' + "'''" + '''    if right < left || bottom < top {\n        return None;\n    }''' + "'''" + '''
+          if text.count(old_guard) != 2:
+              raise RuntimeError(
+                  f'{REGION}: expected two empty-region guards, found {text.count(old_guard)}'
+              )
+          write(REGION, text.replace(old_guard, new_guard))
+          '''
+          if text.count(old) != 1:
+              raise SystemExit('atomic-region empty-guard patch block mismatch')
+          path.write_text(text.replace(old, new), encoding='utf-8', newline='\n')
+          PY
+          python -m py_compile .github/region-v13b/apply_atomic_region.py
+          git diff --check
+
+      - name: Commit corrected script
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .github/region-v13b/apply_atomic_region.py
+          git commit -m 'fix: patch both empty-region guards intentionally'
+          git push origin HEAD:refs/heads/agent/region-atomic-v13b-control
