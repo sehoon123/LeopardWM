@@ -310,3 +310,7 @@ if text.count(test_marker) != 1:
 write(PLACEMENT, text.replace(test_marker, flush_tests + test_marker, 1))
 
 print('DWM preview proxy hardening applied')
+exec(
+    Path(__file__).with_name('cleanup_legacy_region_v15.py').read_text(encoding='utf-8'),
+    {'__name__': '__main__'},
+)
