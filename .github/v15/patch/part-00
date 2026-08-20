@@ -1,0 +1,154 @@
+diff --git a/crates/platform_win32/src/placement.rs b/crates/platform_win32/src/placement.rs
+index 84cf270..bbf437d 100644
+--- a/crates/platform_win32/src/placement.rs
++++ b/crates/platform_win32/src/placement.rs
+@@ -2,9 +2,14 @@
+ 
+ use crate::types::{AnimationPlacementPolicy, PlatformConfig, Win32Error};
+ use crate::window_id_to_hwnd;
++use crate::thumbnail::{
++    clear_persistent_previews, commit_persistent_previews, forget_persistent_preview,
++    lock_persistent_preview_transaction, prepare_persistent_preview,
++    publish_persistent_previews, PersistentPreviewRequest,
++};
+ use crate::window_region::{
+-    apply_window_region_clip, has_owned_window_region, prepare_window_region_clip,
+-    reconcile_window_regions, restore_all_window_regions, restore_window_region, WindowRegionClip,
++    has_owned_window_region, reconcile_window_regions, restore_all_window_regions,
++    restore_window_region, WindowRegionClip,
+ };
+ use leopardwm_core_layout::{Rect, Visibility, WindowId, WindowPlacement};
+ use std::collections::{HashMap, HashSet};
+@@ -247,6 +252,7 @@ pub fn dwm_uncloak_window(window_id: WindowId) {
+ /// Force-uncloak every tracked window from both sets. Called during
+ /// shutdown and panic recovery. Bypasses `apply_cloak_state`.
+ pub fn dwm_uncloak_all() {
++    clear_persistent_previews();
+     restore_all_window_regions();
+     let _commit = lock_cloak_commit();
+     let global_ids: Vec<WindowId> = {
+@@ -441,9 +447,8 @@ struct DeferEntry {
+     visibility: Visibility,
+     flags: windows::Win32::UI::WindowsAndMessaging::SET_WINDOW_POS_FLAGS,
+     column_index: usize,
+-    region_clip_bounds: Option<Rect>,
+-    fallback_rect: Option<Rect>,
+-    fallback_visibility: Option<Visibility>,
++    /// Off-screen source that must remain composed for a DWM thumbnail.
++    preview_source: bool,
+ }
+ 
+ /// Apply window placements from the layout engine.
+@@ -470,6 +475,7 @@ pub fn apply_placements_with_regions(
+     mut cache: Option<&mut PlacementCache>,
+     nudge_sticky_compositors: bool,
+ ) -> Result<ApplyPlacementsResult, Win32Error> {
++    let _preview_transaction = lock_persistent_preview_transaction();
+     let empty_result = ApplyPlacementsResult {
+         width_violations: Vec::new(),
+         height_violations: Vec::new(),
+@@ -479,7 +485,8 @@ pub fn apply_placements_with_regions(
+         if let Some(cache) = cache {
+             cache.clear();
+         }
+-        // Empty layout is also a hard region-lifecycle boundary.
++        // Empty layout is also a hard visual-lifecycle boundary.
++        clear_persistent_previews();
+         restore_all_window_regions();
+         // Uncloak all tracked windows — no placements means all previous
+         // windows have left this layout (e.g., workspace switch to empty workspace).
+@@ -515,7 +522,7 @@ pub fn apply_placements_with_regions(
+     // overlap and the layout gaps disappear.  Zero the insets to keep correct spacing.
+     let high_contrast = crate::is_high_contrast_enabled();
+ 
+-    let (mut entries, skipped) = build_defer_entries(
++    let (entries, preview_requests, skipped, safe_fallbacks) = build_defer_entries(
+         placements,
+         region_clips,
+         &mut cache,
+@@ -524,35 +531,46 @@ pub fn apply_placements_with_regions(
+         high_contrast,
+     );
+ 
+-    // Restrict first, then reveal and move. This removes the frame in which
+-    // DWM could previously display a gray rectangular backing surface outside
+-    // the owner monitor before SetWindowRgn was committed.
+-    let mut failed_window_ids = HashSet::new();
+-    let pre_fallbacks =
+-        prepare_entry_region_clips(&mut entries, &mut failed_window_ids, animation_frame);
++    // A DWM thumbnail needs a live redirection surface. Remove placement
++    // cloaks and publish the crop before moving its real source off-screen.
++    uncloak_preview_sources(&preview_requests);
++    let _ = publish_persistent_previews(&preview_requests);
+ 
+     uncloak_becoming_visible(&entries);
++    let (applied, failed_window_ids) = position_entries(&entries);
+ 
+-    let (applied, position_failures) = position_entries(&entries);
+-    failed_window_ids.extend(position_failures);
+-    let post_fallbacks =
+-        apply_entry_region_clips(&mut entries, &mut failed_window_ids, animation_frame);
++    let committed_preview_requests: Vec<_> = preview_requests
++        .iter()
++        .copied()
++        .filter(|request| !failed_window_ids.contains(&request.window_id))
++        .collect();
+ 
+-    let mut active_clipped_window_ids: HashSet<WindowId> =
+-        region_clips.iter().map(|clip| clip.window_id).collect();
+-    for entry in &entries {
+-        if entry.region_clip_bounds.is_none() {
+-            active_clipped_window_ids.remove(&entry.window_id);
++    // Any SetWindowRgn state left by older versions is safe to remove only
++    // after the replacement geometry landed. Preserve it if SetWindowPos failed.
++    for clip in region_clips {
++        if !failed_window_ids.contains(&clip.window_id) {
++            let _ = restore_window_region(clip.window_id, true);
+         }
+     }
+-    // Regions on windows becoming fully contained keep their old restrictive region until
+-    // the move completes; only then is the region removed.
++    if !animation_frame && !committed_preview_requests.is_empty() {
++        unsafe {
++            let _ = DwmFlush();
++        }
++    }
++    let active_preview_count = commit_persistent_previews(&committed_preview_requests);
++
++    let preserved_region_ids: HashSet<WindowId> = region_clips
++        .iter()
++        .filter(|clip| failed_window_ids.contains(&clip.window_id))
++        .map(|clip| clip.window_id)
++        .collect();
++    // This backend creates no new regions on foreign HWNDs. Reconciliation is
++    // retained solely to recover stale regions from older LeopardWM versions.
+     reconcile_window_regions(
+         &managed_window_ids,
+-        &active_clipped_window_ids,
++        &preserved_region_ids,
+         !animation_frame,
+     );
+-    let region_fallbacks = pre_fallbacks + post_fallbacks;
+ 
+     // Detect size violations by comparing the DWM extended frame bounds
+     // (the window's actual visible content area) against the layout rect the
+@@ -605,7 +623,12 @@ pub fn apply_placements_with_regions(
+     // Routed through `apply_cloak_state` so a window that's also in
+     // `GHOST_CLOAKED` stays cloaked even if we remove it from
+     // `GLOBAL_CLOAKED` during pruning.
+-    sync_cloak_state(&entries, placements, &failed_window_ids);
++    sync_cloak_state(
++        &entries,
++        placements,
++        &failed_window_ids,
++        &committed_preview_requests,
++    );
+ 
+     // DirectComposition swap-chain repair.
+     //
+@@ -637,10 +660,11 @@ pub fn apply_placements_with_regions(
+     }
+ 
+     tracing::debug!(
+-        "Applied {} placements ({} skipped unchanged), {} region fallback(s), {} off-screen total",
++        "Applied {} placements ({} skipped unchanged), {} preview(s), {} safe fallback(s), {} off-screen 
