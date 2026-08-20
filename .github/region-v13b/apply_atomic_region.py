@@ -333,15 +333,20 @@ pub(crate) fn prepare_window_region_clip(
         Ok(region) => region,
         Err(result) => return result,
     };
-    let current_region = if let Some(region) = current_owned {
-        region
+    let bridge = if let Some(region) = current_owned {
+        intersect_regions(region, target_region)
     } else {
         let Some((current_outer, current_visible)) = current_window_geometry(hwnd) else {
             return RegionClipResult::Failed;
         };
-        allowed_region(current_outer, current_visible, clip_bounds)
+        bridge_clip_region(
+            current_outer,
+            current_visible,
+            target_outer,
+            target_visible,
+            clip_bounds,
+        )
     };
-    let bridge = intersect_regions(current_region, target_region);
     if current_owned == Some(bridge) && actual_region_matches(hwnd, bridge) {
         return RegionClipResult::Unchanged;
     }
@@ -367,6 +372,20 @@ text = read(REGION)
 if text.count(marker) != 1:
     raise RuntimeError('window_region.rs: no-region marker mismatch')
 write(REGION, text.replace(marker, marker + helpers, 1))
+
+# Ownership recovery is integrated into `owned_region_for_identity`.
+# Remove the superseded helper and keep the convenience predicate test-only.
+text = read(REGION)
+start, end = function_span(
+    text,
+    'fn recover_stale_metadata(hwnd: HWND, redraw: bool) -> bool',
+)
+text = text[:start] + text[end:]
+no_region = 'fn window_has_no_region(hwnd: HWND) -> bool {'
+if text.count(no_region) != 1:
+    raise RuntimeError('window_region.rs: no-region helper mismatch')
+text = text.replace(no_region, '#[cfg(test)]\n' + no_region, 1)
+write(REGION, text)
 
 replace_function(
     REGION,
