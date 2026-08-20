@@ -1,4 +1,4 @@
-name: Run atomic-region generator cleanup
+name: Converge atomic-region verification
 
 on:
   push:
@@ -11,22 +11,34 @@ permissions:
   contents: write
 
 jobs:
-  fix:
+  converge:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           ref: agent/region-atomic-v13b-control
           fetch-depth: 0
-      - run: python .github/region-v13b/fix_clippy_generator.py
-      - run: python -m py_compile .github/region-v13b/apply_atomic_region.py
-      - run: git diff --check
-      - name: Commit generator fix
+      - name: Keep only the newest release verification active
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('.github/workflows/agent-region-atomic-v13b.yml')
+          text = path.read_text(encoding='utf-8')
+          old = '  cancel-in-progress: false\n'
+          new = '  cancel-in-progress: true\n'
+          if text.count(old) != 1:
+              raise SystemExit(f'expected one old concurrency flag, found {text.count(old)}')
+          path.write_text(text.replace(old, new), encoding='utf-8', newline='\n')
+          PY
+          git diff --check
+      - name: Commit workflow convergence
         shell: bash
         run: |
           set -euo pipefail
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add .github/region-v13b/apply_atomic_region.py
-          git commit -m 'fix: keep atomic-region production target warning-free'
+          git add .github/workflows/agent-region-atomic-v13b.yml
+          git commit -m 'ci: cancel obsolete atomic-region release attempts'
           git push origin HEAD:refs/heads/agent/region-atomic-v13b-control
