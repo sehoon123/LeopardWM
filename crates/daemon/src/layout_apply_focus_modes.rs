@@ -1,4 +1,4 @@
-use super::prepare_monitor_overflow;
+use super::{prepare_monitor_overflow, visible_floating_rects, OverflowContext};
 use crate::config::MonitorOverflowModeConfig;
 use leopardwm_core_layout::{CenteringMode, Rect, Visibility, WindowPlacement, Workspace};
 use leopardwm_platform_win32::{MonitorId, MonitorInfo};
@@ -62,13 +62,17 @@ fn apply_clip(
     let monitor_rects: Vec<_> = monitors.values().map(|monitor| monitor.rect).collect();
     let mut placements = workspace.compute_placements(owner);
     let mut clips = Vec::new();
+    let floating_snapshot = visible_floating_rects(&placements);
     prepare_monitor_overflow(
         &mut placements,
         2,
         Some(workspace.focused_column_index()),
         MonitorOverflowModeConfig::Clip,
-        &monitors,
-        &monitor_rects,
+        &OverflowContext {
+            monitors: &monitors,
+            monitor_rects: &monitor_rects,
+            floating_rects: &floating_snapshot,
+        },
         &mut clips,
     );
     (placements, clips)

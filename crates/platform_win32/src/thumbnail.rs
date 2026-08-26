@@ -221,11 +221,13 @@ fn register_to(
             .unwrap_or_else(crate::recover_poisoned_mutex);
         z.balance += 1;
         REGISTER_BALANCE.store(z.balance, Ordering::Relaxed);
-        // First active HOST thumbnail: promote the host to HWND_TOPMOST so
-        // the composition sits above ordinary windows. While idle the host
-        // stays non-topmost so the Windows taskbar (also topmost) can
-        // animate without z-order interference. Non-host registrations
-        // (overview overlay) never move the host.
+        // First host thumbnail that *asks* for the topmost band promotes the
+        // host, so a transition ghost composites above ordinary windows. Edge
+        // previews ask for the normal band and never promote it, or they would
+        // cover floating windows. While no ghost is alive the host stays
+        // non-topmost so the Windows taskbar (also topmost) can animate without
+        // z-order interference. Non-host registrations (overview overlay) never
+        // move the host.
         if host_z {
             z.host_balance += 1;
             if band == HostBand::Topmost {

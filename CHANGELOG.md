@@ -2,6 +2,35 @@
 
 All notable changes to LeopardWM will be documented in this file.
 
+## 0.2.6-sehoon.22
+
+### Fixes
+
+- **A window no longer stays broken after returning from an edge preview.** Two
+  causes, both fixed. `DWMWA_EXTENDED_FRAME_BOUNDS` reports where DWM is
+  *compositing* a window, so for a Chromium, Electron or WinUI window whose visual
+  is still at a stale transform it is not where the window is — and that
+  difference was read as an invisible border, baked into placement, blessed by the
+  next verification pass and cached for the session. Inset measurements are now
+  rejected unless every side is a plausible border and the horizontal pair is
+  symmetric. Separately, a window returning from a preview or from off-monitor
+  parking gets the size-delta repair that makes such a renderer rebuild; the
+  evidence is latched, because an intermediate animation frame drops the preview
+  registration before the landing pass could see it.
+- **A live preview no longer covers a floating window.** The shared thumbnail host
+  was promoted to the topmost band by any thumbnail, so edge previews composited
+  above every ordinary window, and their click targets were topmost for the same
+  reason. Only transition ghosts claim that band now; previews and their click
+  targets live in the normal band. In addition, a preview is not planned at all
+  when its on-owner strip intersects a visible floating window — floats sit above
+  the tiled layer by design, so the float owns those pixels. The floating snapshot
+  is taken across every monitor, since a float may span them.
+- **Dragging from a preview waits for the window to be settled.** A live layout
+  transition made the corrective apply a no-op, queued animation frames could move
+  the window afterwards, and the pointer was handed over even when the apply
+  failed. The transition is now ended, queued frames dropped, taskbar buttons
+  re-synced, and the hand-off is skipped entirely if placement did not land.
+
 ## 0.2.6-sehoon.21
 
 ### Fixes

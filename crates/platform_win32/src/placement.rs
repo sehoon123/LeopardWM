@@ -14,7 +14,7 @@ use crate::window_region::{
 use leopardwm_core_layout::{Rect, Visibility, WindowId, WindowPlacement};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use windows::core::BOOL;
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Dwm::{
@@ -448,9 +448,44 @@ struct DeferEntry {
     flags: windows::Win32::UI::WindowsAndMessaging::SET_WINDOW_POS_FLAGS,
     column_index: usize,
     preview_source: bool,
-    /// Set when this entry brings a window back from off-monitor parking, so the
-    /// landing pass can repair a renderer still painting at the old offset.
-    returns_from_park: bool,
+}
+
+/// Windows that returned to the viewport from a preview or from parking and are
+/// still owed one compositor repair.
+///
+/// The evidence is consumed by whichever pass observes it, and during an animated
+/// scroll that is an intermediate frame: the first interpolated rect that no
+/// longer crosses the monitor edge drops the preview registration and the cloak,
+/// so the exact landing would see nothing left to repair. Latching the identity
+/// keeps the repair for the landing, which is the only pass that may resize.
+static PENDING_RETURN_REPAIR: OnceLock<Mutex<HashSet<WindowId>>> = OnceLock::new();
+
+fn pending_return_repair() -> &'static Mutex<HashSet<WindowId>> {
+    PENDING_RETURN_REPAIR.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn latch_return_repair(window_id: WindowId) {
+    pending_return_repair()
+        .lock()
+        .unwrap_or_else(crate::recover_poisoned_mutex)
+        .insert(window_id);
+}
+
+/// Take the latched repairs, leaving the set empty.
+fn take_return_repairs() -> HashSet<WindowId> {
+    std::mem::take(
+        &mut *pending_return_repair()
+            .lock()
+            .unwrap_or_else(crate::recover_poisoned_mutex),
+    )
+}
+
+/// Forget a latched repair for a window that will not be placed again.
+pub(crate) fn forget_return_repair(window_id: WindowId) {
+    pending_return_repair()
+        .lock()
+        .unwrap_or_else(crate::recover_poisoned_mutex)
+        .remove(&window_id);
 }
 
 /// Whether a placement brings a window back to the viewport after it was
@@ -679,13 +714,14 @@ pub fn apply_placements_with_regions(
     // mode only serialises *animation* frames — it does nothing for a single
     // multi-thousand-pixel jump back into the viewport.
     if !animation_frame {
+        let returned_from_park = take_return_repairs();
         let nudge_targets: Vec<NudgeTarget> = entries
             .iter()
             .filter(|e| {
                 e.visibility == Visibility::Visible
                     && e.w > 1
                     && !failed_window_ids.contains(&e.window_id)
-                    && (nudge_sticky_compositors || e.returns_from_park)
+                    && (nudge_sticky_compositors || returned_from_park.contains(&e.window_id))
             })
             .map(|e| NudgeTarget {
                 hwnd: e.hwnd,
@@ -987,19 +1023,19 @@ fn build_defer_entries(
                 flags,
                 column_index: placement.column_index,
                 preview_source: true,
-                returns_from_park: false,
             });
         } else if placement.visibility == Visibility::Visible {
             let frame_w = placement.rect.width + inset_l + inset_r;
             let frame_h = placement.rect.height + inset_t + inset_b;
             let flags = visible_position_flags(animation_frame, dispatch, position_only);
             // Read the state the window is leaving *before* this pass changes it.
-            let returns_from_park = returns_from_offscreen_park(
-                placement.visibility,
-                had_preview,
-                was_cloaked,
-                previous,
-            );
+            if returns_from_offscreen_park(placement.visibility, had_preview, was_cloaked, previous)
+            {
+                // Latched rather than acted on here: only the exact landing may
+                // resize, and an animation frame would otherwise consume the
+                // evidence before the landing sees it.
+                latch_return_repair(placement.window_id);
+            }
             entries.push(DeferEntry {
                 hwnd,
                 window_id: placement.window_id,
@@ -1014,7 +1050,6 @@ fn build_defer_entries(
                 flags,
                 column_index: placement.column_index,
                 preview_source: false,
-                returns_from_park,
             });
         } else {
             let frame_w = placement.rect.width + inset_l + inset_r;
@@ -1037,7 +1072,6 @@ fn build_defer_entries(
                 flags,
                 column_index: placement.column_index,
                 preview_source: false,
-                returns_from_park: false,
             });
         }
     }
@@ -1227,6 +1261,7 @@ fn lock_suspected_oversize() -> std::sync::MutexGuard<'static, Option<HashMap<u6
 /// the set stays bounded and a recycled HWND starts fresh.
 pub fn clear_suspected_oversize(window_id: WindowId) {
     forget_persistent_preview(window_id);
+    forget_return_repair(window_id);
     crate::window_region::forget_window_region(window_id);
     let mut guard = lock_suspected_oversize();
     if let Some(map) = guard.as_mut() {
@@ -2272,7 +2307,6 @@ mod persistent_preview_placement_tests {
             flags: SET_WINDOW_POS_FLAGS::default(),
             column_index: 0,
             preview_source: true,
-            returns_from_park: false,
         }
     }
 

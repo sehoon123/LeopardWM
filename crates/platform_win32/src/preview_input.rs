@@ -354,8 +354,8 @@ unsafe fn reconcile_targets(class: &[u16], windows_by_id: &mut HashMap<WindowId,
                 let _ = ShowWindow(hwnd, SW_HIDE);
                 continue;
             }
-            // Re-assert the topmost band only when the overlay was hidden: a
-            // window that was not visible may have lost its place in the band,
+            // Re-assert the front of the normal band only when the overlay was
+            // hidden: a window that was not visible may have lost its place,
             // while a per-frame re-pin would fight the tab strip.
             if !IsWindowVisible(hwnd).as_bool() {
                 let _ = SetWindowPos(
@@ -368,10 +368,10 @@ unsafe fn reconcile_targets(class: &[u16], windows_by_id: &mut HashMap<WindowId,
                     SWP_NOACTIVATE,
                 );
             }
-            // Move only. Re-pinning to the top of the topmost band on every
-            // animation frame would fight the tab strip, which pins itself the
-            // same way, making a click on a tabbed edge column land
-            // nondeterministically on the strip or on this overlay.
+            // Move only. Re-pinning to the front of the band on every animation
+            // frame would fight the tab strip, which pins itself the same way,
+            // making a click on a tabbed edge column land nondeterministically
+            // on the strip or on this overlay.
             let _ = SetWindowPos(
                 hwnd,
                 None,

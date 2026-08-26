@@ -1,5 +1,6 @@
 use super::{
     drifted_off_monitor_window, park_offscreen_avoiding_neighbors, prepare_monitor_overflow,
+    visible_floating_rects, OverflowContext,
 };
 use crate::config::MonitorOverflowModeConfig;
 use leopardwm_core_layout::{Rect, Visibility, WindowPlacement};
@@ -259,14 +260,18 @@ fn assert_clip_preview_distribution(column_width: i32, expected_preview: i32) {
         })
         .collect();
     let mut clips = Vec::new();
+    let floating_snapshot = visible_floating_rects(&placements);
 
     prepare_monitor_overflow(
         &mut placements,
         2,
         Some(1),
         MonitorOverflowModeConfig::Clip,
-        &monitors,
-        &monitor_rects,
+        &OverflowContext {
+            monitors: &monitors,
+            monitor_rects: &monitor_rects,
+            floating_rects: &floating_snapshot,
+        },
         &mut clips,
     );
 
@@ -415,13 +420,17 @@ fn clip_overflow(
     let monitors = side_by_side_monitors();
     let monitor_rects: Vec<_> = monitors.values().map(|monitor| monitor.rect).collect();
     let mut clips = Vec::new();
+    let floating_snapshot = visible_floating_rects(placements);
     prepare_monitor_overflow(
         placements,
         2,
         focused_column,
         MonitorOverflowModeConfig::Clip,
-        &monitors,
-        &monitor_rects,
+        &OverflowContext {
+            monitors: &monitors,
+            monitor_rects: &monitor_rects,
+            floating_rects: &floating_snapshot,
+        },
         &mut clips,
     );
     clips

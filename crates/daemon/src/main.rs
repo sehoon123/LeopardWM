@@ -2419,13 +2419,21 @@ async fn handle_preview_gesture(
     // over: Windows' move loop produces the same MOVESIZESTART/END pair as a
     // title-bar drag, so drag-to-move and drag-to-merge apply unchanged.
     if matches!(gesture, leopardwm_platform_win32::PreviewGesture::Drag) {
+        // Everything that could still move this window has to be finished before
+        // the pointer is handed over, or the OS move loop starts from a rectangle
+        // the daemon is about to overwrite.
         state.settle_scroll_animations();
-        // Drop queued animation frames: one landing after this point would move
-        // the window out from under the pointer that is about to drive it.
+        // A live layout transition makes apply_layout a no-op, so the window
+        // would never reach the geometry the drag is about to start from.
+        state.abort_active_ghost_transition();
+        state.layout_transition = None;
         ctx.animation_worker.clear_cache();
         *ctx.animation_active = false;
         if let Err(error) = state.apply_layout() {
-            warn!("Preview drag apply failed: {}", error);
+            // Handing the pointer to a window whose placement did not land would
+            // drag it from wherever it happens to be. Leave it as a focus change.
+            warn!("Preview drag not handed over, apply failed: {}", error);
+            return;
         }
         // The window was represented by a preview until this pass, so its
         // taskbar button was hidden as off-viewport.

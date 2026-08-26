@@ -249,7 +249,11 @@ fn preview_strip_is_covered_by_floating(
 }
 
 /// Rectangles of the visible floating windows in `placements`.
-fn visible_floating_rects(
+///
+/// Collected across every monitor before overflow is prepared per owner: a
+/// floating window may span monitors deliberately, so a float owned by one
+/// monitor's workspace can cover another monitor's edge strip.
+pub(crate) fn visible_floating_rects(
     placements: &[leopardwm_core_layout::WindowPlacement],
 ) -> Vec<leopardwm_core_layout::Rect> {
     placements
@@ -280,18 +284,33 @@ fn upsert_region_clip(
 /// `clip` preserves partial columns and emits a Win32 region plan; `hide` uses
 /// the existing whole-window fallback directly. Fully off-screen placements
 /// are always parked clear of every monitor.
+/// Desktop geometry the overflow policy needs beyond the owner monitor itself.
+pub(crate) struct OverflowContext<'a> {
+    pub monitors: &'a std::collections::HashMap<
+        leopardwm_platform_win32::MonitorId,
+        leopardwm_platform_win32::MonitorInfo,
+    >,
+    /// Every monitor rectangle, used to park a window clear of all of them.
+    pub monitor_rects: &'a [leopardwm_core_layout::Rect],
+    /// Visible floating rectangles from every monitor's active workspace. A
+    /// floating window may span monitors deliberately, so a float owned
+    /// elsewhere can still cover this monitor's edge strip.
+    pub floating_rects: &'a [leopardwm_core_layout::Rect],
+}
+
 fn prepare_monitor_overflow(
     placements: &mut [leopardwm_core_layout::WindowPlacement],
     owner_id: leopardwm_platform_win32::MonitorId,
     focused_column: Option<usize>,
     mode: crate::config::MonitorOverflowModeConfig,
-    monitors: &std::collections::HashMap<
-        leopardwm_platform_win32::MonitorId,
-        leopardwm_platform_win32::MonitorInfo,
-    >,
-    monitor_rects: &[leopardwm_core_layout::Rect],
+    desktop: &OverflowContext<'_>,
     region_clips: &mut Vec<leopardwm_platform_win32::WindowRegionClip>,
 ) {
+    let OverflowContext {
+        monitors,
+        monitor_rects,
+        floating_rects,
+    } = desktop;
     use crate::config::MonitorOverflowModeConfig;
     use leopardwm_core_layout::Visibility;
 
@@ -316,9 +335,6 @@ fn prepare_monitor_overflow(
             .filter(|(id, _)| **id != owner_id)
             .any(|(_, monitor)| rect.intersects(&monitor.rect))
     };
-    // Taken before the mutable walk below, which cannot borrow `placements`
-    // again, and unaffected by it: this policy never moves a floating window.
-    let floating_rects = visible_floating_rects(placements);
     for placement in placements.iter_mut() {
         if placement.column_index == usize::MAX {
             continue;
@@ -362,7 +378,7 @@ fn prepare_monitor_overflow(
 
         // A floating window over the edge strip owns those pixels; previewing
         // underneath it would either be invisible or composite on top of it.
-        if preview_strip_is_covered_by_floating(placement.rect, owner_rect, &floating_rects) {
+        if preview_strip_is_covered_by_floating(placement.rect, owner_rect, floating_rects) {
             placement.rect = fallback_rect;
             placement.visibility = fallback_visibility;
             continue;
@@ -574,14 +590,21 @@ impl AppState {
         if let Some(ref transition) = self.layout_transition {
             Self::apply_transition_interpolation(transition, &mut all_placements);
         }
+        // One snapshot for every owner: a floating window may span monitors, so
+        // a float owned elsewhere can still cover this monitor's edge strip.
+        let floating_rects = visible_floating_rects(&all_placements);
+        let desktop = OverflowContext {
+            monitors: &self.monitors,
+            monitor_rects: &monitor_rects,
+            floating_rects: &floating_rects,
+        };
         for (owner_id, focused_column, start, end) in owner_ranges {
             prepare_monitor_overflow(
                 &mut all_placements[start..end],
                 owner_id,
                 focused_column,
                 self.config.layout.monitor_overflow,
-                &self.monitors,
-                &monitor_rects,
+                &desktop,
                 &mut region_clips,
             );
         }
@@ -597,8 +620,7 @@ impl AppState {
                     owner_id,
                     None,
                     self.config.layout.monitor_overflow,
-                    &self.monitors,
-                    &monitor_rects,
+                    &desktop,
                     &mut region_clips,
                 );
             }
@@ -957,6 +979,10 @@ impl AppState {
         // Reuse one monitor-rect snapshot for every owner monitor in this
         // batch instead of allocating it again per monitor.
         let monitor_rects: Vec<_> = self.monitors.values().map(|monitor| monitor.rect).collect();
+        // Overflow is prepared in a second pass so every owner sees the same
+        // floating snapshot: a floating window may span monitors, so a float
+        // owned elsewhere can still cover this monitor's edge strip.
+        let mut owner_ranges = Vec::with_capacity(self.monitors.len());
 
         for (monitor_id, ws_vec) in &self.workspaces {
             let idx = self.active_workspace_idx(*monitor_id);
@@ -964,18 +990,10 @@ impl AppState {
                 if self.monitors.contains_key(monitor_id) {
                     // Use animated placements to support smooth scrolling
                     let viewport = self.layout_viewport(*monitor_id);
-                    let mut placements = workspace.compute_placements_animated(viewport);
+                    let placements = workspace.compute_placements_animated(viewport);
                     let focused_column = (*monitor_id == self.focused_monitor)
                         .then(|| workspace.focused_column_index());
-                    prepare_monitor_overflow(
-                        &mut placements,
-                        *monitor_id,
-                        focused_column,
-                        self.config.layout.monitor_overflow,
-                        &self.monitors,
-                        &monitor_rects,
-                        &mut region_clips,
-                    );
+                    let start = all_placements.len();
                     debug!(
                         "Monitor {}: {} placements for viewport {}x{} (animating: {}, scroll: {:.1}, minimized: {})",
                         monitor_id,
@@ -1001,8 +1019,26 @@ impl AppState {
                         }
                     }
                     all_placements.extend(placements);
+                    owner_ranges.push((*monitor_id, focused_column, start, all_placements.len()));
                 }
             }
+        }
+
+        let floating_rects = visible_floating_rects(&all_placements);
+        let desktop = OverflowContext {
+            monitors: &self.monitors,
+            monitor_rects: &monitor_rects,
+            floating_rects: &floating_rects,
+        };
+        for (owner_id, focused_column, start, end) in owner_ranges {
+            prepare_monitor_overflow(
+                &mut all_placements[start..end],
+                owner_id,
+                focused_column,
+                self.config.layout.monitor_overflow,
+                &desktop,
+                &mut region_clips,
+            );
         }
 
         (all_placements, region_clips)
