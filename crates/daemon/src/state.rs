@@ -1193,21 +1193,35 @@ pub(crate) fn merged_cleanup_window_ids(
 }
 
 /// Resolve a clicked monitor-edge preview to the focus target it represents:
-/// `(monitor, workspace index, column index, window index in column)`.
+/// `(monitor, column index, window index in column)`.
 ///
-/// Only a window that is actually in a workspace resolves; a preview whose
-/// source has since been closed or unmanaged yields `None` so the click is
-/// dropped instead of moving focus somewhere unrelated.
+/// Only the *active* workspace of each monitor is searched. A preview exists
+/// solely for a window in the layout that is currently on screen, so an inactive
+/// workspace can never own one; searching them anyway would let a click on a
+/// sticky window's preview resolve to a hidden copy and silently switch
+/// workspaces without the parking and cloaking a real workspace switch performs.
+/// Monitors are visited in a stable order so a duplicate id cannot make the
+/// result depend on hash iteration order.
 pub(crate) fn preview_click_focus_target(
     state: &AppState,
     window_id: u64,
-) -> Option<(MonitorId, usize, usize, usize)> {
-    for (monitor_id, workspaces) in &state.workspaces {
-        for (workspace_idx, workspace) in workspaces.iter().enumerate() {
-            if let Some((column_idx, window_in_column)) = workspace.find_window_location(window_id)
-            {
-                return Some((*monitor_id, workspace_idx, column_idx, window_in_column));
-            }
+) -> Option<(MonitorId, usize, usize)> {
+    let mut monitor_ids: Vec<MonitorId> = state.workspaces.keys().copied().collect();
+    monitor_ids.sort_unstable();
+    // Prefer the focused monitor: with mirrored or duplicated ids, the click the
+    // user made is the one on the output they were already working on.
+    monitor_ids.sort_by_key(|id| *id != state.focused_monitor);
+    for monitor_id in monitor_ids {
+        let active_idx = state.active_workspace_idx(monitor_id);
+        let Some(workspace) = state
+            .workspaces
+            .get(&monitor_id)
+            .and_then(|workspaces| workspaces.get(active_idx))
+        else {
+            continue;
+        };
+        if let Some((column_idx, window_in_column)) = workspace.find_window_location(window_id) {
+            return Some((monitor_id, column_idx, window_in_column));
         }
     }
     None

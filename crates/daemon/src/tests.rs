@@ -92,16 +92,72 @@ fn test_preview_click_resolves_to_the_previewed_column() {
     other.insert_window(300, Some(600)).unwrap();
     other.insert_window_in_column(301, 1).unwrap();
 
+    // Monitor 1's active workspace owns 100: resolved as (monitor, column, window).
     assert_eq!(
         crate::state::preview_click_focus_target(&state, 100),
-        Some((1, 0, 0, 0))
+        Some((1, 0, 0))
     );
-    assert_eq!(
-        crate::state::preview_click_focus_target(&state, 301),
-        Some((2, 1, 1, 1))
-    );
+    // 301 lives in an *inactive* workspace, so it can never be behind a preview.
+    // Resolving it would switch workspaces without parking the visible ones,
+    // which is exactly how a click used to scramble the layout.
+    assert_eq!(crate::state::preview_click_focus_target(&state, 301), None);
     // A preview whose source is gone must not move focus anywhere.
     assert_eq!(crate::state::preview_click_focus_target(&state, 999), None);
+
+    // Activating that workspace makes its stacked window addressable.
+    state.active_workspace.insert(2, 1);
+    assert_eq!(
+        crate::state::preview_click_focus_target(&state, 301),
+        Some((2, 1, 1))
+    );
+}
+
+#[test]
+fn test_preview_click_prefers_the_focused_monitor_for_a_duplicate_id() {
+    let mut state = AppState::new_with_config(test_config(), two_monitors());
+    state.paused = true;
+    // The same window id present on both monitors' active workspaces (sticky
+    // windows are tracked per workspace) must resolve on the focused monitor.
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(100, Some(600))
+        .unwrap();
+    state.workspaces.get_mut(&2).unwrap()[0]
+        .insert_window(100, Some(600))
+        .unwrap();
+
+    state.focused_monitor = 2;
+    assert_eq!(
+        crate::state::preview_click_focus_target(&state, 100),
+        Some((2, 0, 0))
+    );
+    state.focused_monitor = 1;
+    assert_eq!(
+        crate::state::preview_click_focus_target(&state, 100),
+        Some((1, 0, 0))
+    );
+}
+
+#[test]
+fn test_preview_click_focus_rejects_targets_outside_the_active_workspace() {
+    let mut state = AppState::new_with_config(test_config(), two_monitors());
+    state.paused = true;
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(100, Some(600))
+        .unwrap();
+    let inactive = state.ensure_workspace_exists(1, 1).unwrap();
+    inactive.insert_window(200, Some(600)).unwrap();
+
+    // Out-of-range column, out-of-range window, unknown monitor and a column
+    // that only exists on an inactive workspace must all be refused, leaving
+    // focus untouched instead of applying a half-valid layout.
+    for (monitor, column, window) in [(1, 5, 0), (1, 0, 3), (99, 0, 0)] {
+        assert!(matches!(
+            state.focus_column_in_active_workspace(monitor, column, window),
+            IpcResponse::Error { .. }
+        ));
+    }
+    assert_eq!(state.focused_monitor, 1);
+    assert_eq!(state.active_workspace.get(&1).copied(), Some(0));
 }
 
 #[test]

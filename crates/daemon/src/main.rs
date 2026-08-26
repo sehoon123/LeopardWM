@@ -2378,30 +2378,36 @@ async fn handle_preview_click(ctx: &mut EventLoopCtx<'_>, window_id: u64) {
     if state.paused {
         return;
     }
-    let Some((monitor_id, workspace_idx, column_idx, window_in_column)) =
+    let Some((monitor_id, column_idx, window_in_column)) =
         crate::state::preview_click_focus_target(&state, window_id)
     else {
         debug!(
-            "Preview click for unmanaged window {:#x} ignored",
+            "Preview click for window {:#x} ignored: not in an active workspace",
             window_id
         );
         return;
     };
 
-    state.focused_monitor = monitor_id;
-    state.active_workspace.insert(monitor_id, workspace_idx);
-    if let Some(workspace) = state.focused_workspace_mut() {
-        if let Err(error) = workspace.set_focus(column_idx, window_in_column) {
-            warn!("Preview click focus failed: {}", error);
-            return;
+    // Same routing as a focus hotkey: the column scrolls in with its animation
+    // and the OS foreground follows, so a click cannot leave the strip in a
+    // half-applied state.
+    if let IpcResponse::Error { message } =
+        state.focus_column_in_active_workspace(monitor_id, column_idx, window_in_column)
+    {
+        warn!("Preview click focus failed: {}", message);
+        return;
+    }
+    state.update_tab_strip();
+
+    // `ensure_focused_visible_animated` starts a scroll animation; without
+    // driving it the strip would sit at the interpolated offset of frame zero.
+    if state.is_animating() && !*ctx.animation_active {
+        state.tick_animations(0);
+        if let Ok(true) = state.send_animation_frame(ctx.animation_worker) {
+            *ctx.animation_active = true;
+            *ctx.last_frame_instant = Some(std::time::Instant::now());
         }
     }
-    if let Err(error) = state.apply_layout() {
-        warn!("Preview click apply failed: {}", error);
-    }
-    state.sync_taskbar_buttons();
-    state.sync_foreground_window();
-    state.update_tab_strip();
 }
 
 /// Handle a tab-strip click action routed to the captured column identity.

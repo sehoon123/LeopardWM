@@ -370,6 +370,12 @@ impl AppState {
         self.reapply_window_rules();
 
         // Pick up previously-ignored windows that should now be tiled/floated.
+        //
+        // Skipped in test builds: a unit test's AppState is a fixture, and
+        // enumerating the real desktop pulls the developer's own windows into it
+        // (and then strips WS_MAXIMIZEBOX from them through the snap handling
+        // below), which makes assertions depend on what happens to be open.
+        #[cfg(not(test))]
         if let Ok(added) = self.enumerate_and_add_windows() {
             if added > 0 {
                 info!("Config reload: tiled {} previously-ignored windows", added);

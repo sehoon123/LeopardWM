@@ -217,6 +217,58 @@ impl AppState {
         resp
     }
 
+    /// Focus an explicit column (and window within it) on `monitor`, exactly as a
+    /// focus command would: the column scrolls into view with the same animation,
+    /// transition, taskbar and foreground handling.
+    ///
+    /// Used by monitor-edge preview clicks, whose thumbnail cannot receive the
+    /// click itself. Deliberately does not touch `active_workspace`: a preview
+    /// only ever belongs to the workspace already on screen, and switching one
+    /// here would skip the parking and cloaking a real workspace switch performs,
+    /// leaving both workspaces' windows visible at once.
+    pub(crate) fn focus_column_in_active_workspace(
+        &mut self,
+        monitor: MonitorId,
+        column_idx: usize,
+        window_in_column: usize,
+    ) -> IpcResponse {
+        if !self.monitors.contains_key(&monitor) {
+            return IpcResponse::error(format!("Monitor {monitor} is no longer connected"));
+        }
+        let active_idx = self.active_workspace_idx(monitor);
+        let addressable = self
+            .workspaces
+            .get(&monitor)
+            .and_then(|workspaces| workspaces.get(active_idx))
+            .is_some_and(|workspace| {
+                workspace
+                    .column(column_idx)
+                    .is_some_and(|column| window_in_column < column.windows().len())
+            });
+        if !addressable {
+            return IpcResponse::error(format!(
+                "Column {column_idx} window {window_in_column} is not in monitor {monitor}'s active workspace"
+            ));
+        }
+
+        self.focused_monitor = monitor;
+        let mut focus_error = None;
+        let response =
+            self.execute_workspace_command(
+                false,
+                true,
+                |workspace, viewport_width| match workspace.set_focus(column_idx, window_in_column)
+                {
+                    Ok(()) => workspace.ensure_focused_visible_animated(viewport_width),
+                    Err(error) => focus_error = Some(error),
+                },
+            );
+        if let Some(error) = focus_error {
+            return IpcResponse::error(format!("Failed to focus column: {error}"));
+        }
+        response
+    }
+
     /// Focus or move the focused column to the start/end of the strip.
     fn handle_strip_end_command(&mut self, cmd: IpcCommand) -> IpcResponse {
         match cmd {
