@@ -2,6 +2,22 @@
 
 All notable changes to LeopardWM will be documented in this file.
 
+## 0.2.6-sehoon.17
+
+### Fixes
+
+- **Modern apps no longer show a gray box on the neighboring monitor.** Monitor-edge
+  previews are drawn with a DWM thumbnail cropped to the owner monitor instead of a
+  `SetWindowRgn` clip on the foreign window, and the real source is parked clear of
+  every monitor first. Measured with a window straddling the boundary between a
+  3840x2160 and a 2560x1600 display: a GDI window clipped exactly at the edge, while
+  Windows 11 Notepad and File Explorer left a flat gray rectangle plus their caption
+  buttons past it — a window region only cuts the legacy redirection surface, so
+  DirectComposition/XAML content with a system backdrop keeps compositing outside it.
+  Verified after the change: Explorer peeking at the shared edge renders real content
+  with nothing on the neighboring monitor. This merges the `v0.2.6-sehoon.15-rc2`
+  line, which was held back pending exactly this hardware verification.
+
 ## 0.2.6-sehoon.16
 
 ### Improvements
