@@ -13,9 +13,10 @@ concurrency:
 
 jobs:
   build:
-    # Personal `-sehoon.N` releases use the separately verified adaptive
-    # release pipeline. This standard workflow remains for plain semver tags.
-    if: ${{ !contains(github.ref_name, '-sehoon.') }}
+    # Every `v*` tag builds here, including personal `-sehoon.N` builds: the
+    # separate pipeline they used to rely on was retired, which left those tags
+    # producing no assets at all. Any tag carrying a pre-release suffix is
+    # published as a pre-release (see the `channel` step below).
     permissions:
       contents: write
     runs-on: windows-latest
@@ -59,6 +60,17 @@ jobs:
             --bin-path "C:\Program Files (x86)\WiX Toolset v3.14\bin"
           cp target/wix/*.msi "LeopardWM-${VERSION}-x86_64.msi"
           ls -l "LeopardWM-${VERSION}-x86_64.msi"
+      - name: Classify release channel
+        id: channel
+        shell: bash
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          # 0.2.7 -> release; 0.2.7-rc1 / 0.2.6-sehoon.17 -> pre-release.
+          if [[ "$VERSION" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Extract changelog
         id: changelog
         shell: bash
@@ -86,3 +98,4 @@ jobs:
             checksums.txt
           body: ${{ steps.changelog.outputs.body }}
           generate_release_notes: ${{ steps.changelog.outputs.body == '' }}
+          prerelease: ${{ steps.channel.outputs.prerelease == 'true' }}

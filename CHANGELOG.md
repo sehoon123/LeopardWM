@@ -2,6 +2,17 @@
 
 All notable changes to LeopardWM will be documented in this file.
 
+## 0.2.6-sehoon.18
+
+### Improvements
+
+- **Personal tags build their own release assets again.** The release workflow
+  skipped every tag containing `-sehoon.`, deferring to a separate pipeline that
+  no longer exists, so those tags produced no ZIP, MSI, or checksums at all. Any
+  `v*` tag now runs the same gate (fmt, tests, clippy, release build, GUI
+  subsystem check) and publishes ZIP + MSI + `checksums.txt`; a tag with a
+  pre-release suffix is marked as a pre-release automatically.
+
 ## 0.2.6-sehoon.17
 
 ### Fixes
