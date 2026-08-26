@@ -50,6 +50,83 @@ fn test_appearance_change_reapplies_unchanged_layout_with_fresh_insets() {
 }
 
 #[test]
+fn test_monitor_reconcile_invalidates_the_desired_rect_fast_path() {
+    let mut state = AppState::new_with_config(test_config(), two_monitors());
+    state.paused = true;
+    state.workspaces.get_mut(&2).unwrap()[0]
+        .insert_window(100, Some(800))
+        .unwrap();
+    let placements = state.workspaces[&2][0].compute_placements(state.layout_viewport(2));
+    let placed = placements
+        .iter()
+        .find(|placement| placement.window_id == 100)
+        .unwrap()
+        .rect;
+    // Pretend this exact layout was already applied and its feedback suppressed.
+    state.last_placed_layout_rects.insert(100, placed);
+    state.arm_moved_or_resized_suppression([100]);
+    assert!(state.placements_match_last_applied(&placements));
+
+    // Re-arranging monitors and returning to a known arrangement must never
+    // let the unchanged-desired-layout fast path skip placement: Windows moves
+    // windows itself during the topology change, so a tiled window can be
+    // sitting on a neighboring monitor while the cache still looks correct.
+    state.reconcile_monitors(two_monitors());
+
+    assert!(state.last_placed_layout_rects.is_empty());
+    assert!(!state.should_suppress_moved_or_resized(100));
+    assert!(!state.placements_match_last_applied(&placements));
+}
+
+#[test]
+fn test_refresh_invalidates_the_desired_rect_fast_path() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    // Paused keeps `apply_layout` from touching real desktop windows that the
+    // refresh enumeration picks up in a developer session.
+    state.paused = true;
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(100, Some(800))
+        .unwrap();
+    state
+        .last_placed_layout_rects
+        .insert(100, Rect::new(1, 2, 3, 4));
+    state.arm_moved_or_resized_suppression([100]);
+
+    let _ = state.handle_command(IpcCommand::Refresh);
+
+    assert!(
+        !state.last_placed_layout_rects.contains_key(&100),
+        "an explicit refresh must not be short-circuited by the desired-rect cache"
+    );
+    assert!(!state.should_suppress_moved_or_resized(100));
+}
+
+#[test]
+fn test_windows_outside_the_active_layout_are_selected_for_reparking() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.paused = true;
+    // Active workspace 0: stays placed by apply_layout.
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(100, Some(800))
+        .unwrap();
+    // Sticky windows live in the active workspace too and must stay put.
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(400, Some(800))
+        .unwrap();
+    // Inactive workspace 1: kept invisible only by its parked coordinates.
+    let inactive = state.ensure_workspace_exists(1, 1).unwrap();
+    inactive.insert_window(200, Some(800)).unwrap();
+    // Minimized elsewhere: its restore geometry must not be rewritten.
+    inactive.insert_window(300, Some(800)).unwrap();
+    inactive.mark_minimized(300);
+    // The same sticky window is also parked on another inactive workspace.
+    let other = state.ensure_workspace_exists(1, 2).unwrap();
+    other.insert_window(400, Some(800)).unwrap();
+
+    assert_eq!(state.windows_outside_active_layout(), vec![200]);
+}
+
+#[test]
 fn test_compositor_safe_mode_keeps_position_only_scroll_smooth() {
     let mut config = test_config();
     config.behavior.compositor_safe_mode = true;

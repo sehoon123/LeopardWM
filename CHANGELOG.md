@@ -2,6 +2,61 @@
 
 All notable changes to LeopardWM will be documented in this file.
 
+## Unreleased
+
+### Fixes
+
+- **Stop side-by-side monitors from stranding tiled windows on their neighbor.**
+  Re-arranging displays (side-by-side → stacked → side-by-side) let Windows move
+  managed windows itself, and the daemon's unchanged-desired-layout fast path
+  could then match its cache exactly and skip the corrective placement. Tiled
+  windows stayed wherever the OS had left them — including entirely on a
+  neighboring monitor, where the multi-monitor overflow policy never got a
+  chance to hide or clip them, so they showed up as stale, unpainted rectangles
+  on the wrong display. Every monitor reconcile now invalidates the desired-rect
+  and moved/resized-suppression caches, and `lwm refresh` does the same so an
+  explicit refresh always re-places drifted windows.
+- **Verify containment before skipping an unchanged layout.** The fast path
+  compared only what the daemon last *requested*, so any OS-driven relocation
+  whose feedback landed inside the apply-layout suppression window (topology
+  change, session unlock, RDP reconnect, resume from sleep) could leave a window
+  on a neighboring monitor with nothing to reclaim it. An unchanged layout is now
+  skipped only while every visible tiled window is still on its own monitor or
+  clear of every other output.
+- **Re-park windows that no active workspace owns after a display change.**
+  Inactive-workspace windows are kept invisible purely by their off-screen
+  parking coordinates, and Windows drags them back onto the desktop when the
+  topology changes. They are now re-parked explicitly, since the corrective
+  layout pass only places active workspaces. Minimized windows are left alone so
+  their restore geometry survives.
+- **Never present a clipped window as an empty rectangle.** A window region can
+  only hide pixels, so a visible placement that shared no pixels with its owner
+  monitor was clipped to an empty region and rendered as a blank box over the
+  neighbor's desktop. Such a placement is now contained inside its owner (the
+  focused column) or parked clear of every monitor (any other column), and the
+  platform layer refuses to install an empty region, falling back to that safe
+  geometry instead.
+- **Pausing releases monitor-overflow clipping.** `apply_layout` no-ops while
+  paused, so a window clipped at a monitor boundary used to stay clipped — with
+  part of it invisible and clicks in that part passing through — for as long as
+  the pause lasted. Pausing now restores every region it owns; resuming
+  re-installs exactly the clips the current geometry needs.
+- **Clip monitor overflow against the geometry the window actually has.** The
+  boundary region is now intersected with the rectangle read back from the HWND,
+  so an application that refuses a requested size or position (minimum sizes, DPI
+  rounding, self-repositioning) can no longer expose pixels past the monitor
+  edge. Parked placements no longer carry a clip plan at all.
+- **Release a boundary clip only after the window has reached safe geometry.**
+  The fallback and off-screen parking paths that can act on a window straddling a
+  monitor edge used to clear its region first, exposing the overflow for the
+  frames before the corrective `SetWindowPos` landed — including
+  `move_window_offscreen`, used by workspace switching and the scratchpad. The
+  safe move now happens first and before the window is uncloaked, a window whose
+  move failed keeps its restrictive region (and stays cloaked) instead of having
+  it reconciled away, a hung renderer whose frame was skipped keeps its region
+  too, and an intermediate animation frame keeps the bridge region and defers the
+  repair to the exact landing pass instead of popping the column off-monitor.
+
 ## 0.2.6-sehoon.7
 
 ### Fixes

@@ -2019,7 +2019,9 @@ impl AppState {
                     );
                 }
 
-                // Reconcile workspaces with new monitor configuration
+                // Reconcile workspaces with new monitor configuration. This
+                // also drops the desired-rect fast-path cache, so the re-apply
+                // below re-places every managed window.
                 self.reconcile_monitors(new_monitors);
 
                 // Correct any window whose minimized flag went stale across the
@@ -2027,6 +2029,12 @@ impl AppState {
                 // windows but the restored stash still has them flagged), so the
                 // re-apply below tiles what is actually on screen.
                 self.resync_minimized_from_os();
+
+                // Windows drags off-screen parked windows back onto the desktop
+                // during a topology change. The re-apply below only places each
+                // monitor's active workspace, so re-park everything outside it
+                // or those windows stay visible on an arbitrary monitor.
+                self.repark_windows_outside_active_layout();
 
                 // Re-apply layout with updated monitor configuration
                 if let Err(e) = self.apply_layout() {

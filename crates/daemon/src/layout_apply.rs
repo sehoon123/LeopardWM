@@ -34,6 +34,88 @@ pub(crate) fn can_skip_unchanged_layout(
     placements_unchanged && !bypass_fast_path && !post_animation_landing_pending
 }
 
+/// Tolerance for the fast-path containment check.
+///
+/// The authoritative outer rectangle includes the invisible resize border
+/// (roughly 8-14px depending on DPI) and DPI rounding adds a pixel or two, while
+/// an OS-driven relocation moves a window by hundreds of pixels.
+pub(crate) const MONITOR_DRIFT_TOLERANCE_PX: i32 = 32;
+
+/// First visible tiled placement whose real on-screen rectangle has left the
+/// monitor that owns it and reaches another output.
+///
+/// `owner_of` maps a window to the monitor whose workspace owns it and
+/// `actual_rect` returns its authoritative outer rectangle (`GetWindowRect`,
+/// which stays correct even when DWM reports stale extended frame bounds). Both
+/// are injected so the rule is testable without real window handles.
+pub(crate) fn drifted_off_monitor_window(
+    placements: &[leopardwm_core_layout::WindowPlacement],
+    monitors: &std::collections::HashMap<
+        leopardwm_platform_win32::MonitorId,
+        leopardwm_platform_win32::MonitorInfo,
+    >,
+    owner_of: impl Fn(u64) -> Option<leopardwm_platform_win32::MonitorId>,
+    actual_rect: impl Fn(u64) -> Option<leopardwm_core_layout::Rect>,
+) -> Option<u64> {
+    use leopardwm_core_layout::Visibility;
+
+    placements
+        .iter()
+        .filter(|placement| {
+            placement.visibility == Visibility::Visible && placement.column_index != usize::MAX
+        })
+        .find(|placement| {
+            let Some(owner_id) = owner_of(placement.window_id) else {
+                return false;
+            };
+            let Some(owner) = monitors.get(&owner_id) else {
+                return false;
+            };
+            let Some(actual) = actual_rect(placement.window_id) else {
+                return false;
+            };
+            // A leak is pixels that both reach a different output and sit
+            // outside the owner. Testing the whole rectangle instead would flag
+            // a mirrored output (whose rectangle overlaps the owner's) for a
+            // window that merely overhangs into empty virtual-desktop space,
+            // which paints nothing.
+            monitors.iter().any(|(id, monitor)| {
+                if *id == owner_id {
+                    return false;
+                }
+                let Some(overlap) = intersection(actual, monitor.rect) else {
+                    return false;
+                };
+                escapes_bounds(overlap, owner.rect, MONITOR_DRIFT_TOLERANCE_PX)
+            })
+        })
+        .map(|placement| placement.window_id)
+}
+
+/// Positive-area overlap of two rectangles, if any.
+fn intersection(
+    left: leopardwm_core_layout::Rect,
+    right: leopardwm_core_layout::Rect,
+) -> Option<leopardwm_core_layout::Rect> {
+    let x = left.x.max(right.x);
+    let y = left.y.max(right.y);
+    let width = left.right().min(right.right()).saturating_sub(x);
+    let height = left.bottom().min(right.bottom()).saturating_sub(y);
+    (width > 0 && height > 0).then(|| leopardwm_core_layout::Rect::new(x, y, width, height))
+}
+
+/// Whether `rect` reaches more than `tolerance` past any edge of `bounds`.
+fn escapes_bounds(
+    rect: leopardwm_core_layout::Rect,
+    bounds: leopardwm_core_layout::Rect,
+    tolerance: i32,
+) -> bool {
+    rect.x < bounds.x - tolerance
+        || rect.right() > bounds.right() + tolerance
+        || rect.y < bounds.y - tolerance
+        || rect.bottom() > bounds.bottom() + tolerance
+}
+
 pub(crate) fn legacy_compositor_nudge_required(
     landing_pending: bool,
     compositor_safe_mode: bool,
@@ -194,15 +276,17 @@ fn prepare_monitor_overflow(
         return;
     };
     let owner_rect = owner.rect;
+    let intersects_neighbor = |rect: leopardwm_core_layout::Rect| {
+        monitors
+            .iter()
+            .filter(|(id, _)| **id != owner_id)
+            .any(|(_, monitor)| rect.intersects(&monitor.rect))
+    };
     for placement in placements {
         if placement.column_index == usize::MAX {
             continue;
         }
-        let intersects_neighbor = monitors
-            .iter()
-            .filter(|(id, _)| **id != owner_id)
-            .any(|(_, monitor)| placement.rect.intersects(&monitor.rect));
-        if !intersects_neighbor {
+        if !intersects_neighbor(placement.rect) {
             continue;
         }
 
@@ -238,6 +322,20 @@ fn prepare_monitor_overflow(
                 visibility,
             )
         };
+
+        // A window region can only hide pixels; it cannot pull a window that
+        // shares no pixels with its owner monitor back onto it. Clipping such a
+        // placement would install an empty region, so the HWND would be
+        // presented as an empty rectangle sitting on the neighbor's desktop
+        // instead of window content. Apply the safe geometry immediately and
+        // plan no region for it. Reachable whenever an interpolated frame, a
+        // drag, or a display-topology change leaves a still-visible placement
+        // completely outside its owner.
+        if !placement.rect.intersects(&owner_rect) {
+            placement.rect = fallback_rect;
+            placement.visibility = fallback_visibility;
+            continue;
+        }
 
         upsert_region_clip(
             region_clips,
@@ -650,8 +748,26 @@ impl AppState {
             bypass_fast_path,
             self.post_animation_landing_pending,
         ) {
-            self.applying_layout = false;
-            return Ok(());
+            // "Unchanged" only describes what this daemon last *requested*.
+            // Windows relocates managed windows on its own (display topology
+            // changes, session unlock, RDP reconnect, resume from sleep) and that
+            // feedback arrives inside the apply-layout suppression window, so a
+            // window can be sitting on a neighboring monitor while the desired
+            // layout still matches the cache. Verify containment before skipping
+            // placement, otherwise nothing ever reclaims it.
+            match self.drifted_off_monitor_window(&all_placements) {
+                None => {
+                    self.applying_layout = false;
+                    return Ok(());
+                }
+                Some(window_id) => {
+                    debug!(
+                        "Re-placing unchanged layout: window {:#x} drifted off its monitor",
+                        window_id
+                    );
+                    self.last_placed_layout_rects.remove(&window_id);
+                }
+            }
         }
         if placements_unchanged && self.post_animation_landing_pending {
             debug!("Forcing exact post-animation landing for unchanged placements");
@@ -847,8 +963,32 @@ impl AppState {
         (all_placements, region_clips)
     }
 
+    /// Fast-path guard: the first visible tiled window that is physically off
+    /// its owning monitor and overlapping another output. Skipped under
+    /// `cfg(test)`, where placeholder hwnds have no real geometry.
+    fn drifted_off_monitor_window(
+        &self,
+        all_placements: &[leopardwm_core_layout::WindowPlacement],
+    ) -> Option<u64> {
+        #[cfg(test)]
+        {
+            let _ = all_placements;
+            None
+        }
+        #[cfg(not(test))]
+        drifted_off_monitor_window(
+            all_placements,
+            &self.monitors,
+            |window_id| {
+                self.find_window_workspace(window_id)
+                    .map(|(monitor_id, _)| monitor_id)
+            },
+            leopardwm_platform_win32::get_window_chrome_rect,
+        )
+    }
+
     /// Fast-path check: every placement matches the last applied rect and the visible-set is unchanged.
-    fn placements_match_last_applied(
+    pub(crate) fn placements_match_last_applied(
         &self,
         all_placements: &[leopardwm_core_layout::WindowPlacement],
     ) -> bool {

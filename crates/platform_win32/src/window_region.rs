@@ -289,10 +289,35 @@ fn rect_from_win32(rect: RECT) -> Option<Rect> {
     (width > 0 && height > 0).then(|| Rect::new(rect.left, rect.top, width, height))
 }
 
-fn current_window_geometry(hwnd: HWND) -> Option<(Rect, Rect)> {
+fn current_outer_rect(hwnd: HWND) -> Option<Rect> {
     let mut outer = RECT::default();
     unsafe { GetWindowRect(hwnd, &mut outer) }.ok()?;
-    let outer = rect_from_win32(outer)?;
+    rect_from_win32(outer)
+}
+
+/// Re-anchor a requested visible frame onto the outer rectangle the HWND
+/// actually occupies. The requested insets are reused deliberately: they were
+/// measured for this frame, while `DWMWA_EXTENDED_FRAME_BOUNDS` can still
+/// report the pre-move rectangle right after a placement batch.
+pub(crate) fn reanchor_visible_rect(
+    requested_outer: Rect,
+    requested_visible: Rect,
+    actual_outer: Rect,
+) -> Rect {
+    Rect::new(
+        actual_outer
+            .x
+            .saturating_add(requested_visible.x.saturating_sub(requested_outer.x)),
+        actual_outer
+            .y
+            .saturating_add(requested_visible.y.saturating_sub(requested_outer.y)),
+        requested_visible.width,
+        requested_visible.height,
+    )
+}
+
+fn current_window_geometry(hwnd: HWND) -> Option<(Rect, Rect)> {
+    let outer = current_outer_rect(hwnd)?;
 
     let mut visible = RECT::default();
     let visible = if unsafe {
@@ -411,6 +436,13 @@ fn owned_region_for_identity(
 }
 
 /// Install a restrictive bridge before the HWND is uncloaked or moved.
+///
+/// An empty bridge is a valid result and is installed deliberately: a jump
+/// between opposite monitor edges has no shape that is safe at both endpoints,
+/// and hiding the window for the duration of that move is preferable to letting
+/// it sweep across a neighboring output. The bridge is transient —
+/// [`apply_window_region_clip`] is the layer that refuses to *commit* an empty
+/// region, so a window is never left blank once the move has landed.
 pub(crate) fn prepare_window_region_clip(
     window_id: WindowId,
     target_outer: Rect,
@@ -521,7 +553,6 @@ pub(crate) fn apply_window_region_clip(
     clip_bounds: Rect,
     redraw: bool,
 ) -> RegionClipResult {
-    let target_region = allowed_region(outer_rect, visible_rect, clip_bounds);
     let _commit = lock_commit();
     let Some(current_identity) = identity(window_id) else {
         lock_states().remove(&window_id);
@@ -530,6 +561,33 @@ pub(crate) fn apply_window_region_clip(
     let Ok(hwnd) = window_id_to_hwnd(window_id) else {
         return RegionClipResult::Failed;
     };
+
+    // The region is interpreted against the rectangle the HWND actually
+    // occupies, which an application can refuse to match (minimum sizes, DPI
+    // rounding, self-repositioning, a placement message not yet processed). A
+    // region derived from the requested rectangle alone would then expose
+    // pixels outside `clip_bounds`. Intersecting both interpretations is safe
+    // for either position and is exactly the requested region once the window
+    // honors placement.
+    let requested_region = allowed_region(outer_rect, visible_rect, clip_bounds);
+    let target_region = match current_outer_rect(hwnd) {
+        Some(actual_outer) if actual_outer != outer_rect => intersect_regions(
+            requested_region,
+            allowed_region(
+                actual_outer,
+                reanchor_visible_rect(outer_rect, visible_rect, actual_outer),
+                clip_bounds,
+            ),
+        ),
+        _ => requested_region,
+    };
+    if target_region.width <= 0 || target_region.height <= 0 {
+        // An empty region hides the window completely while the layout still
+        // treats it as visible, which reads as a blank rectangle where content
+        // belongs. Report failure so the caller installs its safe fallback
+        // geometry (contained for the focused column, parked otherwise).
+        return RegionClipResult::Failed;
+    }
 
     let current_owned = match owned_region_for_identity(window_id, hwnd, &current_identity) {
         Ok(region) => region,
@@ -621,8 +679,9 @@ mod tests {
     use super::{
         actual_region_matches, apply_window_region_clip, bridge_clip_region,
         classify_window_region_kind, decode_coordinate, encode_coordinate,
-        prepare_window_region_clip, relative_clip_region, restore_window_region,
-        window_has_no_region, WindowRegionKind, ERROR_REGION_KIND,
+        prepare_window_region_clip, reanchor_visible_rect, relative_clip_region,
+        restore_window_region, window_has_no_region, RegionClipResult, WindowRegionKind,
+        ERROR_REGION_KIND,
     };
     use leopardwm_core_layout::Rect;
     use std::sync::OnceLock;
@@ -884,6 +943,51 @@ mod tests {
 
         assert!(prepare_window_region_clip(id, target, target, owner).succeeded());
         assert!(actual_region_matches(window.0, Rect::new(500, 0, 250, 800)));
+    }
+
+    #[test]
+    fn reanchor_keeps_the_requested_insets_on_the_actual_outer_rect() {
+        let requested_outer = Rect::new(1000, 100, 618, 918);
+        let requested_visible = Rect::new(1009, 100, 600, 900);
+        let actual_outer = Rect::new(1240, 100, 618, 918);
+        assert_eq!(
+            reanchor_visible_rect(requested_outer, requested_visible, actual_outer),
+            Rect::new(1249, 100, 600, 900)
+        );
+    }
+
+    #[test]
+    fn commit_refuses_to_blank_a_window_with_nothing_inside_the_owner() {
+        let window = TestWindow::new();
+        let id = window_id(window.0);
+        let owner = Rect::new(2000, 0, 1000, 800);
+        let outside = Rect::new(0, 0, 1000, 800);
+        position_test_window(window.0, outside);
+
+        // A region cannot pull the window back onto its owner, so an empty
+        // region is never installed: the caller must apply safe geometry.
+        assert_eq!(
+            apply_window_region_clip(id, outside, outside, owner, false),
+            RegionClipResult::Failed
+        );
+        assert!(window_has_no_region(window.0));
+    }
+
+    #[test]
+    fn commit_clips_for_the_position_the_window_actually_has() {
+        let window = TestWindow::new();
+        let id = window_id(window.0);
+        let owner = Rect::new(0, 0, 1000, 800);
+        // The window refused the requested move and stayed further right, so
+        // the requested region alone (0..750) would expose 250px past the owner.
+        let requested = Rect::new(250, 0, 750, 800);
+        let actual = Rect::new(500, 0, 750, 800);
+        position_test_window(window.0, actual);
+
+        assert!(apply_window_region_clip(id, requested, requested, owner, false).succeeded());
+        assert!(actual_region_matches(window.0, Rect::new(0, 0, 500, 800)));
+        let clipped_right = actual.x + 500;
+        assert!(clipped_right <= owner.right());
     }
 
     #[test]

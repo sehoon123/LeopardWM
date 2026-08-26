@@ -31,7 +31,6 @@ pub fn is_move_offscreen_sentinel_rect(rect: &Rect) -> bool {
 /// Move a single window to the off-screen sentinel position.
 /// Used by workspace switching to hide inactive workspace windows.
 pub fn move_window_offscreen(window_id: WindowId) -> Result<(), Win32Error> {
-    let _ = crate::window_region::restore_window_region(window_id, false);
     let hwnd = window_id_to_hwnd(window_id)?;
     unsafe {
         if let Err(e) = SetWindowPos(
@@ -49,6 +48,10 @@ pub fn move_window_offscreen(window_id: WindowId) -> Result<(), Win32Error> {
             )));
         }
     }
+    // Release a monitor-overflow clip only after the window has reached the
+    // sentinel. Clearing it first would expose the clipped overflow at the old
+    // boundary-crossing position, and a failed move keeps the window protected.
+    let _ = crate::window_region::restore_window_region(window_id, false);
     Ok(())
 }
 

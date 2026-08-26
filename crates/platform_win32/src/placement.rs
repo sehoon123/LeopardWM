@@ -515,7 +515,11 @@ pub fn apply_placements_with_regions(
     // overlap and the layout gaps disappear.  Zero the insets to keep correct spacing.
     let high_contrast = crate::is_high_contrast_enabled();
 
-    let (mut entries, skipped) = build_defer_entries(
+    let DeferEntryPlan {
+        mut entries,
+        skipped,
+        stale_region_window_ids,
+    } = build_defer_entries(
         placements,
         region_clips,
         &mut cache,
@@ -531,7 +535,9 @@ pub fn apply_placements_with_regions(
     let pre_fallbacks =
         prepare_entry_region_clips(&mut entries, &mut failed_window_ids, animation_frame);
 
-    uncloak_becoming_visible(&entries);
+    // Never reveal a window whose safe placement did not land: it is still at
+    // whatever rectangle it had, which may cross into a neighboring monitor.
+    uncloak_becoming_visible(&entries, &failed_window_ids);
 
     let (applied, position_failures) = position_entries(&entries);
     failed_window_ids.extend(position_failures);
@@ -541,10 +547,16 @@ pub fn apply_placements_with_regions(
     let mut active_clipped_window_ids: HashSet<WindowId> =
         region_clips.iter().map(|clip| clip.window_id).collect();
     for entry in &entries {
-        if entry.region_clip_bounds.is_none() {
+        // A window we could not place keeps whatever restrictive region it has:
+        // it is still at its old rectangle, so releasing the region would expose
+        // the very overflow the region was installed to hide.
+        if entry.region_clip_bounds.is_none() && !failed_window_ids.contains(&entry.window_id) {
             active_clipped_window_ids.remove(&entry.window_id);
         }
     }
+    // A hung renderer whose frame was skipped entirely has not moved either, so
+    // its region stays until a later pass can place it.
+    active_clipped_window_ids.extend(stale_region_window_ids.iter().copied());
     // Regions on windows becoming fully contained keep their old restrictive region until
     // the move completes; only then is the region removed.
     reconcile_window_regions(
@@ -752,6 +764,15 @@ fn cached_compositor_sensitive(
     value
 }
 
+/// Outcome of entry building: the placements to apply, how many were skipped,
+/// and the windows whose region must survive this pass because their HWND was
+/// deliberately left where it is.
+struct DeferEntryPlan {
+    entries: Vec<DeferEntry>,
+    skipped: u32,
+    stale_region_window_ids: HashSet<WindowId>,
+}
+
 /// Build the defer-entry list for all placements, skipping cache-unchanged windows.
 fn build_defer_entries(
     placements: &[WindowPlacement],
@@ -760,8 +781,9 @@ fn build_defer_entries(
     animation_frame: bool,
     policy: AnimationPlacementPolicy,
     high_contrast: bool,
-) -> (Vec<DeferEntry>, u32) {
+) -> DeferEntryPlan {
     let mut skipped = 0u32;
+    let mut stale_region_window_ids: HashSet<WindowId> = HashSet::new();
     let mut entries: Vec<DeferEntry> = Vec::with_capacity(placements.len());
 
     for requested in placements {
@@ -821,7 +843,12 @@ fn build_defer_entries(
         if dispatch == AnimationDispatchMode::SkipHungSensitive {
             // Do not let a hung renderer pin the persistent animation worker.
             // Its cache entry stays unchanged, and the bounded exact landing
-            // worker will retry it when the animation finishes.
+            // worker will retry it when the animation finishes. Because the HWND
+            // does not move, any region it owns must stay installed — releasing
+            // it would uncover the overflow at its current rectangle.
+            if region_managed {
+                stale_region_window_ids.insert(placement.window_id);
+            }
             skipped += 1;
             continue;
         }
@@ -882,7 +909,11 @@ fn build_defer_entries(
         }
     }
 
-    (entries, skipped)
+    DeferEntryPlan {
+        entries,
+        skipped,
+        stale_region_window_ids,
+    }
 }
 
 fn configure_entry_fallback(entry: &mut DeferEntry, animation_frame: bool) -> bool {
@@ -940,6 +971,15 @@ fn prepare_entry_region_clips(
         let Some(clip_bounds) = entry.region_clip_bounds else {
             continue;
         };
+        if entry.visibility != Visibility::Visible {
+            // Only a visible placement carries usable frame geometry: a parked
+            // entry is positioned with SWP_NOSIZE and keeps its real size, so a
+            // region derived from its requested rectangle would be meaningless.
+            // Dropping the plan hands it to `reconcile_window_regions`, which
+            // releases the region only after the parking move has landed.
+            entry.region_clip_bounds = None;
+            continue;
+        }
         let target_outer = Rect::new(entry.x, entry.y, entry.w.max(1), entry.h.max(1));
         let result = prepare_window_region_clip(
             entry.window_id,
@@ -951,9 +991,14 @@ fn prepare_entry_region_clips(
             continue;
         }
 
-        let _ = restore_window_region(entry.window_id, false);
+        // Move to the safe geometry now, before `uncloak_becoming_visible` can
+        // reveal this HWND at a position Windows chose for it, and keep any
+        // region already installed until then: releasing it here would leave the
+        // window unclipped at its current boundary-crossing rectangle.
+        // `reconcile_window_regions` performs the release once the batch has
+        // landed, and only for windows whose move succeeded.
         fallback_count += 1;
-        if !configure_entry_fallback(entry, animation_frame) {
+        if !set_entry_to_fallback(entry, animation_frame) {
             failed_window_ids.insert(entry.window_id);
         }
     }
@@ -976,6 +1021,10 @@ fn apply_entry_region_clips(
         if failed_window_ids.contains(&entry.window_id) {
             continue;
         }
+        if entry.visibility != Visibility::Visible {
+            entry.region_clip_bounds = None;
+            continue;
+        }
         let outer_rect = Rect::new(entry.x, entry.y, entry.w.max(1), entry.h.max(1));
         let result = apply_window_region_clip(
             entry.window_id,
@@ -987,10 +1036,23 @@ fn apply_entry_region_clips(
         if result.succeeded() {
             continue;
         }
+        if animation_frame && has_owned_window_region(entry.window_id) {
+            // Intermediate frame: the bridge installed before the move is safe at
+            // this position by construction, so keep it and let the exact landing
+            // pass reconcile the geometry once the application settles. Forcing
+            // the fallback here would pop a column off-monitor mid-animation.
+            continue;
+        }
 
-        let _ = restore_window_region(entry.window_id, false);
         fallback_count += 1;
-        if !set_entry_to_fallback(entry, animation_frame) {
+        // Move to the safe rectangle first, then release the region. The
+        // fallback is either contained by the owner work area or clear of every
+        // monitor, so a still-restrictive region cannot strand it, while
+        // releasing first would flash the unclipped overflow on the neighbor.
+        // A failed fallback move deliberately keeps the region installed.
+        if set_entry_to_fallback(entry, animation_frame) {
+            let _ = restore_window_region(entry.window_id, !animation_frame);
+        } else {
             failed_window_ids.insert(entry.window_id);
         }
     }
@@ -998,14 +1060,18 @@ fn apply_entry_region_clips(
 }
 
 /// Uncloak entries becoming visible and drop them from the tracking set.
-fn uncloak_becoming_visible(entries: &[DeferEntry]) {
+fn uncloak_becoming_visible(entries: &[DeferEntry], failed_window_ids: &HashSet<WindowId>) {
     let _commit = lock_cloak_commit();
     let to_consider: Vec<WindowId> = {
         let mut cloaked = lock_cloaked();
         if let Some(ref mut set) = *cloaked {
             entries
                 .iter()
-                .filter(|e| e.visibility == Visibility::Visible && set.remove(&e.window_id))
+                .filter(|e| {
+                    e.visibility == Visibility::Visible
+                        && !failed_window_ids.contains(&e.window_id)
+                        && set.remove(&e.window_id)
+                })
                 .map(|e| e.window_id)
                 .collect()
         } else {

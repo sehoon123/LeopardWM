@@ -701,6 +701,12 @@ impl AppState {
         if self.paused {
             // Restore WS_MAXIMIZEBOX so windows behave normally while paused
             self.restore_snap_for_all_windows();
+            // Release monitor-overflow clipping too. apply_layout no-ops while
+            // paused, so a boundary window would otherwise keep a region that
+            // hides part of it (and swallows clicks there) for as long as the
+            // pause lasts. Resuming re-applies the layout, which re-installs
+            // exactly the clips the current geometry needs.
+            leopardwm_platform_win32::restore_all_window_regions();
             self.hide_border();
             self.hide_tab_strip();
             // Hide any visible drag ghost overlay

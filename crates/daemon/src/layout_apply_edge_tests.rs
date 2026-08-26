@@ -1,4 +1,6 @@
-use super::{park_offscreen_avoiding_neighbors, prepare_monitor_overflow};
+use super::{
+    drifted_off_monitor_window, park_offscreen_avoiding_neighbors, prepare_monitor_overflow,
+};
 use crate::config::MonitorOverflowModeConfig;
 use leopardwm_core_layout::{Rect, Visibility, WindowPlacement};
 use leopardwm_platform_win32::{MonitorId, MonitorInfo};
@@ -293,6 +295,237 @@ fn assert_clip_preview_distribution(column_width: i32, expected_preview: i32) {
     assert_eq!(clips.len(), 1);
     assert_eq!(clips[0].window_id, 20);
     assert_eq!(clips[0].clip_bounds, owner);
+}
+
+fn visible_tiled(window_id: u64, rect: Rect) -> WindowPlacement {
+    WindowPlacement {
+        window_id,
+        rect,
+        visibility: Visibility::Visible,
+        column_index: 0,
+    }
+}
+
+#[test]
+fn drift_detection_flags_a_window_relocated_onto_another_monitor() {
+    let monitors = side_by_side_monitors();
+    let placements = vec![visible_tiled(40, Rect::new(2000, 40, 700, 800))];
+
+    // Owned by monitor 2 but physically sitting on monitor 1.
+    let drifted = drifted_off_monitor_window(
+        &placements,
+        &monitors,
+        |_| Some(2),
+        |_| Some(Rect::new(300, 40, 700, 800)),
+    );
+    assert_eq!(drifted, Some(40));
+}
+
+#[test]
+fn drift_detection_tolerates_invisible_borders_and_missing_geometry() {
+    let monitors = side_by_side_monitors();
+    let owner = monitors[&2].rect;
+    let placements = vec![visible_tiled(41, Rect::new(owner.x + 10, 40, 700, 800))];
+
+    // The authoritative outer rect includes the invisible resize border, so a
+    // window flush against the shared edge overhangs it by a few pixels.
+    let outer = Rect::new(owner.x - 9, 40, 718, 818);
+    assert!(outer.intersects(&monitors[&1].rect));
+    assert_eq!(
+        drifted_off_monitor_window(&placements, &monitors, |_| Some(2), |_| Some(outer)),
+        None
+    );
+
+    // A dead or unreadable HWND must never force placement.
+    assert_eq!(
+        drifted_off_monitor_window(&placements, &monitors, |_| Some(2), |_| None),
+        None
+    );
+    // Neither must a window whose owning monitor is unknown.
+    assert_eq!(
+        drifted_off_monitor_window(
+            &placements,
+            &monitors,
+            |_| None,
+            |_| Some(Rect::new(300, 40, 700, 800))
+        ),
+        None
+    );
+}
+
+#[test]
+fn drift_detection_ignores_mirrored_outputs_floating_and_parked_windows() {
+    let mirrored = HashMap::from([(1, monitor(1, 0)), (2, monitor(2, 0))]);
+    let inside = Rect::new(100, 40, 700, 800);
+    assert_eq!(
+        drifted_off_monitor_window(
+            &[visible_tiled(42, inside)],
+            &mirrored,
+            |_| Some(2),
+            |_| Some(inside)
+        ),
+        None
+    );
+    // Mirrored outputs share a rectangle, so a window hanging far into empty
+    // virtual-desktop space still overlaps the mirror through its contained
+    // part. Only pixels that reach another output *and* sit outside the owner
+    // count, so this must not disable the unchanged-layout fast path.
+    let overhanging = Rect::new(1500, 40, 900, 800);
+    assert!(overhanging.intersects(&mirrored[&1].rect));
+    assert_eq!(
+        drifted_off_monitor_window(
+            &[visible_tiled(45, overhanging)],
+            &mirrored,
+            |_| Some(2),
+            |_| Some(overhanging)
+        ),
+        None
+    );
+
+    let monitors = side_by_side_monitors();
+    let elsewhere = Rect::new(300, 40, 700, 800);
+    let floating = WindowPlacement {
+        window_id: 43,
+        rect: Rect::new(2000, 40, 700, 800),
+        visibility: Visibility::Visible,
+        column_index: usize::MAX,
+    };
+    let parked = WindowPlacement {
+        window_id: 44,
+        rect: Rect::new(2000, 40, 700, 800),
+        visibility: Visibility::OffScreenLeft,
+        column_index: 0,
+    };
+    assert_eq!(
+        drifted_off_monitor_window(
+            &[floating, parked],
+            &monitors,
+            |_| Some(2),
+            |_| Some(elsewhere)
+        ),
+        None
+    );
+}
+
+/// Run the clip policy for owner monitor 2 of a side-by-side pair.
+fn clip_overflow(
+    placements: &mut [WindowPlacement],
+    focused_column: Option<usize>,
+) -> Vec<leopardwm_platform_win32::WindowRegionClip> {
+    let monitors = side_by_side_monitors();
+    let monitor_rects: Vec<_> = monitors.values().map(|monitor| monitor.rect).collect();
+    let mut clips = Vec::new();
+    prepare_monitor_overflow(
+        placements,
+        2,
+        focused_column,
+        MonitorOverflowModeConfig::Clip,
+        &monitors,
+        &monitor_rects,
+        &mut clips,
+    );
+    clips
+}
+
+#[test]
+fn clip_mode_contains_a_focused_column_that_left_its_owner_entirely() {
+    let monitors = side_by_side_monitors();
+    let owner = monitors[&2].rect;
+    let mut placements = vec![WindowPlacement {
+        window_id: 30,
+        // Fully on monitor 1 while it still belongs to monitor 2's workspace.
+        rect: Rect::new(600, 40, 800, 800),
+        visibility: Visibility::Visible,
+        column_index: 1,
+    }];
+
+    let clips = clip_overflow(&mut placements, Some(1));
+
+    // A region could only blank it, so the placement itself must be corrected.
+    assert!(clips.is_empty());
+    assert_eq!(placements[0].visibility, Visibility::Visible);
+    assert!(placements[0].rect.x >= owner.x);
+    assert!(placements[0].rect.right() <= owner.right());
+    assert!(!placements[0].rect.intersects(&monitors[&1].rect));
+}
+
+#[test]
+fn clip_mode_parks_an_unfocused_column_that_left_its_owner_entirely() {
+    let monitors = side_by_side_monitors();
+    let mut placements = vec![WindowPlacement {
+        window_id: 31,
+        rect: Rect::new(600, 40, 800, 800),
+        visibility: Visibility::Visible,
+        column_index: 0,
+    }];
+
+    let clips = clip_overflow(&mut placements, Some(1));
+
+    assert!(clips.is_empty());
+    assert_ne!(placements[0].visibility, Visibility::Visible);
+    assert!(monitors
+        .values()
+        .all(|monitor| !placements[0].rect.intersects(&monitor.rect)));
+}
+
+#[test]
+fn clip_mode_never_plans_a_region_that_cannot_show_pixels() {
+    let monitors = side_by_side_monitors();
+    let owner = monitors[&2].rect;
+
+    for width in [200, 900, 1920, 2400] {
+        for x in (-600..=4200).step_by(101) {
+            for focused in [false, true] {
+                let original = Rect::new(x, 40, width, 800);
+                let mut placements = vec![WindowPlacement {
+                    window_id: 32,
+                    rect: original,
+                    visibility: Visibility::Visible,
+                    column_index: 0,
+                }];
+
+                let clips = clip_overflow(&mut placements, focused.then_some(0));
+                let placement = &placements[0];
+
+                let inside_owner = |rect: Rect| {
+                    rect.x >= owner.x
+                        && rect.right() <= owner.right()
+                        && rect.y >= owner.y
+                        && rect.bottom() <= owner.bottom()
+                };
+
+                if let Some(clip) = clips.first() {
+                    // Every planned clip keeps a non-empty area on its owner,
+                    // leaves the layout geometry untouched, and carries a
+                    // fallback that is itself monitor-safe.
+                    assert_eq!(clip.clip_bounds, owner);
+                    assert_eq!(placement.rect, original);
+                    assert_eq!(placement.visibility, Visibility::Visible);
+                    assert!(placement.rect.intersects(&owner));
+                    if clip.fallback_visibility == Visibility::Visible {
+                        assert!(inside_owner(clip.fallback_rect));
+                    } else {
+                        assert!(monitors
+                            .values()
+                            .all(|monitor| !clip.fallback_rect.intersects(&monitor.rect)));
+                    }
+                } else if placement.visibility == Visibility::Visible {
+                    // No clip and still visible: it must be inside its owner, or
+                    // hang only into empty virtual-desktop space.
+                    assert!(
+                        inside_owner(placement.rect)
+                            || !placement.rect.intersects(&monitors[&1].rect),
+                        "visible placement {:?} leaked onto the neighbor without a clip",
+                        placement.rect
+                    );
+                } else {
+                    assert!(monitors
+                        .values()
+                        .all(|monitor| !placement.rect.intersects(&monitor.rect)));
+                }
+            }
+        }
+    }
 }
 
 #[test]

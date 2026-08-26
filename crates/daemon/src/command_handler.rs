@@ -585,6 +585,16 @@ impl AppState {
             Ok(added) => {
                 self.prune_stale_windows();
                 info!("Refreshed: added {} new windows across all monitors", added);
+                // An explicit refresh is the user's recovery path when windows
+                // have drifted away from the layout (OS-driven repositioning
+                // after a topology change, an app that fought placement). Drop
+                // the desired-rect cache and its feedback suppression so
+                // placement actually runs instead of short-circuiting on an
+                // unchanged desired layout, and re-park anything the apply below
+                // will not place.
+                self.last_placed_layout_rects.clear();
+                self.moved_or_resized_suppression.clear();
+                self.repark_windows_outside_active_layout();
                 if let Err(e) = self.apply_layout() {
                     return IpcResponse::error(format!("Failed to apply layout: {}", e));
                 }

@@ -61,6 +61,19 @@ impl AppState {
     /// - Removing workspaces for disconnected monitors (migrating windows to primary)
     /// - Adding workspaces for newly connected monitors
     pub(crate) fn reconcile_monitors(&mut self, new_monitors: Vec<MonitorInfo>) {
+        // Windows repositions and rescales windows itself while a topology
+        // change is in flight, and the moved/resized events it emits arrive
+        // inside the apply-layout suppression window. The desired-rect fast path
+        // only compares against what this daemon last *requested*, so returning
+        // to a previously used arrangement (side-by-side -> stacked ->
+        // side-by-side) can match the cache exactly and skip the corrective
+        // placement entirely, stranding tiled windows wherever the OS left them
+        // — including fully on a neighboring monitor, where the overflow policy
+        // never gets a chance to hide or clip them. Every reconcile therefore
+        // invalidates both caches so the following apply re-places every window.
+        self.last_placed_layout_rects.clear();
+        self.moved_or_resized_suppression.clear();
+
         let new_ids: HashSet<MonitorId> = new_monitors.iter().map(|m| m.id).collect();
         let new_id_by_name: HashMap<&str, MonitorId> = new_monitors
             .iter()
@@ -351,6 +364,63 @@ impl AppState {
     /// startup, before the first layout is applied.
     pub(crate) fn resync_minimized_from_os(&mut self) {
         self.resync_minimized_with(leopardwm_platform_win32::window_minimized_state);
+    }
+
+    /// Managed windows that no monitor's *active* workspace owns, excluding
+    /// minimized ones (whose restore geometry must not be rewritten) and the
+    /// drag placeholder sentinel.
+    pub(crate) fn windows_outside_active_layout(&self) -> Vec<u64> {
+        let mut active: HashSet<u64> = HashSet::new();
+        let mut minimized: HashSet<u64> = HashSet::new();
+        for (monitor_id, ws_vec) in &self.workspaces {
+            let active_idx = self.active_workspace_idx(*monitor_id);
+            for (idx, workspace) in ws_vec.iter().enumerate() {
+                for window_id in workspace.all_window_ids() {
+                    if idx == active_idx {
+                        active.insert(window_id);
+                    }
+                    if workspace.is_minimized(window_id) {
+                        minimized.insert(window_id);
+                    }
+                }
+            }
+        }
+        let mut outside: Vec<u64> = self
+            .all_managed_window_ids()
+            .into_iter()
+            .filter(|window_id| {
+                !active.contains(window_id)
+                    && !minimized.contains(window_id)
+                    && *window_id != crate::state::DRAG_PLACEHOLDER_HWND
+            })
+            .collect();
+        outside.sort_unstable();
+        outside.dedup();
+        outside
+    }
+
+    /// Re-park every managed window that the next `apply_layout()` will not
+    /// place.
+    ///
+    /// `apply_layout` only places each monitor's active workspace, and windows
+    /// that left the layout are uncloaked again by `sync_cloak_state`, so an
+    /// inactive workspace's window is kept invisible purely by its off-screen
+    /// parking coordinates. Windows drags such windows back onto the desktop
+    /// when the display topology changes, where they would stay visible on an
+    /// arbitrary monitor with no overflow policy ever running for them.
+    /// No-op while paused: a paused daemon must not move windows at all.
+    pub(crate) fn repark_windows_outside_active_layout(&mut self) {
+        if self.paused {
+            return;
+        }
+        for window_id in self.windows_outside_active_layout() {
+            // Placeholder hwnds in unit tests would otherwise reach real
+            // desktop windows through this call.
+            #[cfg(not(test))]
+            let _ = leopardwm_platform_win32::move_window_offscreen(window_id);
+            #[cfg(test)]
+            let _ = window_id;
+        }
     }
 
     /// Core of [`resync_minimized_from_os`], parameterized on the per-window OS
