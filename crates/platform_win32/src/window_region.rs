@@ -700,16 +700,18 @@ pub fn forget_window_region(window_id: WindowId) {
 #[cfg(test)]
 mod tests {
     use super::{
-        actual_region_matches, apply_window_region_clip, bridge_clip_region,
-        classify_window_region_kind, decode_coordinate, encode_coordinate,
-        prepare_window_region_clip, reanchor_visible_rect, relative_clip_region,
+        apply_window_region_clip, bridge_clip_region, classify_window_region_kind, create_region,
+        current_outer_rect, decode_coordinate, delete_region, encode_coordinate, intersect_regions,
+        prepare_window_region_clip, reanchor_visible_rect, rect_from_win32, relative_clip_region,
         restore_window_region, window_has_no_region, RegionClipResult, WindowRegionKind,
         ERROR_REGION_KIND,
     };
     use leopardwm_core_layout::Rect;
     use std::sync::OnceLock;
     use windows::core::w;
+    use windows::Win32::Foundation::RECT;
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::Graphics::Gdi::GetWindowRgn;
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassExW, SetWindowPos,
@@ -909,6 +911,52 @@ mod tests {
         }
     }
 
+    /// Rectangle the HWND actually occupies. A test must never assume the
+    /// requested rectangle landed: window minimums, DPI and virtual-desktop
+    /// geometry differ between a developer desktop and a CI session, which is
+    /// exactly the mismatch the production code has to survive.
+    fn actual_outer(hwnd: HWND) -> Rect {
+        current_outer_rect(hwnd).expect("window rect")
+    }
+
+    /// Bounding box of the region currently installed on the HWND, in local
+    /// window coordinates.
+    fn installed_region(hwnd: HWND) -> Rect {
+        use windows::Win32::Graphics::Gdi::GetRgnBox;
+        let probe = create_region(Rect::new(0, 0, 1, 1)).expect("probe region");
+        let kind = classify_window_region_kind(unsafe { GetWindowRgn(hwnd, probe) }.0);
+        assert!(
+            matches!(
+                kind,
+                Some(WindowRegionKind::Simple) | Some(WindowRegionKind::Complex)
+            ),
+            "expected an installed region, got {kind:?}"
+        );
+        let mut box_rect = RECT::default();
+        let region_type = unsafe { GetRgnBox(probe, &mut box_rect) };
+        delete_region(probe);
+        assert!(
+            classify_window_region_kind(region_type.0).is_some(),
+            "GetRgnBox failed"
+        );
+        rect_from_win32(box_rect).expect("non-empty region box")
+    }
+
+    /// Where the installed region lands on screen, given a window origin.
+    fn region_on_screen(local: Rect, outer: Rect) -> Rect {
+        screen_region(outer, local)
+    }
+
+    fn assert_inside(rect: Rect, bounds: Rect, what: &str) {
+        assert!(
+            rect.x >= bounds.x
+                && rect.right() <= bounds.right()
+                && rect.y >= bounds.y
+                && rect.bottom() <= bounds.bottom(),
+            "{what}: {rect:?} escapes {bounds:?}"
+        );
+    }
+
     #[test]
     fn bridge_is_safe_at_endpoints_and_intermediate_positions() {
         let owner = Rect::new(1000, 0, 1000, 800);
@@ -961,11 +1009,44 @@ mod tests {
         let current = Rect::new(-250, 0, 750, 800);
         let target = Rect::new(-500, 0, 750, 800);
         position_test_window(window.0, current);
+        let landed = actual_outer(window.0);
         assert!(apply_window_region_clip(id, current, current, owner, false).succeeded());
-        assert!(actual_region_matches(window.0, Rect::new(250, 0, 500, 800)));
+        // The commit exposes exactly the part of the window that is on the owner.
+        assert_eq!(
+            region_on_screen(installed_region(window.0), landed),
+            intersect_regions(landed, owner)
+        );
 
+        // Preparing the further-out move must restrict now, while the HWND is
+        // still at its old position: the installed shape has to be safe there
+        // and at the target, so no frame can leak past the owner mid-move.
         assert!(prepare_window_region_clip(id, target, target, owner).succeeded());
-        assert!(actual_region_matches(window.0, Rect::new(500, 0, 250, 800)));
+        let bridge = installed_region(window.0);
+        assert_inside(
+            region_on_screen(bridge, landed),
+            owner,
+            "bridge at old position",
+        );
+        let target_outer = Rect::new(
+            landed.x + (target.x - current.x),
+            landed.y + (target.y - current.y),
+            landed.width,
+            landed.height,
+        );
+        assert_inside(
+            region_on_screen(bridge, target_outer),
+            owner,
+            "bridge at target position",
+        );
+        assert!(
+            bridge.width <= installed_region_width_before(landed, owner),
+            "an outward move must not widen the exposed strip"
+        );
+    }
+
+    /// Width the commit exposes for a window sitting at `outer`.
+    fn installed_region_width_before(outer: Rect, owner: Rect) -> i32 {
+        intersect_regions(outer, owner).width
     }
 
     #[test]
@@ -1001,16 +1082,27 @@ mod tests {
         let window = TestWindow::new();
         let id = window_id(window.0);
         let owner = Rect::new(0, 0, 1000, 800);
-        // The window refused the requested move and stayed further right, so
-        // the requested region alone (0..750) would expose 250px past the owner.
+        // The window refused the requested move and stayed further right, so a
+        // region derived from the requested rectangle alone would expose pixels
+        // past the owner's right edge.
         let requested = Rect::new(250, 0, 750, 800);
-        let actual = Rect::new(500, 0, 750, 800);
-        position_test_window(window.0, actual);
+        position_test_window(window.0, Rect::new(500, 0, 750, 800));
+        let landed = actual_outer(window.0);
+        assert_ne!(landed.x, requested.x, "test needs a position disagreement");
 
         assert!(apply_window_region_clip(id, requested, requested, owner, false).succeeded());
-        assert!(actual_region_matches(window.0, Rect::new(0, 0, 500, 800)));
-        let clipped_right = actual.x + 500;
-        assert!(clipped_right <= owner.right());
+        let local = installed_region(window.0);
+        assert_inside(
+            region_on_screen(local, landed),
+            owner,
+            "commit against actual geometry",
+        );
+        // It is also safe if the window later honors the requested rectangle.
+        assert_inside(
+            region_on_screen(local, requested),
+            owner,
+            "commit at the requested position",
+        );
     }
 
     #[test]
@@ -1021,14 +1113,40 @@ mod tests {
         let current = Rect::new(-500, 0, 750, 800);
         let target = Rect::new(-250, 0, 750, 800);
         position_test_window(window.0, current);
+        let landed = actual_outer(window.0);
         assert!(apply_window_region_clip(id, current, current, owner, false).succeeded());
-        assert!(actual_region_matches(window.0, Rect::new(500, 0, 250, 800)));
+        let restrictive = installed_region(window.0);
+        assert_eq!(
+            region_on_screen(restrictive, landed),
+            intersect_regions(landed, owner)
+        );
 
+        // Preparing the inward move may not widen anything yet: the HWND has
+        // not moved, so a wider shape would expose the old overflow.
         assert!(prepare_window_region_clip(id, target, target, owner).succeeded());
-        assert!(actual_region_matches(window.0, Rect::new(500, 0, 250, 800)));
+        let bridge = installed_region(window.0);
+        assert!(
+            bridge.width <= restrictive.width,
+            "bridge {bridge:?} widened before the move landed"
+        );
+        assert_inside(
+            region_on_screen(bridge, landed),
+            owner,
+            "bridge before move",
+        );
 
         position_test_window(window.0, target);
+        let moved = actual_outer(window.0);
         assert!(apply_window_region_clip(id, target, target, owner, false).succeeded());
-        assert!(actual_region_matches(window.0, Rect::new(250, 0, 500, 800)));
+        let expanded = installed_region(window.0);
+        assert_eq!(
+            region_on_screen(expanded, moved),
+            intersect_regions(moved, owner),
+            "the landing commit exposes the full on-owner part"
+        );
+        assert!(
+            expanded.width >= bridge.width,
+            "an inward move should expose at least as much after landing"
+        );
     }
 }
