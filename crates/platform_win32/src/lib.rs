@@ -18,6 +18,7 @@ pub mod keyboard_hook;
 pub mod mouse_hook;
 pub mod overlay;
 pub mod overview;
+pub mod preview_input;
 pub mod shell;
 pub mod snapshot;
 pub mod tab_strip;
@@ -25,6 +26,7 @@ pub mod taskbar;
 pub mod thumbnail;
 pub mod toast;
 
+pub use preview_input::{PreviewClickEvent, PreviewClickTarget};
 pub use tab_strip::{TabAction, TabActionEvent, TabCloseAction};
 
 mod elevation;

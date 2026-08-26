@@ -1192,6 +1192,27 @@ pub(crate) fn merged_cleanup_window_ids(
     merged
 }
 
+/// Resolve a clicked monitor-edge preview to the focus target it represents:
+/// `(monitor, workspace index, column index, window index in column)`.
+///
+/// Only a window that is actually in a workspace resolves; a preview whose
+/// source has since been closed or unmanaged yields `None` so the click is
+/// dropped instead of moving focus somewhere unrelated.
+pub(crate) fn preview_click_focus_target(
+    state: &AppState,
+    window_id: u64,
+) -> Option<(MonitorId, usize, usize, usize)> {
+    for (monitor_id, workspaces) in &state.workspaces {
+        for (workspace_idx, workspace) in workspaces.iter().enumerate() {
+            if let Some((column_idx, window_in_column)) = workspace.find_window_location(window_id)
+            {
+                return Some((*monitor_id, workspace_idx, column_idx, window_in_column));
+            }
+        }
+    }
+    None
+}
+
 pub(crate) fn run_visibility_recovery_pass(managed_window_ids: &[u64], context_label: &str) {
     use leopardwm_platform_win32::{
         enumerate_windows, restore_windows_moved_offscreen, uncloak_all_managed_windows,

@@ -79,6 +79,32 @@ fn test_monitor_reconcile_invalidates_the_desired_rect_fast_path() {
 }
 
 #[test]
+fn test_preview_click_resolves_to_the_previewed_column() {
+    let mut state = AppState::new_with_config(test_config(), two_monitors());
+    state.paused = true;
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(100, Some(600))
+        .unwrap();
+    // Monitor 2, inactive workspace 1, second column, stacked second window:
+    // a preview click must resolve all four coordinates, not just the window.
+    let other = state.ensure_workspace_exists(2, 1).unwrap();
+    other.insert_window(200, Some(600)).unwrap();
+    other.insert_window(300, Some(600)).unwrap();
+    other.insert_window_in_column(301, 1).unwrap();
+
+    assert_eq!(
+        crate::state::preview_click_focus_target(&state, 100),
+        Some((1, 0, 0, 0))
+    );
+    assert_eq!(
+        crate::state::preview_click_focus_target(&state, 301),
+        Some((2, 1, 1, 1))
+    );
+    // A preview whose source is gone must not move focus anywhere.
+    assert_eq!(crate::state::preview_click_focus_target(&state, 999), None);
+}
+
+#[test]
 fn test_refresh_invalidates_the_desired_rect_fast_path() {
     let mut state = AppState::new_with_config(test_config(), test_monitors());
     // Paused keeps `apply_layout` from touching real desktop windows that the

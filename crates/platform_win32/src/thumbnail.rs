@@ -454,15 +454,42 @@ pub(crate) fn commit_persistent_previews(
             .iter()
             .any(|request| request.window_id == *window_id)
     });
-    published.min(previews.len())
+    let live = published.min(previews.len());
+    drop(previews);
+    // A thumbnail is pixels only, so the strip needs its own click target for
+    // the scroll-first gesture of clicking a partially visible column.
+    crate::preview_input::sync_preview_click_targets(&preview_click_targets(requests));
+    live
+}
+
+/// Click targets for the previews that are actually published: one per request,
+/// covering exactly the rectangle the thumbnail is drawn into.
+pub(crate) fn preview_click_targets(
+    requests: &[PersistentPreviewRequest],
+) -> Vec<crate::preview_input::PreviewClickTarget> {
+    requests
+        .iter()
+        .filter(|request| {
+            request.destination_screen_rect.width > 0 && request.destination_screen_rect.height > 0
+        })
+        .map(|request| crate::preview_input::PreviewClickTarget {
+            window_id: request.window_id,
+            rect: request.destination_screen_rect,
+        })
+        .collect()
 }
 
 pub(crate) fn clear_persistent_previews() {
     lock_persistent_previews().clear();
+    crate::preview_input::clear_preview_click_targets();
 }
 
 pub(crate) fn forget_persistent_preview(window_id: WindowId) {
     lock_persistent_previews().remove(&window_id);
+    // Drop every overlay rather than leave a stale one swallowing clicks for a
+    // window that no longer has a preview; the next applied frame republishes
+    // the survivors.
+    crate::preview_input::clear_preview_click_targets();
 }
 
 pub fn source_size(handle: isize) -> Option<(i32, i32)> {

@@ -2,6 +2,25 @@
 
 All notable changes to LeopardWM will be documented in this file.
 
+## 0.2.6-sehoon.19
+
+### Fixes
+
+- **Clicking a monitor-edge preview focuses that column again.** A preview is a
+  DWM thumbnail and its source window is parked clear of every monitor, so the
+  scroll-first gesture of clicking a partially visible column stopped working
+  when previews moved off `SetWindowRgn`. Each published preview now gets a
+  matching click target: a tiny overlay that drops `WS_EX_TRANSPARENT` so clicks
+  land on it, answers `WM_MOUSEACTIVATE` with `MA_NOACTIVATE` so it never takes
+  focus itself, and reports which window it was showing. The daemon then focuses
+  that column, which scrolls it into view and hands the OS foreground to it —
+  the same routing the tab strip already uses for tab clicks. Occlusion stays
+  correct because these are real windows, and pausing drops them so no overlay
+  absorbs clicks while tiling is off.
+
+  Known limitation: dragging *from* a preview does not move the window yet; the
+  click focuses and scrolls the column, then the window can be dragged normally.
+
 ## 0.2.6-sehoon.18
 
 ### Improvements

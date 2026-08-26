@@ -707,6 +707,10 @@ impl AppState {
             // pause lasts. Resuming re-applies the layout, which re-installs
             // exactly the clips the current geometry needs.
             leopardwm_platform_win32::restore_all_window_regions();
+            // Same reasoning for preview click targets: while paused nothing
+            // reconciles them, and an overlay that no longer corresponds to a
+            // live preview must not keep absorbing clicks.
+            leopardwm_platform_win32::preview_input::clear_preview_click_targets();
             self.hide_border();
             self.hide_tab_strip();
             // Hide any visible drag ghost overlay

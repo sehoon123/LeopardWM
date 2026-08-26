@@ -1104,6 +1104,34 @@ async fn spawn_tab_forwarders(
         }
     }
 
+    // Monitor-edge preview click channel. Each preview overlay posts the
+    // identity of the window it is showing on WM_LBUTTONDOWN; this forwarder
+    // turns it into a `DaemonEvent::PreviewClick` so the focus change happens
+    // under the main event loop's serial lock.
+    let (preview_click_tx, preview_click_rx) =
+        std::sync::mpsc::channel::<leopardwm_platform_win32::PreviewClickEvent>();
+    leopardwm_platform_win32::preview_input::set_click_sender(preview_click_tx);
+    {
+        let event_tx_for_preview = event_tx.clone();
+        match std::thread::Builder::new()
+            .name("preview-click-forwarder".into())
+            .spawn(move || {
+                while let Ok(click) = preview_click_rx.recv() {
+                    if event_tx_for_preview
+                        .blocking_send(DaemonEvent::PreviewClick {
+                            window_id: click.window_id,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }) {
+            Ok(handle) => thread_handles.push(handle),
+            Err(e) => warn!("Failed to spawn preview-click forwarder thread: {}", e),
+        }
+    }
+
     // Rename-dialog result channel. The Rename arm spawns a modal
     // dialog on its own short-lived thread; that thread posts a
     // `TabRenameResult` here when the user OKs or cancels. This
@@ -2339,6 +2367,43 @@ async fn spawn_debounced_save(state: &Arc<Mutex<AppState>>, event_tx: &mpsc::Sen
     });
 }
 
+/// Focus the window a monitor-edge preview was showing.
+///
+/// The preview is a thumbnail of a source parked clear of every monitor, so the
+/// click cannot reach the window itself. Resolving it through the layout keeps
+/// the scroll-first gesture intact: the clicked column becomes focused, which
+/// scrolls it into view, and the OS foreground follows.
+async fn handle_preview_click(ctx: &mut EventLoopCtx<'_>, window_id: u64) {
+    let mut state = ctx.state.lock().await;
+    if state.paused {
+        return;
+    }
+    let Some((monitor_id, workspace_idx, column_idx, window_in_column)) =
+        crate::state::preview_click_focus_target(&state, window_id)
+    else {
+        debug!(
+            "Preview click for unmanaged window {:#x} ignored",
+            window_id
+        );
+        return;
+    };
+
+    state.focused_monitor = monitor_id;
+    state.active_workspace.insert(monitor_id, workspace_idx);
+    if let Some(workspace) = state.focused_workspace_mut() {
+        if let Err(error) = workspace.set_focus(column_idx, window_in_column) {
+            warn!("Preview click focus failed: {}", error);
+            return;
+        }
+    }
+    if let Err(error) = state.apply_layout() {
+        warn!("Preview click apply failed: {}", error);
+    }
+    state.sync_taskbar_buttons();
+    state.sync_foreground_window();
+    state.update_tab_strip();
+}
+
 /// Handle a tab-strip click action routed to the captured column identity.
 async fn handle_tab_action(
     state: &Arc<Mutex<AppState>>,
@@ -3351,6 +3416,9 @@ async fn main() -> Result<()> {
             } => {
                 handle_tab_action(&state, monitor, workspace_idx, column_idx, tab_idx, action)
                     .await;
+            }
+            DaemonEvent::PreviewClick { window_id } => {
+                handle_preview_click(&mut ctx, window_id).await;
             }
             DaemonEvent::TabRenameSubmitted {
                 monitor,
