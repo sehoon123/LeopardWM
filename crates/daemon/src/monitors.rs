@@ -73,6 +73,11 @@ impl AppState {
         // invalidates both caches so the following apply re-places every window.
         self.last_placed_layout_rects.clear();
         self.moved_or_resized_suppression.clear();
+        // Preview click targets are positioned in screen coordinates, so every
+        // one of them is stale the moment the topology changes. Drop them now
+        // rather than risk an overlay absorbing clicks at an old rectangle if
+        // the corrective apply below fails; a successful apply republishes them.
+        leopardwm_platform_win32::preview_input::clear_preview_click_targets();
 
         let new_ids: HashSet<MonitorId> = new_monitors.iter().map(|m| m.id).collect();
         let new_id_by_name: HashMap<&str, MonitorId> = new_monitors

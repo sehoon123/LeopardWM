@@ -556,6 +556,11 @@ fn setup_hotkeys(config: &Config, event_tx: mpsc::Sender<DaemonEvent>) -> Hotkey
 async fn run_shutdown_cleanup(state: &Arc<Mutex<AppState>>, mode: ShutdownMode) {
     info!("Running {} shutdown cleanup", mode.label());
 
+    // Drop the preview click route so its forwarder can finish: the receiver
+    // only ends when the last sender goes away, and a thread blocked in recv()
+    // would otherwise burn part of the shared join budget below.
+    leopardwm_platform_win32::preview_input::clear_click_sender();
+
     let (managed_window_ids, pending_apply_workers, apply_timeout) = {
         let mut state = state.lock().await;
         // Restore WS_MAXIMIZEBOX before visibility recovery so Windows allows resize
@@ -1680,6 +1685,11 @@ async fn process_window_event(ctx: &mut EventLoopCtx<'_>, win_event: WindowEvent
         // Immediately clear inset cache and refresh high contrast state
         // (cheap operations that should happen right away).
         leopardwm_platform_win32::clear_inset_cache();
+        // Preview click targets are screen-positioned, so they are stale the
+        // moment the topology starts changing. Windows moves the strip before
+        // the debounce settles; dropping them now keeps an invisible overlay
+        // from absorbing clicks at an old rectangle in the meantime.
+        leopardwm_platform_win32::preview_input::clear_preview_click_targets();
         {
             let mut state = ctx.state.lock().await;
             state.refresh_high_contrast();
@@ -2375,7 +2385,9 @@ async fn spawn_debounced_save(state: &Arc<Mutex<AppState>>, event_tx: &mpsc::Sen
 /// scrolls it into view, and the OS foreground follows.
 async fn handle_preview_click(ctx: &mut EventLoopCtx<'_>, window_id: u64) {
     let mut state = ctx.state.lock().await;
-    if state.paused {
+    // The overview owns the screen while it is open and its model is not rebuilt
+    // from here, so a click queued before it opened must not move focus behind it.
+    if state.paused || state.overview_open {
         return;
     }
     let Some((monitor_id, column_idx, window_in_column)) =
@@ -2395,12 +2407,12 @@ async fn handle_preview_click(ctx: &mut EventLoopCtx<'_>, window_id: u64) {
         state.focus_column_in_active_workspace(monitor_id, column_idx, window_in_column)
     {
         warn!("Preview click focus failed: {}", message);
-        return;
     }
-    state.update_tab_strip();
 
     // `ensure_focused_visible_animated` starts a scroll animation; without
     // driving it the strip would sit at the interpolated offset of frame zero.
+    // Checked even after a failed apply, exactly like the gesture path: the
+    // animation may already exist by the time the failure happened.
     if state.is_animating() && !*ctx.animation_active {
         state.tick_animations(0);
         if let Ok(true) = state.send_animation_frame(ctx.animation_worker) {

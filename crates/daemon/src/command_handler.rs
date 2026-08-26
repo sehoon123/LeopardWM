@@ -236,15 +236,25 @@ impl AppState {
             return IpcResponse::error(format!("Monitor {monitor} is no longer connected"));
         }
         let active_idx = self.active_workspace_idx(monitor);
-        let addressable = self
+        let Some(workspace) = self
             .workspaces
             .get(&monitor)
             .and_then(|workspaces| workspaces.get(active_idx))
-            .is_some_and(|workspace| {
-                workspace
-                    .column(column_idx)
-                    .is_some_and(|column| window_in_column < column.windows().len())
-            });
+        else {
+            return IpcResponse::error(format!("Monitor {monitor} has no active workspace"));
+        };
+        if workspace.is_fullscreen() {
+            // A fullscreen workspace cloaks the rest of the strip, so it cannot
+            // own an edge preview: such a click is stale. Refusing keeps column
+            // focus and the fullscreen target from disagreeing, which is what
+            // the focus commands' fullscreen policy exists to prevent.
+            return IpcResponse::error(format!(
+                "Monitor {monitor}'s active workspace is fullscreen"
+            ));
+        }
+        let addressable = workspace
+            .column(column_idx)
+            .is_some_and(|column| window_in_column < column.windows().len());
         if !addressable {
             return IpcResponse::error(format!(
                 "Column {column_idx} window {window_in_column} is not in monitor {monitor}'s active workspace"
@@ -252,6 +262,13 @@ impl AppState {
         }
 
         self.focused_monitor = monitor;
+        // Pointer-driven focus is explicit intent, so drop any floating-window
+        // preference first. `sync_foreground_window` otherwise keeps foregrounding
+        // a floating window that still holds `previous_focused_hwnd` (a dialog, a
+        // summoned scratchpad, a sticky pin), and the strip would scroll while
+        // keystrokes and the border stayed on the float — the same reason
+        // focus-follows-mouse clears it before syncing.
+        self.previous_focused_hwnd = None;
         let mut focus_error = None;
         let response =
             self.execute_workspace_command(

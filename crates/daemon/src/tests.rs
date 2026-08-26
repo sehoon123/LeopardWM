@@ -1,5 +1,5 @@
 use super::*;
-use leopardwm_core_layout::{FloatingSize, Rect, Workspace};
+use leopardwm_core_layout::{FloatingSize, Rect, Visibility, Workspace};
 use std::sync::atomic::Ordering;
 
 fn test_config() -> Config {
@@ -158,6 +158,126 @@ fn test_preview_click_focus_rejects_targets_outside_the_active_workspace() {
     }
     assert_eq!(state.focused_monitor, 1);
     assert_eq!(state.active_workspace.get(&1).copied(), Some(0));
+}
+
+#[test]
+fn test_preview_click_focuses_the_clicked_column_without_switching_workspaces() {
+    // 25% / 50% / 25% strip: clicking the left preview must focus column 0,
+    // scroll it in, and leave every other piece of state alone. This is the
+    // regression the first click handler broke by writing `active_workspace`.
+    let mut state = AppState::new_with_config(test_config(), two_monitors());
+    state.paused = true;
+    let viewport = state.layout_viewport(1);
+    {
+        let workspace = &mut state.workspaces.get_mut(&1).unwrap()[0];
+        // Wider than the viewport, so reaching column 0 genuinely needs a scroll.
+        workspace.insert_window(100, Some(900)).unwrap();
+        workspace.insert_window(101, Some(1000)).unwrap();
+        workspace.insert_window(102, Some(900)).unwrap();
+        workspace.set_focus(2, 0).unwrap();
+        workspace.ensure_focused_visible(viewport.width);
+    }
+    // Populate an inactive workspace on the same monitor and the other monitor,
+    // so a stray workspace switch or cross-monitor change would be visible.
+    state
+        .ensure_workspace_exists(1, 1)
+        .unwrap()
+        .insert_window(200, Some(600))
+        .unwrap();
+    state.workspaces.get_mut(&2).unwrap()[0]
+        .insert_window(300, Some(600))
+        .unwrap();
+    let monitor2_focus = state.workspaces[&2][0].focused_column_index();
+    let monitor2_scroll = state.workspaces[&2][0].scroll_offset();
+    state.focused_monitor = 2;
+    // A floating window holding the foreground preference must not keep it:
+    // otherwise the strip scrolls while keystrokes stay on the float.
+    state.previous_focused_hwnd = Some(999);
+
+    let response = state.focus_column_in_active_workspace(1, 0, 0);
+
+    assert!(
+        matches!(response, IpcResponse::Ok),
+        "unexpected response: {response:?}"
+    );
+    assert_eq!(state.focused_monitor, 1);
+    assert_eq!(state.workspaces[&1][0].focused_column_index(), 0);
+    // The clicked column must end up fully in view, which is the user-visible
+    // half of the fix: focus alone left the strip where it was. Settle the
+    // scroll animation first so this asserts the landing, not frame zero.
+    state.tick_animations(10_000);
+    let workspace = &state.workspaces[&1][0];
+    let landed = workspace
+        .compute_placements(viewport)
+        .into_iter()
+        .find(|placement| placement.window_id == 100)
+        .expect("clicked window has a placement");
+    assert_eq!(landed.visibility, Visibility::Visible);
+    assert!(
+        landed.rect.x >= viewport.x && landed.rect.right() <= viewport.right(),
+        "clicked column {:?} is not fully inside {viewport:?}",
+        landed.rect
+    );
+    // The clicked window now owns the foreground preference: the floating
+    // window that held it (999) must not keep it, or the strip would scroll
+    // while keystrokes and the border stayed on the float.
+    assert_eq!(state.previous_focused_hwnd, Some(100));
+    // No workspace switched, and the other monitor is untouched.
+    assert_eq!(state.active_workspace.get(&1).copied(), Some(0));
+    assert_eq!(state.active_workspace.get(&2).copied(), Some(0));
+    assert_eq!(
+        state.workspaces[&2][0].focused_column_index(),
+        monitor2_focus
+    );
+    assert_eq!(state.workspaces[&2][0].scroll_offset(), monitor2_scroll);
+}
+
+#[test]
+fn test_preview_click_on_a_tabbed_column_activates_that_tab() {
+    let mut state = AppState::new_with_config(test_config(), two_monitors());
+    state.paused = true;
+    {
+        let workspace = &mut state.workspaces.get_mut(&1).unwrap()[0];
+        workspace.insert_window(100, Some(480)).unwrap();
+        workspace.insert_window_in_column(101, 0).unwrap();
+        workspace.insert_window(102, Some(960)).unwrap();
+        workspace.set_focus(0, 0).unwrap();
+        workspace.toggle_focused_column_tabbed_mode();
+        workspace.set_focus(1, 0).unwrap();
+    }
+
+    // A tabbed column previews only its active tab, so focusing the window index
+    // must promote that tab rather than leave a hidden one active.
+    assert!(matches!(
+        state.focus_column_in_active_workspace(1, 0, 1),
+        IpcResponse::Ok
+    ));
+    let column = state.workspaces[&1][0].column(0).unwrap();
+    assert!(column.is_tabbed());
+    assert_eq!(column.active_tab_idx(), Some(1));
+}
+
+#[test]
+fn test_preview_click_is_refused_while_a_workspace_is_fullscreen() {
+    let mut state = AppState::new_with_config(test_config(), two_monitors());
+    state.paused = true;
+    {
+        let workspace = &mut state.workspaces.get_mut(&1).unwrap()[0];
+        workspace.insert_window(100, Some(480)).unwrap();
+        workspace.insert_window(101, Some(960)).unwrap();
+        workspace.set_focus(1, 0).unwrap();
+        workspace.toggle_fullscreen();
+    }
+    state.focused_monitor = 2;
+
+    // A fullscreen workspace cloaks the strip, so it owns no preview: a click
+    // arriving from a stale overlay must not retarget focus underneath it.
+    assert!(matches!(
+        state.focus_column_in_active_workspace(1, 0, 0),
+        IpcResponse::Error { .. }
+    ));
+    assert_eq!(state.focused_monitor, 2);
+    assert_eq!(state.workspaces[&1][0].focused_column_index(), 1);
 }
 
 #[test]

@@ -18,6 +18,15 @@ All notable changes to LeopardWM will be documented in this file.
   correct because these are real windows, and pausing drops them so no overlay
   absorbs clicks while tiling is off.
 
+  A click routes through the same path as a focus hotkey, so the column scrolls
+  in, the tab of a tabbed column is activated, and the foreground preference
+  moves off a floating window that held it. Clicks are refused when they cannot
+  be honoured cleanly: an id that is not in the monitor's active workspace, a
+  fullscreen workspace, an open overview, or a paused daemon. Click targets are
+  created only for previews that actually published, are dropped as soon as a
+  display change starts, and are torn down with their pump thread, so an
+  invisible overlay can never absorb a click where no preview is drawn.
+
   Known limitation: dragging *from* a preview does not move the window yet; the
   click focuses and scrolls the column, then the window can be dragged normally.
 

@@ -27,9 +27,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
     GetWindowLongPtrW, PostThreadMessageW, RegisterClassW, SetLayeredWindowAttributes,
     SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, GWLP_USERDATA, HWND_TOPMOST,
-    LWA_ALPHA, MA_NOACTIVATE, MSG, SWP_NOACTIVATE, SW_HIDE, SW_SHOWNOACTIVATE, WM_APP,
-    WM_LBUTTONDOWN, WM_MOUSEACTIVATE, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_POPUP,
+    LWA_ALPHA, MA_NOACTIVATE, MSG, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE,
+    WM_APP, WM_LBUTTONDOWN, WM_MOUSEACTIVATE, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 const PREVIEW_TARGET_CLASS: &str = "LeopardWMPreviewClickTarget";
@@ -71,6 +71,15 @@ pub fn set_click_sender(sender: mpsc::Sender<PreviewClickEvent>) {
     *click_sender()
         .lock()
         .unwrap_or_else(crate::recover_poisoned_mutex) = Some(sender);
+}
+
+/// Drop the click route so its forwarder thread can finish. Called during
+/// shutdown: the receiver only ends when the last sender goes away, and a
+/// forwarder blocked in `recv()` would otherwise consume the join budget.
+pub fn clear_click_sender() {
+    *click_sender()
+        .lock()
+        .unwrap_or_else(crate::recover_poisoned_mutex) = None;
 }
 
 fn emit_click(window_id: WindowId) {
@@ -149,13 +158,26 @@ impl PreviewInput {
 
                 let mut windows_by_id: HashMap<WindowId, HWND> = HashMap::new();
                 let mut message = MSG::default();
-                while GetMessageW(&mut message, None, 0, 0).as_bool() {
+                // `GetMessageW` returns -1 on error, which `as_bool()` reports as
+                // true; spinning on that would peg a core, so stop on anything
+                // that is not a real message.
+                loop {
+                    let result = GetMessageW(&mut message, None, 0, 0).0;
+                    if result <= 0 {
+                        break;
+                    }
                     if message.message == WM_PREVIEW_SYNC {
                         reconcile_targets(&class, &mut windows_by_id);
                         continue;
                     }
                     let _ = TranslateMessage(&message);
                     DispatchMessageW(&message);
+                }
+                // Never leave an invisible topmost window behind: without this
+                // an exiting pump would strand click-absorbing overlays for the
+                // rest of the session.
+                for hwnd in windows_by_id.values() {
+                    let _ = DestroyWindow(*hwnd);
                 }
             })
             .map_err(|error| {
@@ -227,6 +249,13 @@ unsafe fn reconcile_targets(class: &[u16], windows_by_id: &mut HashMap<WindowId,
         if target.rect.width <= 0 || target.rect.height <= 0 {
             continue;
         }
+        // Defensive: a tracked HWND for this id would be orphaned by the insert
+        // below and could never be destroyed again.
+        if let Some(stale) = windows_by_id.remove(&target.window_id) {
+            unsafe {
+                let _ = DestroyWindow(stale);
+            }
+        }
         let created = unsafe {
             CreateWindowExW(
                 WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
@@ -259,7 +288,17 @@ unsafe fn reconcile_targets(class: &[u16], windows_by_id: &mut HashMap<WindowId,
                 let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
                 windows_by_id.insert(target.window_id, hwnd);
             },
-            Err(error) => warn!("Preview click target creation failed: {error}"),
+            Err(error) => {
+                warn!("Preview click target creation failed: {error}");
+                // The desired state already records this target, so an identical
+                // next publish would be deduplicated into a no-op and the click
+                // target would stay dead. Forget it so the next frame retries.
+                input
+                    .desired
+                    .lock()
+                    .unwrap_or_else(crate::recover_poisoned_mutex)
+                    .retain(|pending| pending.window_id != target.window_id);
+            }
         }
     }
 
@@ -272,14 +311,18 @@ unsafe fn reconcile_targets(class: &[u16], windows_by_id: &mut HashMap<WindowId,
                 let _ = ShowWindow(hwnd, SW_HIDE);
                 continue;
             }
+            // Move only. Re-pinning to the top of the topmost band on every
+            // animation frame would fight the tab strip, which pins itself the
+            // same way, making a click on a tabbed edge column land
+            // nondeterministically on the strip or on this overlay.
             let _ = SetWindowPos(
                 hwnd,
-                Some(HWND_TOPMOST),
+                None,
                 target.rect.x,
                 target.rect.y,
                 target.rect.width,
                 target.rect.height,
-                SWP_NOACTIVATE,
+                SWP_NOACTIVATE | SWP_NOZORDER,
             );
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         }

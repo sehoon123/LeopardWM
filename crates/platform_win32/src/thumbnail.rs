@@ -390,17 +390,24 @@ fn normalized_preview_geometry(
     ))
 }
 
-fn publish_preview_requests(requests: &[PersistentPreviewRequest], refresh_size: bool) -> usize {
+/// Publish each request and report the windows whose thumbnail is actually on
+/// screen afterwards. Callers need the identities, not just a count: an overlay
+/// must never be placed over a preview that failed to publish, or it would
+/// absorb clicks where no pixels of ours are drawn.
+fn publish_preview_requests(
+    requests: &[PersistentPreviewRequest],
+    refresh_size: bool,
+) -> Vec<WindowId> {
     #[cfg(test)]
     {
         let _ = (requests, refresh_size);
-        0
+        Vec::new()
     }
     #[cfg(not(test))]
     {
         let origin = host().origin();
         let mut failed = Vec::new();
-        let mut published = 0usize;
+        let mut published = Vec::new();
         let mut previews = lock_persistent_previews();
         for request in requests {
             let Some(preview) = previews.get_mut(&request.window_id) else {
@@ -429,7 +436,7 @@ fn publish_preview_requests(requests: &[PersistentPreviewRequest], refresh_size:
             };
             let destination = screen_to_host_client(destination_screen, origin);
             if update_cropped(preview.handle.as_isize(), source, destination, 255, true).is_ok() {
-                published += 1;
+                published.push(request.window_id);
             } else {
                 failed.push(request.window_id);
             }
@@ -454,29 +461,46 @@ pub(crate) fn commit_persistent_previews(
             .iter()
             .any(|request| request.window_id == *window_id)
     });
-    let live = published.min(previews.len());
+    let live = published.len().min(previews.len());
     drop(previews);
     // A thumbnail is pixels only, so the strip needs its own click target for
     // the scroll-first gesture of clicking a partially visible column.
-    crate::preview_input::sync_preview_click_targets(&preview_click_targets(requests));
+    crate::preview_input::sync_preview_click_targets(&preview_click_targets(requests, &published));
     live
 }
 
-/// Click targets for the previews that are actually published: one per request,
-/// covering exactly the rectangle the thumbnail is drawn into.
+/// Click targets for the previews that are actually on screen: one per request
+/// that published, covering exactly the rectangle its thumbnail is drawn into.
+///
+/// Requests that failed to publish are skipped deliberately — their source is
+/// already parked off-monitor, so an overlay there would swallow clicks over a
+/// region showing nothing of ours. Duplicate ids collapse to their first
+/// request so a single overlay is never created twice and orphaned.
 pub(crate) fn preview_click_targets(
     requests: &[PersistentPreviewRequest],
+    published: &[WindowId],
 ) -> Vec<crate::preview_input::PreviewClickTarget> {
-    requests
-        .iter()
-        .filter(|request| {
-            request.destination_screen_rect.width > 0 && request.destination_screen_rect.height > 0
-        })
-        .map(|request| crate::preview_input::PreviewClickTarget {
+    let mut targets: Vec<crate::preview_input::PreviewClickTarget> = Vec::new();
+    for request in requests {
+        if request.destination_screen_rect.width <= 0 || request.destination_screen_rect.height <= 0
+        {
+            continue;
+        }
+        if !published.contains(&request.window_id) {
+            continue;
+        }
+        if targets
+            .iter()
+            .any(|target| target.window_id == request.window_id)
+        {
+            continue;
+        }
+        targets.push(crate::preview_input::PreviewClickTarget {
             window_id: request.window_id,
             rect: request.destination_screen_rect,
-        })
-        .collect()
+        });
+    }
+    targets
 }
 
 pub(crate) fn clear_persistent_previews() {
@@ -940,6 +964,54 @@ fn virtual_screen_size() -> (i32, i32) {
 // are used directly.
 #[allow(dead_code)]
 const _UNUSED_IMPORTS: (SET_WINDOW_POS_FLAGS, i32) = (SWP_NOZORDER, CW_USEDEFAULT);
+
+#[cfg(test)]
+mod preview_click_target_tests {
+    use super::{preview_click_targets, PersistentPreviewRequest};
+    use leopardwm_core_layout::Rect;
+
+    fn request(window_id: u64, x: i32, width: i32) -> PersistentPreviewRequest {
+        PersistentPreviewRequest {
+            window_id,
+            source_rect: Rect::new(0, 0, width, 800),
+            expected_source_size: (width, 800),
+            destination_screen_rect: Rect::new(x, 100, width, 800),
+        }
+    }
+
+    #[test]
+    fn only_published_previews_get_a_click_target() {
+        let requests = [request(1, 0, 250), request(2, 1670, 250)];
+        // Window 2 failed to publish: its source is already parked off-monitor,
+        // so an overlay there would swallow clicks over nothing of ours.
+        let targets = preview_click_targets(&requests, &[1]);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].window_id, 1);
+        assert_eq!(targets[0].rect, Rect::new(0, 100, 250, 800));
+    }
+
+    #[test]
+    fn nothing_published_means_no_click_targets() {
+        let requests = [request(1, 0, 250)];
+        assert!(preview_click_targets(&requests, &[]).is_empty());
+    }
+
+    #[test]
+    fn a_duplicate_request_yields_one_target() {
+        // Two overlays for one id would orphan the first HWND in the pump's map.
+        let requests = [request(7, 0, 250), request(7, 1670, 250)];
+        let targets = preview_click_targets(&requests, &[7]);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].rect, Rect::new(0, 100, 250, 800));
+    }
+
+    #[test]
+    fn an_empty_destination_is_never_clickable() {
+        let mut empty = request(3, 0, 0);
+        empty.destination_screen_rect = Rect::new(0, 100, 0, 800);
+        assert!(preview_click_targets(&[empty], &[3]).is_empty());
+    }
+}
 
 #[cfg(test)]
 mod tests {
