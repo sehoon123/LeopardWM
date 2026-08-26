@@ -1709,6 +1709,47 @@ pub fn get_window_invisible_insets(window_id: WindowId) -> (i32, i32, i32, i32) 
 /// we expand the frame rect by the invisible border amount.
 ///
 /// Returns (left, top, right, bottom) insets to subtract/add to the target rect.
+/// Largest invisible resize border Windows actually draws, with headroom.
+///
+/// It is about 7px at 100% DPI and scales with the monitor, so ~14px at 200%.
+/// A measurement past this bound is not a border: it is a displaced compositor
+/// surface being reported as geometry.
+pub(crate) const MAX_INVISIBLE_BORDER_PX: i32 = 32;
+
+/// Insets implied by a window's outer frame and its visible DWM frame, or `None`
+/// when the pair cannot honestly describe an invisible border.
+///
+/// `DWMWA_EXTENDED_FRAME_BOUNDS` reports where DWM is *compositing* the window.
+/// For a Chromium, Electron or WinUI window whose visual is still at a stale
+/// transform, that is not where the window is, and the difference is exactly what
+/// this function would otherwise return as an inset. Accepting it is worse than
+/// having no measurement: the caller places the chrome shifted by the error so
+/// the displaced content lands on the layout slot, the next verification pass
+/// then sees matching edges, and the bogus inset is cached and blessed. The
+/// window stays visibly broken until something clears the inset cache.
+///
+/// So a measurement is only trusted when every side is a plausible border and
+/// the horizontal and vertical pairs are symmetric, which a real invisible border
+/// always is. Pure, and unit-tested against the displaced-visual case.
+pub(crate) fn insets_from_frames(frame: Rect, extended: Rect) -> Option<(i32, i32, i32, i32)> {
+    let left = extended.x - frame.x;
+    let top = extended.y - frame.y;
+    let right = frame.right() - extended.right();
+    let bottom = frame.bottom() - extended.bottom();
+
+    let plausible = |value: i32| (0..=MAX_INVISIBLE_BORDER_PX).contains(&value);
+    if !plausible(left) || !plausible(top) || !plausible(right) || !plausible(bottom) {
+        return None;
+    }
+    // Windows draws the same border on both sides; a horizontal or vertical
+    // asymmetry means one edge absorbed a displacement.
+    const MAX_ASYMMETRY_PX: i32 = 2;
+    if (left - right).abs() > MAX_ASYMMETRY_PX {
+        return None;
+    }
+    Some((left, top, right, bottom))
+}
+
 pub(crate) fn invisible_border_insets(hwnd: HWND) -> (i32, i32, i32, i32) {
     unsafe {
         let mut frame_rect = RECT::default();
@@ -1728,13 +1769,22 @@ pub(crate) fn invisible_border_insets(hwnd: HWND) -> (i32, i32, i32, i32) {
             return (0, 0, 0, 0);
         }
 
-        // Insets = how much the frame rect extends beyond the visible area
-        let left = extended_rect.left - frame_rect.left;
-        let top = extended_rect.top - frame_rect.top;
-        let right = frame_rect.right - extended_rect.right;
-        let bottom = frame_rect.bottom - extended_rect.bottom;
-
-        (left.max(0), top.max(0), right.max(0), bottom.max(0))
+        let frame = Rect::new(
+            frame_rect.left,
+            frame_rect.top,
+            frame_rect.right - frame_rect.left,
+            frame_rect.bottom - frame_rect.top,
+        );
+        let extended = Rect::new(
+            extended_rect.left,
+            extended_rect.top,
+            extended_rect.right - extended_rect.left,
+            extended_rect.bottom - extended_rect.top,
+        );
+        // No measurement is better than a poisoned one: zero insets place the
+        // chrome exactly where the layout asked, which is off by at most a real
+        // border, instead of off by a whole displaced surface.
+        insets_from_frames(frame, extended).unwrap_or((0, 0, 0, 0))
     }
 }
 
@@ -2063,6 +2113,60 @@ mod tests {
             let mut g = lock_ghost_cloaked();
             g.get_or_insert_with(HashSet::new).insert(wid);
         }
+    }
+}
+
+#[cfg(test)]
+mod inset_plausibility_tests {
+    use super::{insets_from_frames, MAX_INVISIBLE_BORDER_PX};
+    use leopardwm_core_layout::Rect;
+
+    #[test]
+    fn a_real_invisible_border_is_accepted() {
+        // 1920x1080 client, 7px border on the sides and bottom, none on top.
+        let frame = Rect::new(93, 100, 1934, 1087);
+        let extended = Rect::new(100, 100, 1920, 1080);
+        assert_eq!(insets_from_frames(frame, extended), Some((7, 0, 7, 7)));
+    }
+
+    #[test]
+    fn a_zero_border_window_is_accepted() {
+        let rect = Rect::new(0, 0, 800, 600);
+        assert_eq!(insets_from_frames(rect, rect), Some((0, 0, 0, 0)));
+    }
+
+    #[test]
+    fn a_displaced_compositor_surface_is_rejected() {
+        // The window is at x=100 but DWM reports the visual 240px to the right,
+        // which would otherwise be read as a 240px left border and a clamped
+        // right border, and then baked into the placement.
+        let frame = Rect::new(100, 100, 1920, 1080);
+        let extended = Rect::new(340, 100, 1920, 1080);
+        assert_eq!(insets_from_frames(frame, extended), None);
+    }
+
+    #[test]
+    fn an_asymmetric_pair_inside_the_bound_is_still_rejected() {
+        // Both sides plausible on their own, but a real border is symmetric.
+        let frame = Rect::new(100, 100, 1920, 1080);
+        let extended = Rect::new(120, 100, 1900, 1080);
+        assert_eq!(insets_from_frames(frame, extended), None);
+    }
+
+    #[test]
+    fn a_border_past_the_bound_is_rejected() {
+        let over = MAX_INVISIBLE_BORDER_PX + 1;
+        let frame = Rect::new(0, 0, 1000 + over * 2, 800);
+        let extended = Rect::new(over, 0, 1000, 800);
+        assert_eq!(insets_from_frames(frame, extended), None);
+    }
+
+    #[test]
+    fn a_negative_side_is_rejected() {
+        // Extended bounds outside the frame cannot describe a border.
+        let frame = Rect::new(100, 100, 800, 600);
+        let extended = Rect::new(90, 100, 820, 600);
+        assert_eq!(insets_from_frames(frame, extended), None);
     }
 }
 
