@@ -58,6 +58,8 @@ static REGISTER_BALANCE: AtomicI64 = AtomicI64::new(0);
 struct ZOrderState {
     /// Every handle we own, wherever it is composited (health metric).
     balance: i64,
+    /// Host-bound handles that require the topmost band (transition ghosts).
+    topmost_balance: i64,
     /// Handles composited on the singleton HOST only — drives the host's
     /// topmost promotion/demotion. Overview-overlay registrations are
     /// excluded: shuffling the host's z-order around the (itself topmost)
@@ -66,6 +68,7 @@ struct ZOrderState {
 }
 static Z_ORDER_STATE: Mutex<ZOrderState> = Mutex::new(ZOrderState {
     balance: 0,
+    topmost_balance: 0,
     host_balance: 0,
 });
 
@@ -88,6 +91,9 @@ pub struct ThumbnailHandle {
     /// Whether this registration participates in the HOST z-order
     /// accounting (true only for host-destined thumbnails).
     host_z: bool,
+    /// Which band this registration claimed, so unregistering releases the
+    /// same claim it made.
+    band: HostBand,
 }
 
 // SAFETY: HTHUMBNAIL is a process-wide DWM handle, not bound to any HWND
@@ -99,7 +105,7 @@ unsafe impl Sync for ThumbnailHandle {}
 impl Drop for ThumbnailHandle {
     fn drop(&mut self) {
         if self.handle != 0 {
-            unregister_impl(self.handle, self.host_z);
+            unregister_impl(self.handle, self.host_z, self.band);
         }
     }
 }
@@ -135,6 +141,7 @@ impl ThumbnailHandle {
         Self {
             handle: 0,
             host_z: false,
+            band: HostBand::Normal,
         }
     }
 }
@@ -142,13 +149,29 @@ impl ThumbnailHandle {
 /// Register a DWM thumbnail of `source` against the singleton host window.
 /// On success, returns an owning handle whose `Drop` unregisters.
 pub fn register(wid: WindowId) -> Result<ThumbnailHandle, Win32Error> {
+    register_on_host(wid, HostBand::Topmost)
+}
+
+/// Where a host-bound thumbnail wants the shared host in the z-order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostBand {
+    /// Transition ghosts composite over live windows that may be cloaked
+    /// underneath, so they need the topmost band.
+    Topmost,
+    /// A monitor-edge preview stands in for a tiled window, so it belongs in the
+    /// normal band: in the topmost band it would cover floating windows, which
+    /// sit above the tiled layer by design.
+    Normal,
+}
+
+fn register_on_host(wid: WindowId, band: HostBand) -> Result<ThumbnailHandle, Win32Error> {
     let host_hwnd = host().hwnd();
     if host_hwnd.0.is_null() {
         return Err(Win32Error::SetPositionFailed(
             "thumbnail host unavailable".into(),
         ));
     }
-    register_to(host_hwnd, wid, true)
+    register_to(host_hwnd, wid, true, band)
 }
 
 /// Register a DWM thumbnail of `source_wid` against an arbitrary top-level
@@ -166,10 +189,20 @@ pub fn register_for_window(
             "thumbnail destination hwnd is null".into(),
         ));
     }
-    register_to(HWND(dest_hwnd_raw as *mut c_void), source_wid, false)
+    register_to(
+        HWND(dest_hwnd_raw as *mut c_void),
+        source_wid,
+        false,
+        HostBand::Normal,
+    )
 }
 
-fn register_to(dest: HWND, wid: WindowId, host_z: bool) -> Result<ThumbnailHandle, Win32Error> {
+fn register_to(
+    dest: HWND,
+    wid: WindowId,
+    host_z: bool,
+    band: HostBand,
+) -> Result<ThumbnailHandle, Win32Error> {
     let source = window_id_to_hwnd(wid)?;
     let raw = unsafe { DwmRegisterThumbnail(dest, source) }.map_err(|e| {
         Win32Error::SetPositionFailed(format!("DwmRegisterThumbnail({:?}): {}", source.0, e))
@@ -195,7 +228,13 @@ fn register_to(dest: HWND, wid: WindowId, host_z: bool) -> Result<ThumbnailHandl
         // (overview overlay) never move the host.
         if host_z {
             z.host_balance += 1;
-            if z.host_balance == 1 {
+            if band == HostBand::Topmost {
+                z.topmost_balance += 1;
+            }
+            // Only a ghost demands the topmost band. A host that carries nothing
+            // but previews stays in the normal band so floating windows keep
+            // their place above the tiled layer.
+            if z.topmost_balance == 1 && band == HostBand::Topmost {
                 host().set_topmost(true);
             }
         }
@@ -203,6 +242,7 @@ fn register_to(dest: HWND, wid: WindowId, host_z: bool) -> Result<ThumbnailHandl
     Ok(ThumbnailHandle {
         handle: raw,
         host_z,
+        band,
     })
 }
 
@@ -332,7 +372,7 @@ pub(crate) fn prepare_persistent_preview(window_id: WindowId) -> bool {
         if previews.contains_key(&window_id) {
             return true;
         }
-        let Ok(handle) = register(window_id) else {
+        let Ok(handle) = register_on_host(window_id, HostBand::Normal) else {
             return false;
         };
         let initial_size = source_size(handle.as_isize());
@@ -545,10 +585,12 @@ pub fn source_size(handle: isize) -> Option<(i32, i32)> {
 ///
 /// Idempotent on null/zero handles — does nothing.
 pub fn unregister_raw(handle: isize) {
-    unregister_impl(handle, true);
+    // Only ghost handles are transferred raw (see `into_isize`), and a ghost
+    // always claims the topmost band.
+    unregister_impl(handle, true, HostBand::Topmost);
 }
 
-fn unregister_impl(handle: isize, host_z: bool) {
+fn unregister_impl(handle: isize, host_z: bool, band: HostBand) {
     if handle == 0 {
         return;
     }
@@ -574,10 +616,13 @@ fn unregister_impl(handle: isize, host_z: bool) {
     // non-topmost so it stops interfering with the taskbar's auto-hide
     // z-order. Guard on prev >= 1 so a clamped underflow can't skip it.
     if host_z {
-        let prev = z.host_balance;
         z.host_balance = (z.host_balance - 1).max(0);
-        if prev >= 1 && z.host_balance == 0 {
-            host().set_topmost(false);
+        if band == HostBand::Topmost {
+            let prev = z.topmost_balance;
+            z.topmost_balance = (z.topmost_balance - 1).max(0);
+            if prev >= 1 && z.topmost_balance == 0 {
+                host().set_topmost(false);
+            }
         }
     }
 }

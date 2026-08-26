@@ -448,6 +448,38 @@ struct DeferEntry {
     flags: windows::Win32::UI::WindowsAndMessaging::SET_WINDOW_POS_FLAGS,
     column_index: usize,
     preview_source: bool,
+    /// Set when this entry brings a window back from off-monitor parking, so the
+    /// landing pass can repair a renderer still painting at the old offset.
+    returns_from_park: bool,
+}
+
+/// Whether a placement brings a window back to the viewport after it was
+/// represented by an edge preview or parked off every monitor.
+///
+/// That transition moves a window thousands of pixels in one step, and Chromium,
+/// Electron and WinUI renderers routinely present one more frame at the old
+/// transform: the frame, focus border and taskbar are correct while the painted
+/// content sits beside them. A real size delta is the only thing that makes such
+/// a renderer rebuild, which is what `nudge_sticky_compositor_windows` does.
+///
+/// The cached placement cannot carry this on its own: the exact landing pass runs
+/// without a cache, so `previous` is `None` there. The durable signals are the
+/// preview registration and the placement cloak, both of which describe the state
+/// the window is leaving.
+///
+/// Pure so the rule is testable without Win32.
+pub(crate) fn returns_from_offscreen_park(
+    current_visibility: Visibility,
+    had_preview: bool,
+    was_cloaked: bool,
+    previous: Option<(Rect, Visibility)>,
+) -> bool {
+    if current_visibility != Visibility::Visible {
+        return false;
+    }
+    had_preview
+        || was_cloaked
+        || previous.is_some_and(|(_, visibility)| visibility != Visibility::Visible)
 }
 
 /// Apply window placements from the layout engine.
@@ -641,13 +673,19 @@ pub fn apply_placements_with_regions(
     // sees "no size change" and never rebuilds. A brief (w-1 -> w) resize pair
     // forces a real delta through. Scoped to known-affected classes to avoid a
     // universal flicker tax.
-    if !animation_frame && nudge_sticky_compositors {
+    // Two reasons to repair on an exact landing: the legacy post-animation case,
+    // and a window that just returned from an edge preview or off-monitor
+    // parking. The latter is independent of `compositor_safe_mode`, because safe
+    // mode only serialises *animation* frames — it does nothing for a single
+    // multi-thousand-pixel jump back into the viewport.
+    if !animation_frame {
         let nudge_targets: Vec<NudgeTarget> = entries
             .iter()
             .filter(|e| {
                 e.visibility == Visibility::Visible
                     && e.w > 1
                     && !failed_window_ids.contains(&e.window_id)
+                    && (nudge_sticky_compositors || e.returns_from_park)
             })
             .map(|e| NudgeTarget {
                 hwnd: e.hwnd,
@@ -868,6 +906,10 @@ fn build_defer_entries(
             target_frame_h.max(1),
         );
 
+        // Captured before this pass mutates preview or cloak state: they are the
+        // durable evidence that the window is returning from a parked preview.
+        let had_preview = has_persistent_preview(requested.window_id);
+        let was_cloaked = is_placement_cloaked(requested.window_id);
         let mut preview_source = false;
         let mut placement = requested.clone();
         let mut preview_request = None;
@@ -945,11 +987,19 @@ fn build_defer_entries(
                 flags,
                 column_index: placement.column_index,
                 preview_source: true,
+                returns_from_park: false,
             });
         } else if placement.visibility == Visibility::Visible {
             let frame_w = placement.rect.width + inset_l + inset_r;
             let frame_h = placement.rect.height + inset_t + inset_b;
             let flags = visible_position_flags(animation_frame, dispatch, position_only);
+            // Read the state the window is leaving *before* this pass changes it.
+            let returns_from_park = returns_from_offscreen_park(
+                placement.visibility,
+                had_preview,
+                was_cloaked,
+                previous,
+            );
             entries.push(DeferEntry {
                 hwnd,
                 window_id: placement.window_id,
@@ -964,6 +1014,7 @@ fn build_defer_entries(
                 flags,
                 column_index: placement.column_index,
                 preview_source: false,
+                returns_from_park,
             });
         } else {
             let frame_w = placement.rect.width + inset_l + inset_r;
@@ -986,6 +1037,7 @@ fn build_defer_entries(
                 flags,
                 column_index: placement.column_index,
                 preview_source: false,
+                returns_from_park: false,
             });
         }
     }
@@ -2015,6 +2067,86 @@ mod tests {
 }
 
 #[cfg(test)]
+mod compositor_return_repair_tests {
+    use super::returns_from_offscreen_park;
+    use leopardwm_core_layout::{Rect, Visibility};
+
+    fn parked() -> Option<(Rect, Visibility)> {
+        Some((
+            Rect::new(-32000, -32000, 800, 600),
+            Visibility::OffScreenLeft,
+        ))
+    }
+
+    fn onscreen() -> Option<(Rect, Visibility)> {
+        Some((Rect::new(100, 100, 800, 600), Visibility::Visible))
+    }
+
+    #[test]
+    fn a_window_leaving_a_preview_is_repaired() {
+        // The exact landing pass runs without a cache, so the preview
+        // registration is the only signal available there.
+        assert!(returns_from_offscreen_park(
+            Visibility::Visible,
+            true,
+            false,
+            None
+        ));
+    }
+
+    #[test]
+    fn a_window_leaving_the_placement_cloak_is_repaired() {
+        assert!(returns_from_offscreen_park(
+            Visibility::Visible,
+            false,
+            true,
+            None
+        ));
+    }
+
+    #[test]
+    fn a_cached_parked_window_becoming_visible_is_repaired() {
+        assert!(returns_from_offscreen_park(
+            Visibility::Visible,
+            false,
+            false,
+            parked()
+        ));
+    }
+
+    #[test]
+    fn an_ordinary_move_is_not_repaired() {
+        // Repairing every scroll landing would resize every Chromium window on
+        // every navigation.
+        assert!(!returns_from_offscreen_park(
+            Visibility::Visible,
+            false,
+            false,
+            onscreen()
+        ));
+        assert!(!returns_from_offscreen_park(
+            Visibility::Visible,
+            false,
+            false,
+            None
+        ));
+    }
+
+    #[test]
+    fn a_placement_that_is_not_visible_is_never_repaired() {
+        // Nudging a window on its way out would resize it off-screen for nothing.
+        for previous in [None, parked(), onscreen()] {
+            assert!(!returns_from_offscreen_park(
+                Visibility::OffScreenRight,
+                true,
+                true,
+                previous
+            ));
+        }
+    }
+}
+
+#[cfg(test)]
 mod persistent_preview_placement_tests {
     use super::{persistent_preview_request, should_cloak_entry, DeferEntry};
     use leopardwm_core_layout::{Rect, Visibility};
@@ -2036,6 +2168,7 @@ mod persistent_preview_placement_tests {
             flags: SET_WINDOW_POS_FLAGS::default(),
             column_index: 0,
             preview_source: true,
+            returns_from_park: false,
         }
     }
 

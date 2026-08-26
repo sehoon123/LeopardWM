@@ -529,6 +529,58 @@ fn clip_mode_never_plans_a_region_that_cannot_show_pixels() {
 }
 
 #[test]
+fn clip_mode_yields_the_strip_to_a_floating_window() {
+    let monitors = side_by_side_monitors();
+    let owner = monitors[&2].rect;
+    // A left-edge preview strip on monitor 2, plus a floating window parked on
+    // top of it. Floating windows sit above the tiled layer, so the float owns
+    // those pixels: previewing underneath would either be invisible or, through
+    // the thumbnail host, composite on top of the float.
+    let mut placements = vec![
+        visible_tiled(50, Rect::new(owner.x - 600, 40, 800, 800)),
+        WindowPlacement {
+            window_id: 51,
+            rect: Rect::new(owner.x + 40, 100, 400, 400),
+            visibility: Visibility::Visible,
+            column_index: usize::MAX,
+        },
+    ];
+
+    let clips = clip_overflow(&mut placements, Some(1));
+
+    assert!(clips.is_empty(), "no preview may be planned under a float");
+    assert_ne!(placements[0].visibility, Visibility::Visible);
+    assert!(monitors
+        .values()
+        .all(|monitor| !placements[0].rect.intersects(&monitor.rect)));
+    // The float itself is untouched.
+    assert_eq!(placements[1].rect, Rect::new(owner.x + 40, 100, 400, 400));
+    assert_eq!(placements[1].visibility, Visibility::Visible);
+}
+
+#[test]
+fn clip_mode_keeps_a_preview_a_float_does_not_cover() {
+    let monitors = side_by_side_monitors();
+    let owner = monitors[&2].rect;
+    // Same geometry, but the float sits well clear of the 200px strip.
+    let mut placements = vec![
+        visible_tiled(52, Rect::new(owner.x - 600, 40, 800, 800)),
+        WindowPlacement {
+            window_id: 53,
+            rect: Rect::new(owner.x + 900, 100, 400, 400),
+            visibility: Visibility::Visible,
+            column_index: usize::MAX,
+        },
+    ];
+
+    let clips = clip_overflow(&mut placements, Some(1));
+
+    assert_eq!(clips.len(), 1);
+    assert_eq!(clips[0].window_id, 52);
+    assert_eq!(placements[0].visibility, Visibility::Visible);
+}
+
+#[test]
 fn clip_mode_preserves_25_50_25_on_a_rightmost_monitor() {
     assert_clip_preview_distribution(960, 480);
 }

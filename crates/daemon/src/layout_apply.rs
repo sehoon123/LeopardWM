@@ -228,6 +228,40 @@ pub(crate) fn park_offscreen_avoiding_neighbors(
     }
 }
 
+/// Whether the part of `placement` that stays on `owner` would be covered by a
+/// floating window.
+///
+/// Floating windows sit above the tiled band by design, so a preview drawn under
+/// one is either invisible or, worse, drawn over it by the thumbnail host. The
+/// float owns those pixels: the column is simply hidden instead of previewed.
+/// Pure so the policy is testable without Win32.
+fn preview_strip_is_covered_by_floating(
+    placement_rect: leopardwm_core_layout::Rect,
+    owner_rect: leopardwm_core_layout::Rect,
+    floating_rects: &[leopardwm_core_layout::Rect],
+) -> bool {
+    let Some(strip) = intersection(placement_rect, owner_rect) else {
+        return false;
+    };
+    floating_rects
+        .iter()
+        .any(|floating| floating.intersects(&strip))
+}
+
+/// Rectangles of the visible floating windows in `placements`.
+fn visible_floating_rects(
+    placements: &[leopardwm_core_layout::WindowPlacement],
+) -> Vec<leopardwm_core_layout::Rect> {
+    placements
+        .iter()
+        .filter(|placement| {
+            placement.column_index == usize::MAX
+                && placement.visibility == leopardwm_core_layout::Visibility::Visible
+        })
+        .map(|placement| placement.rect)
+        .collect()
+}
+
 fn upsert_region_clip(
     clips: &mut Vec<leopardwm_platform_win32::WindowRegionClip>,
     clip: leopardwm_platform_win32::WindowRegionClip,
@@ -282,7 +316,10 @@ fn prepare_monitor_overflow(
             .filter(|(id, _)| **id != owner_id)
             .any(|(_, monitor)| rect.intersects(&monitor.rect))
     };
-    for placement in placements {
+    // Taken before the mutable walk below, which cannot borrow `placements`
+    // again, and unaffected by it: this policy never moves a floating window.
+    let floating_rects = visible_floating_rects(placements);
+    for placement in placements.iter_mut() {
         if placement.column_index == usize::MAX {
             continue;
         }
@@ -322,6 +359,14 @@ fn prepare_monitor_overflow(
                 visibility,
             )
         };
+
+        // A floating window over the edge strip owns those pixels; previewing
+        // underneath it would either be invisible or composite on top of it.
+        if preview_strip_is_covered_by_floating(placement.rect, owner_rect, &floating_rects) {
+            placement.rect = fallback_rect;
+            placement.visibility = fallback_visibility;
+            continue;
+        }
 
         // A window region can only hide pixels; it cannot pull a window that
         // shares no pixels with its owner monitor back onto it. Clipping such a

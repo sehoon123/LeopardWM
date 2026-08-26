@@ -34,11 +34,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW,
     GetSystemMetrics, GetWindowLongPtrW, IsWindowVisible, LoadCursorW, PostThreadMessageW,
     RegisterClassW, SetCursor, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos,
-    ShowWindow, TranslateMessage, GWLP_USERDATA, HWND_TOPMOST, IDC_HAND, LWA_ALPHA, MA_NOACTIVATE,
-    MSG, SM_CXDRAG, SM_CYDRAG, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, WM_APP,
+    ShowWindow, TranslateMessage, GWLP_USERDATA, HWND_TOP, IDC_HAND, LWA_ALPHA, MA_NOACTIVATE, MSG,
+    SM_CXDRAG, SM_CYDRAG, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, WM_APP,
     WM_CAPTURECHANGED, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_PAINT,
-    WM_SETCURSOR, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_POPUP,
+    WM_SETCURSOR, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 const PREVIEW_TARGET_CLASS: &str = "LeopardWMPreviewClickTarget";
@@ -298,7 +297,11 @@ unsafe fn reconcile_targets(class: &[u16], windows_by_id: &mut HashMap<WindowId,
         }
         let created = unsafe {
             CreateWindowExW(
-                WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
+                // Normal band, deliberately not topmost: a preview stands in for
+                // a tiled window, and a floating window sits above the tiled
+                // layer. In the topmost band this overlay would take clicks that
+                // belong to a float covering the strip.
+                WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
                 windows::core::PCWSTR(class.as_ptr()),
                 None,
                 WS_POPUP,
@@ -318,7 +321,7 @@ unsafe fn reconcile_targets(class: &[u16], windows_by_id: &mut HashMap<WindowId,
                 let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), TARGET_ALPHA, LWA_ALPHA);
                 let _ = SetWindowPos(
                     hwnd,
-                    Some(HWND_TOPMOST),
+                    Some(HWND_TOP),
                     target.rect.x,
                     target.rect.y,
                     target.rect.width,
@@ -357,7 +360,7 @@ unsafe fn reconcile_targets(class: &[u16], windows_by_id: &mut HashMap<WindowId,
             if !IsWindowVisible(hwnd).as_bool() {
                 let _ = SetWindowPos(
                     hwnd,
-                    Some(HWND_TOPMOST),
+                    Some(HWND_TOP),
                     target.rect.x,
                     target.rect.y,
                     target.rect.width,
