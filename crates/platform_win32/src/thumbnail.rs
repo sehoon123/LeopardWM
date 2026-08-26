@@ -11,6 +11,7 @@
 
 use crate::{window_id_to_hwnd, Win32Error};
 use leopardwm_core_layout::{Rect, WindowId};
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::mpsc;
@@ -21,7 +22,7 @@ use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Dwm::{
     DwmQueryThumbnailSourceSize, DwmRegisterThumbnail, DwmUnregisterThumbnail,
     DwmUpdateThumbnailProperties, DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY,
-    DWM_TNP_RECTDESTINATION, DWM_TNP_VISIBLE,
+    DWM_TNP_RECTDESTINATION, DWM_TNP_RECTSOURCE, DWM_TNP_VISIBLE,
 };
 use windows::Win32::Graphics::Gdi::{
     CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC, SelectObject,
@@ -220,13 +221,41 @@ pub fn update(
     opacity: u8,
     visible: bool,
 ) -> Result<(), Win32Error> {
+    update_properties(handle, None, dest_client_rect, opacity, visible)
+}
+
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn update_cropped(
+    handle: isize,
+    source_rect: Rect,
+    dest_client_rect: Rect,
+    opacity: u8,
+    visible: bool,
+) -> Result<(), Win32Error> {
+    update_properties(
+        handle,
+        Some(source_rect),
+        dest_client_rect,
+        opacity,
+        visible,
+    )
+}
+
+fn update_properties(
+    handle: isize,
+    source_rect: Option<Rect>,
+    dest_client_rect: Rect,
+    opacity: u8,
+    visible: bool,
+) -> Result<(), Win32Error> {
     if handle == 0 {
         return Err(Win32Error::SetPositionFailed(
             "thumbnail::update called with null handle".into(),
         ));
     }
-    let props = DWM_THUMBNAIL_PROPERTIES {
-        dwFlags: DWM_TNP_RECTDESTINATION | DWM_TNP_OPACITY | DWM_TNP_VISIBLE,
+    let mut flags = DWM_TNP_RECTDESTINATION | DWM_TNP_OPACITY | DWM_TNP_VISIBLE;
+    let mut props = DWM_THUMBNAIL_PROPERTIES {
+        dwFlags: flags,
         rcDestination: RECT {
             left: dest_client_rect.x,
             top: dest_client_rect.y,
@@ -238,18 +267,204 @@ pub fn update(
         fVisible: BOOL::from(visible),
         fSourceClientAreaOnly: BOOL::from(false),
     };
-    let result = unsafe { DwmUpdateThumbnailProperties(handle, &props) };
-    if let Err(e) = result {
-        return Err(Win32Error::SetPositionFailed(format!(
-            "DwmUpdateThumbnailProperties: {}",
-            e
-        )));
+    if let Some(source) = source_rect {
+        flags |= DWM_TNP_RECTSOURCE;
+        props.dwFlags = flags;
+        props.rcSource = RECT {
+            left: source.x,
+            top: source.y,
+            right: source.x + source.width,
+            bottom: source.y + source.height,
+        };
     }
-    Ok(())
+    unsafe { DwmUpdateThumbnailProperties(handle, &props) }.map_err(|error| {
+        Win32Error::SetPositionFailed(format!("DwmUpdateThumbnailProperties: {error}"))
+    })
 }
 
 /// Source window's true size for a registered thumbnail, used for
 /// aspect-fit destination rects. `None` on null handles or DWM failure.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PersistentPreviewRequest {
+    pub window_id: WindowId,
+    pub source_rect: Rect,
+    pub expected_source_size: (i32, i32),
+    pub destination_screen_rect: Rect,
+}
+
+#[cfg_attr(test, allow(dead_code))]
+struct PersistentPreview {
+    handle: ThumbnailHandle,
+    source_size: Option<(i32, i32)>,
+    expected_source_size: Option<(i32, i32)>,
+}
+
+static PERSISTENT_PREVIEWS: OnceLock<Mutex<HashMap<WindowId, PersistentPreview>>> = OnceLock::new();
+static PERSISTENT_PREVIEW_TRANSACTION: Mutex<()> = Mutex::new(());
+
+fn persistent_previews() -> &'static Mutex<HashMap<WindowId, PersistentPreview>> {
+    PERSISTENT_PREVIEWS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn lock_persistent_previews() -> std::sync::MutexGuard<'static, HashMap<WindowId, PersistentPreview>>
+{
+    persistent_previews()
+        .lock()
+        .unwrap_or_else(crate::recover_poisoned_mutex)
+}
+
+pub(crate) fn lock_persistent_preview_transaction() -> std::sync::MutexGuard<'static, ()> {
+    PERSISTENT_PREVIEW_TRANSACTION
+        .lock()
+        .unwrap_or_else(crate::recover_poisoned_mutex)
+}
+
+pub(crate) fn prepare_persistent_preview(window_id: WindowId) -> bool {
+    #[cfg(test)]
+    {
+        let _ = window_id;
+        false
+    }
+    #[cfg(not(test))]
+    {
+        let mut previews = lock_persistent_previews();
+        if previews.contains_key(&window_id) {
+            return true;
+        }
+        let Ok(handle) = register(window_id) else {
+            return false;
+        };
+        let initial_size = source_size(handle.as_isize());
+        previews.insert(
+            window_id,
+            PersistentPreview {
+                handle,
+                source_size: initial_size,
+                expected_source_size: None,
+            },
+        );
+        true
+    }
+}
+
+pub(crate) fn has_persistent_preview(window_id: WindowId) -> bool {
+    #[cfg(test)]
+    {
+        let _ = window_id;
+        false
+    }
+    #[cfg(not(test))]
+    {
+        lock_persistent_previews().contains_key(&window_id)
+    }
+}
+
+fn scale_edge(value: i32, actual: i32, expected: i32) -> i32 {
+    if actual <= 0 || expected <= 0 {
+        return 0;
+    }
+    ((i64::from(value.max(0)) * i64::from(actual) + i64::from(expected) / 2) / i64::from(expected))
+        .clamp(0, i64::from(actual)) as i32
+}
+
+fn normalized_preview_geometry(
+    request: PersistentPreviewRequest,
+    actual_source_size: (i32, i32),
+) -> Option<(Rect, Rect)> {
+    let (actual_w, actual_h) = actual_source_size;
+    let (expected_w, expected_h) = request.expected_source_size;
+    if actual_w <= 0 || actual_h <= 0 || expected_w <= 0 || expected_h <= 0 {
+        return None;
+    }
+    let left = scale_edge(request.source_rect.x, actual_w, expected_w);
+    let top = scale_edge(request.source_rect.y, actual_h, expected_h);
+    let right = scale_edge(request.source_rect.right(), actual_w, expected_w).max(left);
+    let bottom = scale_edge(request.source_rect.bottom(), actual_h, expected_h).max(top);
+    if right <= left || bottom <= top {
+        return None;
+    }
+    Some((
+        Rect::new(left, top, right - left, bottom - top),
+        request.destination_screen_rect,
+    ))
+}
+
+fn publish_preview_requests(requests: &[PersistentPreviewRequest], refresh_size: bool) -> usize {
+    #[cfg(test)]
+    {
+        let _ = (requests, refresh_size);
+        0
+    }
+    #[cfg(not(test))]
+    {
+        let origin = host().origin();
+        let mut failed = Vec::new();
+        let mut published = 0usize;
+        let mut previews = lock_persistent_previews();
+        for request in requests {
+            let Some(preview) = previews.get_mut(&request.window_id) else {
+                continue;
+            };
+            if refresh_size
+                && (preview.expected_source_size != Some(request.expected_source_size)
+                    || preview.source_size.is_none())
+            {
+                preview.source_size = source_size(preview.handle.as_isize());
+                preview.expected_source_size = Some(request.expected_source_size);
+            }
+            let Some(source_size) = preview.source_size else {
+                if refresh_size {
+                    failed.push(request.window_id);
+                }
+                continue;
+            };
+            let Some((source, destination_screen)) =
+                normalized_preview_geometry(*request, source_size)
+            else {
+                if refresh_size {
+                    failed.push(request.window_id);
+                }
+                continue;
+            };
+            let destination = screen_to_host_client(destination_screen, origin);
+            if update_cropped(preview.handle.as_isize(), source, destination, 255, true).is_ok() {
+                published += 1;
+            } else {
+                failed.push(request.window_id);
+            }
+        }
+        if refresh_size {
+            for window_id in failed {
+                previews.remove(&window_id);
+            }
+        }
+        published
+    }
+}
+
+pub(crate) fn commit_persistent_previews(
+    requests: &[PersistentPreviewRequest],
+    refresh_source_size: bool,
+) -> usize {
+    let published = publish_preview_requests(requests, refresh_source_size);
+    let mut previews = lock_persistent_previews();
+    previews.retain(|window_id, _| {
+        requests
+            .iter()
+            .any(|request| request.window_id == *window_id)
+    });
+    published.min(previews.len())
+}
+
+pub(crate) fn clear_persistent_previews() {
+    lock_persistent_previews().clear();
+}
+
+pub(crate) fn forget_persistent_preview(window_id: WindowId) {
+    lock_persistent_previews().remove(&window_id);
+}
+
 pub fn source_size(handle: isize) -> Option<(i32, i32)> {
     if handle == 0 {
         return None;
@@ -344,6 +559,7 @@ pub fn is_compositor_sensitive_class_str(class: &str) -> bool {
         || class == "ExploreWClass"
         || class == "ApplicationFrameWindow"
         || class == "WinUIDesktopWin32WindowClass"
+        || class == "Notepad"
         || class == "CEF-OSC-WIDGET"
         || class.starts_with("Qt5QWindow")
         || class.starts_with("Qt6QWindow")
@@ -772,7 +988,7 @@ mod tests {
         assert!(is_compositor_sensitive_class_str("CEF-OSC-WIDGET"));
         assert!(is_compositor_sensitive_class_str("Qt6QWindowIcon"));
 
-        assert!(!is_ghost_animation_class_str("Notepad"));
+        assert!(is_ghost_animation_class_str("Notepad"));
         assert!(!is_ghost_animation_class_str(""));
         assert!(!is_ghost_animation_class_str("Chrome_RenderWidgetHostHWND")); // internal widget; skipped earlier
         assert!(!is_ghost_animation_class_str("Chrome_Widget")); // prefix-only match avoided
@@ -785,5 +1001,53 @@ mod tests {
         // Process-global; may have non-zero state from other tests in the
         // same binary, but we can at least observe the read API.
         let _initial = current_register_balance();
+    }
+}
+
+#[cfg(test)]
+mod persistent_preview_geometry_tests {
+    use super::{normalized_preview_geometry, PersistentPreviewRequest};
+    use leopardwm_core_layout::Rect;
+
+    #[test]
+    fn matching_source_size_preserves_crop_and_destination() {
+        let request = PersistentPreviewRequest {
+            window_id: 1,
+            source_rect: Rect::new(500, 0, 250, 800),
+            expected_source_size: (750, 800),
+            destination_screen_rect: Rect::new(1000, 0, 250, 800),
+        };
+        assert_eq!(
+            normalized_preview_geometry(request, (750, 800)),
+            Some((request.source_rect, request.destination_screen_rect))
+        );
+    }
+
+    #[test]
+    fn crop_scales_to_the_actual_dwm_source_size() {
+        let request = PersistentPreviewRequest {
+            window_id: 1,
+            source_rect: Rect::new(500, 80, 250, 640),
+            expected_source_size: (750, 800),
+            destination_screen_rect: Rect::new(1000, 80, 250, 640),
+        };
+        assert_eq!(
+            normalized_preview_geometry(request, (1500, 1600)),
+            Some((
+                Rect::new(1000, 160, 500, 1280),
+                request.destination_screen_rect,
+            ))
+        );
+    }
+
+    #[test]
+    fn invalid_or_empty_source_geometry_is_rejected() {
+        let request = PersistentPreviewRequest {
+            window_id: 1,
+            source_rect: Rect::new(750, 0, 0, 800),
+            expected_source_size: (750, 800),
+            destination_screen_rect: Rect::new(1000, 0, 0, 800),
+        };
+        assert_eq!(normalized_preview_geometry(request, (750, 800)), None);
     }
 }

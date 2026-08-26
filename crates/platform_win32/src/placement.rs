@@ -1,10 +1,15 @@
 //! Window placement application via SetWindowPos / DeferWindowPos.
 
+use crate::thumbnail::{
+    clear_persistent_previews, commit_persistent_previews, forget_persistent_preview,
+    has_persistent_preview, lock_persistent_preview_transaction, prepare_persistent_preview,
+    PersistentPreviewRequest,
+};
 use crate::types::{AnimationPlacementPolicy, PlatformConfig, Win32Error};
 use crate::window_id_to_hwnd;
 use crate::window_region::{
-    apply_window_region_clip, has_owned_window_region, prepare_window_region_clip,
-    reconcile_window_regions, restore_all_window_regions, restore_window_region, WindowRegionClip,
+    has_owned_window_region, reconcile_window_regions, restore_all_window_regions,
+    restore_window_region, WindowRegionClip,
 };
 use leopardwm_core_layout::{Rect, Visibility, WindowId, WindowPlacement};
 use std::collections::{HashMap, HashSet};
@@ -247,6 +252,7 @@ pub fn dwm_uncloak_window(window_id: WindowId) {
 /// Force-uncloak every tracked window from both sets. Called during
 /// shutdown and panic recovery. Bypasses `apply_cloak_state`.
 pub fn dwm_uncloak_all() {
+    clear_persistent_previews();
     restore_all_window_regions();
     let _commit = lock_cloak_commit();
     let global_ids: Vec<WindowId> = {
@@ -441,9 +447,7 @@ struct DeferEntry {
     visibility: Visibility,
     flags: windows::Win32::UI::WindowsAndMessaging::SET_WINDOW_POS_FLAGS,
     column_index: usize,
-    region_clip_bounds: Option<Rect>,
-    fallback_rect: Option<Rect>,
-    fallback_visibility: Option<Visibility>,
+    preview_source: bool,
 }
 
 /// Apply window placements from the layout engine.
@@ -479,6 +483,7 @@ pub fn apply_placements_with_regions(
         if let Some(cache) = cache {
             cache.clear();
         }
+        clear_persistent_previews();
         // Empty layout is also a hard region-lifecycle boundary.
         restore_all_window_regions();
         // Uncloak all tracked windows — no placements means all previous
@@ -500,6 +505,7 @@ pub fn apply_placements_with_regions(
         .iter()
         .map(|placement| placement.window_id)
         .collect();
+    let _preview_transaction = lock_persistent_preview_transaction();
 
     // Prepare all window entries — visible and off-screen alike.
     // All windows get full position + size with border inset adjustment.
@@ -515,56 +521,57 @@ pub fn apply_placements_with_regions(
     // overlap and the layout gaps disappear.  Zero the insets to keep correct spacing.
     let high_contrast = crate::is_high_contrast_enabled();
 
-    let DeferEntryPlan {
-        mut entries,
-        skipped,
-        stale_region_window_ids,
-    } = build_defer_entries(
-        placements,
-        region_clips,
-        &mut cache,
-        animation_frame,
-        config.animation_placement_policy,
-        high_contrast,
-    );
+    let (entries, preview_requests, new_preview_count, skipped, safe_fallbacks) =
+        build_defer_entries(
+            placements,
+            region_clips,
+            &mut cache,
+            animation_frame,
+            config.animation_placement_policy,
+            high_contrast,
+        );
 
-    // Restrict first, then reveal and move. This removes the frame in which
-    // DWM could previously display a gray rectangular backing surface outside
-    // the owner monitor before SetWindowRgn was committed.
-    let mut failed_window_ids = HashSet::new();
-    let pre_fallbacks =
-        prepare_entry_region_clips(&mut entries, &mut failed_window_ids, animation_frame);
+    uncloak_becoming_visible(&entries);
+    let (applied, failed_window_ids) = position_entries(&entries);
 
-    // Never reveal a window whose safe placement did not land: it is still at
-    // whatever rectangle it had, which may cross into a neighboring monitor.
-    uncloak_becoming_visible(&entries, &failed_window_ids);
+    let committed_preview_requests: Vec<_> = preview_requests
+        .iter()
+        .copied()
+        .filter(|request| !failed_window_ids.contains(&request.window_id))
+        .collect();
 
-    let (applied, position_failures) = position_entries(&entries);
-    failed_window_ids.extend(position_failures);
-    let post_fallbacks =
-        apply_entry_region_clips(&mut entries, &mut failed_window_ids, animation_frame);
-
-    let mut active_clipped_window_ids: HashSet<WindowId> =
-        region_clips.iter().map(|clip| clip.window_id).collect();
-    for entry in &entries {
-        // A window we could not place keeps whatever restrictive region it has:
-        // it is still at its old rectangle, so releasing the region would expose
-        // the very overflow the region was installed to hide.
-        if entry.region_clip_bounds.is_none() && !failed_window_ids.contains(&entry.window_id) {
-            active_clipped_window_ids.remove(&entry.window_id);
+    // The real source is now outside every monitor. Only now may it be
+    // uncloaked and its legacy HRGN removed. A new thumbnail is not published
+    // until DWM has committed that safe source landing.
+    uncloak_preview_sources(&committed_preview_requests);
+    for clip in region_clips {
+        if !failed_window_ids.contains(&clip.window_id) {
+            let _ = restore_window_region(clip.window_id, true);
         }
     }
-    // A hung renderer whose frame was skipped entirely has not moved either, so
-    // its region stays until a later pass can place it.
-    active_clipped_window_ids.extend(stale_region_window_ids.iter().copied());
-    // Regions on windows becoming fully contained keep their old restrictive region until
-    // the move completes; only then is the region removed.
-    reconcile_window_regions(
-        &managed_window_ids,
-        &active_clipped_window_ids,
-        !animation_frame,
+    if preview_commit_needs_flush(
+        animation_frame,
+        new_preview_count,
+        committed_preview_requests.len(),
+    ) {
+        unsafe {
+            let _ = DwmFlush();
+        }
+    }
+    let active_preview_count = commit_persistent_previews(
+        &committed_preview_requests,
+        !animation_frame || new_preview_count > 0,
     );
-    let region_fallbacks = pre_fallbacks + post_fallbacks;
+
+    // If the source move failed, retain an older LeopardWM region rather than
+    // exposing the full foreign HWND. No new SetWindowRgn state is created by
+    // this backend.
+    let preserved_region_ids: HashSet<WindowId> = region_clips
+        .iter()
+        .filter(|clip| failed_window_ids.contains(&clip.window_id))
+        .map(|clip| clip.window_id)
+        .collect();
+    reconcile_window_regions(&managed_window_ids, &preserved_region_ids, !animation_frame);
 
     // Detect size violations by comparing the DWM extended frame bounds
     // (the window's actual visible content area) against the layout rect the
@@ -617,7 +624,12 @@ pub fn apply_placements_with_regions(
     // Routed through `apply_cloak_state` so a window that's also in
     // `GHOST_CLOAKED` stays cloaked even if we remove it from
     // `GLOBAL_CLOAKED` during pruning.
-    sync_cloak_state(&entries, placements, &failed_window_ids);
+    sync_cloak_state(
+        &entries,
+        placements,
+        &failed_window_ids,
+        &committed_preview_requests,
+    );
 
     // DirectComposition swap-chain repair.
     //
@@ -649,10 +661,11 @@ pub fn apply_placements_with_regions(
     }
 
     tracing::debug!(
-        "Applied {} placements ({} skipped unchanged), {} region fallback(s), {} off-screen total",
+        "Applied {} placements ({} skipped unchanged), {} DWM preview(s), {} safe fallback(s), {} off-screen total",
         applied,
         skipped,
-        region_fallbacks,
+        active_preview_count,
+        safe_fallbacks,
         offscreen_count,
     );
 
@@ -764,13 +777,41 @@ fn cached_compositor_sensitive(
     value
 }
 
-/// Outcome of entry building: the placements to apply, how many were skipped,
-/// and the windows whose region must survive this pass because their HWND was
-/// deliberately left where it is.
-struct DeferEntryPlan {
-    entries: Vec<DeferEntry>,
-    skipped: u32,
-    stale_region_window_ids: HashSet<WindowId>,
+fn preview_commit_needs_flush(
+    animation_frame: bool,
+    new_preview_count: usize,
+    committed_preview_count: usize,
+) -> bool {
+    // existing animation frames do not block on DwmFlush; only activation and
+    // the exact landing synchronize with the compositor.
+    new_preview_count > 0 || (!animation_frame && committed_preview_count > 0)
+}
+
+fn persistent_preview_request(
+    window_id: WindowId,
+    target_outer: Rect,
+    clip_bounds: Rect,
+) -> Option<PersistentPreviewRequest> {
+    let left = target_outer.x.max(clip_bounds.x);
+    let top = target_outer.y.max(clip_bounds.y);
+    let right = target_outer.right().min(clip_bounds.right());
+    let bottom = target_outer.bottom().min(clip_bounds.bottom());
+    if right <= left || bottom <= top {
+        return None;
+    }
+    let source = Rect::new(
+        left.saturating_sub(target_outer.x),
+        top.saturating_sub(target_outer.y),
+        right - left,
+        bottom - top,
+    );
+    let destination = Rect::new(left, top, right - left, bottom - top);
+    Some(PersistentPreviewRequest {
+        window_id,
+        source_rect: source,
+        expected_source_size: (target_outer.width.max(1), target_outer.height.max(1)),
+        destination_screen_rect: destination,
+    })
 }
 
 /// Build the defer-entry list for all placements, skipping cache-unchanged windows.
@@ -781,48 +822,89 @@ fn build_defer_entries(
     animation_frame: bool,
     policy: AnimationPlacementPolicy,
     high_contrast: bool,
-) -> DeferEntryPlan {
+) -> (
+    Vec<DeferEntry>,
+    Vec<PersistentPreviewRequest>,
+    usize,
+    u32,
+    u32,
+) {
     let mut skipped = 0u32;
-    let mut stale_region_window_ids: HashSet<WindowId> = HashSet::new();
+    let mut safe_fallbacks = 0u32;
     let mut entries: Vec<DeferEntry> = Vec::with_capacity(placements.len());
+    let mut preview_requests = Vec::with_capacity(region_clips.len());
+    let mut new_preview_count = 0usize;
 
     for requested in placements {
         let region_clip = region_clips
             .iter()
             .find(|clip| clip.window_id == requested.window_id);
-        let placement = requested.clone();
-        let previous = cache
-            .as_ref()
-            .and_then(|cache| cache.positions.get(&placement.window_id).copied());
-        // A requested clip is deliberately revalidated even when geometry is
-        // unchanged, so an application-owned region replacement is detected.
-        if region_clip.is_none() && previous == Some((placement.rect, placement.visibility)) {
-            skipped += 1;
-            continue;
-        }
-        let position_only = animation_move_is_position_only(previous, &placement);
-        let Ok(hwnd) = window_id_to_hwnd(placement.window_id) else {
+        let Ok(hwnd) = window_id_to_hwnd(requested.window_id) else {
             continue;
         };
         unsafe {
             if !IsWindow(Some(hwnd)).as_bool() || IsIconic(hwnd).as_bool() {
                 continue;
             }
-            // Restore maximized tiled windows before positioning — WS_MAXIMIZE
-            // causes some windows to ignore SetWindowPos size changes.
-            // Only for tiled windows (column_index != MAX); floating windows
-            // may be intentionally maximized by the user.
-            if placement.visibility == Visibility::Visible
-                && placement.column_index != usize::MAX
+            if requested.visibility == Visibility::Visible
+                && requested.column_index != usize::MAX
                 && IsZoomed(hwnd).as_bool()
             {
                 let _ = ShowWindow(hwnd, SW_RESTORE);
             }
         }
 
-        let region_managed = region_clip.is_some() || has_owned_window_region(placement.window_id);
+        let (inset_l, inset_t, inset_r, inset_b) = if high_contrast {
+            (0, 0, 0, 0)
+        } else {
+            cached_border_insets(hwnd, requested.window_id, cache.as_deref_mut())
+        };
+        let target_frame_w = requested.rect.width + inset_l + inset_r;
+        let target_frame_h = requested.rect.height + inset_t + inset_b;
+        let target_outer = Rect::new(
+            requested.rect.x - inset_l,
+            requested.rect.y - inset_t,
+            target_frame_w.max(1),
+            target_frame_h.max(1),
+        );
+
+        let mut preview_source = false;
+        let mut placement = requested.clone();
+        let mut preview_request = None;
+        if let Some(clip) = region_clip {
+            placement.rect = clip.fallback_rect;
+            placement.visibility = clip.fallback_visibility;
+            if clip.fallback_visibility != Visibility::Visible
+                && !ghost_cloaked_contains(requested.window_id)
+            {
+                preview_request =
+                    persistent_preview_request(requested.window_id, target_outer, clip.clip_bounds);
+                let preview_existed = has_persistent_preview(requested.window_id);
+                if preview_request.is_some() && prepare_persistent_preview(requested.window_id) {
+                    preview_source = true;
+                    if !preview_existed {
+                        new_preview_count += 1;
+                    }
+                } else {
+                    preview_request = None;
+                    safe_fallbacks += 1;
+                }
+            }
+        }
+
+        let previous = cache
+            .as_ref()
+            .and_then(|cache| cache.positions.get(&placement.window_id).copied());
+        let unchanged = previous == Some((placement.rect, placement.visibility));
+        if unchanged && region_clip.is_none() && !has_owned_window_region(placement.window_id) {
+            skipped += 1;
+            continue;
+        }
+        let position_only = animation_move_is_position_only(previous, &placement);
+        let managed_transition =
+            region_clip.is_some() || has_owned_window_region(placement.window_id) || preview_source;
         let dispatch = if animation_frame {
-            let sensitive = region_managed
+            let sensitive = managed_transition
                 || (policy == AnimationPlacementPolicy::AdaptiveCompositorSafe
                     && cached_compositor_sensitive(
                         hwnd,
@@ -830,9 +912,7 @@ fn build_defer_entries(
                         cache.as_deref_mut(),
                     ));
             let hung = sensitive && unsafe { IsHungAppWindow(hwnd).as_bool() };
-            if region_managed && !hung {
-                // Keep SetWindowRgn and SetWindowPos ordered only for boundary
-                // HWNDs. The normal in-monitor animation path remains async.
+            if managed_transition && !hung {
                 AnimationDispatchMode::Synchronous
             } else {
                 animation_dispatch_mode(policy, sensitive, hung)
@@ -841,27 +921,34 @@ fn build_defer_entries(
             AnimationDispatchMode::Synchronous
         };
         if dispatch == AnimationDispatchMode::SkipHungSensitive {
-            // Do not let a hung renderer pin the persistent animation worker.
-            // Its cache entry stays unchanged, and the bounded exact landing
-            // worker will retry it when the animation finishes. Because the HWND
-            // does not move, any region it owns must stay installed — releasing
-            // it would uncover the overflow at its current rectangle.
-            if region_managed {
-                stale_region_window_ids.insert(placement.window_id);
-            }
             skipped += 1;
             continue;
         }
 
-        let (inset_l, inset_t, inset_r, inset_b) = if high_contrast {
-            (0, 0, 0, 0)
-        } else {
-            cached_border_insets(hwnd, placement.window_id, cache.as_deref_mut())
-        };
-        let frame_w = placement.rect.width + inset_l + inset_r;
-        let frame_h = placement.rect.height + inset_t + inset_b;
+        if let Some(request) = preview_request {
+            preview_requests.push(request);
+        }
 
-        if placement.visibility == Visibility::Visible {
+        if preview_source {
+            let flags = SWP_NOZORDER | SWP_NOACTIVATE;
+            entries.push(DeferEntry {
+                hwnd,
+                window_id: placement.window_id,
+                x: placement.rect.x.saturating_sub(inset_l),
+                y: placement.rect.y.saturating_sub(inset_t),
+                w: target_frame_w.max(1),
+                h: target_frame_h.max(1),
+                layout_rect: placement.rect,
+                used_insets: (inset_l, inset_t, inset_r, inset_b),
+                validate_insets: !high_contrast,
+                visibility: placement.visibility,
+                flags,
+                column_index: placement.column_index,
+                preview_source: true,
+            });
+        } else if placement.visibility == Visibility::Visible {
+            let frame_w = placement.rect.width + inset_l + inset_r;
+            let frame_h = placement.rect.height + inset_t + inset_b;
             let flags = visible_position_flags(animation_frame, dispatch, position_only);
             entries.push(DeferEntry {
                 hwnd,
@@ -876,14 +963,10 @@ fn build_defer_entries(
                 visibility: placement.visibility,
                 flags,
                 column_index: placement.column_index,
-                region_clip_bounds: region_clip.map(|clip| clip.clip_bounds),
-                fallback_rect: region_clip.map(|clip| clip.fallback_rect),
-                fallback_visibility: region_clip.map(|clip| clip.fallback_visibility),
+                preview_source: false,
             });
         } else {
-            // Off-screen: SWP_NOSIZE keeps current size (no resize side-effects).
-            // w stores estimated frame width for clamping only — SetWindowPos
-            // ignores it due to SWP_NOSIZE.
+            let frame_w = placement.rect.width + inset_l + inset_r;
             let (x, y) = offscreen_position(&placement, inset_l, inset_t);
             let mut flags = SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE;
             if animation_frame && dispatch == AnimationDispatchMode::Asynchronous {
@@ -902,176 +985,63 @@ fn build_defer_entries(
                 visibility: placement.visibility,
                 flags,
                 column_index: placement.column_index,
-                region_clip_bounds: region_clip.map(|clip| clip.clip_bounds),
-                fallback_rect: region_clip.map(|clip| clip.fallback_rect),
-                fallback_visibility: region_clip.map(|clip| clip.fallback_visibility),
+                preview_source: false,
             });
         }
     }
 
-    DeferEntryPlan {
+    (
         entries,
+        preview_requests,
+        new_preview_count,
         skipped,
-        stale_region_window_ids,
-    }
-}
-
-fn configure_entry_fallback(entry: &mut DeferEntry, animation_frame: bool) -> bool {
-    let (Some(rect), Some(visibility)) = (entry.fallback_rect, entry.fallback_visibility) else {
-        return false;
-    };
-    let (inset_l, inset_t, inset_r, inset_b) = entry.used_insets;
-    entry.layout_rect = rect;
-    entry.visibility = visibility;
-    entry.region_clip_bounds = None;
-    entry.x = rect.x.saturating_sub(inset_l);
-    entry.y = rect.y.saturating_sub(inset_t);
-    if visibility == Visibility::Visible {
-        entry.w = rect.width.saturating_add(inset_l).saturating_add(inset_r);
-        entry.h = rect.height.saturating_add(inset_t).saturating_add(inset_b);
-        entry.flags = SWP_NOZORDER | SWP_NOACTIVATE;
-        if !animation_frame {
-            entry.flags |= SWP_FRAMECHANGED;
-        }
-    } else {
-        entry.w = 0;
-        entry.h = 0;
-        entry.flags = SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE;
-    }
-    true
-}
-
-fn set_entry_to_fallback(entry: &mut DeferEntry, animation_frame: bool) -> bool {
-    if !configure_entry_fallback(entry, animation_frame) {
-        return false;
-    }
-    unsafe {
-        SetWindowPos(
-            entry.hwnd,
-            None,
-            entry.x,
-            entry.y,
-            entry.w,
-            entry.h,
-            entry.flags,
-        )
-        .is_ok()
-    }
+        safe_fallbacks,
+    )
 }
 
 /// Install a bridge before uncloaking or moving. Unsupported application-owned
 /// regions use the existing safe whole-window fallback before presentation.
-fn prepare_entry_region_clips(
-    entries: &mut [DeferEntry],
-    failed_window_ids: &mut HashSet<u64>,
-    animation_frame: bool,
-) -> u32 {
-    let mut fallback_count = 0;
-    for entry in entries {
-        let Some(clip_bounds) = entry.region_clip_bounds else {
-            continue;
-        };
-        if entry.visibility != Visibility::Visible {
-            // Only a visible placement carries usable frame geometry: a parked
-            // entry is positioned with SWP_NOSIZE and keeps its real size, so a
-            // region derived from its requested rectangle would be meaningless.
-            // Dropping the plan hands it to `reconcile_window_regions`, which
-            // releases the region only after the parking move has landed.
-            entry.region_clip_bounds = None;
-            continue;
-        }
-        let target_outer = Rect::new(entry.x, entry.y, entry.w.max(1), entry.h.max(1));
-        let result = prepare_window_region_clip(
-            entry.window_id,
-            target_outer,
-            entry.layout_rect,
-            clip_bounds,
-        );
-        if result.succeeded() {
-            continue;
-        }
-
-        // Move to the safe geometry now, before `uncloak_becoming_visible` can
-        // reveal this HWND at a position Windows chose for it, and keep any
-        // region already installed until then: releasing it here would leave the
-        // window unclipped at its current boundary-crossing rectangle.
-        // `reconcile_window_regions` performs the release once the batch has
-        // landed, and only for windows whose move succeeded.
-        fallback_count += 1;
-        if !set_entry_to_fallback(entry, animation_frame) {
-            failed_window_ids.insert(entry.window_id);
+fn uncloak_preview_sources(requests: &[PersistentPreviewRequest]) {
+    if requests.is_empty() {
+        return;
+    }
+    let _commit = lock_cloak_commit();
+    let mut changed = Vec::new();
+    {
+        let mut cloaked = lock_cloaked();
+        if let Some(ref mut set) = *cloaked {
+            for request in requests {
+                if set.remove(&request.window_id) {
+                    changed.push(request.window_id);
+                }
+            }
         }
     }
-    fallback_count
+    for window_id in changed {
+        let _ = apply_cloak_state_locked(window_id);
+    }
 }
 
-/// Commit requested regions after the HWND batch lands. A rare ownership or
-/// Win32 failure is converted immediately to the precomputed safe fallback so
-/// no frame is allowed to leak into a neighboring monitor.
-fn apply_entry_region_clips(
-    entries: &mut [DeferEntry],
-    failed_window_ids: &mut HashSet<u64>,
-    animation_frame: bool,
-) -> u32 {
-    let mut fallback_count = 0;
-    for entry in entries {
-        let Some(clip_bounds) = entry.region_clip_bounds else {
-            continue;
-        };
-        if failed_window_ids.contains(&entry.window_id) {
-            continue;
-        }
-        if entry.visibility != Visibility::Visible {
-            entry.region_clip_bounds = None;
-            continue;
-        }
-        let outer_rect = Rect::new(entry.x, entry.y, entry.w.max(1), entry.h.max(1));
-        let result = apply_window_region_clip(
-            entry.window_id,
-            outer_rect,
-            entry.layout_rect,
-            clip_bounds,
-            !animation_frame,
-        );
-        if result.succeeded() {
-            continue;
-        }
-        if animation_frame && has_owned_window_region(entry.window_id) {
-            // Intermediate frame: the bridge installed before the move is safe at
-            // this position by construction, so keep it and let the exact landing
-            // pass reconcile the geometry once the application settles. Forcing
-            // the fallback here would pop a column off-monitor mid-animation.
-            continue;
-        }
-
-        fallback_count += 1;
-        // Move to the safe rectangle first, then release the region. The
-        // fallback is either contained by the owner work area or clear of every
-        // monitor, so a still-restrictive region cannot strand it, while
-        // releasing first would flash the unclipped overflow on the neighbor.
-        // A failed fallback move deliberately keeps the region installed.
-        if set_entry_to_fallback(entry, animation_frame) {
-            let _ = restore_window_region(entry.window_id, !animation_frame);
-        } else {
-            failed_window_ids.insert(entry.window_id);
-        }
-    }
-    fallback_count
+fn should_cloak_entry(
+    entry: &DeferEntry,
+    placement_exists: bool,
+    positioning_failed: bool,
+) -> bool {
+    placement_exists
+        && !positioning_failed
+        && entry.visibility != Visibility::Visible
+        && !entry.preview_source
 }
 
 /// Uncloak entries becoming visible and drop them from the tracking set.
-fn uncloak_becoming_visible(entries: &[DeferEntry], failed_window_ids: &HashSet<WindowId>) {
+fn uncloak_becoming_visible(entries: &[DeferEntry]) {
     let _commit = lock_cloak_commit();
     let to_consider: Vec<WindowId> = {
         let mut cloaked = lock_cloaked();
         if let Some(ref mut set) = *cloaked {
             entries
                 .iter()
-                .filter(|e| {
-                    e.visibility == Visibility::Visible
-                        && !failed_window_ids.contains(&e.window_id)
-                        && set.remove(&e.window_id)
-                })
+                .filter(|e| e.visibility == Visibility::Visible && set.remove(&e.window_id))
                 .map(|e| e.window_id)
                 .collect()
         } else {
@@ -1204,6 +1174,7 @@ fn lock_suspected_oversize() -> std::sync::MutexGuard<'static, Option<HashMap<u6
 /// Drop a window's suspect state. Called when a window is destroyed/unmanaged so
 /// the set stays bounded and a recycled HWND starts fresh.
 pub fn clear_suspected_oversize(window_id: WindowId) {
+    forget_persistent_preview(window_id);
     crate::window_region::forget_window_region(window_id);
     let mut guard = lock_suspected_oversize();
     if let Some(map) = guard.as_mut() {
@@ -1449,38 +1420,60 @@ fn sync_cloak_state(
     entries: &[DeferEntry],
     placements: &[WindowPlacement],
     failed_window_ids: &HashSet<u64>,
+    preview_requests: &[PersistentPreviewRequest],
 ) {
+    let preview_ids: HashSet<WindowId> = preview_requests
+        .iter()
+        .map(|request| request.window_id)
+        .collect();
     let _commit = lock_cloak_commit();
-    let (to_cloak, to_uncloak): (Vec<WindowId>, Vec<WindowId>) = {
-        let mut cloaked = lock_cloaked();
-        let set = cloaked.get_or_insert_with(HashSet::new);
-
-        let cloak: Vec<WindowId> = entries
+    let mut changed: Vec<WindowId> = Vec::new();
+    {
+        let mut guard = lock_cloaked();
+        let cloaked = guard.get_or_insert_with(HashSet::new);
+        for entry in entries {
+            if failed_window_ids.contains(&entry.window_id) {
+                continue;
+            }
+            let placement_exists = placements
+                .iter()
+                .any(|placement| placement.window_id == entry.window_id);
+            let should_cloak = should_cloak_entry(
+                entry,
+                placement_exists,
+                failed_window_ids.contains(&entry.window_id),
+            );
+            if should_cloak {
+                if cloaked.insert(entry.window_id) {
+                    changed.push(entry.window_id);
+                }
+            } else if cloaked.remove(&entry.window_id) {
+                changed.push(entry.window_id);
+            }
+        }
+        for window_id in &preview_ids {
+            if cloaked.remove(window_id) {
+                changed.push(*window_id);
+            }
+        }
+        let current_ids: HashSet<u64> = placements
             .iter()
-            .filter(|e| {
-                !failed_window_ids.contains(&e.window_id)
-                    && e.visibility != Visibility::Visible
-                    && set.insert(e.window_id)
-            })
-            .map(|e| e.window_id)
+            .map(|placement| placement.window_id)
             .collect();
-
-        // Prune windows no longer in the layout (e.g., workspace switch).
-        let current_ids: HashSet<u64> = placements.iter().map(|p| p.window_id).collect();
-        let uncloak: Vec<WindowId> = set
+        let stale: Vec<WindowId> = cloaked
             .iter()
-            .filter(|id| !current_ids.contains(id))
+            .filter(|window_id| !current_ids.contains(window_id))
             .copied()
             .collect();
-        set.retain(|id| current_ids.contains(id));
-
-        (cloak, uncloak)
-    };
-    for wid in to_cloak {
-        let _ = apply_cloak_state_locked(wid);
+        for window_id in stale {
+            cloaked.remove(&window_id);
+            changed.push(window_id);
+        }
     }
-    for wid in to_uncloak {
-        let _ = apply_cloak_state_locked(wid);
+    changed.sort_unstable();
+    changed.dedup();
+    for window_id in changed {
+        let _ = apply_cloak_state_locked(window_id);
     }
 }
 
@@ -2018,5 +2011,89 @@ mod tests {
             let mut g = lock_ghost_cloaked();
             g.get_or_insert_with(HashSet::new).insert(wid);
         }
+    }
+}
+
+#[cfg(test)]
+mod persistent_preview_placement_tests {
+    use super::{persistent_preview_request, should_cloak_entry, DeferEntry};
+    use leopardwm_core_layout::{Rect, Visibility};
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::SET_WINDOW_POS_FLAGS;
+
+    fn preview_entry() -> DeferEntry {
+        DeferEntry {
+            hwnd: HWND::default(),
+            window_id: 1,
+            x: 0,
+            y: 0,
+            w: 750,
+            h: 800,
+            layout_rect: Rect::new(0, 0, 750, 800),
+            used_insets: (0, 0, 0, 0),
+            validate_insets: false,
+            visibility: Visibility::OffScreenLeft,
+            flags: SET_WINDOW_POS_FLAGS::default(),
+            column_index: 0,
+            preview_source: true,
+        }
+    }
+
+    #[test]
+    fn new_preview_flushes_once_but_existing_animation_frames_do_not() {
+        assert!(super::preview_commit_needs_flush(true, 1, 1));
+        assert!(!super::preview_commit_needs_flush(true, 0, 1));
+        assert!(super::preview_commit_needs_flush(false, 0, 1));
+        assert!(!super::preview_commit_needs_flush(false, 0, 0));
+    }
+
+    #[test]
+    fn left_preview_is_cropped_strictly_to_the_owner_monitor() {
+        let request = persistent_preview_request(
+            1,
+            Rect::new(500, 0, 750, 800),
+            Rect::new(1000, 0, 1000, 800),
+        )
+        .unwrap();
+        assert_eq!(request.source_rect, Rect::new(500, 0, 250, 800));
+        assert_eq!(
+            request.destination_screen_rect,
+            Rect::new(1000, 0, 250, 800)
+        );
+        assert_eq!(request.expected_source_size, (750, 800));
+        assert!(!request
+            .destination_screen_rect
+            .intersects(&Rect::new(0, 0, 1000, 800)));
+    }
+
+    #[test]
+    fn right_preview_is_symmetric_and_cannot_touch_the_next_monitor() {
+        let request = persistent_preview_request(
+            1,
+            Rect::new(1750, 0, 750, 800),
+            Rect::new(1000, 0, 1000, 800),
+        )
+        .unwrap();
+        assert_eq!(request.source_rect, Rect::new(0, 0, 250, 800));
+        assert_eq!(
+            request.destination_screen_rect,
+            Rect::new(1750, 0, 250, 800)
+        );
+        assert!(!request
+            .destination_screen_rect
+            .intersects(&Rect::new(2000, 0, 1000, 800)));
+    }
+
+    #[test]
+    fn preview_source_remains_uncloaked_while_ordinary_offscreen_windows_cloak() {
+        let preview = preview_entry();
+        assert!(!should_cloak_entry(&preview, true, false));
+        let ordinary = DeferEntry {
+            preview_source: false,
+            ..preview
+        };
+        assert!(should_cloak_entry(&ordinary, true, false));
+        assert!(!should_cloak_entry(&ordinary, false, false));
+        assert!(!should_cloak_entry(&ordinary, true, true));
     }
 }
