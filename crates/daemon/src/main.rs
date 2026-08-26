@@ -1902,6 +1902,13 @@ async fn handle_gesture_event(ctx: &mut EventLoopCtx<'_>, gesture_event: Gesture
         GestureEvent::ScrollDown => &gesture_config.scroll_down,
     };
 
+    // A blank action is how the Settings GUI (and config.toml) turns a single
+    // gesture off. Treat it as a deliberate no-op instead of an unknown command.
+    if cmd_str.trim().is_empty() || cmd_str.eq_ignore_ascii_case("none") {
+        debug!("Gesture {:?} has no action configured", gesture_event);
+        return false;
+    }
+
     if let Some(cmd) = config::parse_command(cmd_str) {
         debug!("Gesture {:?} triggered, executing {:?}", gesture_event, cmd);
         if let Some(mode) = shutdown_mode_for_command(&cmd) {

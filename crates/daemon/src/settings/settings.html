@@ -927,6 +927,7 @@ input[type="range"]::-webkit-slider-thumb {
       <!-- Layout -->
       <div id="sec-layout" class="section active">
         <h2 class="section-title">Layout</h2>
+        <p class="section-desc">Windows sit on a horizontal strip and each monitor is a viewport that scrolls over it. These settings control spacing, where the focused column lands, and the sizes new windows start at.</p>
         <div class="card">
           <div class="field">
             <div class="field-info"><div class="field-label">Gap</div><div class="field-desc">Space between columns and between stacked windows (px)</div></div>
@@ -964,9 +965,9 @@ input[type="range"]::-webkit-slider-thumb {
             <label class="toggle"><input type="checkbox" id="layout-center_past_edges"><span class="track"></span><span class="thumb"></span></label>
           </div>
           <div class="field">
-            <div class="field-info"><div class="field-label">Monitor overflow</div><div class="field-desc">Show partial neighboring columns without painting on another monitor</div></div>
+            <div class="field-info"><div class="field-label">Monitor overflow</div><div class="field-desc">What happens to a column that reaches past this monitor onto the next one. <strong>Clip at monitor edge</strong> keeps the part inside this monitor visible as a preview and hides the rest. <strong>Hide whole window</strong> moves the whole window out of sight instead. Either way nothing is ever painted on a neighboring monitor; on a single monitor this setting has no effect.</div></div>
             <select id="layout-monitor_overflow">
-              <option value="clip">Clip at monitor edge</option>
+              <option value="clip">Clip at monitor edge (show a preview)</option>
               <option value="hide">Hide whole window</option>
             </select>
           </div>
@@ -1027,6 +1028,7 @@ input[type="range"]::-webkit-slider-thumb {
       <!-- Appearance -->
       <div id="sec-appearance" class="section">
         <h2 class="section-title">Appearance</h2>
+        <p class="section-desc">Focus border and tab strip styling. Colors accept any hex value; the border follows the system highlight color in high contrast mode.</p>
         <div class="card">
           <div class="info-bar" id="hc-info-bar" hidden>
             <svg class="info-bar-icon" viewBox="0 0 16 16">
@@ -1089,11 +1091,20 @@ input[type="range"]::-webkit-slider-thumb {
       <!-- Behavior -->
       <div id="sec-behavior" class="section">
         <h2 class="section-title">Behavior</h2>
+        <p class="section-desc">Startup, focus, dragging, rendering, and diagnostics. Changes save automatically and apply to the running daemon.</p>
+        <h3 class="section-subtitle">Startup and updates</h3>
         <div class="card">
           <div class="field">
             <div class="field-info"><div class="field-label">Start with Windows</div><div class="field-desc">Automatically launch LeopardWM when you sign in to Windows</div></div>
             <label class="toggle"><input type="checkbox" id="startup-auto_start" data-no-config><span class="track"></span><span class="thumb"></span></label>
           </div>
+          <div class="field">
+            <div class="field-info"><div class="field-label">Check for updates</div><div class="field-desc">Ask GitHub Releases once a day whether a newer version exists and show a tray notification. No data is sent about you; turn off to disable the check entirely.</div></div>
+            <label class="toggle"><input type="checkbox" id="behavior-check_for_updates"><span class="track"></span><span class="thumb"></span></label>
+          </div>
+        </div>
+        <h3 class="section-subtitle">Focus</h3>
+        <div class="card">
           <div class="field">
             <div class="field-info"><div class="field-label">Focus new windows</div><div class="field-desc">Automatically focus newly opened windows</div></div>
             <label class="toggle"><input type="checkbox" id="behavior-focus_new_windows"><span class="track"></span><span class="thumb"></span></label>
@@ -1122,6 +1133,9 @@ input[type="range"]::-webkit-slider-thumb {
             <div class="field-info"><div class="field-label">Fullscreen follows focus</div><div class="field-desc">Carry fullscreen to the next focused window (monocle) instead of dropping to the tiled layout. Turn off so fullscreen affects only the one window</div></div>
             <label class="toggle"><input type="checkbox" id="behavior-fullscreen_follows_focus"><span class="track"></span><span class="thumb"></span></label>
           </div>
+        </div>
+        <h3 class="section-subtitle">Windows and dragging</h3>
+        <div class="card">
           <div class="field">
             <div class="field-info"><div class="field-label">Disable snap layouts</div><div class="field-desc">Prevent Windows 11 edge-drag snapping for tiled windows</div></div>
             <label class="toggle"><input type="checkbox" id="behavior-disable_snap_layouts"><span class="track"></span><span class="thumb"></span></label>
@@ -1133,14 +1147,6 @@ input[type="range"]::-webkit-slider-thumb {
           <div class="field">
             <div class="field-info"><div class="field-label">Allow drag to merge windows</div><div class="field-desc">Drop over a column to consume into it. Turn off to keep dragged windows as standalone columns; Ctrl+Alt at drag start temporarily bypasses merging.</div></div>
             <label class="toggle"><input type="checkbox" id="behavior-drag_to_merge"><span class="track"></span><span class="thumb"></span></label>
-          </div>
-          <div class="field">
-            <div class="field-info"><div class="field-label">Adaptive compositor-safe animation</div><div class="field-desc">Keep position-only scrolling smooth while serializing GPU-backed windows per frame. Size-changing transitions use a safe DWM ghost or one exact landing.</div></div>
-            <label class="toggle"><input type="checkbox" id="behavior-compositor_safe_mode"><span class="track"></span><span class="thumb"></span></label>
-          </div>
-          <div class="field">
-            <div class="field-info"><div class="field-label">DWM thumbnail animation (experimental)</div><div class="field-desc">Use a live DWM ghost for size-changing transitions when Windows can safely hide the source. Otherwise adaptive mode performs an exact landing.</div></div>
-            <label class="toggle"><input type="checkbox" id="behavior-swap_chain_ghost_animation"><span class="track"></span><span class="thumb"></span></label>
           </div>
           <div class="field">
             <div class="field-info"><div class="field-label">Hide taskbar buttons for off-screen windows</div><div class="field-desc">Hide a window's taskbar button while it's on another workspace or scrolled out of view. Floating and minimized windows always keep theirs.</div></div>
@@ -1157,6 +1163,28 @@ input[type="range"]::-webkit-slider-thumb {
             </div>
           </div>
           <div class="field">
+            <div class="field-info"><div class="field-label">Tab close action</div><div class="field-desc">What X-button click and middle-click do to a tab</div></div>
+            <div class="combobox" id="cb-behavior-tab_close_action">
+              <button class="combobox-trigger" type="button"><span class="combobox-text">Close window</span><svg class="combobox-chevron" viewBox="0 0 12 12"><path d="M2.15 4.65a.5.5 0 01.7 0L6 7.79l3.15-3.14a.5.5 0 11.7.7l-3.5 3.5a.5.5 0 01-.7 0l-3.5-3.5a.5.5 0 010-.7z"/></svg></button>
+              <div class="combobox-popup">
+                <div class="combobox-option selected" data-value="close_window">Close window</div>
+                <div class="combobox-option" data-value="untab">Untab</div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <h3 class="section-subtitle">Rendering</h3>
+        <p class="section-desc">How windows are moved on screen. Leave adaptive mode on unless an app misrenders while scrolling.</p>
+        <div class="card">
+          <div class="field">
+            <div class="field-info"><div class="field-label">Adaptive compositor-safe animation</div><div class="field-desc">Keep position-only scrolling smooth while serializing GPU-backed windows per frame. Size-changing transitions use a safe DWM ghost or one exact landing.</div></div>
+            <label class="toggle"><input type="checkbox" id="behavior-compositor_safe_mode"><span class="track"></span><span class="thumb"></span></label>
+          </div>
+          <div class="field">
+            <div class="field-info"><div class="field-label">DWM thumbnail animation (experimental)</div><div class="field-desc">Use a live DWM ghost for size-changing transitions when Windows can safely hide the source. Otherwise adaptive mode performs an exact landing.</div></div>
+            <label class="toggle"><input type="checkbox" id="behavior-swap_chain_ghost_animation"><span class="track"></span><span class="thumb"></span></label>
+          </div>
+          <div class="field">
             <div class="field-info"><div class="field-label">Overview previews</div><div class="field-desc">Card contents in the workspace overview: live window previews, snapshots captured when windows leave the screen, or placeholder icons</div></div>
             <div class="combobox" id="cb-overview-render">
               <button class="combobox-trigger" type="button"><span class="combobox-text">Live previews</span><svg class="combobox-chevron" viewBox="0 0 12 12"><path d="M2.15 4.65a.5.5 0 01.7 0L6 7.79l3.15-3.14a.5.5 0 11.7.7l-3.5 3.5a.5.5 0 01-.7 0l-3.5-3.5a.5.5 0 010-.7z"/></svg></button>
@@ -1167,18 +1195,11 @@ input[type="range"]::-webkit-slider-thumb {
               </div>
             </div>
           </div>
+        </div>
+        <h3 class="section-subtitle">Diagnostics</h3>
+        <div class="card">
           <div class="field">
-            <div class="field-info"><div class="field-label">Tab close action</div><div class="field-desc">What X-button click and middle-click do to a tab</div></div>
-            <div class="combobox" id="cb-behavior-tab_close_action">
-              <button class="combobox-trigger" type="button"><span class="combobox-text">Close window</span><svg class="combobox-chevron" viewBox="0 0 12 12"><path d="M2.15 4.65a.5.5 0 01.7 0L6 7.79l3.15-3.14a.5.5 0 11.7.7l-3.5 3.5a.5.5 0 01-.7 0l-3.5-3.5a.5.5 0 010-.7z"/></svg></button>
-              <div class="combobox-popup">
-                <div class="combobox-option selected" data-value="close_window">Close window</div>
-                <div class="combobox-option" data-value="untab">Untab</div>
-              </div>
-            </div>
-          </div>
-          <div class="field">
-            <div class="field-info"><div class="field-label">Log level</div><div class="field-desc">Daemon logging verbosity</div></div>
+            <div class="field-info"><div class="field-label">Log level</div><div class="field-desc">Daemon logging verbosity. Debug and trace are for troubleshooting only; the log lives in <code>%LOCALAPPDATA%\leopardwm\logs</code>.</div></div>
             <div class="combobox" id="cb-behavior-log_level">
               <button class="combobox-trigger" type="button"><span class="combobox-text">Info</span><svg class="combobox-chevron" viewBox="0 0 12 12"><path d="M2.15 4.65a.5.5 0 01.7 0L6 7.79l3.15-3.14a.5.5 0 11.7.7l-3.5 3.5a.5.5 0 01-.7 0l-3.5-3.5a.5.5 0 010-.7z"/></svg></button>
               <div class="combobox-popup">
@@ -1232,6 +1253,7 @@ input[type="range"]::-webkit-slider-thumb {
       <!-- Hotkeys -->
       <div id="sec-hotkeys" class="section">
         <h2 class="section-title">Hotkeys</h2>
+        <p class="section-desc">Click a key binding and press the shortcut you want. Clear a binding to disable that command; it stays disabled instead of returning to its default. The scroll modifier row sets the chord held while turning the wheel.</p>
         <div class="info-bar warning" id="hotkey-warn-bar" hidden>
           <svg class="info-bar-icon" viewBox="0 0 20 20" aria-hidden="true">
             <path d="M10 2.2a1.3 1.3 0 0 1 1.13.66l7.3 12.64A1.3 1.3 0 0 1 17.3 17.5H2.7a1.3 1.3 0 0 1-1.13-1.95L8.87 2.86A1.3 1.3 0 0 1 10 2.2Zm0 9.55a.85.85 0 0 0 .85-.85V7.4a.85.85 0 0 0-1.7 0v3.5c0 .47.38.85.85.85Zm0 1.2a.95.95 0 1 0 0 1.9.95.95 0 0 0 0-1.9Z"/>
@@ -1253,6 +1275,7 @@ input[type="range"]::-webkit-slider-thumb {
       <!-- Rules -->
       <div id="sec-rules" class="section">
         <h2 class="section-title">Window rules</h2>
+        <p class="section-desc">Per-app overrides matched on window class, title, or executable. Use them to float, ignore, or force-tile an app, and to set how it opens (workspace, width, maximized). Leave a match field blank to ignore it.</p>
         <div class="table-wrap">
           <table>
             <thead><tr><th>Class</th><th>Title</th><th>Executable</th><th>Action</th><th title="Per-app open behavior">Options</th><th style="width:36px"></th></tr></thead>
@@ -1265,6 +1288,7 @@ input[type="range"]::-webkit-slider-thumb {
       <!-- Gestures -->
       <div id="sec-gestures" class="section">
         <h2 class="section-title">Gestures</h2>
+        <p class="section-desc">Three-finger touchpad swipes and modifier + wheel scrolling. Pick <strong>No action</strong> to turn a single gesture off, or the toggle below to disable all of them.</p>
         <div class="card">
           <div class="field">
             <div class="field-info"><div class="field-label">Enable gestures</div><div class="field-desc">Enable touchpad gesture support</div></div>
@@ -1300,6 +1324,7 @@ input[type="range"]::-webkit-slider-thumb {
       <!-- Snap Hints -->
       <div id="sec-snaphints" class="section">
         <h2 class="section-title">Snap hints</h2>
+        <p class="section-desc">Translucent overlay shown while resizing a column with the mouse, marking where the edge will land.</p>
         <div class="card">
           <div class="field">
             <div class="field-info"><div class="field-label">Enable snap hints</div><div class="field-desc">Show visual feedback during resize operations</div></div>
@@ -1531,18 +1556,24 @@ function cbVal(id) {
   var el = document.getElementById(id);
   return el ? (el.dataset.value || '') : '';
 }
-function setCb(id, value) {
+/* `showUnknown` keeps a value this build does not list visible in the trigger
+   instead of silently displaying the first option, so saving cannot quietly
+   rewrite a setting the user configured by hand. */
+function setCb(id, value, showUnknown) {
   var cb = document.getElementById(id);
   if (!cb) return;
   cb.dataset.value = value;
+  var matched = false;
   var opts = cb.querySelectorAll('.combobox-option');
   opts.forEach(function(o) {
     o.classList.remove('selected');
     if (o.dataset.value === value) {
       o.classList.add('selected');
+      matched = true;
       cb.querySelector('.combobox-text').textContent = o.textContent;
     }
   });
+  if (!matched && showUnknown) cb.querySelector('.combobox-text').textContent = value;
 }
 function hexToInput(hex) { return '#' + (hex || '000000').toLowerCase(); }
 function inputToHex(v) { return v.replace('#', '').toUpperCase(); }
@@ -1587,6 +1618,7 @@ function init(cfg) {
   }
 
   setChecked('startup-auto_start', !!cfg.auto_start);
+  setChecked('behavior-check_for_updates', cfg.behavior.check_for_updates !== false);
   setChecked('behavior-focus_new_windows', cfg.behavior.focus_new_windows);
   setChecked('behavior-track_focus_changes', cfg.behavior.track_focus_changes);
   setChecked('behavior-focus_follows_mouse', cfg.behavior.focus_follows_mouse);
@@ -1623,12 +1655,12 @@ function init(cfg) {
   if (cfg.window_rules) { cfg.window_rules.forEach(function(r) { addRuleRow(r); }); }
 
   setChecked('gestures-enabled', cfg.gestures.enabled);
-  setCb('cb-gestures-swipe_left', cfg.gestures.swipe_left);
-  setCb('cb-gestures-swipe_right', cfg.gestures.swipe_right);
-  setCb('cb-gestures-swipe_up', cfg.gestures.swipe_up);
-  setCb('cb-gestures-swipe_down', cfg.gestures.swipe_down);
-  setCb('cb-gestures-scroll_up', cfg.gestures.scroll_up);
-  setCb('cb-gestures-scroll_down', cfg.gestures.scroll_down);
+  setCb('cb-gestures-swipe_left', cfg.gestures.swipe_left, true);
+  setCb('cb-gestures-swipe_right', cfg.gestures.swipe_right, true);
+  setCb('cb-gestures-swipe_up', cfg.gestures.swipe_up, true);
+  setCb('cb-gestures-swipe_down', cfg.gestures.swipe_down, true);
+  setCb('cb-gestures-scroll_up', cfg.gestures.scroll_up, true);
+  setCb('cb-gestures-scroll_down', cfg.gestures.scroll_down, true);
   updateScrollLabels();
 
   setChecked('snaphints-enabled', cfg.snap_hints.enabled);
@@ -1705,10 +1737,14 @@ function initGestureCombo(id) {
   if (!cb) return;
   var chevron = '<svg class="combobox-chevron" viewBox="0 0 12 12"><path d="M2.15 4.65a.5.5 0 01.7 0L6 7.79l3.15-3.14a.5.5 0 11.7.7l-3.5 3.5a.5.5 0 01-.7 0l-3.5-3.5a.5.5 0 010-.7z"/></svg>';
   var current = cb.dataset.value || '';
-  var options = CMD_ORDER.map(function(cmd) {
-    return '<div class="combobox-option' + (cmd === current ? ' selected' : '') + '" data-value="' + cmd + '">' + cmdLabel(cmd) + '</div>';
-  }).join('');
-  cb.innerHTML = '<button class="combobox-trigger" type="button"><span class="combobox-text">' + cmdLabel(current) + '</span>' + chevron + '</button>' +
+  /* An empty action is a real choice: it turns the gesture off without having
+     to edit config.toml. The daemon treats a blank command as "do nothing". */
+  var options = '<div class="combobox-option' + (current === '' ? ' selected' : '') + '" data-value="">No action</div>' +
+    CMD_ORDER.map(function(cmd) {
+      return '<div class="combobox-option' + (cmd === current ? ' selected' : '') + '" data-value="' + cmd + '">' + cmdLabel(cmd) + '</div>';
+    }).join('');
+  var currentLabel = current === '' ? 'No action' : cmdLabel(current);
+  cb.innerHTML = '<button class="combobox-trigger" type="button"><span class="combobox-text">' + currentLabel + '</span>' + chevron + '</button>' +
     '<div class="combobox-popup">' + options + '</div>';
   initCombobox(cb);
 }
@@ -2208,7 +2244,7 @@ function readConfig() {
       compositor_safe_mode: checked('behavior-compositor_safe_mode'),
       swap_chain_ghost_animation: checked('behavior-swap_chain_ghost_animation'),
       hide_offscreen_taskbar_buttons: checked('behavior-hide_offscreen_taskbar_buttons'),
-      check_for_updates: window._initConfig.behavior.check_for_updates,
+      check_for_updates: checked('behavior-check_for_updates'),
       log_level: cbVal('cb-behavior-log_level'),
       tab_close_action: cbVal('cb-behavior-tab_close_action'),
       new_window_placement: cbVal('cb-behavior-new_window_placement')

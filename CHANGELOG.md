@@ -2,7 +2,23 @@
 
 All notable changes to LeopardWM will be documented in this file.
 
-## Unreleased
+## 0.2.6-sehoon.16
+
+### Improvements
+
+- **Clearer Settings page.** Every section now opens with a short explanation of
+  what it controls, and the Behavior page is split into labeled groups — Startup
+  and updates, Focus, Windows and dragging, Rendering, Diagnostics, Animation —
+  instead of one long list. The multi-monitor overflow control spells out what
+  each mode does and that neither mode ever paints on a neighboring monitor.
+- **Update checking is now a GUI setting.** `behavior.check_for_updates` used to
+  be editable only by hand in `config.toml`; the Settings page carried the loaded
+  value through invisibly. It is a normal toggle under Startup and updates now.
+- **Gestures can be switched off one at a time from the GUI.** Each swipe and
+  scroll direction offers *No action*, and a command this build does not know
+  stays visible in the control instead of being silently replaced on save. A
+  blank or `none` gesture action is treated as a deliberate no-op by the daemon
+  rather than logged as an unknown command.
 
 ### Fixes
 
