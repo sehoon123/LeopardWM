@@ -26,7 +26,7 @@ pub mod taskbar;
 pub mod thumbnail;
 pub mod toast;
 
-pub use preview_input::{PreviewClickEvent, PreviewClickTarget};
+pub use preview_input::{PreviewClickEvent, PreviewClickTarget, PreviewGesture};
 pub use tab_strip::{TabAction, TabActionEvent, TabCloseAction};
 
 mod elevation;
@@ -57,8 +57,8 @@ pub use enumeration::{
 };
 pub use event_hooks::{install_event_hooks, EventHookHandle, WindowEvent};
 pub use focus::{
-    close_window, get_foreground_window, ms_since_last_user_input, set_foreground_window,
-    warp_cursor_to_window,
+    begin_window_move_drag, close_window, get_foreground_window, ms_since_last_user_input,
+    set_foreground_window, warp_cursor_to_window,
 };
 pub use placement::clear_suspected_oversize;
 pub use placement::{
@@ -77,9 +77,9 @@ pub use types::{
 };
 pub use visibility::{
     cascade_windows, is_move_offscreen_sentinel_position, is_move_offscreen_sentinel_rect,
-    move_window_offscreen, position_window, restore_all_windows_moved_offscreen_best_effort,
-    restore_window_moved_offscreen, restore_windows_moved_offscreen, uncloak_all_managed_windows,
-    uncloak_all_visible_windows,
+    move_window_offscreen, position_window, raise_window,
+    restore_all_windows_moved_offscreen_best_effort, restore_window_moved_offscreen,
+    restore_windows_moved_offscreen, uncloak_all_managed_windows, uncloak_all_visible_windows,
 };
 pub use window_query::{
     cursor_is_over_window, get_cursor_pos, get_window_chrome_rect, get_window_corner_radius,

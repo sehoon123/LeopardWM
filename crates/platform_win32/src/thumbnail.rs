@@ -413,9 +413,14 @@ fn publish_preview_requests(
             let Some(preview) = previews.get_mut(&request.window_id) else {
                 continue;
             };
-            if refresh_size
-                && (preview.expected_source_size != Some(request.expected_source_size)
-                    || preview.source_size.is_none())
+            // A missing source size is always re-queried, even on an
+            // intermediate frame: DWM can refuse the query transiently (a UWP
+            // host still settling, for example) and without this the preview
+            // would stay unpublished until some later event happened to force a
+            // size-refreshing pass.
+            if preview.source_size.is_none()
+                || (refresh_size
+                    && preview.expected_source_size != Some(request.expected_source_size))
             {
                 preview.source_size = source_size(preview.handle.as_isize());
                 preview.expected_source_size = Some(request.expected_source_size);
@@ -462,23 +467,29 @@ pub(crate) fn commit_persistent_previews(
             .any(|request| request.window_id == *window_id)
     });
     let live = published.len().min(previews.len());
+    let registered: Vec<WindowId> = previews.keys().copied().collect();
     drop(previews);
     // A thumbnail is pixels only, so the strip needs its own click target for
     // the scroll-first gesture of clicking a partially visible column.
-    crate::preview_input::sync_preview_click_targets(&preview_click_targets(requests, &published));
+    crate::preview_input::sync_preview_click_targets(&preview_click_targets(requests, &registered));
     live
 }
 
-/// Click targets for the previews that are actually on screen: one per request
-/// that published, covering exactly the rectangle its thumbnail is drawn into.
+/// Click targets for the previews this frame owns: one per request whose
+/// thumbnail registration is alive, covering exactly the rectangle the thumbnail
+/// is drawn into.
 ///
-/// Requests that failed to publish are skipped deliberately — their source is
-/// already parked off-monitor, so an overlay there would swallow clicks over a
-/// region showing nothing of ours. Duplicate ids collapse to their first
-/// request so a single overlay is never created twice and orphaned.
+/// Keyed on the registration rather than on this frame's publish result. A
+/// publish can fail transiently while the source stays parked off-monitor, and
+/// gating the overlay on it left the edge strip dead until some later event
+/// forced another pass — the user had to click the opposite edge and come back.
+/// The registration is the honest signal that this column is represented at the
+/// edge; `clear_persistent_previews` and the reconcile below drop the overlay as
+/// soon as it is not. Duplicate ids collapse to their first request so a single
+/// overlay is never created twice and orphaned.
 pub(crate) fn preview_click_targets(
     requests: &[PersistentPreviewRequest],
-    published: &[WindowId],
+    registered: &[WindowId],
 ) -> Vec<crate::preview_input::PreviewClickTarget> {
     let mut targets: Vec<crate::preview_input::PreviewClickTarget> = Vec::new();
     for request in requests {
@@ -486,7 +497,7 @@ pub(crate) fn preview_click_targets(
         {
             continue;
         }
-        if !published.contains(&request.window_id) {
+        if !registered.contains(&request.window_id) {
             continue;
         }
         if targets
@@ -980,9 +991,9 @@ mod preview_click_target_tests {
     }
 
     #[test]
-    fn only_published_previews_get_a_click_target() {
+    fn only_registered_previews_get_a_click_target() {
         let requests = [request(1, 0, 250), request(2, 1670, 250)];
-        // Window 2 failed to publish: its source is already parked off-monitor,
+        // Window 2 has no live registration — nothing represents it at the edge,
         // so an overlay there would swallow clicks over nothing of ours.
         let targets = preview_click_targets(&requests, &[1]);
         assert_eq!(targets.len(), 1);
@@ -991,7 +1002,15 @@ mod preview_click_target_tests {
     }
 
     #[test]
-    fn nothing_published_means_no_click_targets() {
+    fn a_registered_preview_stays_clickable_across_a_failed_publish() {
+        // The registration is the contract: a transient DWM publish failure must
+        // not leave the edge strip dead until another event forces a pass.
+        let requests = [request(1, 0, 250)];
+        assert_eq!(preview_click_targets(&requests, &[1]).len(), 1);
+    }
+
+    #[test]
+    fn nothing_registered_means_no_click_targets() {
         let requests = [request(1, 0, 250)];
         assert!(preview_click_targets(&requests, &[]).is_empty());
     }

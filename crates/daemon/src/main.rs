@@ -1121,10 +1121,11 @@ async fn spawn_tab_forwarders(
         match std::thread::Builder::new()
             .name("preview-click-forwarder".into())
             .spawn(move || {
-                while let Ok(click) = preview_click_rx.recv() {
+                while let Ok(gesture) = preview_click_rx.recv() {
                     if event_tx_for_preview
-                        .blocking_send(DaemonEvent::PreviewClick {
-                            window_id: click.window_id,
+                        .blocking_send(DaemonEvent::PreviewGesture {
+                            window_id: gesture.window_id,
+                            gesture: gesture.gesture,
                         })
                         .is_err()
                     {
@@ -2383,7 +2384,11 @@ async fn spawn_debounced_save(state: &Arc<Mutex<AppState>>, event_tx: &mpsc::Sen
 /// click cannot reach the window itself. Resolving it through the layout keeps
 /// the scroll-first gesture intact: the clicked column becomes focused, which
 /// scrolls it into view, and the OS foreground follows.
-async fn handle_preview_click(ctx: &mut EventLoopCtx<'_>, window_id: u64) {
+async fn handle_preview_gesture(
+    ctx: &mut EventLoopCtx<'_>,
+    window_id: u64,
+    gesture: leopardwm_platform_win32::PreviewGesture,
+) {
     let mut state = ctx.state.lock().await;
     // The overview owns the screen while it is open and its model is not rebuilt
     // from here, so a click queued before it opened must not move focus behind it.
@@ -2407,6 +2412,22 @@ async fn handle_preview_click(ctx: &mut EventLoopCtx<'_>, window_id: u64) {
         state.focus_column_in_active_workspace(monitor_id, column_idx, window_in_column)
     {
         warn!("Preview click focus failed: {}", message);
+    }
+
+    // A drag continues in the window itself. Settle the scroll first so the
+    // window is where the user is about to drag it from, then hand the pointer
+    // over: Windows' move loop produces the same MOVESIZESTART/END pair as a
+    // title-bar drag, so drag-to-move and drag-to-merge apply unchanged.
+    if matches!(gesture, leopardwm_platform_win32::PreviewGesture::Drag) {
+        state.settle_scroll_animations();
+        if let Err(error) = state.apply_layout() {
+            warn!("Preview drag apply failed: {}", error);
+        }
+        #[cfg(not(test))]
+        if let Err(error) = leopardwm_platform_win32::begin_window_move_drag(window_id) {
+            debug!("Preview drag hand-off failed for {window_id:#x}: {error}");
+        }
+        return;
     }
 
     // `ensure_focused_visible_animated` starts a scroll animation; without
@@ -3435,8 +3456,8 @@ async fn main() -> Result<()> {
                 handle_tab_action(&state, monitor, workspace_idx, column_idx, tab_idx, action)
                     .await;
             }
-            DaemonEvent::PreviewClick { window_id } => {
-                handle_preview_click(&mut ctx, window_id).await;
+            DaemonEvent::PreviewGesture { window_id, gesture } => {
+                handle_preview_gesture(&mut ctx, window_id, gesture).await;
             }
             DaemonEvent::TabRenameSubmitted {
                 monitor,

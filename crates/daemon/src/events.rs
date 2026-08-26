@@ -81,11 +81,16 @@ pub(crate) enum DaemonEvent {
         tab_idx: usize,
         action: TabAction,
     },
-    /// The user clicked a monitor-edge preview. A preview is a DWM thumbnail,
-    /// so the click lands on its overlay rather than on the previewed window;
-    /// the overlay reports which window it was showing and the daemon focuses
-    /// that column, which also scrolls it into view.
-    PreviewClick { window_id: u64 },
+    /// A pointer gesture on a monitor-edge preview. A preview is a DWM
+    /// thumbnail, so the pointer lands on its overlay rather than on the
+    /// previewed window; the overlay reports which window it was showing and
+    /// what the pointer did. A click focuses that column, which also scrolls it
+    /// into view; a drag focuses it and then hands the pointer to the window so
+    /// Windows' own move loop takes over.
+    PreviewGesture {
+        window_id: u64,
+        gesture: leopardwm_platform_win32::PreviewGesture,
+    },
     /// Low-frequency tick that triggers a tab-strip refresh so background
     /// icon changes (notification badges, app icon swaps that don't
     /// accompany a title change) propagate without user interaction.

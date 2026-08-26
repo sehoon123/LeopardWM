@@ -11,7 +11,7 @@ use std::ffi::c_void;
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowRect, IsIconic, IsWindow, SetWindowPos, ShowWindow, HWND_TOP, SWP_NOACTIVATE,
-    SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_RESTORE,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_RESTORE,
 };
 
 // ============================================================================
@@ -87,6 +87,31 @@ pub fn position_window(window_id: WindowId, rect: Rect) -> Result<(), Win32Error
         })?;
     }
     Ok(())
+}
+
+/// Raise a window to the top of the normal (non-topmost) band without moving,
+/// resizing or activating it.
+///
+/// Focus and z-order are separate in Windows: a floating window sits above the
+/// tiled band by design, so focusing a tiled column through an explicit pointer
+/// action would otherwise leave the clicked window behind the float that was
+/// there before. Raising is reversible — clicking the float brings it back.
+pub fn raise_window(window_id: WindowId) -> Result<(), Win32Error> {
+    let hwnd = window_id_to_hwnd(window_id)?;
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            Some(HWND_TOP),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        )
+        .map_err(|e| {
+            Win32Error::SetPositionFailed(format!("Failed to raise window {window_id}: {e}"))
+        })
+    }
 }
 
 #[allow(dead_code)]

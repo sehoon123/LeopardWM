@@ -22,23 +22,39 @@ use std::collections::HashMap;
 use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock};
 use tracing::warn;
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Graphics::Gdi::{
+    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, PAINTSTRUCT,
+};
+use windows::Win32::UI::Controls::WM_MOUSELEAVE;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW,
-    GetWindowLongPtrW, PostThreadMessageW, RegisterClassW, SetLayeredWindowAttributes,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, GWLP_USERDATA, HWND_TOPMOST,
-    LWA_ALPHA, MA_NOACTIVATE, MSG, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE,
-    WM_APP, WM_LBUTTONDOWN, WM_MOUSEACTIVATE, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW,
+    GetSystemMetrics, GetWindowLongPtrW, IsWindowVisible, LoadCursorW, PostThreadMessageW,
+    RegisterClassW, SetCursor, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, TranslateMessage, GWLP_USERDATA, HWND_TOPMOST, IDC_HAND, LWA_ALPHA, MA_NOACTIVATE,
+    MSG, SM_CXDRAG, SM_CYDRAG, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, WM_APP,
+    WM_CAPTURECHANGED, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_PAINT,
+    WM_SETCURSOR, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_POPUP,
 };
 
 const PREVIEW_TARGET_CLASS: &str = "LeopardWMPreviewClickTarget";
+/// Hover wash colour in BGR, matching the default active-border blue.
+const HOVER_WASH_BGR: u32 = 0x00F4_7E43;
 /// Wakes the pump after new desired state has been queued.
 const WM_PREVIEW_SYNC: u32 = WM_APP + 0x51;
 /// Nearly invisible, still hit-testable. Uniform-alpha layered windows keep
 /// normal hit testing; only `WS_EX_TRANSPARENT` or per-pixel alpha of zero make
 /// a window click-through, and 1/255 over a thumbnail is not perceivable.
 const TARGET_ALPHA: u8 = 1;
+/// Alpha while the pointer is over a preview. A preview is a still image of a
+/// window that is not there, so nothing else signals that it can be clicked;
+/// a light wash is the smallest honest affordance and doubles as the hit-test
+/// boundary made visible.
+const HOVER_ALPHA: u8 = 38;
 
 /// One previewed window and the screen rectangle its thumbnail occupies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,11 +63,22 @@ pub struct PreviewClickTarget {
     pub rect: Rect,
 }
 
-/// A click on a preview. Carries the previewed window, not a screen point, so
-/// the daemon focuses the column the user actually saw.
+/// What the pointer did on a preview.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewGesture {
+    /// Press and release without travelling: focus the column.
+    Click,
+    /// Press and drag past the system drag threshold: focus the column, then
+    /// hand the pointer to the real window so Windows' own move loop takes over.
+    Drag,
+}
+
+/// A pointer gesture on a preview. Carries the previewed window rather than a
+/// screen point, so the daemon acts on the column the user actually saw.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PreviewClickEvent {
     pub window_id: WindowId,
+    pub gesture: PreviewGesture,
 }
 
 struct PreviewInput {
@@ -82,13 +109,26 @@ pub fn clear_click_sender() {
         .unwrap_or_else(crate::recover_poisoned_mutex) = None;
 }
 
-fn emit_click(window_id: WindowId) {
+fn emit_gesture(window_id: WindowId, gesture: PreviewGesture) {
     let guard = click_sender()
         .lock()
         .unwrap_or_else(crate::recover_poisoned_mutex);
     if let Some(sender) = guard.as_ref() {
-        let _ = sender.send(PreviewClickEvent { window_id });
+        let _ = sender.send(PreviewClickEvent { window_id, gesture });
     }
+}
+
+/// Whether pointer travel since the press exceeds the system drag threshold.
+///
+/// `SM_CXDRAG`/`SM_CYDRAG` is the same threshold Explorer uses, so a click that
+/// wobbles by a pixel stays a click.
+pub(crate) fn travelled_past_drag_threshold(
+    press: (i32, i32),
+    current: (i32, i32),
+    threshold: (i32, i32),
+) -> bool {
+    (current.0 - press.0).abs() > threshold.0.max(1)
+        || (current.1 - press.1).abs() > threshold.1.max(1)
 }
 
 /// Reconcile the overlays with the previews that are currently published.
@@ -311,6 +351,20 @@ unsafe fn reconcile_targets(class: &[u16], windows_by_id: &mut HashMap<WindowId,
                 let _ = ShowWindow(hwnd, SW_HIDE);
                 continue;
             }
+            // Re-assert the topmost band only when the overlay was hidden: a
+            // window that was not visible may have lost its place in the band,
+            // while a per-frame re-pin would fight the tab strip.
+            if !IsWindowVisible(hwnd).as_bool() {
+                let _ = SetWindowPos(
+                    hwnd,
+                    Some(HWND_TOPMOST),
+                    target.rect.x,
+                    target.rect.y,
+                    target.rect.width,
+                    target.rect.height,
+                    SWP_NOACTIVATE,
+                );
+            }
             // Move only. Re-pinning to the top of the topmost band on every
             // animation frame would fight the tab strip, which pins itself the
             // same way, making a click on a tabbed edge column land
@@ -329,25 +383,173 @@ unsafe fn reconcile_targets(class: &[u16], windows_by_id: &mut HashMap<WindowId,
     }
 }
 
+/// Pointer state of the press in progress, in screen coordinates. Only the
+/// overlay thread touches this, so a plain `Cell` pair is enough.
+struct PressState {
+    origin: (i32, i32),
+    handed_off: bool,
+}
+
+thread_local! {
+    static PRESS: std::cell::RefCell<Option<PressState>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Turn the hover wash on or off, arming `WM_MOUSELEAVE` the first time the
+/// pointer arrives so the wash cannot get stuck on.
+fn set_hover(hwnd: HWND, hovering: bool) {
+    let alpha = if hovering { HOVER_ALPHA } else { TARGET_ALPHA };
+    unsafe {
+        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA);
+    }
+    if hovering {
+        let mut track = TRACKMOUSEEVENT {
+            cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+            dwFlags: TME_LEAVE,
+            hwndTrack: hwnd,
+            dwHoverTime: 0,
+        };
+        unsafe {
+            let _ = TrackMouseEvent(&mut track);
+        }
+    }
+}
+
+fn window_id_of(hwnd: HWND) -> WindowId {
+    unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as WindowId }
+}
+
+fn cursor_screen_point(lparam: LPARAM) -> (i32, i32) {
+    // WM_MOUSEMOVE carries client coordinates; the overlay is a plain popup, so
+    // its client origin is its screen origin plus nothing, but read the real
+    // cursor instead of trusting that.
+    let mut point = POINT::default();
+    if unsafe { GetCursorPos(&mut point) }.is_ok() {
+        return (point.x, point.y);
+    }
+    let packed = lparam.0 as u32;
+    (
+        (packed & 0xFFFF) as i16 as i32,
+        (packed >> 16) as i16 as i32,
+    )
+}
+
 unsafe extern "system" fn target_proc(
     hwnd: HWND,
     message: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    // Clicking a preview must not activate this overlay, or the click would
-    // steal focus from the window the daemon is about to focus.
+    // Interacting with a preview must not activate this overlay, or the pointer
+    // would steal focus from the window the daemon is about to focus.
     if message == WM_MOUSEACTIVATE {
         return LRESULT(MA_NOACTIVATE as isize);
     }
-    if message == WM_LBUTTONDOWN {
-        let window_id = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as WindowId;
-        if window_id != 0 {
-            emit_click(window_id);
+
+    match message {
+        WM_PAINT => {
+            // The wash is only visible while hovering, because the window's
+            // uniform alpha is 1/255 otherwise.
+            let mut paint = PAINTSTRUCT::default();
+            let hdc = unsafe { BeginPaint(hwnd, &mut paint) };
+            if !hdc.is_invalid() {
+                let brush = unsafe { CreateSolidBrush(COLORREF(HOVER_WASH_BGR)) };
+                if !brush.is_invalid() {
+                    unsafe {
+                        let _ = FillRect(hdc, &paint.rcPaint, brush);
+                        let _ = DeleteObject(brush.into());
+                    }
+                }
+                unsafe {
+                    let _ = EndPaint(hwnd, &paint);
+                }
+            }
+            LRESULT(0)
         }
-        return LRESULT(0);
+        WM_SETCURSOR => {
+            // A hand says "this is a control", which is exactly what a preview
+            // is: clicking focuses its column.
+            if let Ok(cursor) = unsafe { LoadCursorW(None, IDC_HAND) } {
+                unsafe { SetCursor(Some(cursor)) };
+                return LRESULT(1);
+            }
+            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
+        }
+        WM_MOUSELEAVE => {
+            set_hover(hwnd, false);
+            LRESULT(0)
+        }
+        WM_LBUTTONDOWN => {
+            // Capture so the drag threshold can be measured even after the
+            // pointer leaves the strip, and release it before handing off.
+            unsafe { SetCapture(hwnd) };
+            PRESS.with(|press| {
+                *press.borrow_mut() = Some(PressState {
+                    origin: cursor_screen_point(lparam),
+                    handed_off: false,
+                });
+            });
+            LRESULT(0)
+        }
+        WM_MOUSEMOVE => {
+            set_hover(hwnd, true);
+            let travelled = PRESS.with(|press| {
+                let mut press = press.borrow_mut();
+                let Some(state) = press.as_mut() else {
+                    return false;
+                };
+                if state.handed_off {
+                    return false;
+                }
+                let threshold =
+                    unsafe { (GetSystemMetrics(SM_CXDRAG), GetSystemMetrics(SM_CYDRAG)) };
+                if travelled_past_drag_threshold(
+                    state.origin,
+                    cursor_screen_point(lparam),
+                    threshold,
+                ) {
+                    state.handed_off = true;
+                    true
+                } else {
+                    false
+                }
+            });
+            if travelled {
+                let window_id = window_id_of(hwnd);
+                // Let go of the pointer first: the window's own move loop needs
+                // the capture, and it starts as soon as the daemon hands it over.
+                unsafe {
+                    let _ = ReleaseCapture();
+                }
+                if window_id != 0 {
+                    emit_gesture(window_id, PreviewGesture::Drag);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_LBUTTONUP => {
+            let was_click = PRESS.with(|press| {
+                press
+                    .borrow_mut()
+                    .take()
+                    .is_some_and(|state| !state.handed_off)
+            });
+            unsafe {
+                let _ = ReleaseCapture();
+            }
+            if was_click {
+                let window_id = window_id_of(hwnd);
+                if window_id != 0 {
+                    emit_gesture(window_id, PreviewGesture::Click);
+                }
+            }
+            LRESULT(0)
+        }
+        WM_CAPTURECHANGED => {
+            PRESS.with(|press| *press.borrow_mut() = None);
+            LRESULT(0)
+        }
+        _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },
     }
-    unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
 }
 
 #[cfg(test)]
@@ -385,6 +587,31 @@ mod tests {
         assert!(create.is_empty());
         assert_eq!(update, vec![target(2, 1670, 250)]);
         assert_eq!(drop, vec![1]);
+    }
+
+    #[test]
+    fn a_wobbling_press_stays_a_click() {
+        assert!(!super::travelled_past_drag_threshold(
+            (100, 100),
+            (103, 101),
+            (4, 4)
+        ));
+        assert!(super::travelled_past_drag_threshold(
+            (100, 100),
+            (120, 100),
+            (4, 4)
+        ));
+        assert!(super::travelled_past_drag_threshold(
+            (100, 100),
+            (100, 80),
+            (4, 4)
+        ));
+        // A zero threshold from a broken metric must not make every move a drag.
+        assert!(!super::travelled_past_drag_threshold(
+            (100, 100),
+            (101, 100),
+            (0, 0)
+        ));
     }
 
     #[test]

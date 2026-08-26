@@ -4,6 +4,23 @@ use crate::state::*;
 use leopardwm_platform_win32::get_process_executable;
 use tracing::{debug, info};
 
+/// Whether a tabbed column's strip can be shown without leaving its monitor.
+///
+/// The strip spans the column's full width, so a partially visible column at a
+/// monitor edge would paint and hit-test outside the owner. Pure so the policy
+/// is testable without Win32.
+pub(crate) fn tab_strip_fits_owner(
+    column_rect: leopardwm_core_layout::Rect,
+    owner: Option<&leopardwm_platform_win32::MonitorInfo>,
+) -> bool {
+    // Without monitor geometry there is nothing to clip against; keep the strip
+    // rather than silently dropping chrome.
+    let Some(owner) = owner else {
+        return true;
+    };
+    column_rect.x >= owner.rect.x && column_rect.right() <= owner.rect.right()
+}
+
 impl AppState {
     /// Convert the config border color (hex RGB string) to BGR u32 for Win32.
     /// When high contrast mode is active, returns the system highlight color instead.
@@ -364,6 +381,14 @@ impl AppState {
                 let Some(rect) = self.compute_window_layout_rect(visible_hwnd) else {
                     continue;
                 };
+                // A column that reaches past its monitor is represented at the
+                // edge by a cropped preview, but the strip is a full-width
+                // layered window: showing it would paint tabs, and accept
+                // clicks, on the neighbouring monitor. Skip it until the column
+                // is fully on its own monitor again.
+                if !tab_strip_fits_owner(rect, self.monitors.get(&monitor)) {
+                    continue;
+                }
                 let stored_active = col.active_tab_idx().unwrap_or(visible_tab);
                 let active_idx = if col.get(stored_active).is_some_and(|w| !ws.is_minimized(w)) {
                     stored_active
@@ -521,4 +546,60 @@ pub(crate) fn hex_rgb_to_bgr(hex: &str) -> Option<u32> {
     let g = (color >> 8) & 0xFF;
     let b = color & 0xFF;
     Some((b << 16) | (g << 8) | r)
+}
+
+#[cfg(test)]
+mod tab_strip_clip_tests {
+    use super::tab_strip_fits_owner;
+    use leopardwm_core_layout::Rect;
+    use leopardwm_platform_win32::MonitorInfo;
+
+    fn monitor(x: i32, width: i32) -> MonitorInfo {
+        let rect = Rect::new(x, 0, width, 1080);
+        MonitorInfo {
+            id: 1,
+            rect,
+            work_area: rect,
+            is_primary: true,
+            device_name: "DISPLAY1".to_string(),
+            scale_factor: 1.0,
+        }
+    }
+
+    #[test]
+    fn a_fully_visible_column_keeps_its_strip() {
+        let owner = monitor(0, 1920);
+        assert!(tab_strip_fits_owner(
+            Rect::new(100, 20, 800, 900),
+            Some(&owner)
+        ));
+        // Flush against both edges still fits.
+        assert!(tab_strip_fits_owner(
+            Rect::new(0, 20, 1920, 900),
+            Some(&owner)
+        ));
+    }
+
+    #[test]
+    fn a_column_reaching_past_either_edge_drops_its_strip() {
+        let owner = monitor(0, 1920);
+        // Right-edge preview: the strip would paint on the next monitor.
+        assert!(!tab_strip_fits_owner(
+            Rect::new(1700, 20, 800, 900),
+            Some(&owner)
+        ));
+        // Left-edge preview on a monitor that does not start at zero.
+        let right_monitor = monitor(1920, 1920);
+        assert!(!tab_strip_fits_owner(
+            Rect::new(1700, 20, 800, 900),
+            Some(&right_monitor)
+        ));
+    }
+
+    #[test]
+    fn unknown_monitor_geometry_keeps_the_strip() {
+        // Dropping chrome because geometry is momentarily unknown would be worse
+        // than a rare overhang.
+        assert!(tab_strip_fits_owner(Rect::new(1700, 20, 800, 900), None));
+    }
 }

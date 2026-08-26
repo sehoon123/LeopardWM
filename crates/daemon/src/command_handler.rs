@@ -283,6 +283,22 @@ impl AppState {
         if let Some(error) = focus_error {
             return IpcResponse::error(format!("Failed to focus column: {error}"));
         }
+
+        // Focus and z-order are independent in Windows. A floating window sits
+        // above the tiled band by design, so without this the clicked column
+        // takes keyboard focus while the float that was in front stays in front
+        // and looks focused. Raising is reversible: clicking the float, or
+        // summoning the scratchpad again, brings it back to the top.
+        #[cfg(not(test))]
+        if let Some(hwnd) = self
+            .focused_workspace()
+            .and_then(|workspace| workspace.focused_visible_window())
+        {
+            if let Err(error) = leopardwm_platform_win32::raise_window(hwnd) {
+                debug!("Could not raise clicked window {hwnd:#x}: {error}");
+            }
+        }
+
         response
     }
 

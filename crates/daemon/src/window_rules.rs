@@ -5,7 +5,7 @@ use crate::state::*;
 use anyhow::Result;
 use leopardwm_core_layout::Rect;
 use leopardwm_platform_win32::{
-    enumerate_windows, find_monitor_for_rect, get_process_executable, scale_px, MonitorId,
+    find_monitor_for_rect, get_process_executable, scale_px, MonitorId,
 };
 use tracing::{debug, info, warn};
 
@@ -120,9 +120,27 @@ impl AppState {
         }
     }
 
+    /// Windows the OS reports as manageable.
+    ///
+    /// Unit tests inject their fixtures through `injected_window_info` instead of
+    /// enumerating the developer's live desktop: an `AppState` in a test is a
+    /// fixture, and pulling real windows into it made assertions depend on
+    /// whatever happened to be open (and let config reload strip
+    /// `WS_MAXIMIZEBOX` from them).
+    fn manageable_windows(&self) -> Result<Vec<leopardwm_platform_win32::WindowInfo>> {
+        #[cfg(test)]
+        {
+            let mut windows: Vec<_> = self.injected_window_info.values().cloned().collect();
+            windows.sort_by_key(|info| info.hwnd);
+            Ok(windows)
+        }
+        #[cfg(not(test))]
+        leopardwm_platform_win32::enumerate_windows().map_err(anyhow::Error::from)
+    }
+
     /// Enumerate windows and add them to the appropriate workspace based on position.
     pub(crate) fn enumerate_and_add_windows(&mut self) -> Result<usize> {
-        let windows = enumerate_windows()?;
+        let windows = self.manageable_windows()?;
         let monitors: Vec<_> = self.monitors.values().cloned().collect();
         let mut added = 0;
 

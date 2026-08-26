@@ -110,6 +110,20 @@ impl AppState {
 
     /// Tick all active animations by the given delta time.
     /// Returns true if any animation is still running.
+    /// Land every in-flight scroll animation immediately.
+    ///
+    /// Used when the pointer is about to act on a window's real geometry: a
+    /// half-finished scroll would hand over a window that is still moving.
+    pub(crate) fn settle_scroll_animations(&mut self) {
+        for ws_vec in self.workspaces.values_mut() {
+            for workspace in ws_vec.iter_mut() {
+                if workspace.is_animating() {
+                    workspace.stop_animation();
+                }
+            }
+        }
+    }
+
     pub(crate) fn tick_animations(&mut self, delta_ms: u64) -> bool {
         let mut still_animating = false;
         let mut scroll_anims_settled = false;

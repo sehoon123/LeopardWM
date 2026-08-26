@@ -2,6 +2,48 @@
 
 All notable changes to LeopardWM will be documented in this file.
 
+## 0.2.6-sehoon.21
+
+### Fixes
+
+- **A preview no longer stops responding to clicks.** Click targets followed each
+  frame's publish result, so a transient `DwmUpdateThumbnailProperties` failure
+  left the edge strip dead until some later event forced another pass — the fix
+  was to click the opposite edge and come back. They now follow the thumbnail
+  *registration*, which is the honest signal that a column is represented at the
+  edge, and a missing source size is re-queried on every frame instead of only on
+  size-refreshing passes. An overlay that was hidden also re-asserts its place in
+  the topmost band when it returns.
+- **Clicking a preview now brings its window in front of a floating window.**
+  Focus and z-order are independent in Windows: the click moved keyboard focus,
+  but a floating window (dialog, summoned scratchpad, sticky pin) stayed in front
+  and looked focused. An explicit pointer focus now raises the clicked window
+  within the normal band, which clicking the float reverses.
+- **A tabbed column at a monitor edge no longer paints its tab strip on the
+  neighbouring monitor.** The strip spans the column's full width, so a column
+  represented at the edge by a cropped preview drew tabs — and accepted clicks —
+  outside its own monitor. Its strip is now withheld until the column is fully on
+  its own monitor.
+
+### Features
+
+- **Drag a window in from its preview.** Pressing a preview and moving past the
+  system drag threshold settles the scroll, then hands the pointer to the real
+  window through `WM_NCLBUTTONDOWN`/`HTCAPTION`, so Windows' own move loop takes
+  over and existing drag-to-move and drag-to-merge behaviour applies unchanged. A
+  press that does not travel stays a click.
+- **Previews say they are interactive.** Hovering one washes it with the accent
+  colour and shows a hand cursor, so a still image of a window that is parked
+  off-monitor no longer looks inert.
+
+### Improvements
+
+- **Unit tests no longer enumerate the developer's desktop.** `AppState` reads
+  window fixtures from `injected_window_info` in test builds, so config reload,
+  refresh and rule evaluation are hermetic instead of depending on which windows
+  happen to be open (which had `test_snap_config_toggle_on` passing or failing by
+  accident).
+
 ## 0.2.6-sehoon.19
 
 ### Fixes

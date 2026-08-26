@@ -186,6 +186,42 @@ pub fn set_foreground_window(hwnd: WindowId) -> Result<bool, Win32Error> {
     }
 }
 
+/// Hand an in-progress pointer press to `window_id` so Windows starts its own
+/// window move loop for it.
+///
+/// Posting `WM_NCLBUTTONDOWN` with `HTCAPTION` is how a drag handle outside a
+/// window hands over to that window: the application enters the standard modal
+/// move loop, which follows the cursor and ends on button-up. The window manager
+/// then sees the same `EVENT_SYSTEM_MOVESIZESTART`/`END` pair it already handles
+/// for an ordinary title-bar drag, so drag-to-move and drag-to-merge behave
+/// identically to dragging the window directly.
+///
+/// The caller must have released mouse capture first, and the physical button
+/// must still be down, or the loop exits immediately.
+pub fn begin_window_move_drag(window_id: WindowId) -> Result<(), Win32Error> {
+    const WM_NCLBUTTONDOWN: u32 = 0x00A1;
+    const HTCAPTION: usize = 2;
+    let hwnd = window_id_to_hwnd(window_id)?;
+    let mut cursor = windows::Win32::Foundation::POINT::default();
+    unsafe {
+        windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut cursor)
+            .map_err(|e| Win32Error::SetPositionFailed(format!("GetCursorPos failed: {e}")))?;
+        let packed = ((cursor.y as u32) << 16) | (cursor.x as u32 & 0xFFFF);
+        PostMessageW(
+            Some(hwnd),
+            WM_NCLBUTTONDOWN,
+            windows::Win32::Foundation::WPARAM(HTCAPTION),
+            windows::Win32::Foundation::LPARAM(packed as isize),
+        )
+        .map_err(|e| {
+            Win32Error::SetPositionFailed(format!(
+                "PostMessageW(WM_NCLBUTTONDOWN) failed for window {window_id}: {e}"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
 /// Close a window by posting WM_CLOSE.
 ///
 /// This is a graceful close that allows the application to handle cleanup.

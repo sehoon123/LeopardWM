@@ -233,6 +233,37 @@ fn test_preview_click_focuses_the_clicked_column_without_switching_workspaces() 
 }
 
 #[test]
+fn test_settling_scroll_animations_lands_every_workspace() {
+    // A drag from a preview hands the pointer to the real window, so any
+    // in-flight scroll must land first: otherwise the window is still moving
+    // when Windows' move loop takes over.
+    let mut state = AppState::new_with_config(test_config(), two_monitors());
+    state.paused = true;
+    let viewport = state.layout_viewport(1);
+    {
+        let workspace = &mut state.workspaces.get_mut(&1).unwrap()[0];
+        workspace.insert_window(100, Some(900)).unwrap();
+        workspace.insert_window(101, Some(1000)).unwrap();
+        workspace.insert_window(102, Some(900)).unwrap();
+        workspace.set_focus(0, 0).unwrap();
+        workspace.ensure_focused_visible(viewport.width);
+        workspace.set_focus(2, 0).unwrap();
+        workspace.ensure_focused_visible_animated(viewport.width);
+    }
+    assert!(state.workspaces[&1][0].is_animating());
+
+    state.settle_scroll_animations();
+
+    assert!(!state.workspaces[&1][0].is_animating());
+    // Landing means the offset is the animation target, not an interpolation.
+    let workspace = &state.workspaces[&1][0];
+    assert_eq!(
+        workspace.scroll_offset(),
+        workspace.effective_scroll_offset()
+    );
+}
+
+#[test]
 fn test_preview_click_on_a_tabbed_column_activates_that_tab() {
     let mut state = AppState::new_with_config(test_config(), two_monitors());
     state.paused = true;
