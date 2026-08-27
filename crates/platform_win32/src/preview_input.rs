@@ -21,26 +21,30 @@ use leopardwm_core_layout::{Rect, WindowId};
 use std::collections::HashMap;
 use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock};
-use tracing::warn;
+use tracing::{debug, warn};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, PAINTSTRUCT,
 };
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+    GetAsyncKeyState, ReleaseCapture, SetCapture, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+    VK_LBUTTON,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetCursorPos, GetMessageW,
-    GetSystemMetrics, GetWindowLongPtrW, IsWindowVisible, LoadCursorW, PostThreadMessageW,
-    RegisterClassW, SetCursor, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos,
-    ShowWindow, TranslateMessage, GWLP_USERDATA, HWND_TOP, IDC_HAND, LWA_ALPHA, MA_NOACTIVATE, MSG,
-    SM_CXDRAG, SM_CYDRAG, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, WM_APP,
-    WM_CAPTURECHANGED, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_PAINT,
-    WM_SETCURSOR, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+    GetSystemMetrics, GetWindowLongPtrW, IsWindow, LoadCursorW, PostThreadMessageW, RegisterClassW,
+    SetCursor, SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    TranslateMessage, GWLP_USERDATA, HWND_TOP, IDC_HAND, LWA_ALPHA, MA_NOACTIVATE, MSG, SM_CXDRAG,
+    SM_CYDRAG, SWP_NOACTIVATE, SW_HIDE, SW_SHOWNOACTIVATE, WM_APP, WM_CAPTURECHANGED,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_PAINT, WM_SETCURSOR,
+    WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 const PREVIEW_TARGET_CLASS: &str = "LeopardWMPreviewClickTarget";
+/// `MK_LBUTTON` from `WM_MOUSEMOVE`'s `wparam`. Declared here because the
+/// `windows` crate exposes it behind a feature this crate does not need.
+const MOUSE_MOVE_LBUTTON_DOWN: usize = 0x0001;
 /// Hover wash colour in BGR, matching the default active-border blue.
 const HOVER_WASH_BGR: u32 = 0x00F4_7E43;
 /// Wakes the pump after new desired state has been queued.
@@ -112,8 +116,16 @@ fn emit_gesture(window_id: WindowId, gesture: PreviewGesture) {
     let guard = click_sender()
         .lock()
         .unwrap_or_else(crate::recover_poisoned_mutex);
-    if let Some(sender) = guard.as_ref() {
-        let _ = sender.send(PreviewClickEvent { window_id, gesture });
+    // A gesture that goes nowhere looks exactly like a dead preview to the user,
+    // and both ways to lose it here are silent, so both are logged: the daemon
+    // may not have installed a route yet, and its forwarder may have exited.
+    let Some(sender) = guard.as_ref() else {
+        warn!("Preview {gesture:?} on {window_id:#x} dropped: no click route installed");
+        return;
+    };
+    match sender.send(PreviewClickEvent { window_id, gesture }) {
+        Ok(()) => debug!("Preview {gesture:?} on {window_id:#x} sent"),
+        Err(error) => warn!("Preview {gesture:?} on {window_id:#x} dropped: {error}"),
     }
 }
 
@@ -148,14 +160,59 @@ pub fn sync_preview_click_targets(targets: &[PreviewClickTarget]) {
         }
         *desired = targets.to_vec();
     }
-    unsafe {
-        let _ = PostThreadMessageW(input.thread_id, WM_PREVIEW_SYNC, WPARAM(0), LPARAM(0));
+    // The wake is the only thing that turns desired state into windows. If it is
+    // lost the state above already matches this call, so an identical next
+    // publish would be deduplicated into a no-op and the previews would stay
+    // dead. Forget the state instead, which forces the next publish to retry.
+    if let Err(error) =
+        unsafe { PostThreadMessageW(input.thread_id, WM_PREVIEW_SYNC, WPARAM(0), LPARAM(0)) }
+    {
+        warn!("Preview click target sync could not be posted, retrying next frame: {error}");
+        input
+            .desired
+            .lock()
+            .unwrap_or_else(crate::recover_poisoned_mutex)
+            .clear();
     }
 }
 
 /// Drop every overlay, e.g. when the last preview disappears or on shutdown.
 pub fn clear_preview_click_targets() {
     sync_preview_click_targets(&[]);
+}
+
+/// Drop the overlays whose window is not in `keep`, leaving the rest in place.
+///
+/// Used when a single preview disappears: the surviving previews are still on
+/// screen, so taking their overlays away would make them look dead until some
+/// later frame republished them.
+pub fn retain_preview_click_targets(keep: &[WindowId]) {
+    let Some(input) = input() else {
+        return;
+    };
+    let remaining: Vec<PreviewClickTarget> = {
+        let desired = input
+            .desired
+            .lock()
+            .unwrap_or_else(crate::recover_poisoned_mutex);
+        desired
+            .iter()
+            .copied()
+            .filter(|target| keep.contains(&target.window_id))
+            .collect()
+    };
+    sync_preview_click_targets(&remaining);
+}
+
+/// Ask the pump to reconcile against the desired state it already has. Used
+/// after a press ends, because a teardown deferred for that press is still due.
+fn request_sync() {
+    let Some(input) = input() else {
+        return;
+    };
+    unsafe {
+        let _ = PostThreadMessageW(input.thread_id, WM_PREVIEW_SYNC, WPARAM(0), LPARAM(0));
+    }
 }
 
 fn input() -> Option<&'static PreviewInput> {
@@ -276,119 +333,151 @@ unsafe fn reconcile_targets(class: &[u16], windows_by_id: &mut HashMap<WindowId,
     let existing: Vec<WindowId> = windows_by_id.keys().copied().collect();
     let (create, update, drop) = reconcile_plan(&existing, &desired);
 
+    // Destroying the overlay the pointer is pressed on cancels its capture and
+    // erases the press, so the release that follows produces nothing and the
+    // user's click is lost. A preview that stops being published mid-press is
+    // kept until the button comes up, which is when the gesture is answered.
+    let pressed = PRESS.with(|press| press.borrow().as_ref().map(|state| state.hwnd));
     for window_id in drop {
-        if let Some(hwnd) = windows_by_id.remove(&window_id) {
-            unsafe {
-                let _ = DestroyWindow(hwnd);
-            }
+        let Some(&hwnd) = windows_by_id.get(&window_id) else {
+            continue;
+        };
+        if pressed == Some(hwnd) {
+            continue;
+        }
+        windows_by_id.remove(&window_id);
+        unsafe {
+            let _ = DestroyWindow(hwnd);
         }
     }
 
     for target in create {
-        if target.rect.width <= 0 || target.rect.height <= 0 {
-            continue;
-        }
-        // Defensive: a tracked HWND for this id would be orphaned by the insert
-        // below and could never be destroyed again.
-        if let Some(stale) = windows_by_id.remove(&target.window_id) {
-            unsafe {
-                let _ = DestroyWindow(stale);
-            }
-        }
-        let created = unsafe {
-            CreateWindowExW(
-                // Normal band, deliberately not topmost: a preview stands in for
-                // a tiled window, and a floating window sits above the tiled
-                // layer. In the topmost band this overlay would take clicks that
-                // belong to a float covering the strip.
-                WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-                windows::core::PCWSTR(class.as_ptr()),
-                None,
-                WS_POPUP,
-                target.rect.x,
-                target.rect.y,
-                target.rect.width,
-                target.rect.height,
-                None,
-                None,
-                None,
-                None,
-            )
-        };
-        match created {
-            Ok(hwnd) => unsafe {
-                SetWindowLongPtrW(hwnd, GWLP_USERDATA, target.window_id as isize);
-                let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), TARGET_ALPHA, LWA_ALPHA);
-                let _ = SetWindowPos(
-                    hwnd,
-                    Some(HWND_TOP),
-                    target.rect.x,
-                    target.rect.y,
-                    target.rect.width,
-                    target.rect.height,
-                    SWP_NOACTIVATE,
-                );
-                let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-                windows_by_id.insert(target.window_id, hwnd);
-            },
-            Err(error) => {
-                warn!("Preview click target creation failed: {error}");
-                // The desired state already records this target, so an identical
-                // next publish would be deduplicated into a no-op and the click
-                // target would stay dead. Forget it so the next frame retries.
-                input
-                    .desired
-                    .lock()
-                    .unwrap_or_else(crate::recover_poisoned_mutex)
-                    .retain(|pending| pending.window_id != target.window_id);
-            }
-        }
+        unsafe { create_target(class, target, windows_by_id) };
     }
 
     for target in update {
         let Some(&hwnd) = windows_by_id.get(&target.window_id) else {
             continue;
         };
+        // A destroyed overlay would stay recorded forever, and an identical next
+        // publish is deduplicated, so the preview would never be clickable again.
+        if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+            windows_by_id.remove(&target.window_id);
+            unsafe { create_target(class, target, windows_by_id) };
+            continue;
+        }
         unsafe {
             if target.rect.width <= 0 || target.rect.height <= 0 {
                 let _ = ShowWindow(hwnd, SW_HIDE);
                 continue;
             }
-            // Re-assert the front of the normal band only when the overlay was
-            // hidden: a window that was not visible may have lost its place,
-            // while a per-frame re-pin would fight the tab strip.
-            if !IsWindowVisible(hwnd).as_bool() {
-                let _ = SetWindowPos(
-                    hwnd,
-                    Some(HWND_TOP),
-                    target.rect.x,
-                    target.rect.y,
-                    target.rect.width,
-                    target.rect.height,
-                    SWP_NOACTIVATE,
-                );
-            }
-            // Move only. Re-pinning to the front of the band on every animation
-            // frame would fight the tab strip, which pins itself the same way,
-            // making a click on a tabbed edge column land nondeterministically
-            // on the strip or on this overlay.
-            let _ = SetWindowPos(
+            // Move and re-assert the front of the normal band in one call. The
+            // pin cannot be skipped: every focus change raises an application
+            // window to the top of this band, and an overlay that has sunk below
+            // one that overlaps its strip silently stops receiving clicks. The
+            // tab strip pins itself the same way but is drawn above the focused
+            // column, and previews only exist for other columns, so they do not
+            // compete for the same pixels.
+            if SetWindowPos(
                 hwnd,
-                None,
+                Some(HWND_TOP),
                 target.rect.x,
                 target.rect.y,
                 target.rect.width,
                 target.rect.height,
-                SWP_NOACTIVATE | SWP_NOZORDER,
-            );
+                SWP_NOACTIVATE,
+            )
+            .is_err()
+            {
+                windows_by_id.remove(&target.window_id);
+                let _ = DestroyWindow(hwnd);
+                create_target(class, target, windows_by_id);
+                continue;
+            }
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         }
     }
 }
 
+/// Create one overlay and record it, or forget the desired entry so the next
+/// publish retries instead of being deduplicated into a no-op.
+#[cfg_attr(test, allow(dead_code))]
+unsafe fn create_target(
+    class: &[u16],
+    target: PreviewClickTarget,
+    windows_by_id: &mut HashMap<WindowId, HWND>,
+) {
+    let Some(input) = input() else {
+        return;
+    };
+    if target.rect.width <= 0 || target.rect.height <= 0 {
+        return;
+    }
+    // Defensive: a tracked HWND for this id would be orphaned by the insert
+    // below and could never be destroyed again.
+    if let Some(stale) = windows_by_id.remove(&target.window_id) {
+        unsafe {
+            let _ = DestroyWindow(stale);
+        }
+    }
+    let created = unsafe {
+        CreateWindowExW(
+            // Normal band, deliberately not topmost: a preview stands in for
+            // a tiled window, and a floating window sits above the tiled
+            // layer. In the topmost band this overlay would take clicks that
+            // belong to a float covering the strip.
+            WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            windows::core::PCWSTR(class.as_ptr()),
+            None,
+            WS_POPUP,
+            target.rect.x,
+            target.rect.y,
+            target.rect.width,
+            target.rect.height,
+            None,
+            None,
+            None,
+            None,
+        )
+    };
+    match created {
+        Ok(hwnd) => unsafe {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, target.window_id as isize);
+            let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), TARGET_ALPHA, LWA_ALPHA);
+            let _ = SetWindowPos(
+                hwnd,
+                Some(HWND_TOP),
+                target.rect.x,
+                target.rect.y,
+                target.rect.width,
+                target.rect.height,
+                SWP_NOACTIVATE,
+            );
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            windows_by_id.insert(target.window_id, hwnd);
+        },
+        Err(error) => {
+            warn!("Preview click target creation failed: {error}");
+            // The desired state already records this target, so an identical
+            // next publish would be deduplicated into a no-op and the click
+            // target would stay dead. Forget it so the next frame retries.
+            input
+                .desired
+                .lock()
+                .unwrap_or_else(crate::recover_poisoned_mutex)
+                .retain(|pending| pending.window_id != target.window_id);
+        }
+    }
+}
+
 /// Pointer state of the press in progress, in screen coordinates. Only the
-/// overlay thread touches this, so a plain `Cell` pair is enough.
+/// overlay thread touches this, so a plain `RefCell` is enough.
 struct PressState {
+    /// The overlay the press started on. Every overlay shares this thread and
+    /// this state, and a background window's capture is only honoured while the
+    /// pointer is over it, so a release can land on a *different* overlay; the
+    /// gesture must still be answered for the one the user pressed.
+    hwnd: HWND,
     origin: (i32, i32),
     handed_off: bool,
 }
@@ -397,9 +486,23 @@ thread_local! {
     static PRESS: std::cell::RefCell<Option<PressState>> = const { std::cell::RefCell::new(None) };
 }
 
+thread_local! {
+    /// The overlay currently washed, so the wash is pushed on transitions only.
+    /// Re-pushing `SetLayeredWindowAttributes` on every pointer move makes
+    /// Windows post synthetic `WM_MOUSEMOVE`s under a stationary cursor, and
+    /// those carry no button state, which used to look like a released button.
+    static HOVERED: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+}
+
 /// Turn the hover wash on or off, arming `WM_MOUSELEAVE` the first time the
 /// pointer arrives so the wash cannot get stuck on.
 fn set_hover(hwnd: HWND, hovering: bool) {
+    let raw = hwnd.0 as isize;
+    let already = HOVERED.with(|hovered| hovered.get()) == raw;
+    if hovering == already {
+        return;
+    }
+    HOVERED.with(|hovered| hovered.set(if hovering { raw } else { 0 }));
     let alpha = if hovering { HOVER_ALPHA } else { TARGET_ALPHA };
     unsafe {
         let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), alpha, LWA_ALPHA);
@@ -419,6 +522,13 @@ fn set_hover(hwnd: HWND, hovering: bool) {
 
 fn window_id_of(hwnd: HWND) -> WindowId {
     unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as WindowId }
+}
+
+/// The real left-button state, independent of what a message claims.
+fn left_button_is_down() -> bool {
+    // High bit set means down. Swapped buttons are irrelevant: `VK_LBUTTON` is
+    // the primary button, which is the one that produced `WM_LBUTTONDOWN`.
+    unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16 & 0x8000 != 0 }
 }
 
 fn cursor_screen_point(lparam: LPARAM) -> (i32, i32) {
@@ -487,6 +597,7 @@ unsafe extern "system" fn target_proc(
             unsafe { SetCapture(hwnd) };
             PRESS.with(|press| {
                 *press.borrow_mut() = Some(PressState {
+                    hwnd,
                     origin: cursor_screen_point(lparam),
                     handed_off: false,
                 });
@@ -495,12 +606,28 @@ unsafe extern "system" fn target_proc(
         }
         WM_MOUSEMOVE => {
             set_hover(hwnd, true);
+            // A press whose release was never delivered would otherwise survive
+            // as state: the next hover over the strip travels far from that stale
+            // origin and would be read as a drag with no button held, handing the
+            // window to a move loop the user never started.
+            //
+            // `wparam` alone is not enough. Windows synthesises moves (a layered
+            // attribute change under a stationary cursor does it) whose button
+            // flags are empty even mid-press, and discarding the press then loses
+            // the click. The asynchronous button state settles that disagreement.
+            if wparam.0 & MOUSE_MOVE_LBUTTON_DOWN == 0 && !left_button_is_down() {
+                let ended = PRESS.with(|press| press.borrow_mut().take().is_some());
+                if ended {
+                    request_sync();
+                }
+                return LRESULT(0);
+            }
             let travelled = PRESS.with(|press| {
                 let mut press = press.borrow_mut();
                 let Some(state) = press.as_mut() else {
                     return false;
                 };
-                if state.handed_off {
+                if state.handed_off || state.hwnd != hwnd {
                     return false;
                 }
                 let threshold =
@@ -517,7 +644,9 @@ unsafe extern "system" fn target_proc(
                 }
             });
             if travelled {
-                let window_id = window_id_of(hwnd);
+                let window_id = PRESS
+                    .with(|press| press.borrow().as_ref().map(|state| state.hwnd))
+                    .map_or(0, window_id_of);
                 // Let go of the pointer first: the window's own move loop needs
                 // the capture, and it starts as soon as the daemon hands it over.
                 unsafe {
@@ -530,25 +659,37 @@ unsafe extern "system" fn target_proc(
             LRESULT(0)
         }
         WM_LBUTTONUP => {
-            let was_click = PRESS.with(|press| {
+            // The press may have started on a neighbouring overlay, so the
+            // gesture belongs to the window recorded with it, not to the window
+            // that happens to receive the release.
+            let pressed = PRESS.with(|press| {
                 press
                     .borrow_mut()
                     .take()
-                    .is_some_and(|state| !state.handed_off)
+                    .filter(|state| !state.handed_off)
+                    .map(|state| state.hwnd)
             });
             unsafe {
                 let _ = ReleaseCapture();
             }
-            if was_click {
-                let window_id = window_id_of(hwnd);
+            if let Some(pressed) = pressed {
+                let window_id = window_id_of(pressed);
                 if window_id != 0 {
                     emit_gesture(window_id, PreviewGesture::Click);
                 }
             }
+            // A publish that arrived during the press deferred its overlay
+            // teardown so this gesture could complete; run it now.
+            request_sync();
             LRESULT(0)
         }
         WM_CAPTURECHANGED => {
-            PRESS.with(|press| *press.borrow_mut() = None);
+            // Losing capture ends the gesture: the pointer now belongs to
+            // something else, so a later release is not ours to interpret.
+            let ended = PRESS.with(|press| press.borrow_mut().take().is_some());
+            if ended {
+                request_sync();
+            }
             LRESULT(0)
         }
         _ => unsafe { DefWindowProcW(hwnd, message, wparam, lparam) },

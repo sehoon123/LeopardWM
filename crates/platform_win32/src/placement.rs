@@ -1000,6 +1000,14 @@ fn build_defer_entries(
         };
         if dispatch == AnimationDispatchMode::SkipHungSensitive {
             skipped += 1;
+            // Skipping means "do not touch this HWND on this frame", not "give up
+            // its preview": the commit below treats an omitted request as an
+            // instruction to unregister, so an app that hangs for a moment would
+            // lose a thumbnail whose source is already parked and stays valid.
+            // Keep the request; it positions nothing by itself.
+            if let Some(request) = preview_request {
+                preview_requests.push(request);
+            }
             continue;
         }
 

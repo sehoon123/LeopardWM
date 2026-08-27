@@ -2392,8 +2392,26 @@ async fn handle_preview_gesture(
     let mut state = ctx.state.lock().await;
     // The overview owns the screen while it is open and its model is not rebuilt
     // from here, so a click queued before it opened must not move focus behind it.
+    // Both refusals are logged: from the outside they are indistinguishable from
+    // a preview that stopped responding.
     if state.paused || state.overview_open {
+        debug!(
+            "Preview {gesture:?} on {window_id:#x} refused: paused={} overview={}",
+            state.paused, state.overview_open
+        );
         return;
+    }
+    // A live layout transition turns `apply_layout` into a no-op, so focusing
+    // the column would move the OS foreground to a window still parked clear of
+    // every monitor: nothing visibly happens and the keyboard goes nowhere.
+    // Land the transition first, exactly as the drag hand-off does. A plain
+    // scroll animation is left alone: it is re-targeted by the focus change.
+    if state.layout_transition.is_some() {
+        state.settle_scroll_animations();
+        state.abort_active_ghost_transition();
+        state.layout_transition = None;
+        ctx.animation_worker.clear_cache();
+        *ctx.animation_active = false;
     }
     let Some((monitor_id, column_idx, window_in_column)) =
         crate::state::preview_click_focus_target(&state, window_id)
@@ -2421,14 +2439,9 @@ async fn handle_preview_gesture(
     if matches!(gesture, leopardwm_platform_win32::PreviewGesture::Drag) {
         // Everything that could still move this window has to be finished before
         // the pointer is handed over, or the OS move loop starts from a rectangle
-        // the daemon is about to overwrite.
+        // the daemon is about to overwrite. The transition was already ended
+        // above; the focus change may have started a fresh scroll animation.
         state.settle_scroll_animations();
-        // A live layout transition makes apply_layout a no-op, so the window
-        // would never reach the geometry the drag is about to start from.
-        state.abort_active_ghost_transition();
-        state.layout_transition = None;
-        ctx.animation_worker.clear_cache();
-        *ctx.animation_active = false;
         if let Err(error) = state.apply_layout() {
             // Handing the pointer to a window whose placement did not land would
             // drag it from wherever it happens to be. Leave it as a focus change.

@@ -228,24 +228,80 @@ pub(crate) fn park_offscreen_avoiding_neighbors(
     }
 }
 
-/// Whether the part of `placement` that stays on `owner` would be covered by a
-/// floating window.
+/// A strip narrower than this is not worth previewing: there is nothing
+/// recognisable to see and nothing comfortable to click.
+const MIN_PREVIEW_STRIP_PX: i32 = 24;
+
+/// The pixels on `owner` this placement may still be shown in, or `None` when a
+/// floating window leaves nothing usable.
 ///
 /// Floating windows sit above the tiled band by design, so a preview drawn under
 /// one is either invisible or, worse, drawn over it by the thumbnail host. The
-/// float owns those pixels: the column is simply hidden instead of previewed.
+/// float owns those pixels — but only the pixels it actually covers: a float
+/// overlapping one end of the strip used to suppress the whole preview, which
+/// made a column vanish for no reason the user could see. The strip is a
+/// vertical band at a monitor edge, so subtracting the floats' horizontal spans
+/// and keeping the widest remaining run preserves the visible part with one
+/// rectangle. Sides the floats did not cut keep the monitor's own bounds, so
+/// with no float in the way the result is exactly the owner rectangle.
 /// Pure so the policy is testable without Win32.
-fn preview_strip_is_covered_by_floating(
+fn preview_clip_bounds(
     placement_rect: leopardwm_core_layout::Rect,
     owner_rect: leopardwm_core_layout::Rect,
     floating_rects: &[leopardwm_core_layout::Rect],
-) -> bool {
-    let Some(strip) = intersection(placement_rect, owner_rect) else {
-        return false;
+) -> Option<leopardwm_core_layout::Rect> {
+    let strip = intersection(placement_rect, owner_rect)?;
+    // Cut points are the strip edges plus every covering float's edges, so the
+    // runs between them are each either fully covered or fully clear.
+    let mut cuts = vec![strip.x, strip.x + strip.width];
+    for floating in floating_rects {
+        if !floating.intersects(&strip) {
+            continue;
+        }
+        for edge in [floating.x, floating.x + floating.width] {
+            if edge > strip.x && edge < strip.x + strip.width {
+                cuts.push(edge);
+            }
+        }
+    }
+    cuts.sort_unstable();
+    cuts.dedup();
+
+    let mut widest: Option<(i32, i32)> = None;
+    for pair in cuts.windows(2) {
+        let (left, right) = (pair[0], pair[1]);
+        if right - left < MIN_PREVIEW_STRIP_PX {
+            continue;
+        }
+        let run =
+            leopardwm_core_layout::Rect::new(left, strip.y, right - left, strip.height.max(1));
+        if floating_rects
+            .iter()
+            .any(|floating| floating.intersects(&run))
+        {
+            continue;
+        }
+        if widest.is_none_or(|(best_left, best_right)| right - left > best_right - best_left) {
+            widest = Some((left, right));
+        }
+    }
+
+    let (left, right) = widest?;
+    // Only the float cut is honoured; an untouched side keeps the monitor bound,
+    // so an unobstructed strip yields the owner rectangle unchanged and the
+    // window's invisible border band is clipped exactly as before.
+    let clip_left = if left == strip.x { owner_rect.x } else { left };
+    let clip_right = if right == strip.x + strip.width {
+        owner_rect.x + owner_rect.width
+    } else {
+        right
     };
-    floating_rects
-        .iter()
-        .any(|floating| floating.intersects(&strip))
+    Some(leopardwm_core_layout::Rect::new(
+        clip_left,
+        owner_rect.y,
+        clip_right - clip_left,
+        owner_rect.height,
+    ))
 }
 
 /// Rectangles of the visible floating windows in `placements`.
@@ -377,12 +433,15 @@ fn prepare_monitor_overflow(
         };
 
         // A floating window over the edge strip owns those pixels; previewing
-        // underneath it would either be invisible or composite on top of it.
-        if preview_strip_is_covered_by_floating(placement.rect, owner_rect, floating_rects) {
+        // underneath it would either be invisible or composite on top of it. Only
+        // the covered part is given up: the preview is narrowed to the widest
+        // clear run, and refused only when nothing usable is left.
+        let Some(clip_bounds) = preview_clip_bounds(placement.rect, owner_rect, floating_rects)
+        else {
             placement.rect = fallback_rect;
             placement.visibility = fallback_visibility;
             continue;
-        }
+        };
 
         // A window region can only hide pixels; it cannot pull a window that
         // shares no pixels with its owner monitor back onto it. Clipping such a
@@ -402,7 +461,7 @@ fn prepare_monitor_overflow(
             region_clips,
             leopardwm_platform_win32::WindowRegionClip {
                 window_id: placement.window_id,
-                clip_bounds: owner_rect,
+                clip_bounds,
                 fallback_rect,
                 fallback_visibility,
             },

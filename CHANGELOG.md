@@ -2,6 +2,49 @@
 
 All notable changes to LeopardWM will be documented in this file.
 
+## 0.2.6-sehoon.23
+
+### Fixes
+
+- **Clicking a preview now always answers.** Found by injecting real clicks: in a
+  settled state with a live, hit-testable overlay, every click was swallowed. The
+  overlay is in the normal band and answers `WM_MOUSEACTIVATE` with
+  `MA_NOACTIVATE`, so its process never becomes foreground — and a background
+  window's mouse capture is only honoured while the pointer is over it. A release
+  therefore lands wherever the pointer is, including a neighbouring preview, and a
+  press whose release never arrived stayed as state that later read as a drag with
+  no button held. A press is now tied to the overlay it started on, gestures are
+  answered for that window, and a press is dropped when the button is genuinely up
+  — checked against the real button state, because Windows synthesises
+  button-less moves. The hover wash used to cause exactly those synthetic moves by
+  re-pushing its layered attributes on every move; it is pushed on transitions
+  only.
+- **A preview no longer goes dead after a layout change.** Teardown of an overlay
+  the pointer is pressed on is deferred until the gesture completes, a lost sync
+  wake no longer deduplicates the retry into a no-op, a destroyed or unmovable
+  overlay is recreated instead of staying recorded forever, and forgetting one
+  preview keeps the other previews' overlays. Overlays also re-take the front of
+  the normal band whenever they move: every focus change raises an application
+  window there, and an overlay that had sunk below one silently stopped receiving
+  clicks. Gestures that go nowhere are logged, as are the two refusals (paused,
+  overview open) that used to be silent.
+- **A preview no longer disappears for reasons the user cannot see.** The shared
+  thumbnail host keeps previews out of the topmost band so floats stay above the
+  tiled layer, which also meant it could sink behind ordinary windows; it now
+  re-takes the front of its own band when preview pixels change. A transient DWM
+  refusal keeps its registration for up to three passes instead of dropping it
+  immediately and leaving the column with neither a window nor a thumbnail, and a
+  size that no longer matches the request is re-queried on any pass rather than
+  scaling a crop against stale dimensions. An app that hangs for a moment during
+  an animation keeps its existing preview. Finally, a floating window over the
+  edge strip now takes only the pixels it covers: the preview is narrowed to the
+  widest clear run and refused only when nothing usable is left.
+- **A preview click during a layout transition is no longer a no-op.**
+  `apply_layout` does nothing while a transition is live, so the clicked column
+  stayed parked clear of every monitor while the OS foreground moved to it —
+  nothing visibly happened and the keyboard went to an invisible window. The
+  transition is landed first, exactly as the drag hand-off does.
+
 ## 0.2.6-sehoon.22
 
 ### Fixes

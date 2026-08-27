@@ -31,10 +31,11 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetSystemMetrics,
-    RegisterClassW, SetWindowPos, UpdateLayeredWindow, CW_USEDEFAULT, HWND_NOTOPMOST, HWND_TOPMOST,
-    MSG, SET_WINDOW_POS_FLAGS, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
-    SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, ULW_ALPHA, WNDCLASSW,
-    WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP, WS_VISIBLE,
+    RegisterClassW, SetWindowPos, UpdateLayeredWindow, CW_USEDEFAULT, HWND_NOTOPMOST, HWND_TOP,
+    HWND_TOPMOST, MSG, SET_WINDOW_POS_FLAGS, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    ULW_ALPHA, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
+    WS_POPUP, WS_VISIBLE,
 };
 
 /// Class name for the singleton thumbnail host window. Listed in
@@ -340,7 +341,18 @@ struct PersistentPreview {
     handle: ThumbnailHandle,
     source_size: Option<(i32, i32)>,
     expected_source_size: Option<(i32, i32)>,
+    /// Consecutive size-refreshing passes that could not publish this preview.
+    /// DWM refuses transiently while a source settles, and dropping the
+    /// registration on the first refusal left the column with neither a window
+    /// nor a thumbnail until some unrelated event forced another pass.
+    failed_publishes: u32,
 }
+
+/// How many consecutive size-refreshing passes may fail before a preview is
+/// abandoned. Three passes is long enough for a source that is still settling
+/// and short enough that a genuinely dead registration does not linger.
+#[cfg_attr(test, allow(dead_code))]
+const MAX_FAILED_PUBLISHES: u32 = 3;
 
 static PERSISTENT_PREVIEWS: OnceLock<Mutex<HashMap<WindowId, PersistentPreview>>> = OnceLock::new();
 static PERSISTENT_PREVIEW_TRANSACTION: Mutex<()> = Mutex::new(());
@@ -382,6 +394,7 @@ pub(crate) fn prepare_persistent_preview(window_id: WindowId) -> bool {
             window_id,
             PersistentPreview {
                 handle,
+                failed_publishes: 0,
                 source_size: initial_size,
                 expected_source_size: None,
             },
@@ -460,15 +473,19 @@ fn publish_preview_requests(
             // host still settling, for example) and without this the preview
             // would stay unpublished until some later event happened to force a
             // size-refreshing pass.
+            // A size that no longer matches the request is stale on any pass, not
+            // just a size-refreshing one: normalising a new crop against the old
+            // dimensions scales it wrongly and can round a narrow strip away
+            // entirely, so the preview would vanish for the whole animation.
             if preview.source_size.is_none()
-                || (refresh_size
-                    && preview.expected_source_size != Some(request.expected_source_size))
+                || preview.expected_source_size != Some(request.expected_source_size)
             {
                 preview.source_size = source_size(preview.handle.as_isize());
                 preview.expected_source_size = Some(request.expected_source_size);
             }
             let Some(source_size) = preview.source_size else {
                 if refresh_size {
+                    preview.failed_publishes += 1;
                     failed.push(request.window_id);
                 }
                 continue;
@@ -477,21 +494,44 @@ fn publish_preview_requests(
                 normalized_preview_geometry(*request, source_size)
             else {
                 if refresh_size {
+                    preview.failed_publishes += 1;
                     failed.push(request.window_id);
                 }
                 continue;
             };
             let destination = screen_to_host_client(destination_screen, origin);
             if update_cropped(preview.handle.as_isize(), source, destination, 255, true).is_ok() {
+                preview.failed_publishes = 0;
                 published.push(request.window_id);
             } else {
+                preview.failed_publishes += 1;
+                // A stale size is the most likely reason a publish was refused,
+                // so the next pass re-queries instead of reusing it.
+                preview.source_size = None;
                 failed.push(request.window_id);
             }
         }
         if refresh_size {
             for window_id in failed {
-                previews.remove(&window_id);
+                // Keep a briefly failing registration: its source is already
+                // parked off-monitor, so removing it means the column shows
+                // nothing at all, and the retry costs one thumbnail update.
+                let give_up = previews
+                    .get(&window_id)
+                    .is_some_and(|preview| preview.failed_publishes >= MAX_FAILED_PUBLISHES);
+                if give_up {
+                    warn!(
+                        "Preview for {window_id:#x} gave up after {MAX_FAILED_PUBLISHES} failed publishes"
+                    );
+                    previews.remove(&window_id);
+                }
             }
+        }
+        if !published.is_empty() {
+            // Every focus change raises an application window to the front of the
+            // normal band, which is where the host stays while it carries only
+            // previews, so the front has to be re-taken whenever pixels change.
+            host().raise_within_band();
         }
         published
     }
@@ -562,11 +602,13 @@ pub(crate) fn clear_persistent_previews() {
 }
 
 pub(crate) fn forget_persistent_preview(window_id: WindowId) {
-    lock_persistent_previews().remove(&window_id);
-    // Drop every overlay rather than leave a stale one swallowing clicks for a
-    // window that no longer has a preview; the next applied frame republishes
-    // the survivors.
-    crate::preview_input::clear_preview_click_targets();
+    let mut previews = lock_persistent_previews();
+    previews.remove(&window_id);
+    // Only this window's overlay goes: clearing all of them left every surviving
+    // preview unclickable until some later frame happened to republish them.
+    let survivors: Vec<WindowId> = previews.keys().copied().collect();
+    drop(previews);
+    crate::preview_input::retain_preview_click_targets(&survivors);
 }
 
 pub fn source_size(handle: isize) -> Option<(i32, i32)> {
@@ -903,6 +945,32 @@ impl ThumbnailHost {
     /// auto-hide animation appear correctly in front of windows; topmost
     /// during animation ensures the thumbnail composites above the live
     /// HWNDs that may be cloaked underneath.
+    /// Lift the host to the front of the band it is already in.
+    ///
+    /// Needed for edge previews: they deliberately keep the host out of the
+    /// topmost band so floating windows stay above the tiled layer, but every
+    /// focus change raises an application window to the front of that same band.
+    /// Without this a preview could be composited behind an ordinary window and
+    /// simply never appear. The daemon narrows previews away from floats, so
+    /// nothing that belongs above them is covered by this.
+    #[cfg_attr(test, allow(dead_code))]
+    fn raise_within_band(&self) {
+        if self.hwnd_raw == 0 {
+            return;
+        }
+        unsafe {
+            let _ = SetWindowPos(
+                self.hwnd(),
+                Some(HWND_TOP),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
+            );
+        }
+    }
+
     fn set_topmost(&self, topmost: bool) {
         if self.hwnd_raw == 0 {
             return;
