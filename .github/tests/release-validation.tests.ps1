@@ -65,10 +65,10 @@ try {
 
     # Execute the validator's real checksum function against GNU-style
     # lowercase output, not merely a source-text policy assertion.
-    $functionStart = $validatorSource.IndexOf('function Assert-Checksums')
+    $functionStart = $validatorSource.IndexOf('function Get-MsiProperty')
     $functionEnd = $validatorSource.IndexOf("`nif (-not `$Tag", $functionStart)
     if ($functionStart -lt 0 -or $functionEnd -le $functionStart) {
-        throw 'Could not extract Assert-Checksums from validator'
+        throw 'Could not extract MSI/checksum helpers from validator'
     }
     Invoke-Expression $validatorSource.Substring($functionStart, $functionEnd - $functionStart)
     $artifact = Join-Path $testRoot 'artifact.zip'
@@ -85,6 +85,41 @@ try {
     }
     catch {
         if ($_.Exception.Message -eq 'Changed checksum nibble was accepted') { throw }
+    }
+
+    # COM methods can return null-like automation values that PowerShell still
+    # collects as function output. The identity helpers must emit only MSI data.
+    $script:msiPropertyRecord = New-Object PSObject
+    $script:msiPropertyRecord | Add-Member -MemberType ScriptMethod -Name StringData -Value { param($Index) 'LeopardWM' }
+    $script:msiPropertyView = New-Object PSObject
+    $script:msiPropertyView | Add-Member -MemberType ScriptMethod -Name Execute -Value { 'execute-noise' }
+    $script:msiPropertyView | Add-Member -MemberType ScriptMethod -Name Fetch -Value { $script:msiPropertyRecord }
+    $script:msiPropertyView | Add-Member -MemberType ScriptMethod -Name Close -Value { 'close-noise' }
+    $msiPropertyDatabase = New-Object PSObject
+    $msiPropertyDatabase | Add-Member -MemberType ScriptMethod -Name OpenView -Value { param($Query) $script:msiPropertyView }
+    $propertyResult = @(Get-MsiProperty -Database $msiPropertyDatabase -Name 'ProductName')
+    if ($propertyResult.Count -ne 1 -or $propertyResult[0] -cne 'LeopardWM') {
+        throw "MSI property helper leaked COM output: $($propertyResult -join ', ')"
+    }
+
+    $script:msiFileRecord = New-Object PSObject
+    $script:msiFileRecord | Add-Member -MemberType ScriptMethod -Name StringData -Value { param($Index) 'LEOPARD~1.EXE|leopardwm.exe' }
+    $script:msiFileFetches = 0
+    $script:msiFileView = New-Object PSObject
+    $script:msiFileView | Add-Member -MemberType ScriptMethod -Name Execute -Value { 'execute-noise' }
+    $script:msiFileView | Add-Member -MemberType ScriptMethod -Name Fetch -Value {
+        if ($script:msiFileFetches -eq 0) {
+            $script:msiFileFetches++
+            return $script:msiFileRecord
+        }
+        return $null
+    }
+    $script:msiFileView | Add-Member -MemberType ScriptMethod -Name Close -Value { 'close-noise' }
+    $msiFileDatabase = New-Object PSObject
+    $msiFileDatabase | Add-Member -MemberType ScriptMethod -Name OpenView -Value { param($Query) $script:msiFileView }
+    $fileResult = @(Get-MsiFileNames -Database $msiFileDatabase)
+    if ($fileResult.Count -ne 1 -or $fileResult[0] -cne 'leopardwm.exe') {
+        throw "MSI file helper leaked COM output: $($fileResult -join ', ')"
     }
 
     & git init --bare $remote | Out-Null

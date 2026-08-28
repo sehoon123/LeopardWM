@@ -176,7 +176,7 @@ function Get-MsiProperty {
 
     $view = $Database.OpenView("SELECT ``Value`` FROM ``Property`` WHERE ``Property`` = '$Name'")
     try {
-        $view.Execute()
+        [void]$view.Execute()
         $record = $view.Fetch()
         if ($null -eq $record) {
             throw "MSI property $Name is missing"
@@ -184,7 +184,7 @@ function Get-MsiProperty {
         return $record.StringData(1)
     }
     finally {
-        $view.Close()
+        [void]$view.Close()
     }
 }
 
@@ -196,7 +196,7 @@ function Get-MsiFileNames {
 
     $view = $Database.OpenView("SELECT ``FileName`` FROM ``File``")
     try {
-        $view.Execute()
+        [void]$view.Execute()
         $names = @()
         while ($true) {
             $record = $view.Fetch()
@@ -208,7 +208,7 @@ function Get-MsiFileNames {
         return $names
     }
     finally {
-        $view.Close()
+        [void]$view.Close()
     }
 }
 
