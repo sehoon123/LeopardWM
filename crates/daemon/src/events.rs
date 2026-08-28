@@ -1,6 +1,6 @@
 use leopardwm_platform_win32::overview::OverviewEvent;
 use leopardwm_platform_win32::tab_strip::TabAction;
-use leopardwm_platform_win32::{GestureEvent, HotkeyEvent, WindowEvent};
+use leopardwm_platform_win32::{GestureEvent, HotkeyEvent, WindowEvent, WindowInfo};
 use std::collections::BTreeSet;
 use tokio::sync::{broadcast, oneshot};
 
@@ -23,6 +23,79 @@ pub(crate) struct SubscribeStartup {
     pub(crate) receiver: broadcast::Receiver<IpcEvent>,
 }
 
+/// Process/class identity observed for a live HWND.
+///
+/// Numeric HWND values are recycled. Lifecycle work may wait behind a bounded
+/// daemon queue, so a later dispatch must not apply old-incarnation cleanup to
+/// a replacement window that inherited the same numeric handle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WindowIncarnation {
+    pub(crate) process_id: u32,
+    pub(crate) class_name: String,
+}
+
+impl WindowIncarnation {
+    pub(crate) fn from_window_info(info: &WindowInfo) -> Self {
+        Self {
+            process_id: info.process_id,
+            class_name: info.class_name.clone(),
+        }
+    }
+
+    pub(crate) fn capture(hwnd: u64) -> Option<Self> {
+        leopardwm_platform_win32::get_window_info(hwnd)
+            .as_ref()
+            .map(Self::from_window_info)
+    }
+}
+
+/// A platform lifecycle event plus the source incarnation when the HWND was
+/// still inspectable. Destroy events normally have no live source by the time
+/// they are delivered; dispatch additionally checks current liveness before
+/// treating those as physical cleanup permission.
+#[derive(Debug, Clone)]
+pub(crate) struct DaemonWindowEvent {
+    pub(crate) event: WindowEvent,
+    pub(crate) source_incarnation: Option<WindowIncarnation>,
+}
+
+impl DaemonWindowEvent {
+    pub(crate) fn capture(event: WindowEvent) -> Self {
+        let hwnd = match &event {
+            WindowEvent::Created(hwnd)
+            | WindowEvent::Destroyed(hwnd)
+            | WindowEvent::Hidden(hwnd)
+            | WindowEvent::Focused(hwnd)
+            | WindowEvent::Minimized(hwnd)
+            | WindowEvent::Restored(hwnd)
+            | WindowEvent::MovedOrResized(hwnd)
+            | WindowEvent::MoveSizeStart(hwnd)
+            | WindowEvent::MoveSizeEnd(hwnd)
+            | WindowEvent::TitleChanged(hwnd)
+            | WindowEvent::MouseEnterWindow(hwnd) => Some(*hwnd),
+            WindowEvent::DisplayChange
+            | WindowEvent::WorkAreaChanged
+            | WindowEvent::AppearanceChanged
+            | WindowEvent::MouseLeftManaged => None,
+        };
+        // Do not synchronously inspect every high-rate location/focus event
+        // on the forwarding thread. Creation, restore, hide, and destroy are
+        // the lifecycle edges that can alter ownership; those alone carry a
+        // source identity for recycled-HWND fencing.
+        let source_incarnation = match &event {
+            WindowEvent::Created(_)
+            | WindowEvent::Destroyed(_)
+            | WindowEvent::Hidden(_)
+            | WindowEvent::Restored(_) => hwnd.and_then(WindowIncarnation::capture),
+            _ => None,
+        };
+        Self {
+            source_incarnation,
+            event,
+        }
+    }
+}
+
 /// Events that the daemon event loop processes.
 pub(crate) enum DaemonEvent {
     /// An IPC command from a CLI client.
@@ -39,8 +112,9 @@ pub(crate) enum DaemonEvent {
         events: BTreeSet<EventKind>,
         responder: oneshot::Sender<SubscribeStartup>,
     },
-    /// A window lifecycle event from Win32.
-    WindowEvent(WindowEvent),
+    /// A window lifecycle event from Win32, guarded by its captured HWND
+    /// incarnation when one was available.
+    WindowEvent(DaemonWindowEvent),
     /// A global hotkey was pressed.
     Hotkey(HotkeyEvent),
     /// A touchpad gesture was detected.
@@ -122,6 +196,9 @@ pub(crate) enum DaemonEvent {
     /// through the event loop (rather than locking `AppState` directly in
     /// the spawned task) because `AppState` is not `Send`.
     PersistStateNow,
+    /// Poll a retained timed-out placement worker. The timer keeps paused
+    /// physical cleanup ownership alive even when no user input arrives.
+    ReapPendingApplyWorkers,
     /// Shutdown signal.
     Shutdown,
 }

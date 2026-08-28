@@ -25,6 +25,10 @@ const ROW_GAP_FRAC: f64 = 0.02;
 /// Padding between a row panel's edge and the viewport ring (the
 /// renderer folds the same value into the panel's corner radius).
 const ROW_INNER_PAD: i32 = PANEL_INNER_PAD;
+/// Cross-process icon probes can each wait for a hung application. Bound the
+/// synchronous work performed under the daemon state lock per overview model
+/// rebuild; unprobed cards render without an icon until a later refresh.
+const MAX_OVERVIEW_ICON_PROBES_PER_BUILD: usize = 4;
 /// Body inset from the panel edge (and label strip) to the miniaturized
 /// strip content: panel padding plus the viewport-ring breathing room, so
 /// the ring (drawn VIEWPORT_RING_PAD outside the viewport region) never
@@ -127,6 +131,23 @@ impl StripTransform {
     }
 }
 
+fn overview_icon_probe_candidates(
+    window_ids: &[u64],
+    cache: &std::collections::HashMap<u64, Option<isize>>,
+) -> Vec<u64> {
+    let mut candidates = Vec::with_capacity(MAX_OVERVIEW_ICON_PROBES_PER_BUILD);
+    let mut seen = std::collections::HashSet::new();
+    for &wid in window_ids {
+        if seen.insert(wid) && !cache.contains_key(&wid) {
+            candidates.push(wid);
+            if candidates.len() == MAX_OVERVIEW_ICON_PROBES_PER_BUILD {
+                break;
+            }
+        }
+    }
+    candidates
+}
+
 /// Bounding box of `rects` (assumed non-empty checked by the caller).
 fn bounding_box(rects: impl Iterator<Item = Rect>) -> Rect {
     let mut min_x = i32::MAX;
@@ -179,15 +200,13 @@ impl AppState {
         if non_empty.is_empty() {
             return None;
         }
-        // Fill the icon cache before the row loop re-borrows the
-        // workspaces: a `get_window_icon` miss costs up to two 50ms
-        // `SendMessageTimeoutW` probes against a hung app, so rebuilds
-        // (one per window event while the overview is open) must not
-        // re-probe every card.
-        for wid in icon_wids {
+        // Fill only a bounded slice of missing icons before the row loop
+        // re-borrows workspaces. A miss can wait for two 50ms
+        // SendMessageTimeoutW probes against a hung app; probing every card
+        // under the daemon lock made a large overview unresponsive.
+        for wid in overview_icon_probe_candidates(&icon_wids, &self.overview_icon_cache) {
             self.overview_icon_cache
-                .entry(wid)
-                .or_insert_with(|| leopardwm_platform_win32::get_window_icon(wid));
+                .insert(wid, leopardwm_platform_win32::get_window_icon(wid));
         }
         let ws_vec = self.workspaces.get(&monitor)?;
 
@@ -449,13 +468,10 @@ impl AppState {
                         .lookup_window_info(wid)
                         .map(|i| i.title)
                         .unwrap_or_default(),
-                    // Prefetched into the cache by build_overview_model;
-                    // the fallback probe covers any uncached id.
-                    icon: self
-                        .overview_icon_cache
-                        .get(&wid)
-                        .copied()
-                        .unwrap_or_else(|| leopardwm_platform_win32::get_window_icon(wid)),
+                    // Missing icons are intentionally nonblocking. A later
+                    // bounded refresh fills them incrementally instead of
+                    // probing every card while the daemon lock is held.
+                    icon: self.overview_icon_cache.get(&wid).copied().flatten(),
                     rect: inset_card(&rect),
                     from_rect: Some(from_rect),
                     tab_count,
@@ -1586,6 +1602,16 @@ mod tests {
         // The miss (fake hwnd -> None) is cached so the next rebuild
         // skips the SendMessageTimeoutW probes entirely.
         assert_eq!(state.overview_icon_cache.get(&101), Some(&None));
+    }
+
+    #[test]
+    fn test_icon_probe_candidates_are_bounded_and_skip_cached_entries() {
+        let cached = std::collections::HashMap::from([(2, Some(0x1234))]);
+        let ids: Vec<u64> = (1..=10).collect();
+        let candidates = overview_icon_probe_candidates(&ids, &cached);
+        assert_eq!(candidates.len(), MAX_OVERVIEW_ICON_PROBES_PER_BUILD);
+        assert!(!candidates.contains(&2));
+        assert_eq!(candidates, vec![1, 3, 4, 5]);
     }
 
     #[test]

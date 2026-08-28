@@ -80,7 +80,7 @@ impl Args {
     }
 }
 
-pub(crate) use events::DaemonEvent;
+pub(crate) use events::{DaemonEvent, DaemonWindowEvent, WindowIncarnation};
 
 /// Retry count for shutdown visibility recovery when an apply worker fails to exit in time.
 const SHUTDOWN_RECOVERY_RETRY_ATTEMPTS: usize = 3;
@@ -673,24 +673,54 @@ async fn stop_animation_worker_and_run_recovery(
     run_visibility_recovery_pass(&managed_window_ids, "post-animation-worker");
 }
 
+/// Clear resize-preview activity only when this thread still owns the active
+/// generation. Kept separate from the Win32 loop so generation ownership is
+/// deterministically testable without DwmFlush.
+fn clear_resize_preview_active_if_owned(
+    generation: u64,
+    active_generation: &std::sync::atomic::AtomicU64,
+    active: &std::sync::atomic::AtomicBool,
+) -> bool {
+    if active_generation
+        .compare_exchange(
+            generation,
+            0,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        active.store(false, std::sync::atomic::Ordering::Release);
+        true
+    } else {
+        false
+    }
+}
+
 /// Lightweight DwmFlush-aligned animation loop for resize preview transitions.
 /// Directly repositions the overlay window via SetWindowPos — no channel round-trip.
 fn resize_preview_animation_loop(
     overlay_hwnd: isize,
     start: leopardwm_core_layout::Rect,
     target: leopardwm_core_layout::Rect,
+    generation: u64,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    current_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    active_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
     active: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     use std::sync::atomic::Ordering;
     use windows::Win32::Graphics::Dwm::DwmFlush;
 
+    active_generation.store(generation, Ordering::Release);
     active.store(true, Ordering::Release);
     let start_time = std::time::Instant::now();
     let duration_ms = crate::state::RESIZE_PREVIEW_DURATION_MS;
 
     loop {
-        if cancel.load(Ordering::Relaxed) {
+        if cancel.load(Ordering::Acquire)
+            || current_generation.load(Ordering::Acquire) != generation
+        {
             break;
         }
         let elapsed = start_time.elapsed().as_millis() as u64;
@@ -704,7 +734,9 @@ fn resize_preview_animation_loop(
             crate::state::lerp_i32(start.width, target.width, t),
             crate::state::lerp_i32(start.height, target.height, t),
         );
-        // Direct SetWindowPos — zero indirection, zero channel latency.
+        // Direct SetWindowPos — zero indirection, zero channel latency. The
+        // generation check immediately above prevents a delayed DwmFlush from
+        // writing a replacement overlay generation or a destroyed overlay HWND.
         leopardwm_platform_win32::overlay::reposition_overlay(overlay_hwnd, rect);
         if done {
             break;
@@ -713,7 +745,13 @@ fn resize_preview_animation_loop(
         let _ = unsafe { DwmFlush() };
     }
 
-    active.store(false, Ordering::Release);
+    // Only the generation that set active may clear it. A canceled A must
+    // never clear B after B starts while A was blocked in DwmFlush.
+    let _ = clear_resize_preview_active_if_owned(
+        generation,
+        &active_generation,
+        &active,
+    );
 }
 
 /// Borrowed event-loop state shared by the main-loop event handlers.
@@ -742,7 +780,7 @@ struct EventLoopCtx<'a> {
 fn land_animation_exactly(state: &mut AppState, context: &str) -> bool {
     state.settle_scroll_animations();
     if let Err(error) = state.cancel_layout_transition_for_exact_landing() {
-        state.paused = true;
+        state.enter_paused_state(context);
         error!("{context}: could not park transition exits; tiling paused: {error}");
         return false;
     }
@@ -754,7 +792,7 @@ fn land_animation_exactly(state: &mut AppState, context: &str) -> bool {
             true
         }
         Err(error) => {
-            state.paused = true;
+            state.enter_paused_state(context);
             error!("{context}: exact landing failed; tiling paused: {error}");
             false
         }
@@ -837,6 +875,31 @@ async fn sync_pending_layout_apply_timeout_ui(
             report.timeout.as_secs()
         ),
     );
+}
+
+async fn schedule_pending_apply_worker_reap(
+    state: &Arc<Mutex<AppState>>,
+    event_tx: &mpsc::Sender<DaemonEvent>,
+) {
+    let should_schedule = {
+        let mut state = state.lock().await;
+        if state.pause_cleanup_after_pending_apply
+            && !state.pending_apply_workers.is_empty()
+            && !state.pending_apply_reap_scheduled
+        {
+            state.pending_apply_reap_scheduled = true;
+            true
+        } else {
+            false
+        }
+    };
+    if should_schedule {
+        let event_tx = event_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let _ = event_tx.send(DaemonEvent::ReapPendingApplyWorkers).await;
+        });
+    }
 }
 
 async fn apply_initial_layout(
@@ -1159,10 +1222,6 @@ async fn spawn_tab_forwarders(
     // carrying the captured column identity through the main event queue.
     let (tab_action_tx, tab_action_rx) =
         std::sync::mpsc::channel::<leopardwm_platform_win32::tab_strip::TabActionEvent>();
-    {
-        let mut state_guard = state.lock().await;
-        state_guard.install_tab_strip(tab_action_tx);
-    }
     match spawn_forwarding_thread(
         "tab-action-forwarder",
         tab_action_rx,
@@ -1175,7 +1234,11 @@ async fn spawn_tab_forwarders(
             action: action_event.action,
         },
     ) {
-        Ok(handle) => thread_handles.push(handle),
+        Ok(handle) => {
+            // Do not publish a source sender until its complete route exists.
+            state.lock().await.install_tab_strip(tab_action_tx);
+            thread_handles.push(handle);
+        }
         Err(e) => warn!("Failed to spawn tab-action forwarder thread: {}", e),
     }
 
@@ -1213,10 +1276,6 @@ async fn spawn_tab_forwarders(
     // serial lock (no races with concurrent layout work).
     let (rename_result_tx, rename_result_rx) =
         std::sync::mpsc::channel::<crate::events::TabRenameResult>();
-    {
-        let mut state_guard = state.lock().await;
-        state_guard.rename_result_tx = Some(rename_result_tx);
-    }
     match spawn_forwarding_thread(
         "tab-rename-forwarder",
         rename_result_rx,
@@ -1230,7 +1289,10 @@ async fn spawn_tab_forwarders(
             new_title: result.new_title,
         },
     ) {
-        Ok(handle) => thread_handles.push(handle),
+        Ok(handle) => {
+            state.lock().await.rename_result_tx = Some(rename_result_tx);
+            thread_handles.push(handle);
+        }
         Err(e) => warn!("Failed to spawn tab-rename forwarder thread: {}", e),
     }
     preview_event_rx
@@ -1246,17 +1308,16 @@ async fn spawn_overview_forwarder(
 ) {
     let (overview_tx, overview_rx) =
         std::sync::mpsc::channel::<leopardwm_platform_win32::overview::OverviewEvent>();
-    {
-        let mut state_guard = state.lock().await;
-        state_guard.install_overview(overview_tx);
-    }
     match spawn_forwarding_thread(
         "overview-fwd",
         overview_rx,
         event_tx.clone(),
         DaemonEvent::Overview,
     ) {
-        Ok(handle) => thread_handles.push(handle),
+        Ok(handle) => {
+            state.lock().await.install_overview(overview_tx);
+            thread_handles.push(handle);
+        }
         Err(e) => warn!("{}", e),
     }
 }
@@ -1277,13 +1338,18 @@ fn setup_window_hooks(
                     "winevent-fwd",
                     event_receiver,
                     event_tx.clone(),
-                    DaemonEvent::WindowEvent,
+                    |event| DaemonEvent::WindowEvent(DaemonWindowEvent::capture(event)),
                 ) {
-                    Ok(handle) => thread_handles.push(handle),
-                    Err(e) => warn!("{}", e),
+                    Ok(forwarder) => {
+                        thread_handles.push(forwarder);
+                        Some(handle)
+                    }
+                    Err(e) => {
+                        warn!("Failed to start WinEvent route; disabling hooks: {e}");
+                        drop(handle);
+                        None
+                    }
                 }
-
-                Some(handle)
             }
             Err(e) => {
                 warn!(
@@ -1302,20 +1368,23 @@ fn setup_window_hooks(
     // This allows the hotkey window to forward display changes to our event loop
     {
         let (display_tx, display_rx) = std::sync::mpsc::channel::<WindowEvent>();
-        if let Err(e) = set_display_change_sender(display_tx) {
-            warn!("Failed to register display change sender: {}. Display changes may not be detected.", e);
-        } else {
-            // Forward display change events to the daemon event loop
-            match spawn_forwarding_thread(
-                "display-fwd",
-                display_rx,
-                event_tx.clone(),
-                DaemonEvent::WindowEvent,
-            ) {
-                Ok(handle) => thread_handles.push(handle),
-                Err(e) => warn!("{}", e),
-            }
-            info!("Display change detection enabled");
+        match spawn_forwarding_thread(
+            "display-fwd",
+            display_rx,
+            event_tx.clone(),
+            |event| DaemonEvent::WindowEvent(DaemonWindowEvent::capture(event)),
+        ) {
+            Ok(handle) => match set_display_change_sender(display_tx) {
+                Ok(()) => {
+                    thread_handles.push(handle);
+                    info!("Display change detection enabled");
+                }
+                Err(e) => {
+                    warn!("Failed to register display change sender: {e}. Display changes may not be detected.");
+                    drop(handle);
+                }
+            },
+            Err(e) => warn!("Failed to start display-change route; source was not installed: {e}"),
         }
     }
 
@@ -1323,21 +1392,25 @@ fn setup_window_hooks(
     // Forwards AC/battery and power saver state changes to the daemon event loop
     {
         let (power_tx, power_rx) = std::sync::mpsc::channel::<bool>();
-        if let Err(e) = set_power_state_sender(power_tx) {
-            warn!("Failed to register power state sender: {}. Power state changes may not be detected.", e);
-        } else {
-            match spawn_forwarding_thread(
-                "power-fwd",
-                power_rx,
-                event_tx.clone(),
-                |on_battery_or_saver| DaemonEvent::PowerStateChanged {
-                    on_battery_or_saver,
-                },
-            ) {
-                Ok(handle) => thread_handles.push(handle),
-                Err(e) => warn!("{}", e),
-            }
-            info!("Power state detection enabled");
+        match spawn_forwarding_thread(
+            "power-fwd",
+            power_rx,
+            event_tx.clone(),
+            |on_battery_or_saver| DaemonEvent::PowerStateChanged {
+                on_battery_or_saver,
+            },
+        ) {
+            Ok(handle) => match set_power_state_sender(power_tx) {
+                Ok(()) => {
+                    thread_handles.push(handle);
+                    info!("Power state detection enabled");
+                }
+                Err(e) => {
+                    warn!("Failed to register power state sender: {e}. Power state changes may not be detected.");
+                    drop(handle);
+                }
+            },
+            Err(e) => warn!("Failed to start power-state route; source was not installed: {e}"),
         }
     }
 
@@ -1360,12 +1433,18 @@ fn install_ffm_hook(
                 "mouse-fwd",
                 mouse_rx,
                 event_tx.clone(),
-                DaemonEvent::WindowEvent,
+                |event| DaemonEvent::WindowEvent(DaemonWindowEvent::capture(event)),
             ) {
-                Ok(fwd) => thread_handles.push(fwd),
-                Err(e) => warn!("{}", e),
+                Ok(fwd) => {
+                    thread_handles.push(fwd);
+                    Some(handle)
+                }
+                Err(e) => {
+                    warn!("Failed to start focus-follows-mouse route; disabling hook: {e}");
+                    drop(handle);
+                    None
+                }
             }
-            Some(handle)
         }
         Err(e) => {
             warn!(
@@ -1431,11 +1510,16 @@ fn setup_gestures(
                     event_tx.clone(),
                     DaemonEvent::Gesture,
                 ) {
-                    Ok(handle) => thread_handles.push(handle),
-                    Err(e) => warn!("{}", e),
+                    Ok(forwarder) => {
+                        thread_handles.push(forwarder);
+                        Some(handle)
+                    }
+                    Err(e) => {
+                        warn!("Failed to start gesture route; disabling hook: {e}");
+                        drop(handle);
+                        None
+                    }
                 }
-
-                Some(handle)
             }
             Err(e) => {
                 warn!(
@@ -1467,7 +1551,10 @@ fn setup_tray(
         DaemonEvent::Tray,
     ) {
         Ok(handle) => thread_handles.push(handle),
-        Err(e) => warn!("{}", e),
+        Err(e) => {
+            warn!("Failed to start tray route; tray disabled: {e}");
+            return None;
+        }
     }
 
     let initial_toggles = quick_toggle_state(config);
@@ -1729,7 +1816,39 @@ async fn handle_ipc_command(
 }
 
 /// Handle a platform window event, including display-change and focus-follows-mouse debouncing.
-async fn process_window_event(ctx: &mut EventLoopCtx<'_>, win_event: WindowEvent) {
+fn display_settle_debounce_ms(needs_full: bool) -> u64 {
+    if needs_full { 500 } else { 180 }
+}
+
+fn update_display_change_needs_full(previous: bool, event: &WindowEvent) -> bool {
+    previous || matches!(event, WindowEvent::DisplayChange)
+}
+
+fn window_event_id(event: &WindowEvent) -> Option<u64> {
+    match event {
+        WindowEvent::Created(hwnd)
+        | WindowEvent::Destroyed(hwnd)
+        | WindowEvent::Hidden(hwnd)
+        | WindowEvent::Focused(hwnd)
+        | WindowEvent::Minimized(hwnd)
+        | WindowEvent::Restored(hwnd)
+        | WindowEvent::MovedOrResized(hwnd)
+        | WindowEvent::MoveSizeStart(hwnd)
+        | WindowEvent::MoveSizeEnd(hwnd)
+        | WindowEvent::TitleChanged(hwnd)
+        | WindowEvent::MouseEnterWindow(hwnd) => Some(*hwnd),
+        WindowEvent::DisplayChange
+        | WindowEvent::WorkAreaChanged
+        | WindowEvent::AppearanceChanged
+        | WindowEvent::MouseLeftManaged => None,
+    }
+}
+
+async fn process_window_event(ctx: &mut EventLoopCtx<'_>, daemon_event: DaemonWindowEvent) {
+    let DaemonWindowEvent {
+        event: win_event,
+        source_incarnation,
+    } = daemon_event;
     // Debounce DisplayChange / WorkAreaChanged into a single reconcile.
     // Contrast/DPI changes fire multiple WM_DISPLAYCHANGE messages with
     // intermediate work areas, so they need a longer quiet window; a taskbar
@@ -1749,7 +1868,7 @@ async fn process_window_event(ctx: &mut EventLoopCtx<'_>, win_event: WindowEvent
         // Invalidate frame intent before waiting: queued frames reject this epoch;
         // an already-running one is drained by the barrier, after which the clear
         // below is the final writer of both preview pixels and input.
-        let generation = {
+        let (generation, needs_full) = {
             let mut state = ctx.state.lock().await;
             state
                 .apply_epoch
@@ -1767,10 +1886,14 @@ async fn process_window_event(ctx: &mut EventLoopCtx<'_>, win_event: WindowEvent
             // A real topology/DPI change needs the full reconcile; a
             // work-area-only change (taskbar) does not. Sticky-true if a
             // DisplayChange occurs anywhere in the debounce window.
-            if matches!(win_event, WindowEvent::DisplayChange) {
-                state.display_change_needs_full = true;
-            }
-            state.display_change_generation
+            state.display_change_needs_full = update_display_change_needs_full(
+                state.display_change_needs_full,
+                &win_event,
+            );
+            (
+                state.display_change_generation,
+                state.display_change_needs_full,
+            )
         };
         *ctx.animation_in_flight_epoch = None;
         *ctx.last_frame_instant = None;
@@ -1811,11 +1934,10 @@ async fn process_window_event(ctx: &mut EventLoopCtx<'_>, win_event: WindowEvent
         // hid/disarmed the surface; settle retains ownership and retries cleanup.
         // A work-area change coalesces fast; a topology/DPI change needs to
         // settle. Take the longer of the two if both are in flight.
-        let debounce_ms = if matches!(win_event, WindowEvent::WorkAreaChanged) {
-            180
-        } else {
-            500
-        };
+        // A full topology/DPI change is sticky for the whole debounce
+        // generation. A trailing work-area notification must not shorten the
+        // quiet period that the earlier DisplayChange required.
+        let debounce_ms = display_settle_debounce_ms(needs_full);
         // Cancel pending timer and restart — only process after quiet.
         if let Some(handle) = ctx.display_change_timer.take() {
             handle.abort();
@@ -1865,7 +1987,53 @@ async fn process_window_event(ctx: &mut EventLoopCtx<'_>, win_event: WindowEvent
     } else {
         {
             let mut state = ctx.state.lock().await;
-            state.handle_window_event(win_event);
+            if let Some(hwnd) = window_event_id(&win_event) {
+                let lifecycle_identity_needed = match &win_event {
+                    WindowEvent::Created(_) | WindowEvent::Restored(_) | WindowEvent::Destroyed(_) => true,
+                    _ => source_incarnation.is_some(),
+                };
+                let current_incarnation = lifecycle_identity_needed
+                    .then(|| WindowIncarnation::capture(hwnd))
+                    .flatten();
+                if matches!(win_event, WindowEvent::Destroyed(_)) {
+                    // EVENT_OBJECT_DESTROY normally reaches us after IsWindow
+                    // is false. A live HWND here is necessarily a replacement
+                    // (or an uninspectable live window), so never let the old
+                    // event invoke HWND-keyed physical cleanup on it.
+                    let still_live = current_incarnation.is_some()
+                        || leopardwm_platform_win32::is_window_valid(hwnd);
+                    if still_live {
+                        state.consume_live_destroyed_event(hwnd, current_incarnation.as_ref());
+                        return;
+                    }
+                } else {
+                    // A queued non-destroy event captured for A must not
+                    // mutate B after HWND reuse. When the source was not
+                    // inspectable, current identity remains the best safe
+                    // observation for the live event.
+                    if source_incarnation
+                        .as_ref()
+                        .zip(current_incarnation.as_ref())
+                        .is_some_and(|(source, current)| source != current)
+                    {
+                        debug!("Ignoring stale lifecycle event for recycled HWND {hwnd:#x}");
+                        return;
+                    }
+                    state.observe_window_incarnation(
+                        hwnd,
+                        current_incarnation.or(source_incarnation.clone()),
+                    );
+                    if matches!(win_event, WindowEvent::MoveSizeEnd(_))
+                        && state.resize_hwnd == Some(hwnd)
+                    {
+                        state.invalidate_resize_preview_animation();
+                    }
+                }
+            }
+            state.handle_window_event(win_event.clone());
+            if let WindowEvent::Destroyed(hwnd) = win_event {
+                state.window_incarnations.remove(&hwnd);
+            }
 
             // Keep an open overview in sync with window lifecycle changes
             // (e.g. a card middle-click close completing asynchronously).
@@ -1918,26 +2086,45 @@ async fn process_window_event(ctx: &mut EventLoopCtx<'_>, win_event: WindowEvent
                     aws,
                 );
             }
-            // Spawn vsync-aligned animation thread for resize preview transitions.
+            // Spawn at most one owned vsync-aligned resize-preview writer.
+            // A replacement first invalidates the old generation; if DwmFlush
+            // still owns its thread, publish the target directly rather than
+            // dropping that raw-overlay handle and creating a second writer.
             if let Some(req) = state.pending_resize_animation.take() {
                 if let Some(ref overlay) = ctx.snap_hint_overlay {
-                    // Cancel any running preview animation thread.
-                    state
-                        .resize_preview_cancel
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
-                    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                    state.resize_preview_cancel = cancel.clone();
-                    let active = state.resize_animation_active.clone();
-                    let overlay_hwnd = overlay.hwnd_raw();
-                    std::thread::spawn(move || {
-                        resize_preview_animation_loop(
-                            overlay_hwnd,
-                            req.start_rect,
-                            req.target_rect,
-                            cancel,
-                            active,
-                        );
-                    });
+                    state.invalidate_resize_preview_animation();
+                    if state.reap_resize_preview_thread() {
+                        let (generation, cancel) = state.begin_resize_preview_animation();
+                        let current_generation = state.resize_preview_generation.clone();
+                        let active_generation = state.resize_animation_active_generation.clone();
+                        let active = state.resize_animation_active.clone();
+                        let overlay_hwnd = overlay.hwnd_raw();
+                        match std::thread::Builder::new()
+                            .name("leopardwm-resize-preview".to_string())
+                            .spawn(move || {
+                                resize_preview_animation_loop(
+                                    overlay_hwnd,
+                                    req.start_rect,
+                                    req.target_rect,
+                                    generation,
+                                    cancel,
+                                    current_generation,
+                                    active_generation,
+                                    active,
+                                );
+                            })
+                        {
+                            Ok(thread) => state.resize_preview_thread = Some(thread),
+                            Err(error) => {
+                                warn!("Failed to spawn resize-preview animation: {error}");
+                                state.resize_preview_display_rect = Some(req.target_rect);
+                                overlay.show_snap_target(req.target_rect);
+                            }
+                        }
+                    } else {
+                        state.resize_preview_display_rect = Some(req.target_rect);
+                        overlay.show_snap_target(req.target_rect);
+                    }
                 }
             }
 
@@ -2579,7 +2766,7 @@ async fn handle_preview_gesture(
     if state.layout_transition.is_some() {
         state.settle_scroll_animations();
         if let Err(error) = state.cancel_layout_transition_for_exact_landing() {
-            state.paused = true;
+            state.enter_paused_state("preview gesture transition supersession");
             *ctx.animation_in_flight_epoch = None;
             *ctx.last_frame_instant = None;
             warn!("Preview gesture could not supersede transition; tiling paused: {error}");
@@ -2641,6 +2828,22 @@ async fn handle_preview_gesture(
     );
 }
 
+/// True only when a captured tab-strip workspace is still the workspace that
+/// owns visible tab-strip pixels on its monitor. Actions that mutate focus or
+/// column structure must reject stale captures rather than retargeting the
+/// monitor's current workspace.
+fn captured_tab_workspace_is_active(
+    state: &AppState,
+    monitor: isize,
+    workspace_idx: usize,
+) -> bool {
+    state.active_workspace_idx(monitor) == workspace_idx
+        && state
+            .workspaces
+            .get(&monitor)
+            .is_some_and(|workspaces| workspaces.get(workspace_idx).is_some())
+}
+
 /// Handle a tab-strip click action routed to the captured column identity.
 async fn handle_tab_action(
     state: &Arc<Mutex<AppState>>,
@@ -2658,8 +2861,14 @@ async fn handle_tab_action(
             // dispatch, and we want the click to apply to the
             // column the user saw, not whatever is focused now.
             let mut s = state.lock().await;
+            if !captured_tab_workspace_is_active(&s, monitor, workspace_idx) {
+                debug!(
+                    "Ignoring stale tab activation for monitor={} workspace={}",
+                    monitor, workspace_idx
+                );
+                return;
+            }
             let needs_focus_switch = s.focused_monitor != monitor
-                || s.active_workspace_idx(monitor) != workspace_idx
                 || s.focused_workspace()
                     .is_none_or(|ws| ws.focused_column_index() != column_idx);
             if needs_focus_switch {
@@ -2699,6 +2908,13 @@ async fn handle_tab_action(
         }
         TabAction::Untab => {
             let mut s = state.lock().await;
+            if !captured_tab_workspace_is_active(&s, monitor, workspace_idx) {
+                debug!(
+                    "Ignoring stale tab untab for monitor={} workspace={}",
+                    monitor, workspace_idx
+                );
+                return;
+            }
             if s.focused_monitor != monitor {
                 s.focused_monitor = monitor;
             }
@@ -3312,7 +3528,7 @@ async fn handle_animation_frame_applied(
             let landing_result = state.apply_layout();
             let landing_ok = landing_result.is_ok();
             if let Err(error) = landing_result {
-                state.paused = true;
+                state.enter_paused_state("final animation landing failure");
                 error!(
                     "Final animation landing failed; tiling paused and active ghosts will be dropped: {error}"
                 );
@@ -3433,7 +3649,7 @@ async fn reschedule_display_settle(
     }
     state.display_change_retry_count = state.display_change_retry_count.saturating_add(1);
     if state.display_change_retry_count >= 5 {
-        state.paused = true;
+        state.enter_paused_state("display recovery retry exhaustion");
         state.display_change_pending = false;
         error!(
             "Display recovery generation {generation} exhausted after 5 attempts ({reason}); tiling paused"
@@ -3503,6 +3719,27 @@ async fn handle_display_change_settled(ctx: &mut EventLoopCtx<'_>, generation: u
         let state = ctx.state.lock().await;
         state.display_change_needs_full
     };
+    // A display generation is not complete until monitor enumeration yields a
+    // usable snapshot. Keep its pending token on transient failure so the
+    // bounded retry path can converge without waiting for another OS event.
+    let new_monitors = match enumerate_monitors() {
+        Ok(monitors) if !monitors.is_empty() => monitors,
+        Ok(_) => {
+            reschedule_display_settle(ctx, generation, 100, "monitor enumeration was empty")
+                .await;
+            return;
+        }
+        Err(error) => {
+            reschedule_display_settle(
+                ctx,
+                generation,
+                100,
+                &format!("monitor enumeration failed: {error}"),
+            )
+            .await;
+            return;
+        }
+    };
     // Resize the DWM thumbnail host to the new virtual-screen geometry so
     // subsequent ghost-animation registrations use correct coordinates. Only
     // needed for a real topology/DPI change — a work-area (taskbar) toggle
@@ -3516,10 +3753,10 @@ async fn handle_display_change_settled(ctx: &mut EventLoopCtx<'_>, generation: u
         }
     }
     let mut state = ctx.state.lock().await;
-    // Cancel any in-flight ghost animation — its rects were
-    // computed under the old geometry.
+    // Cancel any in-flight ghost animation — its rects were computed under
+    // the old geometry. The overview's geometry is stale too — hide instead
+    // of rebuilding.
     state.abort_active_ghost_transition();
-    // The overview's geometry is stale too — hide instead of rebuilding.
     state.hide_overview();
     state.display_change_pending = false;
     state.display_change_retry_count = 0;
@@ -3537,7 +3774,7 @@ async fn handle_display_change_settled(ctx: &mut EventLoopCtx<'_>, generation: u
         }
     }
     state.display_change_needs_full = false;
-    state.handle_window_event(WindowEvent::DisplayChange);
+    state.reconcile_display_change_snapshot(new_monitors);
     state.refresh_reduce_motion();
 
     start_animation_frame_if_needed(
@@ -3641,6 +3878,11 @@ async fn run_daemon_event_loop(
             }
             DaemonEvent::TabStripIconPoll => handle_tab_strip_icon_poll(ctx.state).await,
             DaemonEvent::PersistStateNow => handle_persist_state_now(ctx.state).await,
+            DaemonEvent::ReapPendingApplyWorkers => {
+                let mut state = ctx.state.lock().await;
+                state.pending_apply_reap_scheduled = false;
+                let _ = state.reap_finished_pending_apply_workers();
+            }
             DaemonEvent::Overview(event) => handle_overview_event(&mut ctx, event).await,
             DaemonEvent::TabAction {
                 monitor,
@@ -3719,6 +3961,7 @@ async fn run_daemon_event_loop(
         }
 
         sync_pending_layout_apply_timeout_ui(ctx.state, ctx.tray_manager, &*ctx.hotkey_state).await;
+        schedule_pending_apply_worker_reap(ctx.state, ctx.event_tx).await;
         leopardwm_platform_win32::thumbnail::service_pending_preview_retry();
     }
     (preview_event_rx, animation_event_rx, event_rx)
@@ -3804,6 +4047,10 @@ async fn main() -> Result<()> {
     {
         let mut state = state.lock().await;
         init_workspace_state(&mut state);
+        // Startup enumeration predates the live Create route. Seed identity
+        // records now so a delayed Destroyed event cannot clean a recycled HWND
+        // against a newly created replacement.
+        state.record_managed_window_incarnations();
     }
 
     // Create the event channel/animation worker before the system-event window.
@@ -3989,6 +4236,14 @@ async fn main() -> Result<()> {
     // before shutdown tears down hooks, UI sources, and forwarding threads.
     let (preview_event_rx, animation_event_rx, event_rx) =
         run_daemon_event_loop(ctx, preview_event_rx, animation_event_rx, event_rx).await;
+    // Fence the raw-overlay resize preview before any source/overlay teardown.
+    // A thread still blocked in DwmFlush owns its handle in AppState and checks
+    // this generation before another SetWindowPos.
+    {
+        let mut state = state.lock().await;
+        state.invalidate_resize_preview_animation();
+        let _ = state.reap_resize_preview_thread();
+    }
     if let Some(forwarder) = hotkey_state.forwarder.take() {
         thread_handles.push(forwarder);
     }

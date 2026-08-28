@@ -25,6 +25,132 @@ fn test_app_state_new() {
 }
 
 #[test]
+fn test_display_full_change_keeps_long_debounce_after_work_area_event() {
+    // Both arrival orders are deterministic: a full event upgrades the
+    // generation, and a trailing work-area event cannot downgrade it.
+    let full_then_work_area = update_display_change_needs_full(
+        update_display_change_needs_full(false, &WindowEvent::DisplayChange),
+        &WindowEvent::WorkAreaChanged,
+    );
+    let work_area_then_full = update_display_change_needs_full(
+        update_display_change_needs_full(false, &WindowEvent::WorkAreaChanged),
+        &WindowEvent::DisplayChange,
+    );
+    assert!(full_then_work_area);
+    assert!(work_area_then_full);
+    assert_eq!(display_settle_debounce_ms(full_then_work_area), 500);
+    assert_eq!(display_settle_debounce_ms(false), 180);
+}
+
+#[test]
+fn test_resize_preview_only_owning_generation_clears_active() {
+    let active_generation = std::sync::atomic::AtomicU64::new(2);
+    let active = std::sync::atomic::AtomicBool::new(true);
+
+    assert!(
+        !clear_resize_preview_active_if_owned(1, &active_generation, &active),
+        "canceled generation A must not clear active generation B"
+    );
+    assert!(active.load(Ordering::SeqCst));
+    assert_eq!(active_generation.load(Ordering::SeqCst), 2);
+
+    assert!(clear_resize_preview_active_if_owned(2, &active_generation, &active));
+    assert!(!active.load(Ordering::SeqCst));
+    assert_eq!(active_generation.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn test_stale_untab_does_not_mutate_the_current_workspace() {
+    let mut app = AppState::new_with_config(test_config(), test_monitors());
+    app.paused = true;
+    {
+        let ws = &mut app.workspaces.get_mut(&1).unwrap()[0];
+        ws.insert_window(100, None).unwrap();
+        ws.insert_window_in_column(101, 0).unwrap();
+        ws.toggle_focused_column_tabbed_mode();
+    }
+    app.ensure_workspace_exists(1, 1);
+    {
+        let ws = &mut app.workspaces.get_mut(&1).unwrap()[1];
+        ws.insert_window(200, None).unwrap();
+        ws.insert_window_in_column(201, 0).unwrap();
+        ws.toggle_focused_column_tabbed_mode();
+    }
+    app.active_workspace.insert(1, 1);
+    let before = app.workspaces[&1][1].column(0).unwrap().windows().to_vec();
+    let state = std::sync::Arc::new(tokio::sync::Mutex::new(app));
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(handle_tab_action(
+            &state,
+            1,
+            0,
+            0,
+            0,
+            leopardwm_platform_win32::tab_strip::TabAction::Untab,
+        ));
+    let state = state.blocking_lock();
+    assert_eq!(
+        state.workspaces[&1][1].column(0).unwrap().windows(),
+        before.as_slice(),
+        "a stale strip event must not expel a tab from the active workspace"
+    );
+}
+
+#[test]
+fn test_live_destroyed_event_never_cleans_a_recycled_incarnation() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(100, None)
+        .unwrap();
+    let old = WindowIncarnation {
+        process_id: 1,
+        class_name: "OldWindow".to_string(),
+    };
+    let replacement = WindowIncarnation {
+        process_id: 2,
+        class_name: "ReplacementWindow".to_string(),
+    };
+    state.window_incarnations.insert(100, old);
+
+    assert!(state.consume_live_destroyed_event(100, Some(&replacement)));
+    assert!(
+        !state.workspaces[&1][0].contains_window(100),
+        "the old logical owner is discarded before replacement creation"
+    );
+
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(100, None)
+        .unwrap();
+    state.window_incarnations.insert(100, replacement.clone());
+    assert!(state.consume_live_destroyed_event(100, Some(&replacement)));
+    assert!(
+        state.workspaces[&1][0].contains_window(100),
+        "a delayed old Destroyed event must preserve the known replacement"
+    );
+}
+
+#[test]
+fn test_late_timeout_worker_reap_repeats_paused_cleanup() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.paused = true;
+    state.pause_cleanup_after_pending_apply = true;
+    state.pending_drag_hint = Some(DragHintAction::ShowGhost {
+        rect: Rect::new(5, 5, 5, 5),
+    });
+    let worker = std::thread::spawn(|| {});
+    while !worker.is_finished() {
+        std::thread::yield_now();
+    }
+    state.pending_apply_workers.push(worker);
+
+    assert_eq!(state.reap_finished_pending_apply_workers(), 1);
+    assert!(!state.pause_cleanup_after_pending_apply);
+    assert!(matches!(state.pending_drag_hint, Some(DragHintAction::Hide)));
+}
+
+#[test]
 fn test_appearance_change_reapplies_unchanged_layout_with_fresh_insets() {
     let mut state = AppState::new_with_config(test_config(), test_monitors());
     state.paused = false;
@@ -4388,6 +4514,10 @@ fn test_apply_layout_timeout_auto_pauses_and_records_batch() {
     state
         .moved_or_resized_suppression
         .insert(42, std::time::Instant::now() + Duration::from_secs(1));
+    state.snap_disabled_hwnds.insert(100);
+    state.pending_drag_hint = Some(DragHintAction::ShowGhost {
+        rect: Rect::new(1, 2, 3, 4),
+    });
     state.injected_apply_placements_behavior = Some(TestApplyPlacementsBehavior::SleepAndSucceed(
         Duration::from_millis(40),
     ));
@@ -4414,6 +4544,15 @@ fn test_apply_layout_timeout_auto_pauses_and_records_batch() {
     assert!(
         state.last_placed_layout_rects.is_empty(),
         "a timed-out placement batch must not poison the unchanged-layout cache"
+    );
+    assert!(
+        state.snap_disabled_hwnds.is_empty(),
+        "timeout pause must restore the same snap ownership as user pause"
+    );
+    assert!(matches!(state.pending_drag_hint, Some(DragHintAction::Hide)));
+    assert!(
+        state.pause_cleanup_after_pending_apply,
+        "late worker completion must retain a second cleanup obligation"
     );
 
     let report = state

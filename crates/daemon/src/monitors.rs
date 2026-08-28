@@ -357,6 +357,28 @@ impl AppState {
         }
     }
 
+    /// Reconcile one already-validated display snapshot. Keeping monitor
+    /// enumeration outside this method lets the event-loop debounce retain its
+    /// generation and retry transient empty/error snapshots instead of marking
+    /// the generation complete before topology is known.
+    pub(crate) fn reconcile_display_change_snapshot(&mut self, new_monitors: Vec<MonitorInfo>) {
+        debug_assert!(!new_monitors.is_empty());
+        // A topology change can remove the source monitor while a drag preview
+        // still owns a placeholder. Restore that logical ownership first.
+        if let Some(drag_hwnd) = self.drag_state.as_ref().map(|drag| drag.hwnd) {
+            let restore_window = leopardwm_platform_win32::is_valid_window(drag_hwnd);
+            if let Some(aborted_hwnd) = self.abort_active_drag(restore_window) {
+                leopardwm_platform_win32::set_dwm_transitions_disabled(aborted_hwnd, false);
+            }
+        }
+        self.reconcile_monitors(new_monitors);
+        self.resync_minimized_from_os();
+        self.repark_windows_outside_active_layout();
+        if let Err(error) = self.apply_layout() {
+            warn!("Failed to apply layout after display change: {error}");
+        }
+    }
+
     /// Reconcile every managed window's minimized flag with the OS.
     ///
     /// A monitor sleep/wake cycle desyncs this: a stashed workspace restored on

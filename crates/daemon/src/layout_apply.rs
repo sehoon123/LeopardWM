@@ -703,6 +703,18 @@ impl AppState {
             }
         }
         self.pending_apply_workers = still_running;
+        if reaped > 0
+            && self.pending_apply_workers.is_empty()
+            && self.pause_cleanup_after_pending_apply
+        {
+            // A timed-out worker may have entered Win32 before its epoch was
+            // invalidated. Re-run the same paused cleanup after its final
+            // recovery pass so late regions/previews/overlay state cannot
+            // remain published.
+            self.enter_paused_state("late layout worker completion");
+            self.pause_cleanup_after_pending_apply = false;
+            self.pending_apply_reap_scheduled = false;
+        }
         reaped
     }
 
@@ -1196,10 +1208,15 @@ impl AppState {
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                self.paused = true;
-                // Invalidate this apply epoch so late-starting workers bail before placement calls.
+                // Fence both queued and already-returning worker paths before
+                // releasing paused desktop ownership. A worker that is already
+                // inside Win32 checks this epoch again on return and performs
+                // recovery; its owned handle triggers a second paused cleanup
+                // when reaped.
                 self.apply_epoch.fetch_add(1, Ordering::SeqCst);
                 self.pending_apply_workers.push(worker_handle);
+                self.pause_cleanup_after_pending_apply = true;
+                self.enter_paused_state("layout application timeout");
                 self.moved_or_resized_suppression.clear();
                 let msg = layout_apply_timeout_message(timeout);
                 let report = LayoutApplyTimeoutReport {

@@ -1,6 +1,7 @@
 //! Shared helper methods on AppState: window lookup, config application, snap suppression, pause.
 
 use crate::config;
+use crate::events::WindowIncarnation;
 use crate::state::*;
 use anyhow::Result;
 use leopardwm_core_layout::{centered_rect_for_size, FloatingSize, Rect, Workspace};
@@ -479,10 +480,11 @@ impl AppState {
         }
     }
 
-    /// Clear every HWND-incarnation cache that must not survive a real destroy
-    /// or a reconciliation prune. Keeping this centralized prevents a missed
-    /// WinEvent from leaving a ghost column with stale focus/restore metadata.
-    pub(crate) fn clear_recycled_hwnd_metadata(&mut self, wid: u64) {
+    /// Clear daemon-owned data for an HWND without touching the numeric HWND
+    /// through Win32. This is the safe half of destroy cleanup when a queued
+    /// destroy event turns out to belong to an older incarnation that has
+    /// already been recycled by Windows.
+    fn clear_recycled_hwnd_metadata_logically(&mut self, wid: u64) {
         self.scratchpad_on_window_destroyed(wid);
         self.sticky_on_window_destroyed(wid);
         self.floating_size_history.remove(&wid);
@@ -507,11 +509,126 @@ impl AppState {
                 workspace.window_count() > 0 || !workspace.floating_windows().is_empty()
             })
         });
+        self.window_incarnations.remove(&wid);
+    }
+
+    /// Clear every HWND-incarnation cache that must not survive a real destroy
+    /// or a reconciliation prune. Keeping this centralized prevents a missed
+    /// WinEvent from leaving a ghost column with stale focus/restore metadata.
+    pub(crate) fn clear_recycled_hwnd_metadata(&mut self, wid: u64) {
+        self.clear_recycled_hwnd_metadata_logically(wid);
         #[cfg(not(test))]
         {
             leopardwm_platform_win32::taskbar::taskbar_forget(wid);
             leopardwm_platform_win32::clear_suspected_oversize(wid);
         }
+    }
+
+    /// Seed identity records after startup enumeration, when no Created event
+    /// may have passed through the live event route yet.
+    pub(crate) fn record_managed_window_incarnations(&mut self) {
+        for wid in self.all_managed_window_ids() {
+            if let Some(incarnation) = self
+                .lookup_window_info(wid)
+                .as_ref()
+                .map(WindowIncarnation::from_window_info)
+            {
+                self.window_incarnations.insert(wid, incarnation);
+            }
+        }
+    }
+
+    /// Record a live event's source identity. A mismatching identity means a
+    /// new window inherited an old numeric HWND; discard the old logical owner
+    /// before the incoming Created event can see that stale owner and return.
+    pub(crate) fn observe_window_incarnation(
+        &mut self,
+        wid: u64,
+        incarnation: Option<WindowIncarnation>,
+    ) -> bool {
+        let Some(incarnation) = incarnation else {
+            return false;
+        };
+        let replaced = self
+            .window_incarnations
+            .get(&wid)
+            .is_some_and(|known| known != &incarnation);
+        if replaced {
+            self.discard_stale_window_incarnation(wid);
+        }
+        self.window_incarnations.insert(wid, incarnation);
+        replaced
+    }
+
+    /// Consume a Destroyed event that reached the daemon after Windows has
+    /// already assigned its numeric HWND to a live incarnation. If that live
+    /// incarnation is already known, preserve it; otherwise discard only the
+    /// prior logical owner so the pending Created event can manage the new one.
+    pub(crate) fn consume_live_destroyed_event(
+        &mut self,
+        wid: u64,
+        live_incarnation: Option<&WindowIncarnation>,
+    ) -> bool {
+        match live_incarnation {
+            Some(live) if self.window_incarnations.get(&wid) == Some(live) => true,
+            Some(_) => {
+                self.discard_stale_window_incarnation(wid);
+                true
+            }
+            // A live HWND that could not be inspected is still unsafe for
+            // HWND-keyed platform cleanup. Preserve it until a later Created
+            // or focus event supplies an identity.
+            None => true,
+        }
+    }
+
+    /// Drop only the old logical incarnation of `wid`. Do not restore styles,
+    /// taskbar state, snapshots, regions, or DWM state here: each of those
+    /// platform registries is HWND-keyed and could mutate the replacement
+    /// window. Returns whether a logical owner was discarded.
+    pub(crate) fn discard_stale_window_incarnation(&mut self, wid: u64) -> bool {
+        let had_owner = self.find_window_workspace(wid).is_some()
+            || self.window_incarnations.contains_key(&wid)
+            || self.scratchpad.is_some_and(|scratchpad| scratchpad.window_id == wid)
+            || self.sticky_windows.contains(&wid);
+        if !had_owner {
+            return false;
+        }
+
+        for ws_vec in self.workspaces.values_mut() {
+            for workspace in ws_vec.iter_mut() {
+                if !workspace.remove_floating(wid) {
+                    let _ = workspace.remove_window(wid);
+                }
+            }
+        }
+        self.clear_recycled_hwnd_metadata_logically(wid);
+        self.last_placed_layout_rects.remove(&wid);
+        self.hidden_column_widths.remove(&wid);
+        self.tab_title_overrides.remove(&wid);
+        self.window_managed_at.remove(&wid);
+        self.window_last_maximized_at.remove(&wid);
+        self.recently_hidden_hwnds.remove(&wid);
+        self.moved_or_resized_suppression.remove(&wid);
+        self.snap_disabled_hwnds.remove(&wid);
+        if self.previous_focused_hwnd == Some(wid) {
+            self.previous_focused_hwnd = None;
+            self.broadcast_focused_window_if_changed(self.focused_monitor as i64, None);
+        }
+        if self.drag_state.as_ref().is_some_and(|drag| drag.hwnd == wid) {
+            self.drag_state = None;
+            for ws_vec in self.workspaces.values_mut() {
+                for workspace in ws_vec.iter_mut() {
+                    let _ = workspace.remove_window(DRAG_PLACEHOLDER_HWND);
+                }
+            }
+            self.pending_drag_hint = Some(DragHintAction::Hide);
+        }
+        self.ghost_handles.remove(&wid);
+        for (sources, _) in self.crossfade_sources.values_mut() {
+            sources.remove(&wid);
+        }
+        true
     }
 
     /// Testable reconciliation core. `should_prune` receives the HWND and
@@ -763,6 +880,82 @@ impl AppState {
         }
     }
 
+    /// Establish the physical postconditions of paused mode.
+    ///
+    /// This intentionally contains no worker barrier: callers that can wait
+    /// establish their ordering edge first, while the layout-timeout path has a
+    /// worker that may already be inside Win32. That path fences the worker by
+    /// epoch and invokes this cleanup again after the retained handle exits.
+    pub(crate) fn enter_paused_state(&mut self, source: &str) {
+        self.paused = true;
+        self.restore_snap_for_all_windows();
+        leopardwm_platform_win32::restore_all_window_regions();
+        leopardwm_platform_win32::thumbnail::invalidate_persistent_preview_surface();
+        match leopardwm_platform_win32::thumbnail::clear_persistent_previews_best_effort() {
+            Ok(true) => {}
+            Ok(false) => warn!("Paused preview cleanup deferred behind active placement ({source})"),
+            Err(error) => warn!("Paused preview cleanup degraded ({source}): {error}"),
+        }
+        self.hide_border();
+        self.hide_tab_strip();
+        self.pending_drag_hint = Some(DragHintAction::Hide);
+    }
+
+    /// Reap the one owned resize-preview thread if it has completed. The raw
+    /// overlay HWND is never handed to a second thread while this handle is
+    /// still live.
+    pub(crate) fn reap_resize_preview_thread(&mut self) -> bool {
+        let Some(thread) = self.resize_preview_thread.as_ref() else {
+            return true;
+        };
+        if !thread.is_finished() {
+            return false;
+        }
+        let thread = self
+            .resize_preview_thread
+            .take()
+            .expect("finished resize-preview thread must still be owned");
+        let _ = thread.join();
+        true
+    }
+
+    /// Invalidate the current resize-preview writer before a replacement or
+    /// teardown. Incrementing first makes a thread that returns from DwmFlush
+    /// fail its ownership check before touching the overlay again.
+    pub(crate) fn invalidate_resize_preview_animation(&mut self) {
+        self.resize_preview_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.resize_preview_cancel
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.resize_animation_active
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Mint a nonzero generation and cancellation token for a replacement
+    /// preview writer. Call only after [`reap_resize_preview_thread`] reports
+    /// that no prior raw-overlay writer remains.
+    pub(crate) fn begin_resize_preview_animation(
+        &mut self,
+    ) -> (u64, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        self.invalidate_resize_preview_animation();
+        let generation = self
+            .resize_preview_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            .wrapping_add(1);
+        // `fetch_add` can produce zero only on wrap. Publish a nonzero owner
+        // token so zero remains the unowned sentinel used by the worker.
+        let generation = if generation == 0 {
+            self.resize_preview_generation
+                .store(1, std::sync::atomic::Ordering::SeqCst);
+            1
+        } else {
+            generation
+        };
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.resize_preview_cancel = cancel.clone();
+        (generation, cancel)
+    }
+
     /// Toggle paused state for tiling operations.
     ///
     /// When resuming, this immediately reapplies layout so windows snap back
@@ -792,28 +985,7 @@ impl AppState {
             source
         );
         if self.paused {
-            // Restore WS_MAXIMIZEBOX so windows behave normally while paused
-            self.restore_snap_for_all_windows();
-            // Release monitor-overflow clipping too. apply_layout no-ops while
-            // paused, so a boundary window would otherwise keep a region that
-            // hides part of it (and swallows clicks there) for as long as the
-            // pause lasts. Resuming re-applies the layout, which re-installs
-            // exactly the clips the current geometry needs.
-            leopardwm_platform_win32::restore_all_window_regions();
-            // Preview is optional to true tiling cleanup. Revoke/hide it first;
-            // a later handle/input acknowledgement failure is degraded health,
-            // not a reason to report that pause failed after state already
-            // changed or to skip border/tab cleanup.
-            leopardwm_platform_win32::thumbnail::invalidate_persistent_preview_surface();
-            match leopardwm_platform_win32::thumbnail::clear_persistent_previews_best_effort() {
-                Ok(true) => {}
-                Ok(false) => warn!("Pause preview cleanup deferred behind active placement"),
-                Err(error) => warn!("Pause preview cleanup degraded: {error}"),
-            }
-            self.hide_border();
-            self.hide_tab_strip();
-            // Hide any visible drag ghost overlay
-            self.pending_drag_hint = Some(crate::state::DragHintAction::Hide);
+            self.enter_paused_state(source);
         } else {
             self.pending_layout_apply_timeout_report = None;
             if let Err(err) = self.apply_layout() {

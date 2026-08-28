@@ -1,6 +1,7 @@
 //! AppState struct definition, constructor, and basic accessors.
 
 use crate::config::{self, Config};
+use crate::events::WindowIncarnation;
 use leopardwm_core_layout::{FloatingSize, Rect, Workspace};
 use leopardwm_platform_win32::{MonitorId, MonitorInfo, PlatformConfig};
 use serde::{Deserialize, Serialize};
@@ -459,10 +460,20 @@ pub(crate) struct AppState {
     pub(crate) resize_preview_display_rect: Option<Rect>,
     /// Pending animation request (consumed by main loop to spawn DwmFlush thread).
     pub(crate) pending_resize_animation: Option<ResizeAnimationRequest>,
+    /// Monotonic owner token for resize-preview animation publication. A
+    /// canceled thread may only clear the active flag when it still owns this
+    /// generation.
+    pub(crate) resize_preview_generation: Arc<AtomicU64>,
+    /// Generation currently represented by `resize_animation_active`.
+    pub(crate) resize_animation_active_generation: Arc<AtomicU64>,
     /// Cancel flag for running resize preview animation thread.
     pub(crate) resize_preview_cancel: Arc<AtomicBool>,
     /// Whether a resize preview animation thread is currently running.
     pub(crate) resize_animation_active: Arc<AtomicBool>,
+    /// The one owned resize-preview thread. A replacement never drops an
+    /// unfinished handle: it cancels and reaps this handle before it can start
+    /// another raw-overlay writer.
+    pub(crate) resize_preview_thread: Option<std::thread::JoinHandle<()>>,
     /// Pending overlay action from drag event handler (consumed by main loop).
     pub(crate) pending_drag_hint: Option<DragHintAction>,
     /// Per-window suppression deadline for MovedOrResized events after apply_layout().
@@ -483,6 +494,12 @@ pub(crate) struct AppState {
     pub(crate) apply_epoch: Arc<AtomicU64>,
     /// Timed-out placement workers retained for join during shutdown/revert.
     pub(crate) pending_apply_workers: Vec<std::thread::JoinHandle<()>>,
+    /// A timeout worker can complete after immediate paused cleanup. Keep the
+    /// cleanup obligation until every retained worker has been reaped, then run
+    /// it again so late placement cannot republish regions/previews/overlays.
+    pub(crate) pause_cleanup_after_pending_apply: bool,
+    /// Ensures only one main-loop timer polls retained timed-out workers.
+    pub(crate) pending_apply_reap_scheduled: bool,
     /// Max time allowed for Win32 placement calls before auto-pausing tiling.
     pub(crate) layout_apply_timeout: Duration,
     /// One-shot report consumed by the main loop after an automatic timeout pause.
@@ -526,6 +543,10 @@ pub(crate) struct AppState {
     /// distinguish transient popups (managed briefly) from real windows
     /// (managed for a long time, e.g., close-to-tray apps).
     pub(crate) window_managed_at: HashMap<u64, std::time::Instant>,
+    /// Last observed process/class identity for each managed HWND. This is
+    /// intentionally session-only: it fences delayed lifecycle events from a
+    /// recycled numeric HWND without persisting process-local identity.
+    pub(crate) window_incarnations: HashMap<u64, WindowIncarnation>,
     /// Last time each tiled window was seen maximized. Lets a window that opens
     /// maximized and momentarily restores itself mid-burst (an app opening
     /// several windows/tabs at once) re-assert maximize instead of being snapped
@@ -813,14 +834,19 @@ impl AppState {
             resize_preview_target: None,
             resize_preview_display_rect: None,
             pending_resize_animation: None,
+            resize_preview_generation: Arc::new(AtomicU64::new(0)),
+            resize_animation_active_generation: Arc::new(AtomicU64::new(0)),
             resize_preview_cancel: Arc::new(AtomicBool::new(false)),
             resize_animation_active: Arc::new(AtomicBool::new(false)),
+            resize_preview_thread: None,
             pending_drag_hint: None,
             moved_or_resized_suppression: HashMap::new(),
             last_placed_layout_rects: HashMap::new(),
             apply_worker_cancelled: Arc::new(AtomicBool::new(false)),
             apply_epoch: Arc::new(AtomicU64::new(0)),
             pending_apply_workers: Vec::new(),
+            pause_cleanup_after_pending_apply: false,
+            pending_apply_reap_scheduled: false,
             layout_apply_timeout: APPLY_LAYOUT_TIMEOUT,
             pending_layout_apply_timeout_report: None,
             start_time: std::time::Instant::now(),
@@ -831,6 +857,7 @@ impl AppState {
             move_origins: HashMap::new(),
             stashed_monitor_layouts: HashMap::new(),
             window_managed_at: HashMap::new(),
+            window_incarnations: HashMap::new(),
             window_last_maximized_at: HashMap::new(),
             snap_disabled_hwnds: HashSet::new(),
             on_battery_or_saver,
