@@ -2,6 +2,59 @@
 
 All notable changes to LeopardWM will be documented in this file.
 
+## 0.2.6-sehoon.24-rc3
+
+### Fixes
+
+- **HWND reuse is fenced end to end.** WinEvent payloads now carry callback-time
+  incarnation identities atomically; lifecycle, focus, minimize and move/size
+  edges without identity become a bounded full reconcile. Layout requests carry
+  the daemon-recorded identity through animation and exact workers, including
+  the unchanged-layout fast path and persisted workspace restoration.
+- **Crash recovery is marker-qualified and transactional.** MoveOffScreen,
+  snap-style, taskbar, region and cloak ledgers retain token-qualified ownership
+  through partial failure. Parking publishes a prepared marker before mutation,
+  records physical commit separately, and never lets watchdog or CLI recovery
+  move an unmarked recycled HWND.
+- **Preview and overview ownership is generation-safe.** Thumbnail-host restart
+  preserves a mandatory exact-relayout obligation; destroy fencing never blocks
+  WinEvent callbacks. Overview thumbnail, mask and animation writers are
+  serialized so stale timer work cannot republish handles, show an orphan mask,
+  or cancel a newer overview generation.
+- **Callback ingress is bounded and nonblocking.** WinEvent, low-level mouse,
+  gesture, display, work-area and power saturation is retried or coalesced by
+  fixed-size reconciliation signals. Queue pressure no longer blocks hooks,
+  disconnects gesture delivery, or consumes an undelivered wheel action.
+- **Workspace and monitor commands roll back model and physical ownership.**
+  Cross-monitor moves, reduced-motion switches, sticky migration and
+  move-to-workspace failures restore complete workspace snapshots, perform a
+  verified physical rollback, and pause with marker-qualified visibility
+  recovery when rollback cannot be proven. Paused workspace mutations are
+  rejected before any HWND or model write.
+- **Snap and taskbar recovery cannot hang shutdown or lose ownership.** Original
+  maximize-box state is proven before marking, inconclusive readback retains the
+  receipt, startup recovery precedes enumeration, and taskbar shutdown has a
+  wall-clock bound with durable watchdog handoff.
+- **Renderer safety fails closed.** Unsafe transition-fence failure now pauses
+  instead of dispatching another resize frame. A worker crossing session-end
+  cancellation runs final visibility recovery after its last DWM write.
+- **Startup and settings state are preserved safely.** Pruned persisted layouts
+  repair blank scroll offsets, width presets cannot undercut a known minimum,
+  CLI safe/no-hotkey policy survives reload, and all autostart surfaces prefer
+  the watchdog. Settings saves are one-in-flight with FIFO acknowledgements,
+  duplicate hotkeys cannot be saved lossily, and custom controls expose keyboard
+  and ARIA state.
+- **Release validation accepts canonical checksum casing without weakening
+  integrity.** The fixture executes the real lowercase-checksum path and still
+  rejects a changed digest.
+
+### Validation
+
+- Windows MSVC: 1,308 tests passed, 0 failed, 7 hardware-sensitive tests ignored.
+- All-target workspace check, Clippy with `-D warnings`, formatting, release
+  fixtures, GUI-subsystem verification, floating-return probe, and ten
+  consecutive preview lifecycle/pixel probes passed on the candidate source.
+
 ## 0.2.6-sehoon.24-rc2
 
 ### Fixes
