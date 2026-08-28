@@ -46,7 +46,7 @@ use anyhow::Result;
 use clap::Parser;
 use config::Config;
 use leopardwm_core_layout::Rect;
-use leopardwm_ipc::{pipe_name_candidates, preferred_pipe_name, IpcCommand, IpcResponse};
+use leopardwm_ipc::{preferred_pipe_name, IpcCommand, IpcResponse};
 use leopardwm_platform_win32::{
     cascade_windows, enumerate_monitors, enumerate_windows, fn_mod_bit, install_event_hooks,
     install_keyboard_hook, install_mouse_hook, overlay::OverlayWindow, parse_hotkey_string,
@@ -3996,6 +3996,11 @@ fn join_forwarding_threads(thread_handles: Vec<ForwardingThreadHandle>) {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
+    // Claim the first pipe instance before loading configuration or touching
+    // any WM state. This is the daemon-wide singleton fence; probing first
+    // leaves a TOCTOU interval in which two processes can both initialize.
+    let ipc_ownership = acquire_daemon_instance_ownership()?;
+
     let (config, config_warnings) = bootstrap_config()?;
 
     // Install panic hook to uncloak all windows and write a crash report
@@ -4008,18 +4013,6 @@ async fn main() -> Result<()> {
     // user-facing notices (e.g. "can't tile this elevated window"). Non-fatal.
     if let Err(e) = notify::init() {
         warn!("Toast notification setup failed (notifications disabled): {e:#}");
-    }
-
-    // Check if another instance is already running
-    let ipc_pipe_names = pipe_name_candidates();
-    if check_already_running().await {
-        eprintln!("Error: Another leopardwm-daemon instance is already running.");
-        eprintln!("Use 'leopardwm-cli status' to check the running instance.");
-        error!(
-            "Another leopardwm-daemon instance is already running (active pipe candidates: {})",
-            ipc_pipe_names.join(", ")
-        );
-        std::process::exit(1);
     }
 
     info!(
@@ -4172,7 +4165,7 @@ async fn main() -> Result<()> {
     // task itself doesn't need direct AppState access.
     let ipc_tx = event_tx.clone();
     tokio::spawn(async move {
-        run_ipc_server(ipc_tx).await;
+        run_ipc_server_with_ownership(ipc_tx, ipc_ownership).await;
     });
 
     info!("IPC server listening on {}", preferred_pipe_name());
@@ -4252,6 +4245,7 @@ async fn main() -> Result<()> {
     drop(_gesture_handle);
     drop(_hook_handle);
     drop(_settings_handle.take());
+    settings::reap_finished_settings_threads();
     drop(settings_sync_tx);
     drop(tray_manager);
 

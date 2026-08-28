@@ -104,16 +104,6 @@ pub(crate) fn response_for_ipc_wait_failure(_cmd: &IpcCommand, timed_out: bool) 
     }
 }
 
-/// Backward-compatible server entry point. New daemon startup must acquire
-/// [`IpcServerOwnership`] before any state, hooks, or layout work, then call
-/// [`run_ipc_server_with_ownership`] with that retained ownership value.
-pub(crate) async fn run_ipc_server(event_tx: mpsc::Sender<DaemonEvent>) {
-    match crate::startup::acquire_daemon_instance_ownership() {
-        Ok(ownership) => run_ipc_server_with_ownership(event_tx, ownership).await,
-        Err(error) => error!(%error, "IPC server did not acquire daemon ownership"),
-    }
-}
-
 /// Run the IPC server after startup has atomically acquired its first pipe
 /// instance with [`acquire_ipc_server_ownership`].
 pub(crate) async fn run_ipc_server_with_ownership(

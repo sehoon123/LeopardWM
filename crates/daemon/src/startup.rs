@@ -2,7 +2,9 @@
 
 use crate::ipc_server::{acquire_ipc_server_ownership, IpcServerOwnership};
 use anyhow::{Context, Result};
+#[cfg(test)]
 use leopardwm_ipc::pipe_name_candidates;
+#[cfg(test)]
 use tracing::warn;
 
 /// Startup banner info for display after initialization.
@@ -147,7 +149,9 @@ pub(crate) fn format_crash_report(info: &std::panic::PanicHookInfo<'_>) -> Strin
     report
 }
 
+#[cfg(test)]
 pub(crate) const ERROR_PIPE_BUSY: i32 = 231;
+#[cfg(test)]
 pub(crate) const ERROR_FILE_NOT_FOUND: i32 = 2;
 
 /// Acquire the daemon's atomic IPC ownership before constructing state,
@@ -162,6 +166,7 @@ pub(crate) fn acquire_daemon_instance_ownership() -> Result<IpcServerOwnership> 
     )
 }
 
+#[cfg(test)]
 pub(crate) fn pipe_probe_error_indicates_running(error: &std::io::Error) -> bool {
     match error.raw_os_error() {
         Some(ERROR_PIPE_BUSY) => true,
@@ -171,6 +176,7 @@ pub(crate) fn pipe_probe_error_indicates_running(error: &std::io::Error) -> bool
     }
 }
 
+#[cfg(test)]
 pub(crate) fn pipe_probe_result_indicates_running<T>(probe_result: std::io::Result<T>) -> bool {
     match probe_result {
         Ok(_) => true,
@@ -182,6 +188,7 @@ pub(crate) fn pipe_probe_result_indicates_running<T>(probe_result: std::io::Resu
 ///
 /// Returns `true` if the pipe exists (connected or busy). ERROR_PIPE_BUSY (231)
 /// means another client is already connected — the daemon is still running.
+#[cfg(test)]
 pub(crate) async fn check_already_running() -> bool {
     for pipe_name in pipe_name_candidates() {
         let probe_result = tokio::net::windows::named_pipe::ClientOptions::new().open(&pipe_name);
