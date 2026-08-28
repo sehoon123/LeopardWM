@@ -1423,7 +1423,10 @@ function closeCombobox(cb) {
 }
 function closeRuleOptions(cell) {
   cell.classList.remove('open');
-  cell.querySelectorAll('.menu-item.subopen').forEach(function(item) { item.classList.remove('subopen'); });
+  cell.querySelectorAll('.menu-item.subopen').forEach(function(item) {
+    item.classList.remove('subopen');
+    item.setAttribute('aria-expanded', 'false');
+  });
   var trigger = cell.querySelector('.rule-opts-btn');
   if (trigger) trigger.setAttribute('aria-expanded', 'false');
   var row = cell.closest('tr');
@@ -1632,8 +1635,10 @@ function setCb(id, value, showUnknown) {
   var opts = cb.querySelectorAll('.combobox-option');
   opts.forEach(function(o) {
     o.classList.remove('selected');
+    o.setAttribute('aria-selected', 'false');
     if (o.dataset.value === value) {
       o.classList.add('selected');
+      o.setAttribute('aria-selected', 'true');
       matched = true;
       cb.querySelector('.combobox-text').textContent = o.textContent;
     }
@@ -2186,7 +2191,12 @@ function initRuleOptions(tr) {
     item.tabIndex = 0;
     var isToggle = item.classList.contains('menu-toggle');
     var isRadio = item.classList.contains('menu-radio');
+    var hasSubmenu = item.classList.contains('has-sub');
     item.setAttribute('role', isToggle ? 'menuitemcheckbox' : (isRadio ? 'menuitemradio' : 'menuitem'));
+    if (hasSubmenu) {
+      item.setAttribute('aria-haspopup', 'menu');
+      item.setAttribute('aria-expanded', 'false');
+    }
     if (isToggle || isRadio) item.setAttribute('aria-checked', item.classList.contains(isToggle ? 'checked' : 'selected') ? 'true' : 'false');
     item.addEventListener('keydown', function(e) {
       var visibleItems = keyboardItems.filter(function(candidate) { return candidate.offsetParent !== null; });
@@ -2239,7 +2249,10 @@ function initRuleOptions(tr) {
   pop.addEventListener('click', function(e) {
     e.stopPropagation();
     if (!e.target.closest('.menu-item.has-sub') && !e.target.closest('.menu-sub')) {
-      pop.querySelectorAll('.menu-item.subopen').forEach(function(m) { m.classList.remove('subopen'); });
+      pop.querySelectorAll('.menu-item.subopen').forEach(function(m) {
+        m.classList.remove('subopen');
+        m.setAttribute('aria-expanded', 'false');
+      });
     }
   });
   pop.addEventListener('input', function() { updateRuleSummary(tr); });
@@ -2250,9 +2263,13 @@ function initRuleOptions(tr) {
       if (e.target.closest('.menu-sub')) return; // handled by radio click
       e.stopPropagation();
       var wasOpen = item.classList.contains('subopen');
-      pop.querySelectorAll('.menu-item.subopen').forEach(function(m) { m.classList.remove('subopen'); });
+      pop.querySelectorAll('.menu-item.subopen').forEach(function(m) {
+        m.classList.remove('subopen');
+        m.setAttribute('aria-expanded', 'false');
+      });
       if (!wasOpen) {
         item.classList.add('subopen');
+        item.setAttribute('aria-expanded', 'true');
         var sub = item.querySelector('.menu-sub');
         // Open inward (the flyout is right-anchored); flip if it would clip left.
         var subRect = sub.getBoundingClientRect();
@@ -2274,6 +2291,8 @@ function initRuleOptions(tr) {
         o.setAttribute('aria-checked', o === opt ? 'true' : 'false');
       });
       parent.classList.remove('subopen');
+      parent.setAttribute('aria-expanded', 'false');
+      parent.focus();
       updateRuleSummary(tr);
       autoSave(0);
     });

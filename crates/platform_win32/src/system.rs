@@ -31,7 +31,7 @@ pub fn is_on_battery_or_power_saver() -> bool {
 /// session. Used only to distinguish an inaccessible legacy daemon pipe owned
 /// by another session from an elevated same-session daemon.
 pub fn other_process_in_current_session(executable_name: &str) -> Result<bool, String> {
-    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_NO_MORE_FILES, HANDLE};
     use windows::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
         TH32CS_SNAPPROCESS,
@@ -39,43 +39,59 @@ pub fn other_process_in_current_session(executable_name: &str) -> Result<bool, S
     use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
     use windows::Win32::System::Threading::GetCurrentProcessId;
 
+    struct Snapshot(HANDLE);
+    impl Drop for Snapshot {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+
     unsafe {
         let current_pid = GetCurrentProcessId();
         let mut current_session = 0;
         ProcessIdToSessionId(current_pid, &mut current_session)
             .map_err(|error| format!("current session query failed: {error}"))?;
-        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
-            .map_err(|error| format!("process snapshot failed: {error}"))?;
+        let snapshot = Snapshot(
+            CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+                .map_err(|error| format!("process snapshot failed: {error}"))?,
+        );
         let mut entry = PROCESSENTRY32W {
             dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
             ..Default::default()
         };
-        let mut found = false;
-        if Process32FirstW(snapshot, &mut entry).is_ok() {
-            loop {
-                if entry.th32ProcessID != current_pid {
-                    let name_end = entry
-                        .szExeFile
-                        .iter()
-                        .position(|character| *character == 0)
-                        .unwrap_or(entry.szExeFile.len());
-                    let name = String::from_utf16_lossy(&entry.szExeFile[..name_end]);
+        Process32FirstW(snapshot.0, &mut entry)
+            .map_err(|error| format!("first process enumeration failed: {error}"))?;
+        loop {
+            if entry.th32ProcessID != current_pid {
+                let name_end = entry
+                    .szExeFile
+                    .iter()
+                    .position(|character| *character == 0)
+                    .unwrap_or(entry.szExeFile.len());
+                let name = String::from_utf16_lossy(&entry.szExeFile[..name_end]);
+                if name.eq_ignore_ascii_case(executable_name) {
                     let mut session = 0;
-                    if name.eq_ignore_ascii_case(executable_name)
-                        && ProcessIdToSessionId(entry.th32ProcessID, &mut session).is_ok()
-                        && session == current_session
-                    {
-                        found = true;
-                        break;
+                    ProcessIdToSessionId(entry.th32ProcessID, &mut session).map_err(|error| {
+                        format!(
+                            "session query failed for matching process {}: {error}",
+                            entry.th32ProcessID
+                        )
+                    })?;
+                    if session == current_session {
+                        return Ok(true);
                     }
                 }
-                if Process32NextW(snapshot, &mut entry).is_err() {
+            }
+            if let Err(error) = Process32NextW(snapshot.0, &mut entry) {
+                if GetLastError() == ERROR_NO_MORE_FILES {
                     break;
                 }
+                return Err(format!("process enumeration failed: {error}"));
             }
         }
-        let _ = CloseHandle(snapshot);
-        Ok(found)
+        Ok(false)
     }
 }
 

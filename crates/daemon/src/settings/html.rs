@@ -192,6 +192,9 @@ mod tests {
         assert!(SETTINGS_HTML.contains("aria-selected"));
         assert!(SETTINGS_HTML.contains("candidate.offsetParent !== null"));
         assert!(SETTINGS_HTML.contains("closeRuleOptions(cell)"));
+        assert!(SETTINGS_HTML.contains("o.setAttribute('aria-selected', 'true')"));
+        assert!(SETTINGS_HTML.contains("item.setAttribute('aria-haspopup', 'menu')"));
+        assert!(SETTINGS_HTML.contains("parent.focus()"));
         assert!(SETTINGS_HTML.contains("aria-label=\"Delete rule\""));
     }
 

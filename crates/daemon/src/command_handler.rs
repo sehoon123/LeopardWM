@@ -1557,7 +1557,13 @@ impl AppState {
                 self.active_workspace.insert(monitor, current_idx);
                 self.previous_focused_hwnd = previous_focus_before;
                 self.last_placed_layout_rects.clear();
-                let rollback = self.apply_layout();
+                let rollback = if self.paused {
+                    Err(anyhow::anyhow!(
+                        "tiling already paused before workspace parking rollback"
+                    ))
+                } else {
+                    self.apply_layout()
+                };
                 if rollback.is_err() {
                     self.enter_paused_state("workspace parking rollback failure");
                     let managed = self.all_managed_window_ids();
