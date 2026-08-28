@@ -13,26 +13,38 @@ concurrency:
 
 jobs:
   build:
-    # Every `v*` tag builds here, including personal `-sehoon.N` builds: the
-    # separate pipeline they used to rely on was retired, which left those tags
-    # producing no assets at all. Any tag carrying a pre-release suffix is
-    # published as a pre-release (see the `channel` step below).
+    # Any version-coherent v* tag can build. The validation step below requires
+    # the tag to resolve to the current origin/main commit and treats a
+    # prerelease suffix (including -sehoon.24-rcN) as a prerelease channel.
     permissions:
       contents: write
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
           components: rustfmt, clippy
+      - name: Validate release candidate provenance
+        shell: pwsh
+        run: ./.github/validate-release.ps1 -RepoRoot (Get-Location).Path -Tag $env:GITHUB_REF_NAME
       - name: Install cargo-wix
         run: cargo install cargo-wix --version ^0.3 --locked
       - name: Verify formatting
         run: cargo fmt --all -- --check
       - name: Run full test suite
         run: cargo test --workspace --all-targets --locked
+      - name: Verify controlled Win32 floating-return probe preflight
+        shell: pwsh
+        run: ./.github/verify-no-leopardwm-daemon.ps1
       - name: Run controlled Win32 floating-return probe
         run: cargo test -p leopardwm-platform-win32 --features integration-probes --test floating_return_windows --locked -- --test-threads=1
+      - name: Verify controlled Win32 preview lifecycle probe preflight
+        shell: pwsh
+        run: ./.github/verify-no-leopardwm-daemon.ps1
+      - name: Run controlled Win32 preview lifecycle probe
+        run: cargo test -p leopardwm-platform-win32 --features integration-probes --test preview_lifecycle_windows --locked -- --test-threads=1
       - name: Run Clippy with warnings denied
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Build optimized binaries
@@ -43,6 +55,7 @@ jobs:
       - name: Package ZIP
         shell: bash
         run: |
+          set -euo pipefail
           VERSION=${GITHUB_REF_NAME#v}
           DIR="LeopardWM-${VERSION}-x86_64-windows"
           mkdir "$DIR"
@@ -55,12 +68,19 @@ jobs:
       - name: Build MSI installer
         shell: bash
         run: |
+          set -euo pipefail
           VERSION=${GITHUB_REF_NAME#v}
           cargo wix -p leopardwm-daemon -I wix/main.wxs \
             --target x86_64-pc-windows-msvc \
             --no-build --nocapture \
             --bin-path "C:\Program Files (x86)\WiX Toolset v3.14\bin"
-          cp target/wix/*.msi "LeopardWM-${VERSION}-x86_64.msi"
+          shopt -s nullglob
+          msis=(target/wix/*.msi)
+          if [[ ${#msis[@]} -ne 1 ]]; then
+            printf 'Expected one MSI from cargo wix, found %s: %s\n' "${#msis[@]}" "${msis[*]:-none}" >&2
+            exit 1
+          fi
+          cp "${msis[0]}" "LeopardWM-${VERSION}-x86_64.msi"
           ls -l "LeopardWM-${VERSION}-x86_64.msi"
       - name: Classify release channel
         id: channel
@@ -77,21 +97,36 @@ jobs:
         id: changelog
         shell: bash
         run: |
+          set -euo pipefail
           VERSION=${GITHUB_REF_NAME#v}
-          NOTES=$(awk "/^## \\[?${VERSION//./\\.}\\]?/{found=1; next} /^## /{if(found) exit} found{print}" CHANGELOG.md 2>/dev/null || true)
-          if [ -z "$NOTES" ]; then
-            echo "body=" >> "$GITHUB_OUTPUT"
-          else
-            EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
-            echo "body<<$EOF" >> "$GITHUB_OUTPUT"
-            echo "$NOTES" >> "$GITHUB_OUTPUT"
-            echo "$EOF" >> "$GITHUB_OUTPUT"
+          NOTES=$(awk -v version="$VERSION" '
+            $0 == "## " version || $0 == "## [" version "]" { found=1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md)
+          if [[ -z "$NOTES" ]]; then
+            echo "Matching changelog section for $VERSION is empty" >&2
+            exit 1
           fi
+          EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
+          echo "body<<$EOF" >> "$GITHUB_OUTPUT"
+          echo "$NOTES" >> "$GITHUB_OUTPUT"
+          echo "$EOF" >> "$GITHUB_OUTPUT"
       - name: Generate SHA-256 checksums
         shell: bash
         run: |
-          sha256sum LeopardWM-*.zip LeopardWM-*.msi > checksums.txt
+          set -euo pipefail
+          VERSION=${GITHUB_REF_NAME#v}
+          sha256sum "LeopardWM-${VERSION}-x86_64-windows.zip" "LeopardWM-${VERSION}-x86_64.msi" > checksums.txt
           cat checksums.txt
+      - name: Validate packaged release identities
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME.Substring(1)
+          ./.github/validate-release.ps1 -RepoRoot (Get-Location).Path -Tag $env:GITHUB_REF_NAME `
+            -ZipPath "LeopardWM-$version-x86_64-windows.zip" `
+            -MsiPath "LeopardWM-$version-x86_64.msi" `
+            -ChecksumsPath checksums.txt
       - uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           files: |
@@ -99,5 +134,5 @@ jobs:
             LeopardWM-*.msi
             checksums.txt
           body: ${{ steps.changelog.outputs.body }}
-          generate_release_notes: ${{ steps.changelog.outputs.body == '' }}
+          generate_release_notes: false
           prerelease: ${{ steps.channel.outputs.prerelease == 'true' }}

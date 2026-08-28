@@ -1,77 +1,35 @@
 # Distribution Setup
 
-Manual one-time steps to enable winget auto-publishing and code signing. Each section is self-contained — do them in any order.
+The release workflow publishes GitHub Release ZIP/MSI assets only. It does not publish Winget or Scoop updates and does not currently sign binaries.
 
-## winget — `WINGET_TOKEN` secret
+## Winget — manual submission
 
-The `publish-winget` job in `.github/workflows/release.yml` uses the `vedantmgoyal9/winget-releaser` action to fork `microsoft/winget-pkgs`, generate a manifest from the released MSI, and open a PR. The action requires a classic personal access token with the `public_repo` and `workflow` scopes; fork synchronization can import upstream workflow files, which GitHub rejects without `workflow`. Fine-grained tokens cannot open the upstream PR.
+There is no `publish-winget` job and no `WINGET_TOKEN` secret in this repository. After a GitHub Release succeeds:
 
-1. Go to https://github.com/settings/tokens/new
-2. **Note:** `LeopardWM winget releaser`
-3. **Expiration:** `1 year` (renew when it expires)
-4. Select the `public_repo` and `workflow` scopes.
-5. Click **Generate token** and copy the value.
-6. Add it as the repository secret:
-   ```
-   gh secret set WINGET_TOKEN --repo jcardama/LeopardWM
-   # (paste the token when prompted)
-   ```
+1. Download the published MSI and read its SHA-256 from `checksums.txt`.
+2. Update or submit the `jcardama.LeopardWM` manifest in `microsoft/winget-pkgs` following that repository's current contribution requirements.
+3. Verify the accepted upstream manifest with `winget show jcardama.LeopardWM` and, when available, `winget upgrade jcardama.LeopardWM` on a clean machine.
 
-The next tagged release that includes the MSI will trigger the action and open a PR to `microsoft/winget-pkgs` automatically.
+Do not claim that a successful GitHub Release updated Winget; upstream review and merge are separate manual work.
 
-**One-time bootstrap caveat:** `winget-releaser` only updates *existing* packages. Before the first time it runs, the package identifier (`jcardama.LeopardWM`) must already exist somewhere in `microsoft/winget-pkgs`. v0.1.11's first manual submission was done via `komac` to seed the package; from v0.1.12 onward the action picks up automatically.
+## Scoop — repository manifest
 
-**Verifying it worked:** after pushing the next `v*` tag, check the `publish-winget` job in the run at https://github.com/jcardama/LeopardWM/actions. On success it logs the PR URL.
+`dist/scoop/leopardwm.json` is the checked-in Scoop manifest. As part of release preparation, update all of these together from the published GitHub Release ZIP:
 
----
+- `version` to `[workspace.package].version`;
+- the URL and `extract_dir` to the matching stable release asset; and
+- the ZIP SHA-256 to the value in that release's `checksums.txt`.
 
-## Code signing — IDs.cloud verification + Azure Trusted Signing
+The manifest ships daemon and both CLI shims. The watchdog remains adjacent to the CLI binaries and is intentionally not shimmed for direct invocation.
 
-This eliminates the SmartScreen "Windows protected your PC" prompt on first install. komorebi doesn't have this; GlazeWM does. Without it, every first-time installer hits the prompt and many users abandon.
+## Code signing — future manual setup
 
-Two parts: **publisher identity verification** (your part, ~$33, ~1 week async) and **Azure Trusted Signing setup** (we wire into CI once verification clears).
-
-### Step 1 — Identity verification (you do this)
-
-The lowest-cost path for an individual OSS dev:
-
-1. Go to https://www.ids.cloud/identity-verification (or alternative verifier accepted by Azure Trusted Signing — check current list at https://learn.microsoft.com/azure/trusted-signing/concept-trusted-signing-trust-models)
-2. Choose **Individual Verification** (~$33). DUNS at $100+ is only needed if signing under a company name.
-3. Submit the requested documents (government ID, proof of address). Turnaround is typically 3–7 business days.
-4. On approval you'll receive a `MS Identity Validation` confirmation. Save the validation ID.
-
-### Step 2 — Azure Trusted Signing account (you do this; ~10 min after Step 1 clears)
-
-1. Sign in to https://portal.azure.com
-2. Search for **Trusted Signing Accounts** → **Create**
-3. Pick a region (East US is fine), resource group, and a unique account name like `leopardwm-signing`
-4. Tier: **Basic** (~$10/mo)
-5. After creation, go to the account → **Identity Validation** → submit the IDs.cloud validation ID from Step 1
-6. Once Microsoft accepts (usually within a day), create a **Certificate Profile**:
-   - Name: `leopardwm`
-   - Type: **Public Trust** → **Individual**
-   - Subject: matches your verified identity
-7. Note these for the next step:
-   - `AZURE_ENDPOINT` (the account's regional endpoint, e.g. `https://eus.codesigning.azure.net`)
-   - `AZURE_CODE_SIGNING_NAME` (the account name)
-   - `AZURE_CERT_PROFILE_NAME` (the certificate profile name)
-
-### Step 3 — Wire into CI (I do this once you finish Step 2)
-
-When you have the values from Step 2, share them and I'll:
-
-1. Set up an Azure App Registration with federated credentials for GitHub Actions OIDC
-2. Add `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_SUBSCRIPTION_ID`, plus the three values above as repo secrets
-3. Add an `AzureSignTool` step to `.github/workflows/release.yml` that signs both the MSI and the bundled exes before they're attached to the release
-4. Tag a release-candidate (`v0.2.0-rc1`) to verify end-to-end: install the signed MSI on a clean VM and confirm no SmartScreen prompt
-
----
+No signing step exists in `.github/workflows/release.yml`, so current releases remain unsigned. If signing is introduced, document the selected provider, required identities/secrets, OIDC permissions, which ZIP/MSI binaries are signed, and a clean-machine verification before representing releases as signed.
 
 ## Status checklist
 
-- [ ] WINGET_TOKEN secret created (Section 1)
-- [ ] IDs.cloud individual verification submitted (Section 2, Step 1)
-- [ ] IDs.cloud verification approved (~3–7 days async)
-- [ ] Azure Trusted Signing account + cert profile created (Section 2, Step 2)
-- [ ] Repo secrets + AzureSignTool step wired (Section 2, Step 3)
-- [ ] v0.2.0-rc1 tagged, signing verified on clean VM
+- [ ] GitHub Release ZIP/MSI inventories and checksums verified
+- [ ] Scoop manifest updated from the matching published ZIP
+- [ ] Winget manifest submitted manually (if a Winget update is desired)
+- [ ] Winget upstream review/merge verified independently
+- [ ] Code-signing plan approved and implemented before claiming signed releases

@@ -8,10 +8,11 @@ Rust workspace, MSVC toolchain (`stable-x86_64-pc-windows-msvc`).
 | Crate | What it does |
 |---|---|
 | `core_layout` | Platform-agnostic scrolling layout engine |
-| `platform_win32` | Win32 APIs, DwmFlush animation engine |
+| `platform_win32` | Win32 APIs and DWM integration |
 | `ipc` | Named-pipe command/response protocol |
-| `daemon` | Event loop, state, message-pump threads, tray, settings WebView |
-| `cli` | User-facing CLI |
+| `daemon` | Event loop, state, message-pump threads, tray, and settings WebView |
+| `cli` | User-facing CLI (`leopardwm-cli` and `lwm`) |
+| `watchdog` | Daemon supervisor and crash-recovery launcher |
 
 All crates live under `crates/`. Internal names still use `leopardwm` (rename is future work).
 
@@ -27,25 +28,14 @@ cargo test --all
 - Verify with tests or logs before declaring done.
 - Keep changes minimal and scoped; avoid unrelated refactors.
 
-## Large files (use offset/limit)
-daemon: `main.rs` (1740), `config.rs` (2233), `helpers.rs` (1749), `tests.rs` (2472). cli: `main.rs` (2732). core_layout: `tests.rs` (3045).
+## Large files
+Use offset/limit when reading large sources, especially `crates/daemon/src/main.rs`,
+`crates/daemon/src/config.rs`, `crates/daemon/src/helpers.rs`, and their test modules.
 
 ## When summarizing this conversation
 Preserve: (1) which files were modified and why, (2) current git branch and uncommitted state, (3) in-progress work or unfinished steps, (4) user corrections/preferences from this session, (5) specific error messages being debugged.
 
-## Reference docs (read when relevant)
-<important if="editing files in crates/daemon/ or crates/core_layout/ or crates/platform_win32/">
-Read `.claude/agent_docs/architecture.md` for crate relationships, module map, and data flow.
-</important>
-<important if="creating a release, tagging, or updating CHANGELOG.md">
-Read `agent_docs/release.md` for the release checklist and changelog format.
-</important>
-<important if="reading files >500 lines, doing large refactors, or 10+ messages into a session">
-Read `.claude/agent_docs/context-management.md` for file read caps, compaction behavior, and verification.
-</important>
-<important if="task touches >5 files or spans multiple crates">
-Read `.claude/agent_docs/context-management.md` — sub-agent swarming section. Launch parallel sub-agents for cross-crate or large-scope work.
-</important>
-
-## Extended policies
-See `AGENTS.md` for agent-agnostic policies that apply across all coding agents.
+## Reference docs
+- Read `AGENTS.md` for repository-wide policies.
+- Read `agent_docs/release.md` before changing release metadata, tags, or `CHANGELOG.md`.
+- Read `agent_docs/ipc-events.md` before changing the public event stream.

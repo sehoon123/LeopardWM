@@ -6,13 +6,24 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - name: Test release validation policy
+        shell: pwsh
+        run: ./.github/tests/release-validation.tests.ps1
       - run: cargo build --release
       - name: Verify GUI executable subsystems
         shell: pwsh
         run: ./.github/verify-gui-subsystems.ps1
       - run: cargo test --all
+      - name: Verify controlled Win32 floating-return probe preflight
+        shell: pwsh
+        run: ./.github/verify-no-leopardwm-daemon.ps1
       - name: Run controlled Win32 floating-return probe
         run: cargo test -p leopardwm-platform-win32 --features integration-probes --test floating_return_windows -- --test-threads=1
+      - name: Verify controlled Win32 preview lifecycle probe preflight
+        shell: pwsh
+        run: ./.github/verify-no-leopardwm-daemon.ps1
+      - name: Run controlled Win32 preview lifecycle probe
+        run: cargo test -p leopardwm-platform-win32 --features integration-probes --test preview_lifecycle_windows -- --test-threads=1
       - run: cargo clippy --all -- -D warnings
       - name: Lint real Win32 lifecycle probes
         run: cargo clippy -p leopardwm-platform-win32 --features integration-probes --test preview_lifecycle_windows -- -D warnings

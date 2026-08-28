@@ -85,14 +85,23 @@ A few deliberate **non-features**, so you know what you're getting:
 
 ## Installation
 
-### Via package manager (recommended)
+### Via Winget
 
 ```powershell
-winget install jcardama.LeopardWM         # Windows Package Manager
-scoop install extras/leopardwm            # Scoop (after `scoop bucket add extras`)
+winget install jcardama.LeopardWM
 ```
 
-Both install LeopardWM and put `leopardwm`, `leopardwm-cli`, and `lwm` on your PATH. `winget upgrade` / `scoop update` keep you on the latest release.
+The release workflow does **not** publish Winget manifests. Winget updates are submitted manually, so `winget upgrade` sees a release only after its upstream manifest is accepted.
+
+### Via the repository Scoop manifest
+
+The maintained manifest is [`dist/scoop/leopardwm.json`](dist/scoop/leopardwm.json). From a checkout:
+
+```powershell
+scoop install .\dist\scoop\leopardwm.json
+```
+
+It installs `leopardwm`, `leopardwm-cli`, and `lwm` shims. Update the manifest's version, URL, and SHA-256 only from the matching GitHub Release asset.
 
 ### Via MSI installer
 
@@ -122,7 +131,7 @@ cargo build --release
 Start the daemon:
 
 ```bash
-./target/release/leopardwm.exe
+./target/x86_64-pc-windows-msvc/release/leopardwm.exe
 ```
 
 A default config is created automatically at `%APPDATA%\leopardwm\config\config.toml`. Customize via the tray icon → Settings, or edit the file directly.
@@ -260,9 +269,9 @@ lwm status             # show version, monitor count, window count, uptime
 ### Query state
 
 ```bash
-lwm query workspace    # current workspace placements as JSON
+lwm query workspace    # current workspace summary (human-readable)
 lwm query focused      # focused window info
-lwm query all-windows  # every managed window across all workspaces
+lwm query all          # every managed window across all workspaces
 ```
 
 ### Layout commands
@@ -304,7 +313,7 @@ After the daemon answers `Subscribed`, the connection stays open and streams `Ip
 
 ```bash
 lwm doctor             # diagnostic checks (config valid, daemon reachable, hotkey conflicts, etc.)
-lwm collect-logs       # bundles logs + crash reports into a zip for bug reports
+lwm collect-logs       # prints config and recent daemon/watchdog logs as a text report
 lwm reload             # reload config from disk without restarting
 lwm refresh            # re-enumerate windows after weird state
 lwm panic-revert       # emergency: uncloak everything, drop daemon out of management
@@ -320,12 +329,13 @@ Run `lwm help` (or `lwm <subcommand> --help`) for the full surface — there are
 |---|---|
 | Config | `%APPDATA%\leopardwm\config\config.toml` |
 | State | `%APPDATA%\leopardwm\data\workspace-state.json` |
-| Log (stdout) | `%TEMP%\leopardwm-daemon.log` |
-| Log (stderr) | `%TEMP%\leopardwm-daemon.err.log` |
+| Daemon log | `%LOCALAPPDATA%\leopardwm\logs\leopardwm-daemon.log` |
+| Daemon error log | `%LOCALAPPDATA%\leopardwm\logs\leopardwm-daemon.err.log` |
+| Watchdog logs | `%LOCALAPPDATA%\leopardwm\logs\leopardwm-watchdog.log` and `.err.log` |
 
 ## Architecture
 
-LeopardWM is a Rust workspace with five crates:
+LeopardWM is a Rust workspace with six crates:
 
 | Crate | Responsibility |
 |---|---|
@@ -334,6 +344,7 @@ LeopardWM is a Rust workspace with five crates:
 | `leopardwm-ipc` | Named-pipe command/response protocol |
 | `leopardwm-daemon` | Runtime event loop, state management, dedicated message-pump threads |
 | `leopardwm-cli` | User-facing CLI (also installed as `lwm` for shorter typing) |
+| `leopardwm-watchdog` | Supervises the daemon and restarts it after abnormal exits |
 
 ## Platform Constraints
 
