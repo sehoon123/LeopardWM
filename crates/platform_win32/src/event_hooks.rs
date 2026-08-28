@@ -6,9 +6,9 @@ use crate::enumeration::{
 };
 use crate::recover_poisoned_mutex;
 use leopardwm_core_layout::WindowId;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
 use windows::core::w;
 use windows::Win32::Foundation::{HANDLE, HWND};
@@ -16,8 +16,8 @@ use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetClassNameW, GetForegroundWindow, GetMessageW, GetPropW,
-    GetWindowThreadProcessId, IsWindow, PeekMessageW, PostThreadMessageW, SetPropW, MSG,
-    PM_NOREMOVE, WM_USER,
+    GetWindowThreadProcessId, IsWindow, KillTimer, PeekMessageW, PostThreadMessageW, SetPropW,
+    SetTimer, MSG, PM_NOREMOVE, WM_TIMER, WM_USER,
 };
 
 // WinEvent constants (not all are exposed by windows-rs)
@@ -71,6 +71,9 @@ pub enum WindowEvent {
     /// separate from display topology so the daemon can refresh UI caches
     /// without a monitor reconcile.
     AppearanceChanged,
+    /// Bounded callback ingress overflowed. The daemon must enumerate/prune
+    /// current state rather than trusting any individual dropped callback.
+    ReconcileAll,
     /// Mouse cursor entered a window (for focus-follows-mouse).
     MouseEnterWindow(WindowId),
     /// Mouse cursor left a manageable window for a non-manageable one (the
@@ -95,37 +98,60 @@ pub struct WindowEventIdentity {
     pub class_name: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum IdentityEventKind {
-    Created,
-    Destroyed,
-    Hidden,
-    Restored,
+/// One callback event and the identity captured in that same callback critical
+/// section. Carrying them in one channel value prevents concurrent callbacks
+/// from swapping tokens for the same recycled numeric HWND.
+#[derive(Debug, Clone)]
+pub struct HookWindowEvent {
+    pub event: WindowEvent,
+    pub identity: Option<WindowEventIdentity>,
 }
 
 static NEXT_WINDOW_INCARNATION: AtomicU64 = AtomicU64::new(1);
 static WINDOW_IDENTITIES: std::sync::Mutex<Option<HashMap<WindowId, WindowEventIdentity>>> =
     std::sync::Mutex::new(None);
-type PendingIdentityQueues = HashMap<(IdentityEventKind, WindowId), VecDeque<WindowEventIdentity>>;
-static PENDING_EVENT_IDENTITIES: std::sync::Mutex<Option<PendingIdentityQueues>> =
-    std::sync::Mutex::new(None);
 
 fn next_window_incarnation() -> u64 {
-    NEXT_WINDOW_INCARNATION
+    use windows::Win32::Security::Cryptography::{
+        BCryptGenRandom, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+    };
+
+    let mut bytes = [0u8; std::mem::size_of::<u64>()];
+    let status = unsafe { BCryptGenRandom(None, &mut bytes, BCRYPT_USE_SYSTEM_PREFERRED_RNG) };
+    let random = u64::from_ne_bytes(bytes);
+    if status.is_ok() && random != 0 {
+        return random;
+    }
+
+    // BCrypt is expected to be available on every supported Windows release.
+    // Keep identity fail-safe if the provider is transiently unavailable: mix
+    // process/time state with the monotonic counter rather than restarting a
+    // predictable token sequence at one.
+    let counter = NEXT_WINDOW_INCARNATION
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
             Some(value.wrapping_add(1).max(1))
         })
         .unwrap_or_else(|value| value)
-        .max(1)
+        .max(1);
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    (elapsed ^ counter.rotate_left(17) ^ u64::from(std::process::id()).rotate_left(33)).max(1)
 }
 
 fn identity_property_token(hwnd: HWND) -> u64 {
     unsafe { GetPropW(hwnd, w!("LeopardWM.WindowIncarnation.v1")) }.0 as u64
 }
 
+pub(crate) fn window_incarnation_property_matches(window_id: WindowId, token: u64) -> bool {
+    token != 0 && identity_property_token(HWND(window_id as *mut c_void)) == token
+}
+
 fn capture_live_window_identity(
     window_id: WindowId,
     force_new_if_unmarked: bool,
+    nonblocking_callback: bool,
 ) -> Option<WindowEventIdentity> {
     let hwnd = HWND(window_id as *mut c_void);
     if !unsafe { IsWindow(Some(hwnd)).as_bool() } {
@@ -140,9 +166,21 @@ fn capture_live_window_identity(
     }
     let class_name = String::from_utf16_lossy(&class[..class_len as usize]);
     let property_token = identity_property_token(hwnd);
-    let existing = WINDOW_IDENTITIES
-        .lock()
-        .unwrap_or_else(recover_poisoned_mutex)
+    let mut identities = if nonblocking_callback {
+        match WINDOW_IDENTITIES.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                EVENT_RESCAN_REQUIRED.store(true, Ordering::Release);
+                return None;
+            }
+        }
+    } else {
+        WINDOW_IDENTITIES
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex)
+    };
+    let existing = identities
         .as_ref()
         .and_then(|identities| identities.get(&window_id).cloned());
     let token = if property_token != 0 {
@@ -177,9 +215,7 @@ fn capture_live_window_identity(
         thread_id,
         class_name,
     };
-    WINDOW_IDENTITIES
-        .lock()
-        .unwrap_or_else(recover_poisoned_mutex)
+    identities
         .get_or_insert_with(HashMap::new)
         .insert(window_id, identity.clone());
     Some(identity)
@@ -187,76 +223,71 @@ fn capture_live_window_identity(
 
 /// Ensure and return the nonzero token for a currently live HWND.
 pub fn ensure_window_incarnation_token(window_id: WindowId) -> Option<u64> {
-    capture_live_window_identity(window_id, false).map(|identity| identity.token)
+    capture_live_window_identity(window_id, false, false).map(|identity| identity.token)
 }
 
 /// Return the complete current live identity, assigning a property token when
 /// this is the first observation in the process.
 pub fn current_window_event_identity(window_id: WindowId) -> Option<WindowEventIdentity> {
-    capture_live_window_identity(window_id, false)
+    capture_live_window_identity(window_id, false, false)
 }
 
-fn identity_event_kind(event: &WindowEvent) -> Option<(IdentityEventKind, WindowId)> {
+pub(crate) fn current_window_event_identity_nonblocking(
+    window_id: WindowId,
+) -> Option<WindowEventIdentity> {
+    capture_live_window_identity(window_id, false, true)
+}
+
+fn capture_callback_window_identity(event: &WindowEvent) -> Option<WindowEventIdentity> {
     match event {
-        WindowEvent::Created(window_id) => Some((IdentityEventKind::Created, *window_id)),
-        WindowEvent::Destroyed(window_id) => Some((IdentityEventKind::Destroyed, *window_id)),
-        WindowEvent::Hidden(window_id) => Some((IdentityEventKind::Hidden, *window_id)),
-        WindowEvent::Restored(window_id) => Some((IdentityEventKind::Restored, *window_id)),
+        WindowEvent::Created(window_id) => capture_live_window_identity(*window_id, true, true),
+        WindowEvent::Destroyed(window_id) => match WINDOW_IDENTITIES.try_lock() {
+            Ok(mut identities) => identities
+                .get_or_insert_with(HashMap::new)
+                .remove(window_id),
+            Err(std::sync::TryLockError::Poisoned(error)) => error
+                .into_inner()
+                .get_or_insert_with(HashMap::new)
+                .remove(window_id),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                EVENT_RESCAN_REQUIRED.store(true, Ordering::Release);
+                None
+            }
+        },
+        WindowEvent::Hidden(window_id) | WindowEvent::Restored(window_id) => {
+            capture_live_window_identity(*window_id, false, true)
+        }
         _ => None,
     }
 }
 
-fn queue_window_event_identity(event: &WindowEvent) {
-    let Some((kind, window_id)) = identity_event_kind(event) else {
-        return;
-    };
-    let identity = match kind {
-        IdentityEventKind::Created => capture_live_window_identity(window_id, true),
-        IdentityEventKind::Destroyed => WINDOW_IDENTITIES
-            .lock()
-            .unwrap_or_else(recover_poisoned_mutex)
-            .get_or_insert_with(HashMap::new)
-            .remove(&window_id),
-        IdentityEventKind::Hidden | IdentityEventKind::Restored => {
-            capture_live_window_identity(window_id, false)
-        }
-    };
-    if let Some(identity) = identity {
-        PENDING_EVENT_IDENTITIES
-            .lock()
-            .unwrap_or_else(recover_poisoned_mutex)
-            .get_or_insert_with(HashMap::new)
-            .entry((kind, window_id))
-            .or_default()
-            .push_back(identity);
+fn callback_payload(event: WindowEvent) -> Option<HookWindowEvent> {
+    let identity = capture_callback_window_identity(&event);
+    if matches!(
+        &event,
+        WindowEvent::Created(_)
+            | WindowEvent::Destroyed(_)
+            | WindowEvent::Hidden(_)
+            | WindowEvent::Restored(_)
+    ) && identity.is_none()
+    {
+        EVENT_RESCAN_REQUIRED.store(true, Ordering::Release);
+        return None;
     }
-}
-
-/// Consume the exact callback identity queued with this lifecycle event.
-/// Synthetic/test events and non-WinEvent sources simply return `None`.
-pub fn take_window_event_identity(event: &WindowEvent) -> Option<WindowEventIdentity> {
-    let key = identity_event_kind(event)?;
-    let mut pending = PENDING_EVENT_IDENTITIES
-        .lock()
-        .unwrap_or_else(recover_poisoned_mutex);
-    let queue = pending.as_mut()?.get_mut(&key)?;
-    let identity = queue.pop_front();
-    if queue.is_empty() {
-        pending.as_mut()?.remove(&key);
-    }
-    identity
+    Some(HookWindowEvent { event, identity })
 }
 
 /// Global sender for window events from WinEvent callbacks.
 ///
 /// This uses a thread-safe channel because WinEvent callbacks run on Windows'
 /// internal thread pool and we need to forward events to the async runtime.
-static EVENT_SENDER: std::sync::Mutex<Option<mpsc::SyncSender<WindowEvent>>> =
+static EVENT_SENDER: std::sync::Mutex<Option<mpsc::SyncSender<HookWindowEvent>>> =
     std::sync::Mutex::new(None);
 static ACTIVE_EVENT_THREAD: AtomicU32 = AtomicU32::new(0);
+static EVENT_RESCAN_REQUIRED: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn set_event_sender(
-    sender: mpsc::SyncSender<WindowEvent>,
+    sender: mpsc::SyncSender<HookWindowEvent>,
 ) -> Result<(), crate::Win32Error> {
     let mut guard = EVENT_SENDER.lock().map_err(|_| {
         crate::Win32Error::HookInstallFailed("Event sender mutex poisoned".to_string())
@@ -275,9 +306,34 @@ pub(crate) fn clear_event_sender() {
     *guard = None;
 }
 
-pub(crate) fn clone_event_sender() -> Option<mpsc::SyncSender<WindowEvent>> {
+pub(crate) fn clone_event_sender() -> Option<mpsc::SyncSender<HookWindowEvent>> {
     let guard = EVENT_SENDER.lock().unwrap_or_else(recover_poisoned_mutex);
     guard.as_ref().cloned()
+}
+
+fn try_clone_event_sender_from_callback() -> Option<mpsc::SyncSender<HookWindowEvent>> {
+    match EVENT_SENDER.try_lock() {
+        Ok(sender) => sender.as_ref().cloned(),
+        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner().as_ref().cloned(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            EVENT_RESCAN_REQUIRED.store(true, Ordering::Release);
+            None
+        }
+    }
+}
+
+fn flush_event_rescan_signal() {
+    if !EVENT_RESCAN_REQUIRED.swap(false, Ordering::AcqRel) {
+        return;
+    }
+    let payload = HookWindowEvent {
+        event: WindowEvent::ReconcileAll,
+        identity: None,
+    };
+    let delivered = clone_event_sender().is_some_and(|sender| sender.try_send(payload).is_ok());
+    if !delivered {
+        EVENT_RESCAN_REQUIRED.store(true, Ordering::Release);
+    }
 }
 
 fn retire_event_thread(thread_id: u32) {
@@ -349,7 +405,7 @@ impl Drop for EventHookHandle {
 /// - Move/resize (EVENT_OBJECT_LOCATIONCHANGE)
 /// - Focus within app (EVENT_OBJECT_FOCUS)
 pub fn install_event_hooks(
-) -> Result<(EventHookHandle, mpsc::Receiver<WindowEvent>), crate::Win32Error> {
+) -> Result<(EventHookHandle, mpsc::Receiver<HookWindowEvent>), crate::Win32Error> {
     // Create channel for events
     // Bound callback ingress. Lifecycle/focus edges use bounded backpressure;
     // high-frequency location/title noise is coalesced by dropping only when a
@@ -412,6 +468,18 @@ pub fn install_event_hooks(
                     hooks.push(hook);
                 }
 
+                let timer_id = SetTimer(None, 0, 25, None);
+                if timer_id == 0 {
+                    for hook in &hooks {
+                        let _ = UnhookWinEvent(*hook);
+                    }
+                    let _ = init_tx.send(Err(crate::Win32Error::HookInstallFailed(
+                        "Could not create WinEvent overflow reconciliation timer".into(),
+                    )));
+                    retire_event_thread(thread_id);
+                    return;
+                }
+
                 tracing::info!("Installed {} WinEvent hooks", hooks.len());
                 let _ = init_tx.send(Ok(thread_id));
 
@@ -424,9 +492,14 @@ pub fn install_event_hooks(
                     if msg.message == WM_QUIT_WINEVENT_THREAD {
                         break;
                     }
+                    if msg.message == WM_TIMER {
+                        flush_event_rescan_signal();
+                        continue;
+                    }
                     let _ = DispatchMessageW(&msg);
                 }
 
+                let _ = KillTimer(None, timer_id);
                 // Clean up hooks
                 for hook in &hooks {
                     if !UnhookWinEvent(*hook).as_bool() {
@@ -550,7 +623,7 @@ fn win_event_callback_inner(
     // events (minimize, close-to-tray) must reach the daemon.
     if matches!(event, EVENT_OBJECT_SHOW | EVENT_OBJECT_LOCATIONCHANGE)
         && (crate::is_placement_cloaked(window_id)
-            || crate::thumbnail::has_persistent_preview(window_id))
+            || crate::thumbnail::has_persistent_preview_nonblocking(window_id))
     {
         return;
     }
@@ -593,33 +666,27 @@ fn win_event_callback_inner(
         _ => return,
     };
 
-    // Capture the callback's exact incarnation before the event can wait in a
-    // forwarding queue. The daemon consumes the paired token on dispatch.
+    // Capture and send one atomic payload. Callbacks never block: a full queue
+    // turns any dropped lifecycle/focus edge into one fixed-size reconciliation
+    // obligation serviced by the hook thread's timer.
     let priority = !matches!(
         &window_event,
         WindowEvent::MovedOrResized(_) | WindowEvent::TitleChanged(_)
     );
-    queue_window_event_identity(&window_event);
-    if let Some(sender) = clone_event_sender() {
-        match sender.try_send(window_event.clone()) {
+    let Some(payload) = callback_payload(window_event) else {
+        return;
+    };
+    if let Some(sender) = try_clone_event_sender_from_callback() {
+        match sender.try_send(payload) {
             Ok(()) => {}
-            Err(mpsc::TrySendError::Full(event)) if priority => {
-                // Never drop lifecycle/focus/drag-final edges. The finite queue
-                // bounds memory; only a persistently stalled daemon can apply
-                // backpressure to this callback.
-                if sender.send(event).is_err() {
-                    let _ = take_window_event_identity(&window_event);
-                }
+            Err(mpsc::TrySendError::Full(_)) if priority => {
+                EVENT_RESCAN_REQUIRED.store(true, Ordering::Release);
             }
             Err(mpsc::TrySendError::Full(_)) => {
                 tracing::trace!("Coalescing high-frequency WinEvent backlog");
             }
-            Err(mpsc::TrySendError::Disconnected(_)) => {
-                let _ = take_window_event_identity(&window_event);
-            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {}
         }
-    } else {
-        let _ = take_window_event_identity(&window_event);
     }
 }
 
@@ -637,16 +704,16 @@ mod tests {
         ACTIVE_EVENT_THREAD.store(0, Ordering::Release);
         clear_event_sender();
 
-        let (first_tx, _first_rx) = mpsc::sync_channel::<WindowEvent>(4);
+        let (first_tx, _first_rx) = mpsc::sync_channel::<HookWindowEvent>(4);
         assert!(set_event_sender(first_tx).is_ok());
 
-        let (second_tx, _second_rx) = mpsc::sync_channel::<WindowEvent>(4);
+        let (second_tx, _second_rx) = mpsc::sync_channel::<HookWindowEvent>(4);
         let err = set_event_sender(second_tx).unwrap_err();
         assert!(matches!(err, crate::Win32Error::HookInstallFailed(_)));
 
         clear_event_sender();
 
-        let (third_tx, _third_rx) = mpsc::sync_channel::<WindowEvent>(4);
+        let (third_tx, _third_rx) = mpsc::sync_channel::<HookWindowEvent>(4);
         assert!(set_event_sender(third_tx).is_ok());
         clear_event_sender();
     }
@@ -683,7 +750,7 @@ mod tests {
             .insert(window_id, old.clone());
 
         let event = WindowEvent::Destroyed(window_id);
-        queue_window_event_identity(&event);
+        let captured = capture_callback_window_identity(&event);
         WINDOW_IDENTITIES
             .lock()
             .unwrap_or_else(recover_poisoned_mutex)
@@ -696,11 +763,45 @@ mod tests {
                 },
             );
 
-        assert_eq!(take_window_event_identity(&event), Some(old));
+        assert_eq!(captured, Some(old));
         WINDOW_IDENTITIES
             .lock()
             .unwrap_or_else(recover_poisoned_mutex)
             .get_or_insert_with(HashMap::new)
             .remove(&window_id);
+    }
+
+    #[test]
+    fn lifecycle_event_without_identity_becomes_only_a_rescan_obligation() {
+        EVENT_RESCAN_REQUIRED.store(false, Ordering::Release);
+        assert!(callback_payload(WindowEvent::Hidden(u64::MAX)).is_none());
+        assert!(EVENT_RESCAN_REQUIRED.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn full_callback_queue_retains_one_nonblocking_rescan_obligation() {
+        let _guard = GLOBAL_SENDER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex);
+        clear_event_sender();
+        let (tx, rx) = mpsc::sync_channel(1);
+        set_event_sender(tx.clone()).unwrap();
+        tx.try_send(HookWindowEvent {
+            event: WindowEvent::AppearanceChanged,
+            identity: None,
+        })
+        .unwrap();
+        EVENT_RESCAN_REQUIRED.store(true, Ordering::Release);
+
+        flush_event_rescan_signal();
+        assert!(EVENT_RESCAN_REQUIRED.load(Ordering::Acquire));
+        let _ = rx.recv().unwrap();
+        flush_event_rescan_signal();
+        assert!(!EVENT_RESCAN_REQUIRED.load(Ordering::Acquire));
+        assert!(matches!(
+            rx.recv().unwrap().event,
+            WindowEvent::ReconcileAll
+        ));
+        clear_event_sender();
     }
 }

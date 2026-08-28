@@ -7,14 +7,14 @@
 
 use crate::{recover_poisoned_mutex, Win32Error, WindowEvent};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, PostMessageW,
-    PostThreadMessageW, RegisterClassW, UnregisterClassW, MSG, WM_USER, WNDCLASSW,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, KillTimer,
+    PostMessageW, PostThreadMessageW, RegisterClassW, SetTimer, UnregisterClassW, MSG, WM_TIMER,
+    WM_USER, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 /// Window message asking whether an interactive session may end.
@@ -165,6 +165,12 @@ static DISPLAY_CHANGE_SENDER: std::sync::Mutex<Option<mpsc::SyncSender<WindowEve
 static POWER_STATE_SENDER: std::sync::Mutex<Option<mpsc::SyncSender<bool>>> =
     std::sync::Mutex::new(None);
 
+const PENDING_DISPLAY: u8 = 1 << 0;
+const PENDING_WORK_AREA: u8 = 1 << 1;
+const PENDING_APPEARANCE: u8 = 1 << 2;
+const PENDING_POWER: u8 = 1 << 3;
+static PENDING_SYSTEM_EVENTS: AtomicU8 = AtomicU8::new(0);
+
 /// Process-lifetime callback for committed interactive session end. Like the
 /// forwarding senders, it survives system-event window recreation.
 static SESSION_END_HANDLER: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync + 'static>>> =
@@ -290,6 +296,58 @@ pub fn set_power_state_sender(sender: mpsc::SyncSender<bool>) -> Result<(), Win3
     Ok(())
 }
 
+fn send_display_or_retain(event: WindowEvent, pending_bit: u8) {
+    let outcome = match DISPLAY_CHANGE_SENDER.try_lock() {
+        Ok(sender) => sender.as_ref().map(|sender| sender.try_send(event)),
+        Err(std::sync::TryLockError::Poisoned(error)) => error
+            .into_inner()
+            .as_ref()
+            .map(|sender| sender.try_send(event)),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            PENDING_SYSTEM_EVENTS.fetch_or(pending_bit, Ordering::AcqRel);
+            return;
+        }
+    };
+    if matches!(outcome, Some(Err(mpsc::TrySendError::Full(_)))) {
+        PENDING_SYSTEM_EVENTS.fetch_or(pending_bit, Ordering::AcqRel);
+    }
+}
+
+fn send_power_or_retain(on_battery_or_saver: bool) {
+    let outcome = match POWER_STATE_SENDER.try_lock() {
+        Ok(sender) => sender
+            .as_ref()
+            .map(|sender| sender.try_send(on_battery_or_saver)),
+        Err(std::sync::TryLockError::Poisoned(error)) => error
+            .into_inner()
+            .as_ref()
+            .map(|sender| sender.try_send(on_battery_or_saver)),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            PENDING_SYSTEM_EVENTS.fetch_or(PENDING_POWER, Ordering::AcqRel);
+            return;
+        }
+    };
+    if matches!(outcome, Some(Err(mpsc::TrySendError::Full(_)))) {
+        PENDING_SYSTEM_EVENTS.fetch_or(PENDING_POWER, Ordering::AcqRel);
+    }
+}
+
+fn flush_pending_system_events() {
+    let pending = PENDING_SYSTEM_EVENTS.swap(0, Ordering::AcqRel);
+    if pending & PENDING_DISPLAY != 0 {
+        send_display_or_retain(WindowEvent::DisplayChange, PENDING_DISPLAY);
+    }
+    if pending & PENDING_WORK_AREA != 0 {
+        send_display_or_retain(WindowEvent::WorkAreaChanged, PENDING_WORK_AREA);
+    }
+    if pending & PENDING_APPEARANCE != 0 {
+        send_display_or_retain(WindowEvent::AppearanceChanged, PENDING_APPEARANCE);
+    }
+    if pending & PENDING_POWER != 0 {
+        send_power_or_retain(crate::system::is_on_battery_or_power_saver());
+    }
+}
+
 /// Register the synchronous recovery callback for committed session end.
 ///
 /// Call this before `register_system_events`. The callback survives system-event
@@ -319,6 +377,7 @@ pub fn register_system_events() -> Result<SystemEventHandle, Win32Error> {
             "System-event window is still owned by an existing generation".into(),
         ));
     }
+    PENDING_SYSTEM_EVENTS.store(0, Ordering::Release);
     // Create the message window on a separate thread.
     // We send isize (raw pointer value) instead of HWND because HWND is !Send
     let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<(isize, u32), Win32Error>>();
@@ -405,6 +464,22 @@ pub fn register_system_events() -> Result<SystemEventHandle, Win32Error> {
                 tracing::debug!("Registered power setting notifications");
             }
 
+            let timer_id = SetTimer(None, 0, 25, None);
+            if timer_id == 0 {
+                for notification in power_notifications {
+                    let _ = windows::Win32::System::Power::UnregisterPowerSettingNotification(
+                        notification,
+                    );
+                }
+                let _ = DestroyWindow(hwnd);
+                let _ = UnregisterClassW(windows::core::PCWSTR(class_name.as_ptr()), None);
+                let _ = init_tx.send(Err(Win32Error::HotkeyRegistrationFailed(
+                    "Could not create system-event reconciliation timer".into(),
+                )));
+                retire_sysevent_thread(thread_id);
+                return;
+            }
+
             // Send initialization result (hwnd as isize for Send safety)
             let hwnd_raw = hwnd.0 as isize;
             let _ = init_tx.send(Ok((hwnd_raw, thread_id)));
@@ -419,9 +494,14 @@ pub fn register_system_events() -> Result<SystemEventHandle, Win32Error> {
                 if msg.message == WM_QUIT_SYSEVENT_THREAD {
                     break;
                 }
+                if msg.message == WM_TIMER {
+                    flush_pending_system_events();
+                    continue;
+                }
                 let _ = DispatchMessageW(&msg);
             }
 
+            let _ = KillTimer(None, timer_id);
             for notification in power_notifications {
                 if let Err(error) =
                     windows::Win32::System::Power::UnregisterPowerSettingNotification(notification)
@@ -516,12 +596,7 @@ fn sysevent_window_proc_inner(
             tracing::info!("Display configuration changed (WM_DISPLAYCHANGE)");
 
             // Send display change event through window event channel (recover from mutex poisoning)
-            let sender_guard = DISPLAY_CHANGE_SENDER
-                .lock()
-                .unwrap_or_else(recover_poisoned_mutex);
-            if let Some(sender) = sender_guard.as_ref() {
-                let _ = sender.try_send(WindowEvent::DisplayChange);
-            }
+            send_display_or_retain(WindowEvent::DisplayChange, PENDING_DISPLAY);
 
             windows::Win32::Foundation::LRESULT(0)
         }
@@ -532,30 +607,15 @@ fn sysevent_window_proc_inner(
             // tiled windows re-fit promptly (the OS shoves them flush against
             // the new taskbar immediately; a slow reconcile makes that a
             // visible two-step).
-            let sender_guard = DISPLAY_CHANGE_SENDER
-                .lock()
-                .unwrap_or_else(recover_poisoned_mutex);
-            if let Some(sender) = sender_guard.as_ref() {
-                let _ = sender.try_send(WindowEvent::WorkAreaChanged);
-            }
+            send_display_or_retain(WindowEvent::WorkAreaChanged, PENDING_WORK_AREA);
             windows::Win32::Foundation::LRESULT(0)
         }
         WM_THEMECHANGED => {
-            let sender_guard = DISPLAY_CHANGE_SENDER
-                .lock()
-                .unwrap_or_else(recover_poisoned_mutex);
-            if let Some(sender) = sender_guard.as_ref() {
-                let _ = sender.try_send(WindowEvent::AppearanceChanged);
-            }
+            send_display_or_retain(WindowEvent::AppearanceChanged, PENDING_APPEARANCE);
             windows::Win32::Foundation::LRESULT(0)
         }
         WM_SETTINGCHANGE if wparam.0 == SPI_SETHIGHCONTRAST => {
-            let sender_guard = DISPLAY_CHANGE_SENDER
-                .lock()
-                .unwrap_or_else(recover_poisoned_mutex);
-            if let Some(sender) = sender_guard.as_ref() {
-                let _ = sender.try_send(WindowEvent::AppearanceChanged);
-            }
+            send_display_or_retain(WindowEvent::AppearanceChanged, PENDING_APPEARANCE);
             windows::Win32::Foundation::LRESULT(0)
         }
         WM_POWERBROADCAST => {
@@ -566,12 +626,7 @@ fn sysevent_window_proc_inner(
                     on_battery_or_saver
                 );
 
-                let sender_guard = POWER_STATE_SENDER
-                    .lock()
-                    .unwrap_or_else(recover_poisoned_mutex);
-                if let Some(sender) = sender_guard.as_ref() {
-                    let _ = sender.try_send(on_battery_or_saver);
-                }
+                send_power_or_retain(on_battery_or_saver);
 
                 windows::Win32::Foundation::LRESULT(1) // TRUE = processed
             } else {
@@ -1036,6 +1091,30 @@ mod tests {
             Ok(WindowEvent::AppearanceChanged)
         ));
 
+        *DISPLAY_CHANGE_SENDER
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex) = None;
+    }
+
+    #[test]
+    fn full_system_event_queue_retains_latest_reconciliation_signal() {
+        let _guard = HOTKEY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex);
+        PENDING_SYSTEM_EVENTS.store(0, Ordering::Release);
+        let (tx, rx) = mpsc::sync_channel(1);
+        set_display_change_sender(tx.clone()).unwrap();
+        tx.try_send(WindowEvent::DisplayChange).unwrap();
+
+        send_display_or_retain(WindowEvent::WorkAreaChanged, PENDING_WORK_AREA);
+        assert_ne!(
+            PENDING_SYSTEM_EVENTS.load(Ordering::Acquire) & PENDING_WORK_AREA,
+            0
+        );
+        let _ = rx.recv().unwrap();
+        flush_pending_system_events();
+        assert!(matches!(rx.recv().unwrap(), WindowEvent::WorkAreaChanged));
+        assert_eq!(PENDING_SYSTEM_EVENTS.load(Ordering::Acquire), 0);
         *DISPLAY_CHANGE_SENDER
             .lock()
             .unwrap_or_else(recover_poisoned_mutex) = None;

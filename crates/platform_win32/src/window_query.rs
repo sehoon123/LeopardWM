@@ -8,9 +8,27 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_RCONTROL, VK_RSHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowLongW, GetWindowRect, IsIconic, IsWindow, IsWindowVisible, GWL_STYLE, WS_CAPTION,
-    WS_MAXIMIZEBOX, WS_MINIMIZEBOX,
+    GetGUIThreadInfo, GetWindowLongW, GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindow,
+    IsWindowVisible, GUITHREADINFO, GUI_INMOVESIZE, GWL_STYLE, WS_CAPTION, WS_MAXIMIZEBOX,
+    WS_MINIMIZEBOX,
 };
+
+/// Whether User32 currently owns this window's modal move/size loop.
+pub fn is_window_in_move_size(window_id: WindowId) -> bool {
+    let hwnd = HWND(window_id as *mut c_void);
+    if !unsafe { IsWindow(Some(hwnd)).as_bool() } {
+        return false;
+    }
+    let thread_id = unsafe { GetWindowThreadProcessId(hwnd, None) };
+    if thread_id == 0 {
+        return false;
+    }
+    let mut info = GUITHREADINFO {
+        cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+        ..Default::default()
+    };
+    unsafe { GetGUIThreadInfo(thread_id, &mut info) }.is_ok() && info.flags.contains(GUI_INMOVESIZE)
+}
 
 /// Query DWM for the window's corner-rounding preference and map to a pixel
 /// radius matching what Windows itself draws.

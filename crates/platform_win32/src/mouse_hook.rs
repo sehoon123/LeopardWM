@@ -5,13 +5,14 @@ use crate::{
     WindowEvent, WM_QUIT_LLHOOK_THREAD,
 };
 use leopardwm_core_layout::WindowId;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc;
+use windows::Win32::Foundation::POINT;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, DispatchMessageW, GetMessageW, PeekMessageW, PostThreadMessageW,
-    SetWindowsHookExW, UnhookWindowsHookEx, WindowFromPoint, MSG, MSLLHOOKSTRUCT, PM_NOREMOVE,
-    WH_MOUSE_LL, WM_MOUSEMOVE,
+    CallNextHookEx, DispatchMessageW, GetCursorPos, GetMessageW, KillTimer, PeekMessageW,
+    PostThreadMessageW, SetTimer, SetWindowsHookExW, UnhookWindowsHookEx, WindowFromPoint, MSG,
+    MSLLHOOKSTRUCT, PM_NOREMOVE, WH_MOUSE_LL, WM_MOUSEMOVE, WM_TIMER,
 };
 
 /// Global sender for mouse enter events.
@@ -26,8 +27,10 @@ static CURRENT_MOUSE_WINDOW: std::sync::Mutex<Option<WindowId>> = std::sync::Mut
 /// managed -> non-manageable transition, not on every move over the taskbar.
 static CURRENT_OVER_MANAGED: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 static ACTIVE_MOUSE_THREAD: AtomicU32 = AtomicU32::new(0);
+static MOUSE_RETRY_REQUIRED: AtomicBool = AtomicBool::new(false);
 
 fn clear_mouse_globals() {
+    MOUSE_RETRY_REQUIRED.store(false, Ordering::Release);
     *MOUSE_EVENT_SENDER
         .lock()
         .unwrap_or_else(recover_poisoned_mutex) = None;
@@ -137,6 +140,16 @@ pub fn install_mouse_hook(
                     }
                 };
 
+                let timer_id = SetTimer(None, 0, 25, None);
+                if timer_id == 0 {
+                    let _ = UnhookWindowsHookEx(hook);
+                    let _ = init_tx.send(Err(Win32Error::HookInstallFailed(
+                        "Could not create mouse reconciliation timer".into(),
+                    )));
+                    retire_mouse_thread(thread_id);
+                    return;
+                }
+
                 let _ = init_tx.send(Ok(thread_id));
 
                 // Message pump — required for WH_MOUSE_LL callbacks
@@ -148,9 +161,14 @@ pub fn install_mouse_hook(
                     if msg.message == WM_QUIT_LLHOOK_THREAD {
                         break;
                     }
+                    if msg.message == WM_TIMER {
+                        retry_current_mouse_position();
+                        continue;
+                    }
                     let _ = DispatchMessageW(&msg);
                 }
 
+                let _ = KillTimer(None, timer_id);
                 let _ = UnhookWindowsHookEx(hook);
                 retire_mouse_thread(thread_id);
             }
@@ -184,6 +202,83 @@ pub fn install_mouse_hook(
     })
 }
 
+fn reconcile_mouse_position(point: POINT) {
+    let raw_hwnd = unsafe { WindowFromPoint(point) };
+    let candidate_hwnd = if raw_hwnd.is_invalid() {
+        None
+    } else {
+        let normalized = normalize_to_root_window(raw_hwnd);
+        (!normalized.is_invalid()).then_some(normalized)
+    };
+    let candidate_window_id = candidate_hwnd.map(|hwnd| hwnd.0 as WindowId);
+
+    let mut current = match CURRENT_MOUSE_WINDOW.try_lock() {
+        Ok(current) => current,
+        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            MOUSE_RETRY_REQUIRED.store(true, Ordering::Release);
+            return;
+        }
+    };
+    if *current == candidate_window_id {
+        MOUSE_RETRY_REQUIRED.store(false, Ordering::Release);
+        return;
+    }
+    let candidate_managed = candidate_hwnd.is_some_and(should_emit_window_event);
+    let mut over_managed = match CURRENT_OVER_MANAGED.try_lock() {
+        Ok(managed) => managed,
+        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            MOUSE_RETRY_REQUIRED.store(true, Ordering::Release);
+            return;
+        }
+    };
+    let event = if candidate_managed {
+        candidate_hwnd.map(|hwnd| WindowEvent::MouseEnterWindow(hwnd.0 as WindowId))
+    } else if *over_managed {
+        Some(WindowEvent::MouseLeftManaged)
+    } else {
+        None
+    };
+    let reconciled = match MOUSE_EVENT_SENDER.try_lock() {
+        Ok(sender) => {
+            event.is_none()
+                || sender.as_ref().is_none_or(|sender| {
+                    match sender.try_send(event.expect("event exists")) {
+                        Ok(()) | Err(mpsc::TrySendError::Disconnected(_)) => true,
+                        Err(mpsc::TrySendError::Full(_)) => false,
+                    }
+                })
+        }
+        Err(std::sync::TryLockError::Poisoned(error)) => {
+            let sender = error.into_inner();
+            event.is_none()
+                || sender.as_ref().is_none_or(|sender| {
+                    match sender.try_send(event.expect("event exists")) {
+                        Ok(()) | Err(mpsc::TrySendError::Disconnected(_)) => true,
+                        Err(mpsc::TrySendError::Full(_)) => false,
+                    }
+                })
+        }
+        Err(std::sync::TryLockError::WouldBlock) => false,
+    };
+    if reconciled {
+        *current = candidate_window_id;
+        *over_managed = candidate_managed;
+    }
+    MOUSE_RETRY_REQUIRED.store(!reconciled, Ordering::Release);
+}
+
+fn retry_current_mouse_position() {
+    if !MOUSE_RETRY_REQUIRED.load(Ordering::Acquire) {
+        return;
+    }
+    let mut point = POINT::default();
+    if unsafe { GetCursorPos(&mut point) }.is_ok() {
+        reconcile_mouse_position(point);
+    }
+}
+
 /// Low-level mouse hook callback.
 ///
 /// Tracks mouse movement and sends MouseEnterWindow events when the cursor
@@ -200,56 +295,7 @@ unsafe extern "system" fn mouse_ll_hook_proc(
 
     if wparam.0 as u32 == WM_MOUSEMOVE {
         let mouse_struct = &*(lparam.0 as *const MSLLHOOKSTRUCT);
-        let point = mouse_struct.pt;
-
-        let raw_hwnd = WindowFromPoint(point);
-        let candidate_hwnd = if raw_hwnd.is_invalid() {
-            None
-        } else {
-            let normalized = normalize_to_root_window(raw_hwnd);
-            if normalized.is_invalid() {
-                None
-            } else {
-                Some(normalized)
-            }
-        };
-        let candidate_window_id = candidate_hwnd.map(|hwnd| hwnd.0 as WindowId);
-
-        let mut current = CURRENT_MOUSE_WINDOW
-            .lock()
-            .unwrap_or_else(recover_poisoned_mutex);
-        if *current != candidate_window_id {
-            *current = candidate_window_id;
-            // Updating CURRENT_MOUSE_WINDOW above means later moves within the
-            // same window hit the early return, so each branch fires once.
-            let candidate_managed = candidate_hwnd.is_some_and(should_emit_window_event);
-            let mut over_managed = CURRENT_OVER_MANAGED
-                .lock()
-                .unwrap_or_else(recover_poisoned_mutex);
-            let was_managed = *over_managed;
-            *over_managed = candidate_managed;
-            drop(over_managed);
-
-            if candidate_managed {
-                if let Some(hwnd) = candidate_hwnd {
-                    let sender_guard = MOUSE_EVENT_SENDER
-                        .lock()
-                        .unwrap_or_else(recover_poisoned_mutex);
-                    if let Some(sender) = sender_guard.as_ref() {
-                        let _ = sender.send(WindowEvent::MouseEnterWindow(hwnd.0 as WindowId));
-                    }
-                }
-            } else if was_managed {
-                // Left a managed window for the taskbar/a popup: cancel any
-                // pending focus so it doesn't fire on the window we just left.
-                let sender_guard = MOUSE_EVENT_SENDER
-                    .lock()
-                    .unwrap_or_else(recover_poisoned_mutex);
-                if let Some(sender) = sender_guard.as_ref() {
-                    let _ = sender.send(WindowEvent::MouseLeftManaged);
-                }
-            }
-        }
+        reconcile_mouse_position(mouse_struct.pt);
     }
 
     CallNextHookEx(None, ncode, wparam, lparam)

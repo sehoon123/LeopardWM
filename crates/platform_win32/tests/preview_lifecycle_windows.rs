@@ -569,27 +569,6 @@ fn ordered_real_preview_lifecycle_contract() {
     );
 
     assert!(
-        leopardwm_platform_win32::dwm_cloak_window(ownership_source.hwnd as u64),
-        "same-process source must accept a durably marked cloak"
-    );
-    assert!(
-        leopardwm_platform_win32::dwm_uncloak_all_marked_best_effort() >= 1,
-        "hard-crash cloak recovery must find the durable HWND marker"
-    );
-    let mut physically_cloaked = 1u32;
-    unsafe {
-        windows::Win32::Graphics::Dwm::DwmGetWindowAttribute(
-            HWND(ownership_source.hwnd as *mut c_void),
-            windows::Win32::Graphics::Dwm::DWMWA_CLOAKED,
-            &mut physically_cloaked as *mut u32 as *mut c_void,
-            std::mem::size_of::<u32>() as u32,
-        )
-        .expect("DWM cloak recovery readback");
-    }
-    assert_eq!(physically_cloaked, 0);
-    leopardwm_platform_win32::dwm_uncloak_window(ownership_source.hwnd as u64);
-
-    assert!(
         leopardwm_platform_win32::remove_maximizebox(ownership_source.hwnd as u64)
             .expect("snap style removal"),
         "controlled source must create a durable snap-style receipt"

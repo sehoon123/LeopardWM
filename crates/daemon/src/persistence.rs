@@ -244,6 +244,14 @@ impl AppState {
             }
         };
 
+        let window_identities: HashMap<_, _> = snapshots
+            .iter()
+            .flat_map(|snapshot| snapshot.workspace.all_window_ids())
+            .filter_map(|hwnd| {
+                crate::state::PersistedWindowIdentity::capture(hwnd)
+                    .map(|identity| (hwnd, identity))
+            })
+            .collect();
         let tab_title_override_identities: HashMap<_, _> = self
             .tab_title_overrides
             .keys()
@@ -264,6 +272,7 @@ impl AppState {
             workspaces: snapshots,
             focused_monitor_name: focused_name,
             active_workspace: active_ws_map,
+            window_identities,
             tab_title_overrides,
             tab_title_override_identities,
         };
@@ -422,11 +431,14 @@ impl AppState {
         snapshot: &StateSnapshot,
     ) -> HashSet<(MonitorId, usize)> {
         self.restore_workspace_structure_with(snapshot, |hwnd| {
-            // Keep a saved window only if it's still alive AND manageable. An
-            // elevated window a non-elevated daemon can't reposition would
-            // otherwise restore as a column we can never fill (a ghost column);
-            // dropping it here lets enumerate re-see it, record it, and notify.
-            leopardwm_platform_win32::is_valid_window(hwnd)
+            // Liveness alone cannot distinguish a recycled HWND. Require the
+            // crash-surviving incarnation token plus process/thread/class proof;
+            // identity-unproven legacy members are safely re-enumerated.
+            snapshot
+                .window_identities
+                .get(&hwnd)
+                .is_some_and(|identity| identity.still_matches(hwnd))
+                && leopardwm_platform_win32::is_valid_window(hwnd)
                 && !leopardwm_platform_win32::window_manage_block(hwnd).is_blocked()
         })
     }

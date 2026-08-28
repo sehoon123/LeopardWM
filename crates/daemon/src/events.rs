@@ -1,6 +1,8 @@
 use leopardwm_platform_win32::overview::OverviewEvent;
 use leopardwm_platform_win32::tab_strip::TabAction;
-use leopardwm_platform_win32::{GestureEvent, HotkeyEvent, WindowEvent, WindowInfo};
+use leopardwm_platform_win32::{
+    GestureEvent, HookWindowEvent, HotkeyEvent, WindowEvent, WindowInfo,
+};
 use std::collections::BTreeSet;
 use tokio::sync::{broadcast, oneshot};
 
@@ -46,6 +48,15 @@ impl WindowIncarnation {
         }
     }
 
+    pub(crate) fn to_platform(&self) -> leopardwm_platform_win32::WindowEventIdentity {
+        leopardwm_platform_win32::WindowEventIdentity {
+            token: self.token,
+            process_id: self.process_id,
+            thread_id: self.thread_id,
+            class_name: self.class_name.clone(),
+        }
+    }
+
     pub(crate) fn from_window_info(info: &WindowInfo) -> Self {
         leopardwm_platform_win32::current_window_event_identity(info.hwnd)
             .map(Self::from_platform)
@@ -80,8 +91,20 @@ pub(crate) struct DaemonWindowEvent {
 
 impl DaemonWindowEvent {
     pub(crate) fn capture(event: WindowEvent) -> Self {
-        let callback_incarnation = leopardwm_platform_win32::take_window_event_identity(&event)
-            .map(WindowIncarnation::from_platform);
+        Self::capture_with_identity(event, None)
+    }
+
+    pub(crate) fn from_hook_event(hook_event: HookWindowEvent) -> Self {
+        Self::capture_with_identity(
+            hook_event.event,
+            hook_event.identity.map(WindowIncarnation::from_platform),
+        )
+    }
+
+    fn capture_with_identity(
+        event: WindowEvent,
+        callback_incarnation: Option<WindowIncarnation>,
+    ) -> Self {
         let hwnd = match &event {
             WindowEvent::Created(hwnd)
             | WindowEvent::Destroyed(hwnd)
@@ -96,6 +119,7 @@ impl DaemonWindowEvent {
             | WindowEvent::MouseEnterWindow(hwnd) => Some(*hwnd),
             WindowEvent::DisplayChange
             | WindowEvent::WorkAreaChanged
+            | WindowEvent::ReconcileAll
             | WindowEvent::AppearanceChanged
             | WindowEvent::MouseLeftManaged => None,
         };

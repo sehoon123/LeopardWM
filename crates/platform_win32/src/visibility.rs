@@ -8,9 +8,7 @@ use crate::window_style::reset_window_border_color;
 use crate::MOVE_OFFSCREEN_SENTINEL_COORD;
 use crate::{combine_operation_failures, is_benign_side_effect_error, window_id_to_hwnd};
 use leopardwm_core_layout::{Rect, Visibility, WindowId, WindowPlacement};
-use std::collections::HashSet;
 use std::ffi::c_void;
-use std::sync::Mutex;
 use windows::core::w;
 use windows::Win32::Foundation::{HANDLE, HWND, RECT};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -23,63 +21,74 @@ use windows::Win32::UI::WindowsAndMessaging::{
 // Offscreen sentinel helpers
 // ============================================================================
 
-const MOVE_OFFSCREEN_OWNER_MAGIC: usize = 0x4c57_4d4f; // "LWMO"
-static MOVE_OFFSCREEN_OWNED: Mutex<Option<HashSet<WindowId>>> = Mutex::new(None);
 // User32 clamps -100000 to the signed virtual-coordinate floor on current
 // Windows builds. Keep legacy crash recovery able to recognize that landing.
 const EFFECTIVE_SENTINEL_THRESHOLD: i32 = -32_768;
 
-fn has_move_offscreen_marker(hwnd: HWND) -> bool {
-    unsafe { GetPropW(hwnd, w!("LeopardWM.MoveOffscreen.v1")) }.0 as usize
-        == MOVE_OFFSCREEN_OWNER_MAGIC
+fn move_offscreen_marker_token(hwnd: HWND) -> u64 {
+    unsafe { GetPropW(hwnd, w!("LeopardWM.MoveOffscreen.v1")) }.0 as u64
+}
+
+fn move_offscreen_committed_token(hwnd: HWND) -> u64 {
+    unsafe { GetPropW(hwnd, w!("LeopardWM.MoveOffscreenCommitted.v1")) }.0 as u64
+}
+
+fn same_window_incarnation(window_id: WindowId, identity: &crate::WindowEventIdentity) -> bool {
+    crate::current_window_event_identity(window_id).as_ref() == Some(identity)
+        && crate::event_hooks::window_incarnation_property_matches(window_id, identity.token)
 }
 
 /// Whether this HWND is still owned by a verified `MoveOffScreen` park.
 /// Placement samples this before moving a window back so compositor-return
 /// repair cannot lose its only durable evidence.
 pub fn has_move_offscreen_ownership(window_id: WindowId) -> bool {
-    let owned = MOVE_OFFSCREEN_OWNED
-        .lock()
-        .unwrap_or_else(crate::recover_poisoned_mutex);
-    let runtime_owned = owned
-        .as_ref()
-        .is_some_and(|windows| windows.contains(&window_id));
-    runtime_owned || window_id_to_hwnd(window_id).is_ok_and(has_move_offscreen_marker)
+    let Ok(hwnd) = window_id_to_hwnd(window_id) else {
+        return false;
+    };
+    let token = move_offscreen_marker_token(hwnd);
+    token != 0
+        && crate::current_window_event_identity(window_id).is_some_and(|identity| {
+            identity.token == token
+                && crate::event_hooks::window_incarnation_property_matches(window_id, token)
+        })
 }
 
-fn set_move_offscreen_marker(hwnd: HWND, window_id: WindowId) -> bool {
-    let mut owned = MOVE_OFFSCREEN_OWNED
-        .lock()
-        .unwrap_or_else(crate::recover_poisoned_mutex);
-    let property_set = unsafe {
+fn set_move_offscreen_marker(hwnd: HWND, identity: &crate::WindowEventIdentity) -> bool {
+    unsafe {
         SetPropW(
             hwnd,
             w!("LeopardWM.MoveOffscreen.v1"),
-            Some(HANDLE(MOVE_OFFSCREEN_OWNER_MAGIC as *mut c_void)),
+            Some(HANDLE(identity.token as usize as *mut c_void)),
         )
     }
-    .is_ok();
-    if property_set {
-        owned.get_or_insert_with(HashSet::new).insert(window_id);
+    .is_ok()
+}
+
+fn set_move_offscreen_committed(hwnd: HWND, token: u64) -> bool {
+    unsafe {
+        SetPropW(
+            hwnd,
+            w!("LeopardWM.MoveOffscreenCommitted.v1"),
+            Some(HANDLE(token as usize as *mut c_void)),
+        )
     }
-    property_set
+    .is_ok()
 }
 
 pub(crate) fn clear_move_offscreen_marker(window_id: WindowId) {
-    let mut owned = MOVE_OFFSCREEN_OWNED
-        .lock()
-        .unwrap_or_else(crate::recover_poisoned_mutex);
-    let property_cleared = if let Ok(hwnd) = window_id_to_hwnd(window_id) {
-        unsafe {
-            let _ = RemovePropW(hwnd, w!("LeopardWM.MoveOffscreen.v1"));
-        }
-        !has_move_offscreen_marker(hwnd)
-    } else {
-        true
+    let Ok(hwnd) = window_id_to_hwnd(window_id) else {
+        return;
     };
-    if property_cleared {
-        if let Some(windows) = owned.as_mut() {
-            windows.remove(&window_id);
+    let token = move_offscreen_marker_token(hwnd);
+    if token != 0
+        && crate::current_window_event_identity(window_id).is_some_and(|identity| {
+            identity.token == token
+                && crate::event_hooks::window_incarnation_property_matches(window_id, token)
+        })
+    {
+        unsafe {
+            let _ = RemovePropW(hwnd, w!("LeopardWM.MoveOffscreenCommitted.v1"));
+            let _ = RemovePropW(hwnd, w!("LeopardWM.MoveOffscreen.v1"));
         }
     }
 }
@@ -98,13 +107,81 @@ pub fn is_move_offscreen_sentinel_rect(rect: &Rect) -> bool {
 /// Used by workspace switching to hide inactive workspace windows.
 pub fn move_window_offscreen(window_id: WindowId) -> Result<(), Win32Error> {
     let hwnd = window_id_to_hwnd(window_id)?;
+    let identity = crate::current_window_event_identity(window_id)
+        .ok_or(Win32Error::WindowNotFound(window_id))?;
+    let already_owned = has_move_offscreen_ownership(window_id);
     let mut original = RECT::default();
     unsafe { GetWindowRect(hwnd, &mut original) }.map_err(|error| {
         Win32Error::SetPositionFailed(format!(
             "Could not capture window {window_id} before offscreen move: {error}"
         ))
     })?;
-    unsafe {
+    let original = Rect::new(
+        original.left,
+        original.top,
+        original.right.saturating_sub(original.left).max(1),
+        original.bottom.saturating_sub(original.top).max(1),
+    );
+    if is_move_offscreen_sentinel_rect(&original) && !already_owned {
+        return Err(Win32Error::SetPositionFailed(format!(
+            "refusing to claim markerless sentinel window {window_id}"
+        )));
+    }
+    if !already_owned {
+        unsafe {
+            let _ = RemovePropW(hwnd, w!("LeopardWM.MoveOffscreenCommitted.v1"));
+        }
+    }
+    if (!already_owned && !set_move_offscreen_marker(hwnd, &identity))
+        || !same_window_incarnation(window_id, &identity)
+        || move_offscreen_marker_token(hwnd) != identity.token
+    {
+        if !already_owned {
+            clear_move_offscreen_marker(window_id);
+        }
+        return Err(Win32Error::SetPositionFailed(format!(
+            "Could not publish offscreen ownership for {window_id}"
+        )));
+    }
+
+    let rollback = || {
+        if !same_window_incarnation(window_id, &identity)
+            || move_offscreen_marker_token(hwnd) != identity.token
+        {
+            return false;
+        }
+        let requested = unsafe {
+            SetWindowPos(
+                hwnd,
+                None,
+                original.x,
+                original.y,
+                original.width,
+                original.height,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+        }
+        .is_ok();
+        let mut restored = RECT::default();
+        let verified = requested
+            && unsafe { GetWindowRect(hwnd, &mut restored) }.is_ok()
+            && same_window_incarnation(window_id, &identity)
+            && positioned_rect_matches(
+                Rect::new(
+                    restored.left,
+                    restored.top,
+                    restored.right.saturating_sub(restored.left),
+                    restored.bottom.saturating_sub(restored.top),
+                ),
+                original,
+            );
+        if verified && !already_owned {
+            clear_move_offscreen_marker(window_id);
+        }
+        verified
+    };
+
+    if let Err(error) = unsafe {
         SetWindowPos(
             hwnd,
             None,
@@ -114,68 +191,37 @@ pub fn move_window_offscreen(window_id: WindowId) -> Result<(), Win32Error> {
             0,
             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
         )
-    }
-    .map_err(|error| {
-        Win32Error::SetPositionFailed(format!(
+    } {
+        let _ = rollback();
+        return Err(Win32Error::SetPositionFailed(format!(
             "Failed to move window {window_id} offscreen: {error}"
-        ))
-    })?;
+        )));
+    }
 
     let mut actual = RECT::default();
-    unsafe { GetWindowRect(hwnd, &mut actual) }.map_err(|error| {
-        Win32Error::SetPositionFailed(format!(
-            "Could not verify window {window_id} offscreen: {error}"
-        ))
-    })?;
+    let readback = unsafe { GetWindowRect(hwnd, &mut actual) };
+    let same_incarnation = same_window_incarnation(window_id, &identity)
+        && move_offscreen_marker_token(hwnd) == identity.token;
     let actual = Rect::new(
         actual.left,
         actual.top,
         actual.right.saturating_sub(actual.left),
         actual.bottom.saturating_sub(actual.top),
     );
-    let clears_every_monitor = actual.width > 0
+    let clears_every_monitor = readback.is_ok()
+        && same_incarnation
+        && actual.width > 0
         && actual.height > 0
         && enumerate_monitors().is_ok_and(|monitors| {
             monitors
                 .iter()
                 .all(|monitor| !actual.intersects(&monitor.rect))
         });
-    if !clears_every_monitor || !set_move_offscreen_marker(hwnd, window_id) {
-        // Without both physical proof and a crash-surviving ownership marker,
-        // retaining transition ownership is safer than claiming the park. A
-        // rollback request alone is not a receipt either: verify all edges so
-        // a rejected rollback cannot silently strand the HWND at the sentinel.
-        let rollback_requested = Rect::new(
-            original.left,
-            original.top,
-            original.right.saturating_sub(original.left).max(1),
-            original.bottom.saturating_sub(original.top).max(1),
-        );
-        let rollback_verified = unsafe {
-            SetWindowPos(
-                hwnd,
-                None,
-                rollback_requested.x,
-                rollback_requested.y,
-                rollback_requested.width,
-                rollback_requested.height,
-                SWP_NOZORDER | SWP_NOACTIVATE,
-            )
-        }
-        .is_ok()
-            && {
-                let mut restored = RECT::default();
-                unsafe { GetWindowRect(hwnd, &mut restored) }.is_ok()
-                    && positioned_rect_matches(
-                        Rect::new(
-                            restored.left,
-                            restored.top,
-                            restored.right.saturating_sub(restored.left),
-                            restored.bottom.saturating_sub(restored.top),
-                        ),
-                        rollback_requested,
-                    )
-            };
+    if !clears_every_monitor
+        || !set_move_offscreen_committed(hwnd, identity.token)
+        || move_offscreen_committed_token(hwnd) != identity.token
+    {
+        let rollback_verified = rollback();
         return Err(Win32Error::SetPositionFailed(format!(
             "window {window_id} did not accept a verifiable offscreen park{}",
             if rollback_verified {
@@ -185,8 +231,6 @@ pub fn move_window_offscreen(window_id: WindowId) -> Result<(), Win32Error> {
             }
         )));
     }
-    // Release a monitor-overflow clip only after the window has reached the
-    // sentinel and carries a recovery marker.
     let _ = crate::window_region::restore_window_region(window_id, false);
     Ok(())
 }
@@ -324,9 +368,10 @@ fn restored_rect_is_on_a_monitor(rect: Rect, monitors: &[crate::MonitorInfo]) ->
             .any(|monitor| rect.intersects(&monitor.rect))
 }
 
-fn restore_window_if_offscreen_to_work_area(
+fn restore_window_if_offscreen_to_work_area_policy(
     window_id: WindowId,
     work_area: &Rect,
+    require_marker: bool,
 ) -> Result<bool, Win32Error> {
     let hwnd = window_id_to_hwnd(window_id)?;
 
@@ -350,9 +395,17 @@ fn restore_window_if_offscreen_to_work_area(
             current_rect.bottom - current_rect.top,
         );
 
-        if !has_move_offscreen_ownership(window_id)
+        let owned = has_move_offscreen_ownership(window_id);
+        if owned
             && !is_move_offscreen_sentinel_rect(&current_rect)
+            && move_offscreen_committed_token(hwnd) != move_offscreen_marker_token(hwnd)
         {
+            // Crash after marker publication but before the destructive move:
+            // retire the prepared receipt without moving an on-screen window.
+            clear_move_offscreen_marker(window_id);
+            return Ok(false);
+        }
+        if !owned && (require_marker || !is_move_offscreen_sentinel_rect(&current_rect)) {
             return Ok(false);
         }
 
@@ -400,6 +453,20 @@ fn restore_window_if_offscreen_to_work_area(
     }
     clear_move_offscreen_marker(window_id);
     Ok(true)
+}
+
+fn restore_window_if_offscreen_to_work_area(
+    window_id: WindowId,
+    work_area: &Rect,
+) -> Result<bool, Win32Error> {
+    restore_window_if_offscreen_to_work_area_policy(window_id, work_area, false)
+}
+
+fn restore_marked_window_to_work_area(
+    window_id: WindowId,
+    work_area: &Rect,
+) -> Result<bool, Win32Error> {
+    restore_window_if_offscreen_to_work_area_policy(window_id, work_area, true)
 }
 
 // ============================================================================
@@ -545,16 +612,41 @@ pub fn restore_all_windows_moved_offscreen_best_effort() -> usize {
     restored_count
 }
 
+/// Cross-process recovery that touches only HWNDs carrying LeopardWM's durable
+/// MoveOffScreen property. Unlike the explicit emergency sweep above, an
+/// unrelated application at a very negative coordinate is never moved.
+pub fn restore_all_marked_windows_moved_offscreen_best_effort() -> usize {
+    let primary = match get_primary_monitor() {
+        Ok(primary) => primary,
+        Err(error) => {
+            tracing::warn!("Marked MoveOffScreen recovery skipped: {error}");
+            return 0;
+        }
+    };
+    let window_ids = collect_all_top_level_window_ids();
+    let (restored, failures) = restore_windows_moved_offscreen_with_work_area(
+        &window_ids,
+        &primary.work_area,
+        restore_marked_window_to_work_area,
+    );
+    if !failures.is_empty() {
+        tracing::warn!(
+            "Marked MoveOffScreen recovery retained {} failed receipt(s)",
+            failures.len()
+        );
+    }
+    restored
+}
+
 /// Restore all visible windows on the system, best-effort.
 ///
-/// Restores any windows parked at MoveOffScreen sentinel coordinates.
-/// This does not require AppState and works even if state is poisoned,
-/// making it suitable for use in panic hooks.
+/// Restore only process-owned cloak receipts and HWNDs carrying LeopardWM's
+/// crash-surviving MoveOffScreen marker. Safe for panic/session-end paths:
+/// unrelated windows at sentinel-like coordinates are left untouched.
 pub fn uncloak_all_visible_windows() {
     crate::dwm_uncloak_all();
-    let _ = restore_all_windows_moved_offscreen_best_effort();
-    // eprintln because tracing may not work in a panic hook
-    eprintln!("[leopardwm] Emergency window restore complete");
+    let _ = restore_all_marked_windows_moved_offscreen_best_effort();
+    eprintln!("[leopardwm] Marker-qualified emergency window restore complete");
 }
 
 /// Cascade windows starting at (0, 0) on the primary monitor work area.

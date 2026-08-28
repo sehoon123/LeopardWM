@@ -1,7 +1,10 @@
 #![cfg(windows)]
 
 use leopardwm_core_layout::{Rect, Visibility, WindowPlacement};
-use leopardwm_platform_win32::{apply_placements_with_regions, PlatformConfig};
+use leopardwm_platform_win32::{
+    apply_placements_with_regions, apply_placements_with_regions_fenced, PlatformConfig,
+};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -179,6 +182,29 @@ fn controlled_visible_float_return_contract() {
         leopardwm_platform_win32::get_window_chrome_rect(window_id),
         Some(before_invalid_batch),
         "invalid sibling must be rejected before mutating a valid HWND"
+    );
+
+    let mut stale_identity =
+        leopardwm_platform_win32::current_window_event_identity(window_id).unwrap();
+    stale_identity.token ^= 1;
+    let stale_batch = apply_placements_with_regions_fenced(
+        &[WindowPlacement {
+            window_id,
+            rect: Rect::new(900, 350, 300, 220),
+            visibility: Visibility::Visible,
+            column_index: usize::MAX,
+        }],
+        &[],
+        &HashMap::from([(window_id, stale_identity)]),
+        &PlatformConfig::default(),
+        None,
+        false,
+    );
+    assert!(stale_batch.is_err());
+    assert_eq!(
+        leopardwm_platform_win32::get_window_chrome_rect(window_id),
+        Some(before_invalid_batch),
+        "stale placement identity must not mutate a replacement HWND"
     );
 
     leopardwm_platform_win32::move_window_offscreen(window_id)

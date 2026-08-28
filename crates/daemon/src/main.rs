@@ -135,7 +135,19 @@ fn restore_windows_for_session_end<WaitAnimation, RestoreSnap, RestoreVisibility
     wait_animation();
     restore_snap();
     restore_visibility();
-    let _ = event_tx.try_send(DaemonEvent::Shutdown);
+    match event_tx.try_send(DaemonEvent::Shutdown) {
+        Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+        Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
+            // Never block WM_ENDSESSION. One latched helper owns the eventual
+            // bounded-channel handoff after synchronous physical recovery.
+            let sender = event_tx.clone();
+            let _ = std::thread::Builder::new()
+                .name("leopardwm-session-end-signal".into())
+                .spawn(move || {
+                    let _ = sender.blocking_send(event);
+                });
+        }
+    }
 }
 
 async fn setup_daemon_runtime(
@@ -937,9 +949,6 @@ async fn apply_initial_layout(
         if let Err(e) = state.apply_layout() {
             warn!("Failed to apply initial layout: {}", e);
         }
-        for wid in state.all_managed_window_ids() {
-            leopardwm_platform_win32::taskbar::taskbar_restore(wid);
-        }
         state.sync_taskbar_buttons();
         state.sync_foreground_window();
     }
@@ -1362,7 +1371,7 @@ fn setup_window_hooks(
                     "winevent-fwd",
                     event_receiver,
                     event_tx.clone(),
-                    |event| DaemonEvent::WindowEvent(DaemonWindowEvent::capture(event)),
+                    |event| DaemonEvent::WindowEvent(DaemonWindowEvent::from_hook_event(event)),
                 ) {
                     Ok(forwarder) => {
                         thread_handles.push(forwarder);
@@ -1861,9 +1870,41 @@ fn window_event_id(event: &WindowEvent) -> Option<u64> {
         | WindowEvent::MouseEnterWindow(hwnd) => Some(*hwnd),
         WindowEvent::DisplayChange
         | WindowEvent::WorkAreaChanged
+        | WindowEvent::ReconcileAll
         | WindowEvent::AppearanceChanged
         | WindowEvent::MouseLeftManaged => None,
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum OverflowMoveAction {
+    None,
+    Defer { hwnd: u64, synthesize_start: bool },
+    Finish(u64),
+}
+
+fn overflow_move_action(
+    drag_hwnd: Option<u64>,
+    resize_hwnd: Option<u64>,
+    foreground: Option<u64>,
+    mut is_in_move_size: impl FnMut(u64) -> bool,
+) -> OverflowMoveAction {
+    if let Some(hwnd) = drag_hwnd.or(resize_hwnd) {
+        return if is_in_move_size(hwnd) {
+            OverflowMoveAction::Defer {
+                hwnd,
+                synthesize_start: false,
+            }
+        } else {
+            OverflowMoveAction::Finish(hwnd)
+        };
+    }
+    foreground
+        .filter(|hwnd| is_in_move_size(*hwnd))
+        .map_or(OverflowMoveAction::None, |hwnd| OverflowMoveAction::Defer {
+            hwnd,
+            synthesize_start: true,
+        })
 }
 
 async fn process_window_event(ctx: &mut EventLoopCtx<'_>, daemon_event: DaemonWindowEvent) {
@@ -1871,6 +1912,47 @@ async fn process_window_event(ctx: &mut EventLoopCtx<'_>, daemon_event: DaemonWi
         event: win_event,
         source_incarnation,
     } = daemon_event;
+    if matches!(&win_event, WindowEvent::ReconcileAll) {
+        let foreground = leopardwm_platform_win32::get_foreground_window();
+        let mut state = ctx.state.lock().await;
+        match overflow_move_action(
+            state.drag_state.as_ref().map(|drag| drag.hwnd),
+            state.resize_hwnd,
+            foreground,
+            leopardwm_platform_win32::is_window_in_move_size,
+        ) {
+            OverflowMoveAction::Defer {
+                hwnd,
+                synthesize_start,
+            } => {
+                if synthesize_start {
+                    state.handle_window_event(WindowEvent::MoveSizeStart(hwnd));
+                }
+                drop(state);
+                let tx = ctx.event_tx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    let _ = tx
+                        .send(DaemonEvent::WindowEvent(DaemonWindowEvent::capture(
+                            WindowEvent::ReconcileAll,
+                        )))
+                        .await;
+                });
+                return;
+            }
+            OverflowMoveAction::Finish(hwnd) => {
+                state.handle_window_event(WindowEvent::MoveSizeEnd(hwnd));
+            }
+            OverflowMoveAction::None => {}
+        }
+        if let IpcResponse::Error { message } = state.handle_command(IpcCommand::Refresh) {
+            warn!("WinEvent overflow reconciliation failed: {message}");
+        }
+        if let Some(hwnd) = foreground.filter(|hwnd| state.find_window_workspace(*hwnd).is_some()) {
+            state.handle_window_event(WindowEvent::Focused(hwnd));
+        }
+        return;
+    }
     // Debounce DisplayChange / WorkAreaChanged into a single reconcile.
     // Contrast/DPI changes fire multiple WM_DISPLAYCHANGE messages with
     // intermediate work areas, so they need a longer quiet window; a taskbar
@@ -4208,6 +4290,10 @@ async fn main() -> Result<()> {
 
     // Print startup banner for immediate user feedback
     print_banner(&state, &config_warnings, &hotkey_state, &args).await;
+
+    // Import crash-surviving receipts before this process publishes new style
+    // or taskbar ownership for the same targets.
+    let _ = leopardwm_platform_win32::restore_marked_maximizeboxes_best_effort();
 
     // Taskbar-button controller (ITaskbarList). Held for the whole session;
     // dropping it on shutdown restores every hidden window's taskbar button.

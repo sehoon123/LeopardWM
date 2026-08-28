@@ -30,6 +30,8 @@ pub struct FrameRequest {
     /// Excludes any windows being driven via DWM thumbnail (those are in
     /// `ghost_updates`).
     pub placements: Vec<WindowPlacement>,
+    pub expected_identities:
+        std::collections::HashMap<u64, leopardwm_platform_win32::WindowEventIdentity>,
     pub region_clips: Vec<leopardwm_platform_win32::WindowRegionClip>,
     /// Thumbnail destination-rect updates for windows being ghost-animated
     /// this frame. The worker calls `DwmUpdateThumbnailProperties` for
@@ -357,9 +359,10 @@ fn worker_loop(
                 // compositor-sensitive HWNDs, and omits already-hung sensitive
                 // targets until the bounded exact landing pass.
                 let (apply_result, width_violations, height_violations) =
-                    match leopardwm_platform_win32::apply_placements_with_regions(
+                    match leopardwm_platform_win32::apply_placements_with_regions_fenced(
                         &request.placements,
                         &request.region_clips,
+                        &request.expected_identities,
                         &request.platform_config,
                         Some(&mut placement_cache),
                         false,
@@ -537,6 +540,7 @@ mod tests {
             .send(WorkerCommand::Frame(FrameRequest {
                 apply_epoch: 1,
                 placements: Vec::new(),
+                expected_identities: std::collections::HashMap::new(),
                 region_clips: Vec::new(),
                 ghost_updates: Vec::new(),
                 platform_config: PlatformConfig::default(),
@@ -570,6 +574,7 @@ mod tests {
             .send(WorkerCommand::Frame(FrameRequest {
                 apply_epoch: 1,
                 placements: Vec::new(),
+                expected_identities: std::collections::HashMap::new(),
                 region_clips: Vec::new(),
                 ghost_updates: Vec::new(),
                 platform_config: PlatformConfig::default(),

@@ -12,7 +12,7 @@ use crate::ipc_client::{
 use crate::output::print_response;
 use anyhow::{Context, Result};
 use leopardwm_ipc::{IpcCommand, IpcResponse, MAX_IPC_MESSAGE_SIZE};
-use leopardwm_platform_win32::uncloak_all_visible_windows;
+use leopardwm_platform_win32::restore_all_windows_moved_offscreen_best_effort;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -246,10 +246,6 @@ pub(crate) fn safe_mode_existing_daemon_message() -> &'static str {
     "Daemon is already running. '--safe-mode' only applies when starting a new daemon. Stop it with 'leopardwm-cli stop', then run 'leopardwm-cli run --safe-mode'."
 }
 
-pub(crate) fn hard_crash_recovery_unavailable_message() -> &'static str {
-    "Cross-process recovery is limited to HWNDs carrying durable LeopardWM properties. Unmarked windows are never modified by numeric handle alone."
-}
-
 pub(crate) fn panic_revert_not_running_message() -> &'static str {
     "Daemon is not running. No automatic cross-process recovery was attempted; ownership cannot be verified. Run `leopardwm-cli emergency-uncloak` only if you explicitly want a global visibility restore."
 }
@@ -290,18 +286,6 @@ pub(crate) fn panic_revert_error_response_recovery_message() -> &'static str {
     "Daemon returned a non-success panic-revert response. No automatic cross-process recovery was attempted because ownership cannot be verified. Run `leopardwm-cli status`."
 }
 
-pub(crate) fn apply_non_success_recovery_reason() -> &'static str {
-    "apply daemon returned non-success response"
-}
-
-pub(crate) fn stop_non_success_recovery_reason() -> &'static str {
-    "stop daemon returned non-success response"
-}
-
-pub(crate) fn panic_revert_non_success_recovery_reason() -> &'static str {
-    "panic-revert daemon returned non-success response"
-}
-
 pub(crate) fn stop_race_shutdown_message() -> &'static str {
     "Daemon is already stopping or stopped. Run 'leopardwm-cli status' to confirm it no longer responds."
 }
@@ -310,24 +294,9 @@ pub(crate) fn stop_unconfirmed_message() -> &'static str {
     "Daemon stop was not confirmed. Treat this as unconfirmed shutdown: run 'leopardwm-cli status'. Use `leopardwm-cli emergency-uncloak` only if you explicitly want a global visibility restore."
 }
 
-/// Recover only crash-surviving HWND-property receipts after an unconfirmed
-/// cross-process failure. Numeric HWNDs without a marker remain untouched.
-fn report_unproven_cross_process_recovery(reason: &str) -> Result<()> {
-    let uncloaked = leopardwm_platform_win32::dwm_uncloak_all_marked_best_effort();
-    let regions = leopardwm_platform_win32::restore_all_marked_window_regions_best_effort();
-    let parked = leopardwm_platform_win32::restore_all_windows_moved_offscreen_best_effort();
-    let snap_styles = leopardwm_platform_win32::restore_marked_maximizeboxes_best_effort();
-    println!("{}", hard_crash_recovery_unavailable_message());
-    println!(
-        "Recovered durable receipts: cloaks={uncloaked}, regions={regions}, parked={parked}, snap-styles={snap_styles}"
-    );
-    println!("Recovery trigger: {}", reason);
-    Ok(())
-}
-
 fn run_explicit_global_visibility_restore() -> Result<()> {
-    uncloak_all_visible_windows();
-    println!("Executed explicit global visibility restore (best-effort). Only cloaking was addressed; maximize-box state remains unavailable without a durable owned recovery record.");
+    let restored = restore_all_windows_moved_offscreen_best_effort();
+    println!("Executed explicit global sentinel sweep: restored={restored}. This opt-in command may move unrelated sentinel-positioned windows; durable recovery remains marker-qualified.");
     Ok(())
 }
 
@@ -363,8 +332,6 @@ pub(crate) async fn handle_run(
     let response = send_apply_with_recovery().await?;
     print_response(&response);
     if is_non_success_response(&response) {
-        report_unproven_cross_process_recovery(apply_non_success_recovery_reason())
-            .context("Failed to report unproven cross-process recovery")?;
         anyhow::bail!(apply_error_response_recovery_message());
     }
 
@@ -381,23 +348,15 @@ async fn send_apply_with_recovery() -> Result<IpcResponse> {
             anyhow::bail!(apply_not_running_message());
         }
         Err(err) if error_chain_has_command_timeout(&err) => {
-            report_unproven_cross_process_recovery("apply response timeout")
-                .context("Failed to report unproven cross-process recovery")?;
             anyhow::bail!(apply_timeout_recovery_message());
         }
         Err(err) if error_chain_has_disconnected_before_response(&err) => {
-            report_unproven_cross_process_recovery("apply daemon disconnected before response")
-                .context("Failed to report unproven cross-process recovery")?;
             anyhow::bail!(apply_unconfirmed_recovery_message());
         }
         Err(err) if error_chain_has_connect_timeout(&err) => {
-            report_unproven_cross_process_recovery("apply IPC connect timeout")
-                .context("Failed to report unproven cross-process recovery")?;
             anyhow::bail!(apply_unconfirmed_recovery_message());
         }
         Err(err) => {
-            report_unproven_cross_process_recovery("apply unexpected IPC failure")
-                .context("Failed to report unproven cross-process recovery")?;
             anyhow::bail!(
                 "{}\nUnderlying IPC error: {}",
                 apply_unconfirmed_recovery_message(),
@@ -411,8 +370,6 @@ pub(crate) async fn handle_stop() -> Result<()> {
     let daemon_running = probe_daemon_running()?;
 
     if !daemon_running {
-        report_unproven_cross_process_recovery("stop requested while daemon not running")
-            .context("Failed to report unproven cross-process recovery")?;
         println!("Daemon not running.");
         return Ok(());
     }
@@ -420,8 +377,6 @@ pub(crate) async fn handle_stop() -> Result<()> {
     let response = match send_command(IpcCommand::Stop).await {
         Ok(response) => response,
         Err(err) if error_chain_has_pipe_not_found(&err) => {
-            report_unproven_cross_process_recovery("stop lost daemon connection before response")
-                .context("Failed to report unproven cross-process recovery")?;
             anyhow::bail!(
                 "{}\n{}",
                 stop_race_shutdown_message(),
@@ -429,8 +384,6 @@ pub(crate) async fn handle_stop() -> Result<()> {
             );
         }
         Err(err) if error_chain_has_disconnected_before_response(&err) => {
-            report_unproven_cross_process_recovery("stop daemon disconnected before response")
-                .context("Failed to report unproven cross-process recovery")?;
             anyhow::bail!(
                 "{}\n{}",
                 stop_race_shutdown_message(),
@@ -438,8 +391,6 @@ pub(crate) async fn handle_stop() -> Result<()> {
             );
         }
         Err(err) if error_chain_has_command_timeout(&err) => {
-            report_unproven_cross_process_recovery("stop response timeout")
-                .context("Failed to report unproven cross-process recovery")?;
             anyhow::bail!(
                 "{}\n{}",
                 stop_timeout_recovery_message(),
@@ -447,8 +398,6 @@ pub(crate) async fn handle_stop() -> Result<()> {
             );
         }
         Err(err) if error_chain_has_connect_timeout(&err) => {
-            report_unproven_cross_process_recovery("stop IPC connect timeout")
-                .context("Failed to report unproven cross-process recovery")?;
             anyhow::bail!(
                 "{}\n{}",
                 stop_timeout_recovery_message(),
@@ -456,8 +405,6 @@ pub(crate) async fn handle_stop() -> Result<()> {
             );
         }
         Err(err) => {
-            report_unproven_cross_process_recovery("stop unexpected IPC failure")
-                .context("Failed to report unproven cross-process recovery")?;
             anyhow::bail!(
                 "{}\nUnderlying IPC error: {}",
                 stop_unconfirmed_message(),
@@ -468,8 +415,6 @@ pub(crate) async fn handle_stop() -> Result<()> {
 
     print_response(&response);
     if is_non_success_response(&response) {
-        report_unproven_cross_process_recovery(stop_non_success_recovery_reason())
-            .context("Failed to report unproven cross-process recovery")?;
         anyhow::bail!(
             "{}\n{}",
             stop_error_response_recovery_message(),
@@ -480,8 +425,6 @@ pub(crate) async fn handle_stop() -> Result<()> {
     match wait_for_daemon_shutdown(SHUTDOWN_CONFIRM_TIMEOUT).await {
         Ok(true) => {}
         Ok(false) => {
-            report_unproven_cross_process_recovery("stop shutdown confirmation timeout")
-                .context("Failed to report unproven cross-process recovery")?;
             anyhow::bail!(
                 "{}\n{}",
                 stop_timeout_recovery_message(),
@@ -489,8 +432,6 @@ pub(crate) async fn handle_stop() -> Result<()> {
             );
         }
         Err(err) => {
-            report_unproven_cross_process_recovery("stop shutdown confirmation probe failed")
-                .context("Failed to report unproven cross-process recovery")?;
             anyhow::bail!(
                 "Failed to confirm daemon shutdown after stop: {}.\n{}",
                 err,
@@ -504,8 +445,6 @@ pub(crate) async fn handle_stop() -> Result<()> {
 pub(crate) async fn handle_panic_revert() -> Result<()> {
     let daemon_running = probe_daemon_running()?;
     if !daemon_running {
-        report_unproven_cross_process_recovery("panic-revert requested while daemon not running")
-            .context("Failed to report unproven cross-process recovery")?;
         println!("{}", panic_revert_not_running_message());
         return Ok(());
     }
@@ -513,32 +452,18 @@ pub(crate) async fn handle_panic_revert() -> Result<()> {
     let response = match send_command(IpcCommand::PanicRevert).await {
         Ok(response) => response,
         Err(err) if error_chain_has_pipe_not_found(&err) => {
-            report_unproven_cross_process_recovery(
-                "panic-revert lost daemon connection before response",
-            )
-            .context("Failed to report unproven cross-process recovery")?;
             anyhow::bail!(panic_revert_unconfirmed_message());
         }
         Err(err) if error_chain_has_disconnected_before_response(&err) => {
-            report_unproven_cross_process_recovery(
-                "panic-revert daemon disconnected before response",
-            )
-            .context("Failed to report unproven cross-process recovery")?;
             anyhow::bail!(panic_revert_unconfirmed_message());
         }
         Err(err) if error_chain_has_command_timeout(&err) => {
-            report_unproven_cross_process_recovery("panic-revert response timeout")
-                .context("Failed to report unproven cross-process recovery")?;
             anyhow::bail!(panic_revert_timeout_recovery_message());
         }
         Err(err) if error_chain_has_connect_timeout(&err) => {
-            report_unproven_cross_process_recovery("panic-revert IPC connect timeout")
-                .context("Failed to report unproven cross-process recovery")?;
             anyhow::bail!(panic_revert_timeout_recovery_message());
         }
         Err(err) => {
-            report_unproven_cross_process_recovery("panic-revert unexpected IPC failure")
-                .context("Failed to report unproven cross-process recovery")?;
             anyhow::bail!(
                 "{}\nUnderlying IPC error: {}",
                 panic_revert_unconfirmed_message(),
@@ -549,8 +474,6 @@ pub(crate) async fn handle_panic_revert() -> Result<()> {
 
     print_response(&response);
     if is_non_success_response(&response) {
-        report_unproven_cross_process_recovery(panic_revert_non_success_recovery_reason())
-            .context("Failed to report unproven cross-process recovery")?;
         anyhow::bail!(
             "{}\n{}",
             panic_revert_error_response_recovery_message(),
@@ -561,15 +484,9 @@ pub(crate) async fn handle_panic_revert() -> Result<()> {
     match wait_for_daemon_shutdown(SHUTDOWN_CONFIRM_TIMEOUT).await {
         Ok(true) => {}
         Ok(false) => {
-            report_unproven_cross_process_recovery("panic-revert shutdown confirmation timeout")
-                .context("Failed to report unproven cross-process recovery")?;
             anyhow::bail!(panic_revert_unconfirmed_message());
         }
         Err(_) => {
-            report_unproven_cross_process_recovery(
-                "panic-revert shutdown confirmation probe failed",
-            )
-            .context("Failed to report unproven cross-process recovery")?;
             anyhow::bail!(panic_revert_unconfirmed_message());
         }
     }

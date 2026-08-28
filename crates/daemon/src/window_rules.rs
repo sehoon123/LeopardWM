@@ -323,6 +323,8 @@ impl AppState {
                 continue;
             }
 
+            let window_incarnation = crate::events::WindowIncarnation::capture(win_info.hwnd);
+
             // New windows land on the monitor's active workspace.
             let target_idx = self.active_workspace_idx(monitor_id);
             let _ = self.ensure_workspace_exists(monitor_id, target_idx);
@@ -359,6 +361,9 @@ impl AppState {
                             Ok(()) => {
                                 self.window_managed_at
                                     .insert(win_info.hwnd, std::time::Instant::now());
+                                if let Some(incarnation) = window_incarnation {
+                                    self.window_incarnations.insert(win_info.hwnd, incarnation);
+                                }
                                 info!(
                                     "Added floating window: {} ({}) to monitor {} - {}x{}",
                                     win_info.title,
@@ -379,6 +384,9 @@ impl AppState {
                             Ok(()) => {
                                 self.window_managed_at
                                     .insert(win_info.hwnd, std::time::Instant::now());
+                                if let Some(incarnation) = window_incarnation {
+                                    self.window_incarnations.insert(win_info.hwnd, incarnation);
+                                }
                                 self.disable_snap_for_window(win_info.hwnd);
                                 info!(
                                     "Added tiled window: {} ({}) to monitor {} - {}x{}",

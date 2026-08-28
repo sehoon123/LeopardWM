@@ -755,22 +755,45 @@ static SUPPRESS_RETRY_FOR_CAPTURE_PROBE: AtomicBool = AtomicBool::new(false);
 #[cfg(not(test))]
 static REGISTRATION_BACKOFF: Mutex<Option<HashMap<WindowId, Instant>>> = Mutex::new(None);
 
-/// Called synchronously from the WinEvent destroy callback, before the queued
-/// daemon lifecycle event can be overtaken by preview input. A held gesture for
-/// this numeric HWND is rejected until a fresh DWM registration is established.
+/// Called synchronously from the WinEvent destroy callback. The global atomic
+/// epoch is the nonblocking safety fence; the per-source tombstone is a
+/// best-effort precision aid and is never allowed to stall the callback.
 pub fn invalidate_persistent_preview_source(window_id: WindowId) {
-    let mut guard = INVALIDATED_PREVIEW_SOURCES
-        .lock()
-        .unwrap_or_else(crate::recover_poisoned_mutex);
-    // Allocate while holding the map lock so concurrent callbacks cannot
-    // acquire generations in one order and publish them in the reverse order.
+    if matches!(
+        persistent_preview_presence_nonblocking(window_id),
+        Some(false)
+    ) {
+        return;
+    }
+    record_preview_source_invalidation(window_id);
+}
+
+fn record_preview_source_invalidation(window_id: WindowId) {
     let generation = NEXT_PREVIEW_SOURCE_INVALIDATION
         .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
             Some(value.wrapping_add(1).max(1))
         })
         .unwrap_or_else(|value| value);
-    let sources = guard.get_or_insert_with(HashMap::new);
-    sources.insert(window_id, PreviewSourceInvalidation { generation });
+    match INVALIDATED_PREVIEW_SOURCES.try_lock() {
+        Ok(mut sources) => {
+            sources
+                .get_or_insert_with(HashMap::new)
+                .insert(window_id, PreviewSourceInvalidation { generation });
+        }
+        Err(std::sync::TryLockError::Poisoned(error)) => {
+            error
+                .into_inner()
+                .get_or_insert_with(HashMap::new)
+                .insert(window_id, PreviewSourceInvalidation { generation });
+        }
+        Err(std::sync::TryLockError::WouldBlock) => {
+            // Contention is rare and cannot block a WinEvent callback. Revoke
+            // every preview producer/input epoch as the fixed-size fallback;
+            // the daemon's next service tick performs a fresh exact relayout.
+            advance_preview_lifecycle_epoch();
+            PREVIEW_RELAYOUT_REQUIRED.store(true, Ordering::Release);
+        }
+    }
 }
 
 fn preview_source_invalidation_generation(window_id: WindowId) -> Option<u64> {
@@ -840,17 +863,22 @@ pub fn preview_lifecycle_epoch() -> u64 {
     PREVIEW_LIFECYCLE_EPOCH.load(Ordering::Acquire)
 }
 
+fn advance_preview_lifecycle_epoch() -> u64 {
+    PREVIEW_LIFECYCLE_EPOCH
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            Some(value.wrapping_add(1).max(1))
+        })
+        .unwrap_or_else(|value| value)
+        .wrapping_add(1)
+        .max(1)
+}
+
 /// Transaction-independent emergency revocation. Hiding/disarming does not
 /// wait for an apply worker that may be wedged inside the preview transaction;
 /// all producers check the epoch before exposing a surface again.
 pub fn invalidate_persistent_preview_surface() {
     PREVIEW_RELAYOUT_REQUIRED.store(false, Ordering::Release);
-    let previous = PREVIEW_LIFECYCLE_EPOCH
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
-            Some(value.wrapping_add(1).max(1))
-        })
-        .unwrap_or_else(|value| value);
-    let epoch = previous.wrapping_add(1).max(1);
+    let epoch = advance_preview_lifecycle_epoch();
     crate::preview_input::set_preview_targets_armed(false);
     #[cfg(not(test))]
     let _ = host().hide_surface();
@@ -1003,6 +1031,20 @@ pub(crate) fn prepare_persistent_preview(window_id: WindowId) -> bool {
         }
         true
     }
+}
+
+fn persistent_preview_presence_nonblocking(window_id: WindowId) -> Option<bool> {
+    match persistent_previews().try_lock() {
+        Ok(state) => Some(state.previews.contains_key(&window_id)),
+        Err(std::sync::TryLockError::Poisoned(error)) => {
+            Some(error.into_inner().previews.contains_key(&window_id))
+        }
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
+pub(crate) fn has_persistent_preview_nonblocking(window_id: WindowId) -> bool {
+    persistent_preview_presence_nonblocking(window_id) == Some(true)
 }
 
 pub(crate) fn has_persistent_preview(window_id: WindowId) -> bool {
@@ -3667,7 +3709,9 @@ mod tests {
     #[test]
     fn destroy_fence_survives_priority_reordering_until_new_registration() {
         let window_id = 0x1234;
-        invalidate_persistent_preview_source(window_id);
+        let preview_state_busy = lock_persistent_previews();
+        record_preview_source_invalidation(window_id);
+        drop(preview_state_busy);
         let observed = preview_source_invalidation_generation(window_id);
         assert!(observed.is_some());
         assert!(validate_new_preview_source(window_id, observed, || ()).is_some());
@@ -3677,7 +3721,7 @@ mod tests {
         // newer generation must survive and the stale install must not run.
         let observed = preview_source_invalidation_generation(window_id);
         assert!(observed.is_none());
-        invalidate_persistent_preview_source(window_id);
+        record_preview_source_invalidation(window_id);
         let mut installed = false;
         assert!(validate_new_preview_source(window_id, observed, || installed = true).is_none());
         assert!(!installed);
@@ -3685,7 +3729,7 @@ mod tests {
 
         // Lifecycle retirement may not erase a still newer destroy.
         let older = preview_source_invalidation_generation(window_id);
-        invalidate_persistent_preview_source(window_id);
+        record_preview_source_invalidation(window_id);
         let newer = preview_source_invalidation_generation(window_id);
         assert_ne!(older, newer);
         retire_preview_source_invalidation(window_id, older);
@@ -3708,6 +3752,16 @@ mod tests {
         let mut disconnected = Some(dead_tx);
         assert!(!signal_existing_retry_worker(&mut disconnected));
         assert!(disconnected.is_none());
+    }
+
+    #[test]
+    fn unrelated_destroy_does_not_revoke_all_previews() {
+        let window_id = 0x5678;
+        lock_persistent_previews().previews.remove(&window_id);
+        let before = preview_lifecycle_epoch();
+        invalidate_persistent_preview_source(window_id);
+        assert_eq!(preview_lifecycle_epoch(), before);
+        assert!(!preview_source_is_invalidated(window_id));
     }
 
     #[test]

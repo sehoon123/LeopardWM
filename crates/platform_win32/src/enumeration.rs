@@ -239,28 +239,45 @@ fn monitor_center(m: &MonitorInfo) -> (i64, i64) {
     )
 }
 
-/// Find the nearest monitor whose center is genuinely left of the current
-/// center. Vertically stacked outputs with the same x are never horizontal
-/// neighbors.
+fn monitors_overlap_vertically(left: &MonitorInfo, right: &MonitorInfo) -> bool {
+    let left_top = i64::from(left.rect.y);
+    let left_bottom = left_top + i64::from(left.rect.height.max(0));
+    let right_top = i64::from(right.rect.y);
+    let right_bottom = right_top + i64::from(right.rect.height.max(0));
+    left_top < right_bottom && right_top < left_bottom
+}
+
+/// Find the nearest monitor whose center is genuinely left and whose vertical
+/// span overlaps the current output. Diagonal/stacked monitors belong to
+/// up/down navigation instead.
 pub fn monitor_to_left(monitors: &[MonitorInfo], current_id: MonitorId) -> Option<&MonitorInfo> {
-    let (cx, cy) = monitor_center(monitors.iter().find(|monitor| monitor.id == current_id)?);
+    let current = monitors.iter().find(|monitor| monitor.id == current_id)?;
+    let (cx, cy) = monitor_center(current);
     monitors
         .iter()
-        .filter(|monitor| monitor.id != current_id && monitor_center(monitor).0 < cx)
+        .filter(|monitor| {
+            monitor.id != current_id
+                && monitor_center(monitor).0 < cx
+                && monitors_overlap_vertically(current, monitor)
+        })
         .min_by_key(|monitor| {
             let (mx, my) = monitor_center(monitor);
             (cx - mx, (my - cy).abs())
         })
 }
 
-/// Find the nearest monitor whose center is genuinely right of the current
-/// center. Vertically stacked outputs with the same x are never horizontal
-/// neighbors.
+/// Find the nearest monitor whose center is genuinely right and whose vertical
+/// span overlaps the current output.
 pub fn monitor_to_right(monitors: &[MonitorInfo], current_id: MonitorId) -> Option<&MonitorInfo> {
-    let (cx, cy) = monitor_center(monitors.iter().find(|monitor| monitor.id == current_id)?);
+    let current = monitors.iter().find(|monitor| monitor.id == current_id)?;
+    let (cx, cy) = monitor_center(current);
     monitors
         .iter()
-        .filter(|monitor| monitor.id != current_id && monitor_center(monitor).0 > cx)
+        .filter(|monitor| {
+            monitor.id != current_id
+                && monitor_center(monitor).0 > cx
+                && monitors_overlap_vertically(current, monitor)
+        })
         .min_by_key(|monitor| {
             let (mx, my) = monitor_center(monitor);
             (mx - cx, (my - cy).abs())
@@ -1097,6 +1114,21 @@ mod tests {
         ];
         assert!(monitor_above(&side, 1).is_none());
         assert!(monitor_below(&side, 1).is_none());
+
+        let diagonal = vec![
+            side[0].clone(),
+            MonitorInfo {
+                id: 3,
+                rect: Rect::new(1920, 1400, 1920, 1080),
+                work_area: Rect::new(1920, 1400, 1920, 1080),
+                is_primary: false,
+                device_name: "DISPLAY3".to_string(),
+                scale_factor: 1.0,
+            },
+        ];
+        assert!(monitor_to_right(&diagonal, 1).is_none());
+        assert!(monitor_to_left(&diagonal, 3).is_none());
+        assert_eq!(monitor_below(&diagonal, 1).unwrap().id, 3);
     }
 
     #[test]

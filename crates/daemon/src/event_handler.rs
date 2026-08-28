@@ -135,6 +135,7 @@ impl AppState {
             | WindowEvent::TitleChanged(id) => Some(*id),
             WindowEvent::DisplayChange
             | WindowEvent::WorkAreaChanged
+            | WindowEvent::ReconcileAll
             | WindowEvent::AppearanceChanged
             | WindowEvent::MouseEnterWindow(_)
             | WindowEvent::MouseLeftManaged => None,
@@ -170,6 +171,9 @@ impl AppState {
             // DisplayChangeSettled path (see process_window_event), so a raw
             // event here is a no-op; reconcile defensively if one arrives.
             WindowEvent::WorkAreaChanged => self.on_display_change(),
+            // The main event loop consumes this synthetic overflow signal and
+            // runs the full refresh before ordinary dispatch reaches here.
+            WindowEvent::ReconcileAll => {}
             WindowEvent::AppearanceChanged => {
                 leopardwm_platform_win32::clear_inset_cache();
                 self.refresh_high_contrast();

@@ -247,6 +247,13 @@ impl WheelGestureEngine {
         }
     }
 
+    fn retry_navigation_after_failed_delivery(&mut self) {
+        self.navigation_cooldown_until_ms = None;
+        if self.navigation_mode == WheelMode::Stream {
+            self.navigation_stream_emitted = self.navigation_stream_emitted.saturating_sub(1);
+        }
+    }
+
     fn reset_navigation_stream(&mut self) {
         self.navigation_mode = WheelMode::Discrete;
         self.navigation_accum = 0;
@@ -508,14 +515,22 @@ fn scroll_modifiers_held(flags: u8) -> bool {
 }
 
 fn send_gesture_event(event: GestureEvent) -> bool {
-    let sender_guard = GESTURE_SENDER.lock().unwrap_or_else(recover_poisoned_mutex);
-    let delivered = sender_guard
-        .as_ref()
-        .is_some_and(|sender| sender.try_send(event).is_ok());
-    if !delivered {
-        GESTURE_DELIVERY_CONNECTED.store(false, Ordering::Release);
+    let result = match GESTURE_SENDER.try_lock() {
+        Ok(sender) => sender.as_ref().map(|sender| sender.try_send(event)),
+        Err(std::sync::TryLockError::Poisoned(error)) => error
+            .into_inner()
+            .as_ref()
+            .map(|sender| sender.try_send(event)),
+        Err(std::sync::TryLockError::WouldBlock) => return false,
+    };
+    match result {
+        Some(Ok(())) => true,
+        Some(Err(mpsc::TrySendError::Full(_))) => false,
+        Some(Err(mpsc::TrySendError::Disconnected(_))) | None => {
+            GESTURE_DELIVERY_CONNECTED.store(false, Ordering::Release);
+            false
+        }
     }
-    delivered
 }
 
 /// Low-level mouse hook callback for gesture detection.
@@ -600,6 +615,9 @@ unsafe extern "system" fn gesture_mouse_hook_proc(
                         "Wheel gesture emitted"
                     );
                     delivery_available = send_gesture_event(event);
+                    if !delivery_available && mods_held {
+                        state.engine.retry_navigation_after_failed_delivery();
+                    }
                 }
                 if result.consume && delivery_available {
                     return windows::Win32::Foundation::LRESULT(1);
@@ -844,6 +862,31 @@ mod tests {
             .lock()
             .unwrap_or_else(recover_poisoned_mutex)
             .is_some());
+        clear_gesture_globals();
+    }
+
+    #[test]
+    fn failed_navigation_delivery_rearms_the_next_notch() {
+        let mut engine = WheelGestureEngine::new();
+        let first = engine.process(input(0, WheelAxis::Vertical, 120, true, 0));
+        assert_eq!(first.event, Some(GestureEvent::ScrollUp));
+        engine.retry_navigation_after_failed_delivery();
+        let retry = engine.process(input(10, WheelAxis::Vertical, 120, true, 0));
+        assert_eq!(retry.event, Some(GestureEvent::ScrollUp));
+    }
+
+    #[test]
+    fn full_delivery_queue_passes_through_without_disabling_generation() {
+        let _guard = GESTURE_GLOBAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex);
+        let (tx, _rx) = mpsc::sync_channel(1);
+        tx.try_send(GestureEvent::SwipeLeft).unwrap();
+        *GESTURE_SENDER.lock().unwrap_or_else(recover_poisoned_mutex) = Some(tx);
+        GESTURE_DELIVERY_CONNECTED.store(true, Ordering::Release);
+
+        assert!(!send_gesture_event(GestureEvent::ScrollUp));
+        assert!(GESTURE_DELIVERY_CONNECTED.load(Ordering::Acquire));
         clear_gesture_globals();
     }
 

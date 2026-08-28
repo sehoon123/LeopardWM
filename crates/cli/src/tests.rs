@@ -743,13 +743,6 @@ fn test_panic_revert_error_response_recovery_message_is_actionable() {
 }
 
 #[test]
-fn test_non_success_recovery_reasons_are_command_specific() {
-    assert!(apply_non_success_recovery_reason().contains("apply"));
-    assert!(stop_non_success_recovery_reason().contains("stop"));
-    assert!(panic_revert_non_success_recovery_reason().contains("panic-revert"));
-}
-
-#[test]
 fn test_parse_ipc_response_line_parses_ok_response() {
     let raw = serde_json::to_string(&IpcResponse::Ok).unwrap();
     let response = parse_ipc_response_line(&raw).unwrap();

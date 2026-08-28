@@ -1146,6 +1146,7 @@ fn test_state_snapshot_serialization() {
         workspaces: vec![],
         focused_monitor_name: "DISPLAY1".to_string(),
         active_workspace: HashMap::new(),
+        window_identities: HashMap::new(),
         tab_title_overrides: HashMap::new(),
         tab_title_override_identities: HashMap::new(),
     };
@@ -1180,6 +1181,7 @@ fn test_save_and_load_roundtrip() {
         }],
         focused_monitor_name: "DISPLAY1".to_string(),
         active_workspace: HashMap::new(),
+        window_identities: HashMap::new(),
         tab_title_overrides: HashMap::new(),
         tab_title_override_identities: HashMap::new(),
     };
@@ -1208,13 +1210,32 @@ fn test_state_snapshot_with_tab_title_overrides_roundtrip() {
         workspaces: vec![],
         focused_monitor_name: "DISPLAY1".to_string(),
         active_workspace: HashMap::new(),
+        window_identities: identities.clone(),
         tab_title_overrides: overrides.clone(),
         tab_title_override_identities: identities.clone(),
     };
     let json = serde_json::to_string(&snapshot).expect("serialize");
     let parsed: StateSnapshot = serde_json::from_str(&json).expect("deserialize");
+    assert_eq!(parsed.window_identities, identities);
     assert_eq!(parsed.tab_title_overrides, overrides);
     assert_eq!(parsed.tab_title_override_identities, identities);
+}
+
+#[test]
+fn persisted_workspace_identity_rejects_same_process_class_hwnd_reuse() {
+    let persisted = crate::state::PersistedWindowIdentity {
+        token: 10,
+        process_id: 20,
+        thread_id: 30,
+        class_name: "SameClass".into(),
+    };
+    let replacement = leopardwm_platform_win32::WindowEventIdentity {
+        token: 11,
+        process_id: 20,
+        thread_id: 30,
+        class_name: "SameClass".into(),
+    };
+    assert!(!persisted.matches(&replacement));
 }
 
 #[test]
@@ -1229,6 +1250,7 @@ fn test_state_snapshot_v0_1_14_backward_compat() {
         "active_workspace": {}
     }"#;
     let parsed: StateSnapshot = serde_json::from_str(legacy_json).expect("deserialize");
+    assert!(parsed.window_identities.is_empty());
     assert!(parsed.tab_title_overrides.is_empty());
     assert!(parsed.tab_title_override_identities.is_empty());
     assert_eq!(parsed.focused_monitor_name, "DISPLAY1");
@@ -1397,6 +1419,32 @@ fn test_shutdown_mode_for_command_maps_shutdown_variants() {
         Some(ShutdownMode::PanicRevert)
     );
     assert_eq!(shutdown_mode_for_command(&IpcCommand::FocusLeft), None);
+}
+
+#[test]
+fn winevent_overflow_preserves_move_size_lifecycle() {
+    assert_eq!(
+        overflow_move_action(Some(10), None, Some(20), |hwnd| hwnd == 10),
+        OverflowMoveAction::Defer {
+            hwnd: 10,
+            synthesize_start: false,
+        }
+    );
+    assert_eq!(
+        overflow_move_action(Some(10), None, Some(20), |_| false),
+        OverflowMoveAction::Finish(10)
+    );
+    assert_eq!(
+        overflow_move_action(None, None, Some(20), |hwnd| hwnd == 20),
+        OverflowMoveAction::Defer {
+            hwnd: 20,
+            synthesize_start: true,
+        }
+    );
+    assert_eq!(
+        overflow_move_action(None, None, Some(20), |_| false),
+        OverflowMoveAction::None
+    );
 }
 
 #[test]
@@ -4079,6 +4127,7 @@ fn test_restore_state_preserves_scroll_offset() {
         }],
         focused_monitor_name: "DISPLAY1".to_string(),
         active_workspace: HashMap::new(),
+        window_identities: HashMap::new(),
         tab_title_overrides: HashMap::new(),
         tab_title_override_identities: HashMap::new(),
     };
@@ -4110,6 +4159,7 @@ fn test_restore_state_on_empty_workspace_safe() {
         }],
         focused_monitor_name: "DISPLAY1".to_string(),
         active_workspace: HashMap::new(),
+        window_identities: HashMap::new(),
         tab_title_overrides: HashMap::new(),
         tab_title_override_identities: HashMap::new(),
     };
@@ -4161,6 +4211,7 @@ fn test_restore_state_returns_restored_monitor_ids() {
         }],
         focused_monitor_name: "DISPLAY1".to_string(),
         active_workspace: HashMap::new(),
+        window_identities: HashMap::new(),
         tab_title_overrides: HashMap::new(),
         tab_title_override_identities: HashMap::new(),
     };
@@ -4183,6 +4234,7 @@ fn test_restore_state_returns_restored_monitor_ids() {
         }],
         focused_monitor_name: "DISPLAY1".to_string(),
         active_workspace: HashMap::new(),
+        window_identities: HashMap::new(),
         tab_title_overrides: HashMap::new(),
         tab_title_override_identities: HashMap::new(),
     };
@@ -7233,6 +7285,7 @@ fn test_restore_structure_preserves_columns_widths_grouping_scroll() {
         }],
         focused_monitor_name: "DISPLAY1".to_string(),
         active_workspace: std::collections::HashMap::new(),
+        window_identities: std::collections::HashMap::new(),
         tab_title_overrides: std::collections::HashMap::new(),
         tab_title_override_identities: std::collections::HashMap::new(),
     };
@@ -7274,6 +7327,7 @@ fn test_restore_structure_prunes_dead_windows() {
         }],
         focused_monitor_name: "DISPLAY1".to_string(),
         active_workspace: std::collections::HashMap::new(),
+        window_identities: std::collections::HashMap::new(),
         tab_title_overrides: std::collections::HashMap::new(),
         tab_title_override_identities: std::collections::HashMap::new(),
     };
@@ -7311,6 +7365,7 @@ fn test_state_snapshot_deserialization_rejects_invalid_focus_indices() {
         }],
         focused_monitor_name: "DISPLAY1".to_string(),
         active_workspace: std::collections::HashMap::new(),
+        window_identities: std::collections::HashMap::new(),
         tab_title_overrides: std::collections::HashMap::new(),
         tab_title_override_identities: std::collections::HashMap::new(),
     };
@@ -7344,6 +7399,7 @@ fn test_restore_structure_drops_duplicate_hwnd_from_later_workspace() {
         ],
         focused_monitor_name: "DISPLAY1".to_string(),
         active_workspace: std::collections::HashMap::new(),
+        window_identities: std::collections::HashMap::new(),
         tab_title_overrides: std::collections::HashMap::new(),
         tab_title_override_identities: std::collections::HashMap::new(),
     };
@@ -7388,6 +7444,7 @@ fn test_restore_structure_rejects_out_of_range_workspace_index() {
         ],
         focused_monitor_name: "DISPLAY1".to_string(),
         active_workspace: std::collections::HashMap::new(),
+        window_identities: std::collections::HashMap::new(),
         tab_title_overrides: std::collections::HashMap::new(),
         tab_title_override_identities: std::collections::HashMap::new(),
     };
@@ -7428,6 +7485,7 @@ fn test_restore_structure_skips_unknown_monitor() {
         }],
         focused_monitor_name: "DISPLAY1".to_string(),
         active_workspace: std::collections::HashMap::new(),
+        window_identities: std::collections::HashMap::new(),
         tab_title_overrides: std::collections::HashMap::new(),
         tab_title_override_identities: std::collections::HashMap::new(),
     };

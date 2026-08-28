@@ -717,13 +717,17 @@ impl PersistedWindowIdentity {
         })
     }
 
+    pub(crate) fn matches(&self, identity: &leopardwm_platform_win32::WindowEventIdentity) -> bool {
+        self.token == identity.token
+            && self.process_id == identity.process_id
+            && self.thread_id == identity.thread_id
+            && self.class_name == identity.class_name
+    }
+
     pub(crate) fn still_matches(&self, hwnd: u64) -> bool {
-        leopardwm_platform_win32::current_window_event_identity(hwnd).is_some_and(|identity| {
-            self.token == identity.token
-                && self.process_id == identity.process_id
-                && self.thread_id == identity.thread_id
-                && self.class_name == identity.class_name
-        })
+        leopardwm_platform_win32::current_window_event_identity(hwnd)
+            .as_ref()
+            .is_some_and(|identity| self.matches(identity))
     }
 }
 
@@ -740,6 +744,11 @@ pub(crate) struct StateSnapshot {
     /// Defaults to empty for backward compatibility.
     #[serde(default)]
     pub(crate) active_workspace: HashMap<String, usize>,
+    /// Incarnation proof for every persisted managed HWND. Legacy snapshots
+    /// without this map retain their workspace files, but raw-HWND members are
+    /// re-enumerated instead of being restored into stale columns.
+    #[serde(default)]
+    pub(crate) window_identities: HashMap<u64, PersistedWindowIdentity>,
     /// User-supplied tab title overrides keyed by HWND. Defaults to
     /// empty so older snapshots without this field load cleanly.
     #[serde(default)]

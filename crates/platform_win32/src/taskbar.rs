@@ -15,17 +15,19 @@ use leopardwm_core_layout::WindowId;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::{mpsc, Mutex};
-use windows::Win32::Foundation::HWND;
+use windows::core::w;
+use windows::Win32::Foundation::{HANDLE, HWND};
 use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_APARTMENTTHREADED,
 };
 use windows::Win32::UI::Shell::{ITaskbarList, TaskbarList};
-use windows::Win32::UI::WindowsAndMessaging::{GetClassNameW, GetWindowThreadProcessId, IsWindow};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetClassNameW, GetPropW, GetWindowThreadProcessId, IsWindow, RemovePropW, SetPropW,
+};
 
 enum TaskbarCmd {
     Hide(WindowId),
     Show(WindowId),
-    Restore(WindowId),
     Forget(WindowId),
     Shutdown(mpsc::Sender<ShutdownAck>),
 }
@@ -41,6 +43,8 @@ struct ShutdownAck {
 /// Global sender to the taskbar thread. `None` until `init_taskbar`, and again
 /// after the handle is dropped. Free functions no-op when unset.
 static TASKBAR_TX: Mutex<Option<mpsc::Sender<TaskbarCmd>>> = Mutex::new(None);
+const TASKBAR_SHUTDOWN_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(750);
+const TASKBAR_INIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn send_taskbar_command(command: TaskbarCmd) {
     let tx = TASKBAR_TX
@@ -63,13 +67,6 @@ pub fn taskbar_hide(wid: WindowId) {
 /// Restore `wid`'s taskbar button (only acts if we'd hidden it).
 pub fn taskbar_show(wid: WindowId) {
     send_taskbar_command(TaskbarCmd::Show(wid));
-}
-
-/// Unconditionally re-add `wid`'s taskbar button. Used at startup to restore
-/// buttons a crashed prior daemon instance may have left deleted (those aren't
-/// in this process's hidden set, so `taskbar_show` wouldn't touch them).
-pub fn taskbar_restore(wid: WindowId) {
-    send_taskbar_command(TaskbarCmd::Restore(wid));
 }
 
 /// Drop `wid` from the hidden set without an `AddTab` (the window is gone).
@@ -106,7 +103,7 @@ pub fn init_taskbar() -> Option<TaskbarHandle> {
         .map_err(|e| tracing::warn!("Failed to spawn taskbar thread: {}", e))
         .ok()?;
 
-    match ready_rx.recv() {
+    match ready_rx.recv_timeout(TASKBAR_INIT_TIMEOUT) {
         Ok(Ok(())) => {
             let mut slot = TASKBAR_TX.lock().unwrap_or_else(recover_poisoned_mutex);
             if slot.is_some() {
@@ -115,8 +112,10 @@ pub fn init_taskbar() -> Option<TaskbarHandle> {
                 drop(slot);
                 let (ack_tx, ack_rx) = mpsc::channel();
                 let _ = tx.send(TaskbarCmd::Shutdown(ack_tx));
-                let _ = ack_rx.recv();
-                let _ = thread.join();
+                let _ = ack_rx.recv_timeout(TASKBAR_SHUTDOWN_ACK_TIMEOUT);
+                if thread.is_finished() {
+                    let _ = thread.join();
+                }
                 tracing::warn!("Taskbar controller initialized concurrently");
                 None
             } else {
@@ -131,9 +130,19 @@ pub fn init_taskbar() -> Option<TaskbarHandle> {
             let _ = thread.join();
             None
         }
-        Err(_) => {
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            tracing::warn!("Taskbar controller initialization timed out; continuing without it");
+            drop(tx);
+            if thread.is_finished() {
+                let _ = thread.join();
+            }
+            None
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
             tracing::warn!("Taskbar controller exited before initialization completed");
-            let _ = thread.join();
+            if thread.is_finished() {
+                let _ = thread.join();
+            }
             None
         }
     }
@@ -151,13 +160,16 @@ impl Drop for TaskbarHandle {
         if let Some(tx) = tx {
             let (ack_tx, ack_rx) = mpsc::channel();
             match tx.send(TaskbarCmd::Shutdown(ack_tx)) {
-                Ok(()) => match ack_rx.recv() {
+                Ok(()) => match ack_rx.recv_timeout(TASKBAR_SHUTDOWN_ACK_TIMEOUT) {
                     Ok(ack) if ack.unrestored.is_empty() => {}
                     Ok(ack) => tracing::error!(
                         windows = ?ack.unrestored,
-                        "Taskbar shutdown completed with unrestored tabs"
+                        "Taskbar shutdown completed with durable recovery pending"
                     ),
-                    Err(_) => tracing::error!(
+                    Err(mpsc::RecvTimeoutError::Timeout) => tracing::error!(
+                        "Taskbar shutdown timed out; durable HWND markers remain for watchdog recovery"
+                    ),
+                    Err(mpsc::RecvTimeoutError::Disconnected) => tracing::error!(
                         "Taskbar controller exited without a shutdown acknowledgement"
                     ),
                 },
@@ -166,10 +178,20 @@ impl Drop for TaskbarHandle {
         }
 
         if let Some(thread) = self.thread.take() {
-            // An acknowledgement means the STA processed every queued command
-            // and every restore attempt. Join instead of detaching so Drop
-            // never falsely claims this owner has completed while it is live.
-            let _ = thread.join();
+            for _ in 0..10 {
+                if thread.is_finished() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if thread.is_finished() {
+                let _ = thread.join();
+            } else {
+                // Remaining worker operations are AddTab-only. Detach rather
+                // than blocking daemon exit; the watchdog consumes markers
+                // after process termination.
+                tracing::warn!("Detaching unfinished taskbar recovery worker");
+            }
         }
     }
 }
@@ -206,9 +228,38 @@ fn taskbar_window_identity(wid: WindowId) -> Option<TaskbarWindowIdentity> {
     })
 }
 
+fn taskbar_marker_token(wid: WindowId) -> u64 {
+    unsafe { GetPropW(hwnd_of(wid), w!("LeopardWM.TaskbarHidden.v1")) }.0 as u64
+}
+
+fn install_taskbar_marker(wid: WindowId, identity: &TaskbarWindowIdentity) -> bool {
+    if !crate::event_hooks::window_incarnation_property_matches(wid, identity.incarnation_token) {
+        return false;
+    }
+    unsafe {
+        SetPropW(
+            hwnd_of(wid),
+            w!("LeopardWM.TaskbarHidden.v1"),
+            Some(HANDLE(identity.incarnation_token as usize as *mut c_void)),
+        )
+    }
+    .is_ok()
+}
+
+fn clear_taskbar_marker_if_owned(wid: WindowId, token: u64) {
+    if taskbar_marker_token(wid) == token {
+        unsafe {
+            let _ = RemovePropW(hwnd_of(wid), w!("LeopardWM.TaskbarHidden.v1"));
+        }
+    }
+}
+
 /// Narrow adapter seam: all ledger transitions are unit-testable without COM.
 trait TaskbarAdapter {
     fn identity(&mut self, wid: WindowId) -> Option<TaskbarWindowIdentity>;
+    fn install_marker(&mut self, wid: WindowId, identity: &TaskbarWindowIdentity) -> bool;
+    fn marker_token(&mut self, wid: WindowId) -> u64;
+    fn clear_marker(&mut self, wid: WindowId, token: u64);
     fn delete_tab(&mut self, wid: WindowId) -> Result<(), String>;
     fn add_tab(&mut self, wid: WindowId) -> Result<(), String>;
 }
@@ -220,6 +271,18 @@ struct ComTaskbarAdapter {
 impl TaskbarAdapter for ComTaskbarAdapter {
     fn identity(&mut self, wid: WindowId) -> Option<TaskbarWindowIdentity> {
         taskbar_window_identity(wid)
+    }
+
+    fn install_marker(&mut self, wid: WindowId, identity: &TaskbarWindowIdentity) -> bool {
+        install_taskbar_marker(wid, identity)
+    }
+
+    fn marker_token(&mut self, wid: WindowId) -> u64 {
+        taskbar_marker_token(wid)
+    }
+
+    fn clear_marker(&mut self, wid: WindowId, token: u64) {
+        clear_taskbar_marker_if_owned(wid, token);
     }
 
     fn delete_tab(&mut self, wid: WindowId) -> Result<(), String> {
@@ -241,14 +304,33 @@ fn hide_tab<A: TaskbarAdapter>(adapter: &mut A, hidden: &mut HiddenTaskbarTabs, 
         tracing::debug!("Skipping taskbar hide for unavailable window {wid}");
         return;
     };
+    if !adapter.install_marker(wid, &identity)
+        || adapter.identity(wid).as_ref() != Some(&identity)
+        || adapter.marker_token(wid) != identity.incarnation_token
+    {
+        adapter.clear_marker(wid, identity.incarnation_token);
+        tracing::warn!("Could not establish taskbar ownership for window {wid}");
+        return;
+    }
     match adapter.delete_tab(wid) {
-        Ok(()) if adapter.identity(wid).as_ref() == Some(&identity) => {
+        Ok(())
+            if adapter.identity(wid).as_ref() == Some(&identity)
+                && adapter.marker_token(wid) == identity.incarnation_token =>
+        {
             hidden.insert(wid, identity);
         }
-        Ok(()) => tracing::warn!(
-            "Window {wid} changed incarnation during DeleteTab; refusing a stale receipt"
-        ),
-        Err(error) => tracing::warn!("ITaskbarList::DeleteTab({wid}) failed: {error}"),
+        Ok(()) => {
+            // DeleteTab may have raced HWND reuse. AddTab is compensating and
+            // monotonic (show-only), so the replacement cannot remain hidden by
+            // an operation intended for the destroyed source.
+            let _ = adapter.add_tab(wid);
+            adapter.clear_marker(wid, identity.incarnation_token);
+            tracing::warn!("Compensated taskbar hide across HWND incarnation change for {wid}");
+        }
+        Err(error) => {
+            adapter.clear_marker(wid, identity.incarnation_token);
+            tracing::warn!("ITaskbarList::DeleteTab({wid}) failed: {error}");
+        }
     }
 }
 
@@ -256,31 +338,17 @@ fn show_tab<A: TaskbarAdapter>(adapter: &mut A, hidden: &mut HiddenTaskbarTabs, 
     let Some(expected) = hidden.get(&wid).cloned() else {
         return;
     };
-    if adapter.identity(wid).as_ref() != Some(&expected) {
-        // The original HWND is gone. Never apply its receipt to a replacement
-        // that inherited the same numeric handle.
+    if adapter.identity(wid).as_ref() != Some(&expected)
+        || adapter.marker_token(wid) != expected.incarnation_token
+    {
+        adapter.clear_marker(wid, expected.incarnation_token);
         hidden.remove(&wid);
         return;
     }
     match adapter.add_tab(wid) {
         Ok(()) => {
+            adapter.clear_marker(wid, expected.incarnation_token);
             hidden.remove(&wid);
-        }
-        Err(error) => tracing::warn!("ITaskbarList::AddTab({wid}) failed: {error}"),
-    }
-}
-
-fn restore_tab<A: TaskbarAdapter>(adapter: &mut A, hidden: &mut HiddenTaskbarTabs, wid: WindowId) {
-    match adapter.add_tab(wid) {
-        Ok(()) => {
-            // Startup restore is unconditional, but it may also satisfy an
-            // identity-matching in-process receipt.
-            if hidden
-                .get(&wid)
-                .is_some_and(|expected| adapter.identity(wid).as_ref() == Some(expected))
-            {
-                hidden.remove(&wid);
-            }
         }
         Err(error) => tracing::warn!("ITaskbarList::AddTab({wid}) failed: {error}"),
     }
@@ -297,26 +365,37 @@ fn restore_hidden_tabs<A: TaskbarAdapter>(
     hidden.keys().copied().collect()
 }
 
-fn restore_hidden_tabs_until_complete<A: TaskbarAdapter>(
+fn restore_hidden_tabs_with_policy<A: TaskbarAdapter>(
     adapter: &mut A,
     hidden: &mut HiddenTaskbarTabs,
-) {
-    let mut attempts = 0u32;
-    while !hidden.is_empty() {
-        attempts = attempts.saturating_add(1);
-        let remaining = restore_hidden_tabs(adapter, hidden);
+    max_attempts: u32,
+    retry_delay: std::time::Duration,
+) -> Vec<WindowId> {
+    let mut remaining = Vec::new();
+    for attempt in 1..=max_attempts {
+        remaining = restore_hidden_tabs(adapter, hidden);
         if remaining.is_empty() {
             break;
         }
-        if attempts == 1 || attempts.is_multiple_of(50) {
+        if attempt == 1 || attempt == max_attempts {
             tracing::error!(
                 windows = ?remaining,
-                attempts,
-                "Taskbar shutdown is waiting for verified AddTab recovery"
+                attempt,
+                "Taskbar shutdown has pending durable AddTab recovery"
             );
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        if attempt != max_attempts {
+            std::thread::sleep(retry_delay);
+        }
     }
+    remaining
+}
+
+fn restore_hidden_tabs_bounded<A: TaskbarAdapter>(
+    adapter: &mut A,
+    hidden: &mut HiddenTaskbarTabs,
+) -> Vec<WindowId> {
+    restore_hidden_tabs_with_policy(adapter, hidden, 50, std::time::Duration::from_millis(100))
 }
 
 fn run_commands<A: TaskbarAdapter>(rx: mpsc::Receiver<TaskbarCmd>, adapter: &mut A) {
@@ -325,20 +404,66 @@ fn run_commands<A: TaskbarAdapter>(rx: mpsc::Receiver<TaskbarCmd>, adapter: &mut
         match rx.recv() {
             Ok(TaskbarCmd::Hide(wid)) => hide_tab(adapter, &mut hidden, wid),
             Ok(TaskbarCmd::Show(wid)) => show_tab(adapter, &mut hidden, wid),
-            Ok(TaskbarCmd::Restore(wid)) => restore_tab(adapter, &mut hidden, wid),
             Ok(TaskbarCmd::Forget(wid)) => {
                 hidden.remove(&wid);
             }
             Ok(TaskbarCmd::Shutdown(ack_tx)) => {
-                restore_hidden_tabs_until_complete(adapter, &mut hidden);
-                let _ = ack_tx.send(ShutdownAck {
-                    unrestored: Vec::new(),
-                });
+                let unrestored = restore_hidden_tabs_bounded(adapter, &mut hidden);
+                let _ = ack_tx.send(ShutdownAck { unrestored });
                 break;
             }
             Err(_) => {
-                restore_hidden_tabs_until_complete(adapter, &mut hidden);
+                let unrestored = restore_hidden_tabs_bounded(adapter, &mut hidden);
+                if !unrestored.is_empty() {
+                    tracing::error!(windows = ?unrestored, "Taskbar channel closed with durable recovery pending");
+                }
                 break;
+            }
+        }
+    }
+}
+
+fn restore_marked_taskbar_tabs_with(taskbar: &ITaskbarList) -> usize {
+    let mut restored = 0;
+    for wid in crate::enumeration::collect_all_top_level_window_ids() {
+        let token = taskbar_marker_token(wid);
+        if token == 0 {
+            continue;
+        }
+        match unsafe { taskbar.AddTab(hwnd_of(wid)) } {
+            Ok(()) => {
+                clear_taskbar_marker_if_owned(wid, token);
+                if taskbar_marker_token(wid) == 0 {
+                    restored += 1;
+                }
+            }
+            Err(error) => tracing::warn!("Marked taskbar recovery failed for {wid:#x}: {error}"),
+        }
+    }
+    restored
+}
+
+/// Cross-process recovery for taskbar hides whose durable HWND marker survived
+/// a daemon exit. `AddTab` is show-only, so a concurrent HWND replacement is
+/// never hidden; marker clearing remains token-qualified.
+pub fn restore_marked_taskbar_tabs_best_effort() -> usize {
+    unsafe {
+        let coinit = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        if coinit.is_err() {
+            tracing::warn!("Taskbar recovery COM initialization failed: {coinit:?}");
+            return 0;
+        }
+        let result = (|| -> Result<usize, windows::core::Error> {
+            let taskbar: ITaskbarList = CoCreateInstance(&TaskbarList, None, CLSCTX_ALL)?;
+            taskbar.HrInit()?;
+            Ok(restore_marked_taskbar_tabs_with(&taskbar))
+        })();
+        CoUninitialize();
+        match result {
+            Ok(restored) => restored,
+            Err(error) => {
+                tracing::warn!("Marked taskbar recovery failed: {error}");
+                0
             }
         }
     }
@@ -369,8 +494,9 @@ fn run(rx: mpsc::Receiver<TaskbarCmd>, ready_tx: mpsc::Sender<Result<(), String>
             return;
         }
 
+        let recovered = restore_marked_taskbar_tabs_with(&taskbar);
         let _ = ready_tx.send(Ok(()));
-        tracing::info!("Taskbar controller initialized");
+        tracing::info!(recovered, "Taskbar controller initialized");
         let mut adapter = ComTaskbarAdapter { taskbar };
         run_commands(rx, &mut adapter);
         drop(adapter);
@@ -388,6 +514,8 @@ mod tests {
         delete_failures: usize,
         add_failures: usize,
         identity_generation: u64,
+        reuse_on_delete: bool,
+        markers: HashMap<WindowId, u64>,
         calls: Vec<(&'static str, WindowId)>,
     }
 
@@ -405,12 +533,31 @@ mod tests {
             Some(fake_identity(wid, self.identity_generation.max(1)))
         }
 
+        fn install_marker(&mut self, wid: WindowId, identity: &TaskbarWindowIdentity) -> bool {
+            self.markers.insert(wid, identity.incarnation_token);
+            true
+        }
+
+        fn marker_token(&mut self, wid: WindowId) -> u64 {
+            self.markers.get(&wid).copied().unwrap_or(0)
+        }
+
+        fn clear_marker(&mut self, wid: WindowId, token: u64) {
+            if self.markers.get(&wid).copied() == Some(token) {
+                self.markers.remove(&wid);
+            }
+        }
+
         fn delete_tab(&mut self, wid: WindowId) -> Result<(), String> {
             self.calls.push(("delete", wid));
             if self.delete_failures > 0 {
                 self.delete_failures -= 1;
                 Err("injected DeleteTab failure".into())
             } else {
+                if self.reuse_on_delete {
+                    self.identity_generation = self.identity_generation.max(1) + 1;
+                    self.markers.remove(&wid);
+                }
                 Ok(())
             }
         }
@@ -445,6 +592,7 @@ mod tests {
     fn show_retains_receipt_until_add_tab_succeeds() {
         let mut adapter = FakeTaskbar {
             add_failures: 1,
+            markers: HashMap::from([(8, 1)]),
             ..Default::default()
         };
         let mut hidden = HiddenTaskbarTabs::from([(8, fake_identity(8, 1))]);
@@ -483,6 +631,7 @@ mod tests {
     fn shutdown_retries_a_retained_receipt_after_prior_add_failure() {
         let mut adapter = FakeTaskbar {
             add_failures: 1,
+            markers: HashMap::from([(10, 1)]),
             ..Default::default()
         };
         let mut hidden = HiddenTaskbarTabs::from([(10, fake_identity(10, 1))]);
@@ -495,9 +644,62 @@ mod tests {
     }
 
     #[test]
+    fn handle_drop_has_a_wall_clock_bound_without_worker_ack() {
+        let (tx, rx) = mpsc::channel();
+        *TASKBAR_TX.lock().unwrap_or_else(recover_poisoned_mutex) = Some(tx);
+        let worker = std::thread::spawn(move || {
+            let _rx = rx;
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        });
+        let handle = TaskbarHandle {
+            thread: Some(worker),
+        };
+
+        let start = std::time::Instant::now();
+        drop(handle);
+        assert!(start.elapsed() < std::time::Duration::from_millis(950));
+    }
+
+    #[test]
+    fn permanent_add_failure_is_bounded_and_handed_off() {
+        let mut adapter = FakeTaskbar {
+            add_failures: usize::MAX,
+            markers: HashMap::from([(12, 1)]),
+            ..Default::default()
+        };
+        let mut hidden = HiddenTaskbarTabs::from([(12, fake_identity(12, 1))]);
+
+        let remaining = restore_hidden_tabs_with_policy(
+            &mut adapter,
+            &mut hidden,
+            2,
+            std::time::Duration::ZERO,
+        );
+
+        assert_eq!(remaining, vec![12]);
+        assert_eq!(adapter.calls, vec![("add", 12), ("add", 12)]);
+        assert_eq!(adapter.markers.get(&12), Some(&1));
+    }
+
+    #[test]
+    fn delete_tab_hwnd_reuse_is_compensated_with_show_only_add() {
+        let mut adapter = FakeTaskbar {
+            reuse_on_delete: true,
+            ..Default::default()
+        };
+        let mut hidden = HiddenTaskbarTabs::new();
+
+        hide_tab(&mut adapter, &mut hidden, 13);
+
+        assert!(hidden.is_empty());
+        assert_eq!(adapter.calls, vec![("delete", 13), ("add", 13)]);
+    }
+
+    #[test]
     fn recycled_hwnd_retires_receipt_without_touching_replacement() {
         let mut adapter = FakeTaskbar {
             identity_generation: 2,
+            markers: HashMap::from([(11, 1)]),
             ..Default::default()
         };
         let mut hidden = HiddenTaskbarTabs::from([(11, fake_identity(11, 1))]);

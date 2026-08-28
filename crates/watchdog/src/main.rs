@@ -163,10 +163,10 @@ fn run(log_paths: &WatchdogLogPaths) -> Result<()> {
     loop {
         let status = spawn_daemon(&daemon_path, &daemon_args, &log_paths.daemon_error)?;
 
-        // Console-control path: do not recover/restart. A mid-cleanup kill
-        // would otherwise spawn a fresh daemon that re-tiles and re-parks
-        // windows at the sentinel right as the session is ending.
+        // Console-control path: recover durable receipts but do not restart. A
+        // fresh daemon would re-tile windows while the session is ending.
         if CONSOLE_CTRL_RECEIVED.load(Ordering::SeqCst) {
+            recover_durable_receipts();
             info!(
                 ?status,
                 "Daemon exited after console control — watchdog stopping without restart"
@@ -175,12 +175,13 @@ fn run(log_paths: &WatchdogLogPaths) -> Result<()> {
         }
 
         if status.success() {
+            recover_durable_receipts();
             info!(?status, "Daemon exited cleanly — watchdog stopping");
             return Ok(());
         }
 
         warn!(?status, "Daemon exited abnormally — running recovery");
-        recover_from_crash();
+        recover_durable_receipts();
 
         match record_crash_and_decide(
             &mut crashes,
@@ -281,19 +282,19 @@ fn hard_crash_recovery_policy_message() -> &'static str {
     "Hard-crash recovery touches only HWNDs carrying durable LeopardWM properties; unmarked windows fail closed and are never changed by numeric handle alone."
 }
 
-fn recover_from_crash() {
+fn recover_durable_receipts() {
     // HWND properties die with their owning window and therefore cannot cross a
     // recycled numeric handle. Recover only these durable receipts; never use a
     // global uncloak/style sweep from the watchdog.
-    let uncloaked = leopardwm_platform_win32::dwm_uncloak_all_marked_best_effort();
     let regions = leopardwm_platform_win32::restore_all_marked_window_regions_best_effort();
-    let parked = leopardwm_platform_win32::restore_all_windows_moved_offscreen_best_effort();
+    let parked = leopardwm_platform_win32::restore_all_marked_windows_moved_offscreen_best_effort();
     let snap_styles = leopardwm_platform_win32::restore_marked_maximizeboxes_best_effort();
+    let taskbar = leopardwm_platform_win32::restore_marked_taskbar_tabs_best_effort();
     warn!(
-        uncloaked,
         regions,
         parked,
         snap_styles,
+        taskbar,
         "{}",
         hard_crash_recovery_policy_message()
     );

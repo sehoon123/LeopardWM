@@ -28,6 +28,7 @@ pub mod toast;
 
 pub use preview_input::{PreviewClickEvent, PreviewClickTarget, PreviewGesture};
 pub use tab_strip::{TabAction, TabActionEvent, TabCloseAction};
+pub use taskbar::restore_marked_taskbar_tabs_best_effort;
 
 mod elevation;
 mod enumeration;
@@ -60,7 +61,7 @@ pub use enumeration::{
 };
 pub use event_hooks::{
     current_window_event_identity, ensure_window_incarnation_token, install_event_hooks,
-    take_window_event_identity, EventHookHandle, WindowEvent, WindowEventIdentity,
+    EventHookHandle, HookWindowEvent, WindowEvent, WindowEventIdentity,
 };
 pub use focus::{
     begin_window_move_drag, close_window, get_foreground_window, ms_since_last_user_input,
@@ -68,8 +69,8 @@ pub use focus::{
 };
 pub use placement::clear_suspected_oversize;
 pub use placement::{
-    apply_placements, apply_placements_with_regions, clear_inset_cache, dwm_cloak_window,
-    dwm_uncloak_all, dwm_uncloak_all_marked_best_effort, dwm_uncloak_window,
+    apply_placements, apply_placements_with_regions, apply_placements_with_regions_fenced,
+    clear_inset_cache, dwm_cloak_window, dwm_uncloak_all, dwm_uncloak_window,
     forget_recycled_ghost_cloak, get_window_invisible_insets, is_placement_cloaked,
     set_dwm_transitions_disabled, try_mark_ghost_cloaked, unmark_ghost_cloaked,
     ApplyPlacementsResult, HeightViolation, PlacementCache, WidthViolation, EDGE_EPSILON_PX,
@@ -84,6 +85,7 @@ pub use types::{
 pub use visibility::{
     cascade_windows, has_move_offscreen_ownership, is_move_offscreen_sentinel_position,
     is_move_offscreen_sentinel_rect, move_window_offscreen, position_window, raise_window,
+    restore_all_marked_windows_moved_offscreen_best_effort,
     restore_all_windows_moved_offscreen_best_effort, restore_window_moved_offscreen,
     restore_windows_moved_offscreen, show_window_no_activate, uncloak_all_managed_windows,
     uncloak_all_visible_windows,
@@ -92,8 +94,8 @@ pub use window_query::{
     cursor_is_over_window, get_cursor_pos, get_window_chrome_rect, get_window_corner_radius,
     get_window_icon, get_window_visible_rect, is_ctrl_alt_pressed, is_cursor_on_resize_border,
     is_dialog_like_window, is_frameless_popup, is_shift_key_pressed, is_valid_window,
-    is_window_alive_and_visible, is_window_maximized, is_window_shell_cloaked, is_window_valid,
-    is_window_visible, window_minimized_state,
+    is_window_alive_and_visible, is_window_in_move_size, is_window_maximized,
+    is_window_shell_cloaked, is_window_valid, is_window_visible, window_minimized_state,
 };
 pub use window_region::{
     forget_window_region, restore_all_marked_window_regions_best_effort,

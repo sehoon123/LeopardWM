@@ -13,22 +13,21 @@ use crate::window_region::{
 };
 use leopardwm_core_layout::{Rect, Visibility, WindowId, WindowPlacement};
 use std::collections::{HashMap, HashSet};
-use std::ffi::c_void;
 #[cfg(feature = "integration-probes")]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use windows::core::{w, BOOL};
-use windows::Win32::Foundation::{HANDLE, HWND, RECT};
+use windows::core::BOOL;
+use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Dwm::{
     DwmFlush, DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS,
     DWMWINDOWATTRIBUTE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, GetClassNameW, GetPropW, GetWindowRect,
-    GetWindowThreadProcessId, IsHungAppWindow, IsIconic, IsWindow, IsZoomed, RemovePropW, SetPropW,
-    SetWindowPos, ShowWindow, SET_WINDOW_POS_FLAGS, SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED,
-    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_RESTORE,
+    BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, GetClassNameW, GetWindowRect,
+    GetWindowThreadProcessId, IsHungAppWindow, IsIconic, IsWindow, IsZoomed, SetWindowPos,
+    ShowWindow, SET_WINDOW_POS_FLAGS, SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+    SWP_NOSIZE, SWP_NOZORDER, SW_RESTORE,
 };
 
 /// Undocumented but well-known DWM attribute for cloaking windows.
@@ -79,40 +78,6 @@ unsafe fn dwm_set_cloak(hwnd: HWND, cloaked: bool) -> bool {
     .is_ok()
 }
 
-const DWM_CLOAK_OWNER_MAGIC: usize = 0x4c57_4d43; // "LWMC"
-
-fn has_dwm_cloak_marker(hwnd: HWND) -> bool {
-    unsafe { GetPropW(hwnd, w!("LeopardWM.DwmCloak.v1")) }.0 as usize == DWM_CLOAK_OWNER_MAGIC
-}
-
-/// Commit DWM cloak state together with a crash-surviving HWND property. A
-/// cloak without durable ownership is rolled back immediately; an uncloak
-/// removes the marker only after DWM accepted the physical write.
-fn set_owned_dwm_cloak(hwnd: HWND, cloaked: bool) -> bool {
-    if !unsafe { dwm_set_cloak(hwnd, cloaked) } {
-        return false;
-    }
-    if cloaked {
-        if unsafe {
-            SetPropW(
-                hwnd,
-                w!("LeopardWM.DwmCloak.v1"),
-                Some(HANDLE(DWM_CLOAK_OWNER_MAGIC as *mut c_void)),
-            )
-        }
-        .is_err()
-        {
-            let _ = unsafe { dwm_set_cloak(hwnd, false) };
-            return false;
-        }
-    } else {
-        unsafe {
-            let _ = RemovePropW(hwnd, w!("LeopardWM.DwmCloak.v1"));
-        }
-    }
-    true
-}
-
 /// Serialize logical cloak-set mutations with the physical DWM commit. The
 /// animation worker and daemon thread can otherwise race and leave DWM in the
 /// opposite state from the final logical OR.
@@ -134,12 +99,15 @@ fn apply_cloak_state_locked(wid: WindowId) -> bool {
     if !unsafe { IsWindow(Some(hwnd)).as_bool() } {
         return false;
     }
-    set_owned_dwm_cloak(hwnd, should_cloak)
+    unsafe { dwm_set_cloak(hwnd, should_cloak) }
+}
+
+fn global_cloak_receipt(wid: WindowId) -> Option<crate::event_hooks::WindowEventIdentity> {
+    matching_cloak_receipt(&mut lock_cloaked(), wid)
 }
 
 fn global_cloaked_contains(wid: WindowId) -> bool {
-    let guard = lock_cloaked();
-    guard.as_ref().is_some_and(|set| set.contains(&wid))
+    global_cloak_receipt(wid).is_some()
 }
 
 /// Change normal-placement cloak ownership only if the corresponding DWM
@@ -149,33 +117,49 @@ fn global_cloaked_contains(wid: WindowId) -> bool {
 ///
 /// Callers must hold `CLOAK_COMMIT`.
 fn commit_global_cloak_state_locked(wid: WindowId, should_cloak: bool) -> bool {
-    let was_cloaked = global_cloaked_contains(wid);
-    if was_cloaked != should_cloak {
+    let previous = global_cloak_receipt(wid);
+    let next = if should_cloak {
+        let Some(identity) = crate::event_hooks::current_window_event_identity(wid) else {
+            return false;
+        };
+        Some(identity)
+    } else {
+        None
+    };
+    if previous == next {
+        return apply_cloak_state_locked(wid);
+    }
+    {
         let mut guard = lock_cloaked();
-        let cloaked = guard.get_or_insert_with(HashSet::new);
-        if should_cloak {
-            cloaked.insert(wid);
+        let cloaked = guard.get_or_insert_with(HashMap::new);
+        if let Some(identity) = next {
+            cloaked.insert(wid, identity);
         } else {
             cloaked.remove(&wid);
         }
     }
 
+    // If the HWND changed after the old receipt was read, retire that receipt
+    // without issuing a DWM write against the replacement.
+    if !should_cloak
+        && previous.as_ref().is_some_and(|identity| {
+            crate::event_hooks::current_window_event_identity(wid).as_ref() != Some(identity)
+        })
+    {
+        return true;
+    }
     if apply_cloak_state_locked(wid) {
         return true;
     }
 
-    // Reconstruct the exact old logical state before retrying its physical OR.
-    // This leaves a failed uncloak retryable and a failed cloak absent from the
-    // placement ledger.
-    if was_cloaked != should_cloak {
-        let mut guard = lock_cloaked();
-        let cloaked = guard.get_or_insert_with(HashSet::new);
-        if was_cloaked {
-            cloaked.insert(wid);
-        } else {
-            cloaked.remove(&wid);
-        }
+    let mut guard = lock_cloaked();
+    let cloaked = guard.get_or_insert_with(HashMap::new);
+    if let Some(identity) = previous {
+        cloaked.insert(wid, identity);
+    } else {
+        cloaked.remove(&wid);
     }
+    drop(guard);
     let _ = apply_cloak_state_locked(wid);
     false
 }
@@ -186,17 +170,46 @@ fn commit_global_cloak_state_locked(wid: WindowId, should_cloak: bool) -> bool {
 // state (see `apply_cloak_state`).
 // ---------------------------------------------------------------------
 
-static GHOST_CLOAKED: Mutex<Option<HashSet<WindowId>>> = Mutex::new(None);
+type CloakLedger = HashMap<WindowId, crate::event_hooks::WindowEventIdentity>;
 
-fn lock_ghost_cloaked() -> std::sync::MutexGuard<'static, Option<HashSet<WindowId>>> {
+static GHOST_CLOAKED: Mutex<Option<CloakLedger>> = Mutex::new(None);
+
+fn lock_ghost_cloaked() -> std::sync::MutexGuard<'static, Option<CloakLedger>> {
     GHOST_CLOAKED
         .lock()
         .unwrap_or_else(crate::recover_poisoned_mutex)
 }
 
+fn reconcile_cloak_receipt(
+    ledger: &mut Option<CloakLedger>,
+    wid: WindowId,
+    current: Option<&crate::event_hooks::WindowEventIdentity>,
+) -> Option<crate::event_hooks::WindowEventIdentity> {
+    let expected = ledger.as_ref()?.get(&wid)?.clone();
+    if current == Some(&expected) {
+        Some(expected)
+    } else {
+        if let Some(ledger) = ledger.as_mut() {
+            ledger.remove(&wid);
+        }
+        None
+    }
+}
+
+fn matching_cloak_receipt(
+    ledger: &mut Option<CloakLedger>,
+    wid: WindowId,
+) -> Option<crate::event_hooks::WindowEventIdentity> {
+    let current = crate::event_hooks::current_window_event_identity(wid);
+    reconcile_cloak_receipt(ledger, wid, current.as_ref())
+}
+
+fn ghost_cloak_receipt(wid: WindowId) -> Option<crate::event_hooks::WindowEventIdentity> {
+    matching_cloak_receipt(&mut lock_ghost_cloaked(), wid)
+}
+
 fn ghost_cloaked_contains(wid: WindowId) -> bool {
-    let guard = lock_ghost_cloaked();
-    guard.as_ref().is_some_and(|set| set.contains(&wid))
+    ghost_cloak_receipt(wid).is_some()
 }
 
 /// Mark a source for ghost animation only when DWM physically cloaks it.
@@ -206,20 +219,29 @@ fn ghost_cloaked_contains(wid: WindowId) -> bool {
 /// uncloaked source.
 pub fn try_mark_ghost_cloaked(wid: WindowId) -> bool {
     let _commit = lock_cloak_commit();
+    let Some(identity) = crate::event_hooks::current_window_event_identity(wid) else {
+        return false;
+    };
+    lock_ghost_cloaked()
+        .get_or_insert_with(HashMap::new)
+        .insert(wid, identity.clone());
+    if apply_cloak_state_locked(wid)
+        && crate::event_hooks::current_window_event_identity(wid).as_ref() == Some(&identity)
     {
-        let mut guard = lock_ghost_cloaked();
-        guard.get_or_insert_with(HashSet::new).insert(wid);
-    }
-    if apply_cloak_state_locked(wid) {
         true
     } else {
-        {
-            let mut guard = lock_ghost_cloaked();
-            if let Some(ref mut set) = *guard {
-                set.remove(&wid);
-            }
+        if let Some(ref mut set) = *lock_ghost_cloaked() {
+            set.remove(&wid);
         }
-        let _ = apply_cloak_state_locked(wid);
+        // A concurrent replacement must never inherit a cloak intended for the
+        // source. This compensation is show-only.
+        if crate::event_hooks::current_window_event_identity(wid).as_ref() != Some(&identity) {
+            if let Ok(hwnd) = window_id_to_hwnd(wid) {
+                let _ = unsafe { dwm_set_cloak(hwnd, false) };
+            }
+        } else {
+            let _ = apply_cloak_state_locked(wid);
+        }
         false
     }
 }
@@ -228,17 +250,21 @@ pub fn try_mark_ghost_cloaked(wid: WindowId) -> bool {
 /// state (which uncloaks it unless normal placement still requires a cloak).
 pub fn unmark_ghost_cloaked(wid: WindowId) {
     let _commit = lock_cloak_commit();
+    let Some(identity) = ghost_cloak_receipt(wid) else {
+        unmark_ghost_cloaked_locked(wid);
+        return;
+    };
     unmark_ghost_cloaked_locked(wid);
-    if apply_cloak_state_locked(wid) || !crate::is_valid_window(wid) {
+    if crate::event_hooks::current_window_event_identity(wid).as_ref() != Some(&identity)
+        || apply_cloak_state_locked(wid)
+        || !crate::is_valid_window(wid)
+    {
         return;
     }
 
-    // A live source that rejected physical uncloak still needs an owner. Put
-    // the ghost receipt back and reassert the OR-cloak state so a later exact
-    // landing/shutdown can retry instead of permanently losing recovery.
     lock_ghost_cloaked()
-        .get_or_insert_with(HashSet::new)
-        .insert(wid);
+        .get_or_insert_with(HashMap::new)
+        .insert(wid, identity);
     let _ = apply_cloak_state_locked(wid);
     tracing::warn!("Retaining ghost-cloak recovery receipt for window {wid:#x}");
 }
@@ -267,12 +293,16 @@ pub fn forget_recycled_ghost_cloak(wid: WindowId) {
 // window would be cloaked with no recovery path = permanently invisible.
 // ---------------------------------------------------------------------
 
-static DIRECT_CLOAKED: Mutex<Option<HashSet<WindowId>>> = Mutex::new(None);
+static DIRECT_CLOAKED: Mutex<Option<CloakLedger>> = Mutex::new(None);
 
-fn lock_direct_cloaked() -> std::sync::MutexGuard<'static, Option<HashSet<WindowId>>> {
+fn lock_direct_cloaked() -> std::sync::MutexGuard<'static, Option<CloakLedger>> {
     DIRECT_CLOAKED
         .lock()
         .unwrap_or_else(crate::recover_poisoned_mutex)
+}
+
+fn direct_cloak_receipt(wid: WindowId) -> Option<crate::event_hooks::WindowEventIdentity> {
+    matching_cloak_receipt(&mut lock_direct_cloaked(), wid)
 }
 
 /// Disable (or re-enable) DWM-managed visual transitions on a window.
@@ -296,7 +326,7 @@ pub fn set_dwm_transitions_disabled(window_id: WindowId, disabled: bool) {
 /// Lock GLOBAL_CLOAKED, recovering from poison (a prior panic while holding
 /// the lock). All access to the cloaked set goes through this helper so that
 /// shutdown/panic cleanup paths never silently give up.
-fn lock_cloaked() -> std::sync::MutexGuard<'static, Option<HashSet<WindowId>>> {
+fn lock_cloaked() -> std::sync::MutexGuard<'static, Option<CloakLedger>> {
     GLOBAL_CLOAKED
         .lock()
         .unwrap_or_else(crate::recover_poisoned_mutex)
@@ -309,18 +339,22 @@ fn lock_cloaked() -> std::sync::MutexGuard<'static, Option<HashSet<WindowId>>> {
 /// is safe and stays put until the owner uncloaks it.
 pub fn dwm_cloak_window(window_id: WindowId) -> bool {
     let _commit = lock_cloak_commit();
+    let Some(identity) = crate::event_hooks::current_window_event_identity(window_id) else {
+        return false;
+    };
     let Ok(hwnd) = window_id_to_hwnd(window_id) else {
         return false;
     };
-    if !unsafe { IsWindow(Some(hwnd)).as_bool() } || !set_owned_dwm_cloak(hwnd, true) {
-        // Do not create a recovery receipt for a cloak DWM rejected. Scratchpad
-        // callers park first, so the verified sentinel remains the safety
-        // mechanism for foreign HWNDs rather than a false logical cloak.
+    if !unsafe { IsWindow(Some(hwnd)).as_bool() } || !unsafe { dwm_set_cloak(hwnd, true) } {
+        return false;
+    }
+    if crate::event_hooks::current_window_event_identity(window_id).as_ref() != Some(&identity) {
+        let _ = unsafe { dwm_set_cloak(hwnd, false) };
         return false;
     }
     lock_direct_cloaked()
-        .get_or_insert_with(HashSet::new)
-        .insert(window_id);
+        .get_or_insert_with(HashMap::new)
+        .insert(window_id, identity);
     true
 }
 
@@ -332,51 +366,52 @@ pub fn dwm_cloak_window(window_id: WindowId) -> bool {
 /// visible" regardless of why the window was originally cloaked.
 pub fn dwm_uncloak_window(window_id: WindowId) {
     let _commit = lock_cloak_commit();
-    let was_global = global_cloaked_contains(window_id);
-    let was_ghost = ghost_cloaked_contains(window_id);
-    let was_direct = lock_direct_cloaked()
+    let global = global_cloak_receipt(window_id);
+    let ghost = ghost_cloak_receipt(window_id);
+    let direct = direct_cloak_receipt(window_id);
+    let expected = global
         .as_ref()
-        .is_some_and(|set| set.contains(&window_id));
+        .or(ghost.as_ref())
+        .or(direct.as_ref())
+        .cloned();
 
-    {
-        let mut guard = lock_cloaked();
-        if let Some(set) = guard.as_mut() {
-            set.remove(&window_id);
-        }
+    if let Some(set) = lock_cloaked().as_mut() {
+        set.remove(&window_id);
     }
     unmark_ghost_cloaked_locked(window_id);
-    {
-        let mut guard = lock_direct_cloaked();
-        if let Some(set) = guard.as_mut() {
-            set.remove(&window_id);
-        }
+    if let Some(set) = lock_direct_cloaked().as_mut() {
+        set.remove(&window_id);
     }
 
+    let Some(expected) = expected else {
+        return;
+    };
+    if crate::event_hooks::current_window_event_identity(window_id).as_ref() != Some(&expected) {
+        return;
+    }
     let uncloaked = window_id_to_hwnd(window_id)
         .ok()
         .is_some_and(|hwnd| unsafe {
-            IsWindow(Some(hwnd)).as_bool() && set_owned_dwm_cloak(hwnd, false)
+            IsWindow(Some(hwnd)).as_bool() && dwm_set_cloak(hwnd, false)
         });
     if uncloaked {
         return;
     }
 
-    // A failed force-uncloak must remain recoverable. Restore every receipt
-    // exactly as it was instead of claiming shutdown/rollback succeeded.
-    if was_global {
+    if let Some(identity) = global {
         lock_cloaked()
-            .get_or_insert_with(HashSet::new)
-            .insert(window_id);
+            .get_or_insert_with(HashMap::new)
+            .insert(window_id, identity);
     }
-    if was_ghost {
+    if let Some(identity) = ghost {
         lock_ghost_cloaked()
-            .get_or_insert_with(HashSet::new)
-            .insert(window_id);
+            .get_or_insert_with(HashMap::new)
+            .insert(window_id, identity);
     }
-    if was_direct {
+    if let Some(identity) = direct {
         lock_direct_cloaked()
-            .get_or_insert_with(HashSet::new)
-            .insert(window_id);
+            .get_or_insert_with(HashMap::new)
+            .insert(window_id, identity);
     }
 }
 
@@ -388,24 +423,32 @@ pub fn dwm_uncloak_all() {
     let _commit = lock_cloak_commit();
     let mut ids = HashSet::new();
     if let Some(set) = lock_cloaked().as_ref() {
-        ids.extend(set.iter().copied());
+        ids.extend(set.keys().copied());
     }
     if let Some(set) = lock_ghost_cloaked().as_ref() {
-        ids.extend(set.iter().copied());
+        ids.extend(set.keys().copied());
     }
     if let Some(set) = lock_direct_cloaked().as_ref() {
-        ids.extend(set.iter().copied());
+        ids.extend(set.keys().copied());
     }
 
     for window_id in ids {
+        let global = global_cloak_receipt(window_id);
+        let ghost = ghost_cloak_receipt(window_id);
+        let direct = direct_cloak_receipt(window_id);
+        let expected = global.as_ref().or(ghost.as_ref()).or(direct.as_ref());
+        let Some(expected) = expected else {
+            continue;
+        };
+        if crate::event_hooks::current_window_event_identity(window_id).as_ref() != Some(expected) {
+            continue;
+        }
         let uncloaked = window_id_to_hwnd(window_id)
             .ok()
             .is_some_and(|hwnd| unsafe {
-                IsWindow(Some(hwnd)).as_bool() && set_owned_dwm_cloak(hwnd, false)
+                IsWindow(Some(hwnd)).as_bool() && dwm_set_cloak(hwnd, false)
             });
         if !uncloaked {
-            // Keep all receipts for a later recovery pass. Draining them before
-            // DWM confirms the write used to make a transient failure permanent.
             continue;
         }
         if let Some(set) = lock_cloaked().as_mut() {
@@ -420,23 +463,6 @@ pub fn dwm_uncloak_all() {
     }
 }
 
-/// Cross-process hard-crash recovery for DWM cloaks. Only HWNDs carrying the
-/// durable LeopardWM property are touched; a recycled replacement cannot
-/// inherit that property from the destroyed original window.
-pub fn dwm_uncloak_all_marked_best_effort() -> usize {
-    let _commit = lock_cloak_commit();
-    let mut restored = 0usize;
-    for window_id in crate::enumeration::collect_all_top_level_window_ids() {
-        let Ok(hwnd) = window_id_to_hwnd(window_id) else {
-            continue;
-        };
-        if has_dwm_cloak_marker(hwnd) && set_owned_dwm_cloak(hwnd, false) {
-            restored += 1;
-        }
-    }
-    restored
-}
-
 /// Check if a window is currently cloaked by the placement system OR the
 /// ghost-animation system. Used by the event hook to suppress spurious
 /// SHOW/LOCATIONCHANGE events fired by DWM when we cloak/uncloak windows
@@ -445,7 +471,21 @@ pub fn dwm_uncloak_all_marked_best_effort() -> usize {
 /// Returns the logical OR of `GLOBAL_CLOAKED` (off-screen parking) and
 /// `GHOST_CLOAKED` (ghost-animation in flight) membership.
 pub fn is_placement_cloaked(window_id: WindowId) -> bool {
-    global_cloaked_contains(window_id) || ghost_cloaked_contains(window_id)
+    let Some(current) = crate::event_hooks::current_window_event_identity_nonblocking(window_id)
+    else {
+        return false;
+    };
+    let contains = |ledger: &'static Mutex<Option<CloakLedger>>| match ledger.try_lock() {
+        Ok(mut ledger) => reconcile_cloak_receipt(&mut ledger, window_id, Some(&current)).is_some(),
+        Err(std::sync::TryLockError::Poisoned(error)) => {
+            let mut ledger = error.into_inner();
+            reconcile_cloak_receipt(&mut ledger, window_id, Some(&current)).is_some()
+        }
+        // Emitting one redundant WinEvent is safer than stalling a system
+        // callback behind a placement transaction.
+        Err(std::sync::TryLockError::WouldBlock) => false,
+    };
+    contains(&GLOBAL_CLOAKED) || contains(&GHOST_CLOAKED)
 }
 
 /// Drain and uncloak all tracked windows. Called when the placement list
@@ -455,7 +495,7 @@ fn uncloak_all_tracked() {
     let _commit = lock_cloak_commit();
     let ids: Vec<WindowId> = lock_cloaked()
         .as_ref()
-        .map(|set| set.iter().copied().collect())
+        .map(|set| set.keys().copied().collect())
         .unwrap_or_default();
     for wid in ids {
         // Keep a failed uncloak receipt instead of draining it before DWM has
@@ -465,7 +505,7 @@ fn uncloak_all_tracked() {
 }
 
 /// Global set of window IDs currently cloaked by the placement system.
-static GLOBAL_CLOAKED: Mutex<Option<HashSet<WindowId>>> = Mutex::new(None);
+static GLOBAL_CLOAKED: Mutex<Option<CloakLedger>> = Mutex::new(None);
 
 /// Cache of last-applied window placements and border insets.
 ///
@@ -702,6 +742,31 @@ pub fn apply_placements_with_regions(
     placements: &[WindowPlacement],
     region_clips: &[WindowRegionClip],
     config: &PlatformConfig,
+    cache: Option<&mut PlacementCache>,
+    nudge_sticky_compositors: bool,
+) -> Result<ApplyPlacementsResult, Win32Error> {
+    let expected_identities: HashMap<_, _> = placements
+        .iter()
+        .filter_map(|placement| {
+            crate::current_window_event_identity(placement.window_id)
+                .map(|identity| (placement.window_id, identity))
+        })
+        .collect();
+    apply_placements_with_regions_fenced(
+        placements,
+        region_clips,
+        &expected_identities,
+        config,
+        cache,
+        nudge_sticky_compositors,
+    )
+}
+
+pub fn apply_placements_with_regions_fenced(
+    placements: &[WindowPlacement],
+    region_clips: &[WindowRegionClip],
+    expected_identities: &HashMap<WindowId, crate::WindowEventIdentity>,
+    config: &PlatformConfig,
     mut cache: Option<&mut PlacementCache>,
     nudge_sticky_compositors: bool,
 ) -> Result<ApplyPlacementsResult, Win32Error> {
@@ -721,6 +786,20 @@ pub fn apply_placements_with_regions(
         // windows have left this layout (e.g., workspace switch to empty workspace).
         uncloak_all_tracked();
         return Ok(empty_result);
+    }
+
+    let stale_identities: Vec<_> = placements
+        .iter()
+        .filter(|placement| {
+            expected_identities.get(&placement.window_id)
+                != crate::current_window_event_identity(placement.window_id).as_ref()
+        })
+        .map(|placement| placement.window_id)
+        .collect();
+    if !stale_identities.is_empty() {
+        return Err(Win32Error::SetPositionFailed(format!(
+            "layout contains stale HWND incarnation(s): {stale_identities:?}"
+        )));
     }
 
     if let Some(ref mut cache) = cache {
@@ -782,6 +861,11 @@ pub fn apply_placements_with_regions(
     }
 
     let (applied, mut failed_window_ids) = position_entries(&entries);
+    failed_window_ids.extend(placements.iter().filter_map(|placement| {
+        (expected_identities.get(&placement.window_id)
+            != crate::current_window_event_identity(placement.window_id).as_ref())
+        .then_some(placement.window_id)
+    }));
     verify_preview_source_landings(&entries, &mut failed_window_ids);
     // A returning window stays cloaked until its visible landing succeeded; the
     // old ordering uncloaked first and could flash a stale offscreen/intermediate
@@ -1970,7 +2054,7 @@ fn sync_cloak_state(
         .as_ref()
         .map(|cloaked| {
             cloaked
-                .iter()
+                .keys()
                 .filter(|window_id| !current_ids.contains(window_id))
                 .copied()
                 .collect()
@@ -2434,7 +2518,7 @@ mod tests {
         assert!(
             !lock_direct_cloaked()
                 .as_ref()
-                .is_some_and(|s| s.contains(&wid)),
+                .is_some_and(|s| s.contains_key(&wid)),
             "failed direct cloak must not record false ownership"
         );
     }
@@ -2514,81 +2598,23 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// Verifies the OR-cloak invariant by directly manipulating the two
-    /// global sets and asserting `is_placement_cloaked` returns the OR.
-    ///
-    /// Uses a synthetic high-bit WindowId that won't collide with any
-    /// real HWND on the test machine, since the tracking sets are
-    /// process-global.
     #[test]
-    fn test_or_cloak_invariant() {
-        let wid: WindowId = 0xFFFF_FFFF_FFFF_FF00;
+    fn recycled_hwnd_cloak_receipt_is_pruned() {
+        let wid = 0x1234;
+        let original = crate::event_hooks::WindowEventIdentity {
+            token: 1,
+            process_id: 2,
+            thread_id: 3,
+            class_name: "Window".into(),
+        };
+        let replacement = crate::event_hooks::WindowEventIdentity {
+            token: 4,
+            ..original.clone()
+        };
+        let mut ledger = Some(HashMap::from([(wid, original)]));
 
-        // Snapshot any pre-existing state so we restore cleanly.
-        let had_global_before = global_cloaked_contains(wid);
-        let had_ghost_before = ghost_cloaked_contains(wid);
-
-        // Case 1: neither set → false.
-        {
-            let mut g = lock_cloaked();
-            if let Some(ref mut s) = *g {
-                s.remove(&wid);
-            }
-        }
-        {
-            let mut g = lock_ghost_cloaked();
-            if let Some(ref mut s) = *g {
-                s.remove(&wid);
-            }
-        }
-        assert!(!is_placement_cloaked(wid), "neither set should give false");
-
-        // Case 2: global only → true.
-        {
-            let mut g = lock_cloaked();
-            let s = g.get_or_insert_with(HashSet::new);
-            s.insert(wid);
-        }
-        assert!(is_placement_cloaked(wid), "global only should give true");
-
-        // Case 3: both sets → true.
-        {
-            let mut g = lock_ghost_cloaked();
-            g.get_or_insert_with(HashSet::new).insert(wid);
-        }
-        assert!(is_placement_cloaked(wid), "both sets should give true");
-
-        // Case 4: ghost only → true.
-        {
-            let mut g = lock_cloaked();
-            if let Some(ref mut s) = *g {
-                s.remove(&wid);
-            }
-        }
-        assert!(is_placement_cloaked(wid), "ghost only should give true");
-
-        // Case 5: neither → false again.
-        {
-            let mut g = lock_ghost_cloaked();
-            if let Some(ref mut s) = *g {
-                s.remove(&wid);
-            }
-        }
-        assert!(
-            !is_placement_cloaked(wid),
-            "neither again should give false"
-        );
-
-        // Restore pre-existing state for whatever ran before this test.
-        if had_global_before {
-            let mut g = lock_cloaked();
-            let s = g.get_or_insert_with(HashSet::new);
-            s.insert(wid);
-        }
-        if had_ghost_before {
-            let mut g = lock_ghost_cloaked();
-            g.get_or_insert_with(HashSet::new).insert(wid);
-        }
+        assert!(reconcile_cloak_receipt(&mut ledger, wid, Some(&replacement)).is_none());
+        assert!(!ledger.as_ref().unwrap().contains_key(&wid));
     }
 }
 

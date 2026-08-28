@@ -926,9 +926,18 @@ impl AppState {
             leopardwm_platform_win32::AnimationPlacementPolicy::LegacyAsync
         };
         let frame_epoch = self.apply_epoch.fetch_add(1, Ordering::SeqCst) + 1;
+        let expected_identities = live_placements
+            .iter()
+            .filter_map(|placement| {
+                self.window_incarnations
+                    .get(&placement.window_id)
+                    .map(|identity| (placement.window_id, identity.to_platform()))
+            })
+            .collect();
         let request = animation_worker::FrameRequest {
             apply_epoch: frame_epoch,
             placements: live_placements,
+            expected_identities,
             region_clips,
             ghost_updates,
             platform_config,
@@ -1468,6 +1477,14 @@ impl AppState {
         let apply_epoch_ref = self.apply_epoch.clone();
         let apply_epoch = apply_epoch_ref.fetch_add(1, Ordering::SeqCst) + 1;
         let apply_window_ids: Vec<u64> = all_placements.iter().map(|p| p.window_id).collect();
+        let expected_identities: std::collections::HashMap<_, _> = all_placements
+            .iter()
+            .filter_map(|placement| {
+                self.window_incarnations
+                    .get(&placement.window_id)
+                    .map(|identity| (placement.window_id, identity.to_platform()))
+            })
+            .collect();
         // Adaptive frames are serialized for sensitive renderers, so their
         // exact landing needs no synthetic resize. Preserve the historical
         // `(w-1 → w)` repair only for the explicitly selected legacy async path.
@@ -1537,9 +1554,10 @@ impl AppState {
                     return;
                 }
                 let (result, width_violations, height_violations, geometry_mismatches) =
-                    match leopardwm_platform_win32::apply_placements_with_regions(
+                    match leopardwm_platform_win32::apply_placements_with_regions_fenced(
                         &all_placements,
                         &region_clips,
+                        &expected_identities,
                         &platform_config,
                         None,
                         post_animation_nudge,
