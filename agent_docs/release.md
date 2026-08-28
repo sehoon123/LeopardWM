@@ -60,12 +60,20 @@ The header must be exactly `## X.Y.Z` (or `## X.Y.Z-prerelease` for a prerelease
    - `cargo test -p leopardwm-platform-win32 --features integration-probes --test preview_lifecycle_windows -- --test-threads=1`
    - `cargo clippy --all -- -D warnings`
    - `cargo fmt --all -- --check`
-4. Commit the release preparation and independently review the exact diff from the prior release.
-5. Push the candidate to `main` without force and wait for the required `check` workflow.
-6. Confirm `origin/main` still equals the reviewed candidate and that the tag does not already exist.
-7. Create and push the tag only after those checks. Do not retag a changed candidate.
-8. Monitor the release workflow and verify the GitHub Release, ZIP/MSI contents, checksums, and release notes.
-9. Update the repository Scoop manifest and submit any Winget update manually from the published MSI.
+4. On the release hardware, connect two physically adjacent displays, stop LeopardWM, and run the interactive pixel/click gate from PowerShell. Physically click the printed preview coordinate; the test must not inject this click:
+   ```powershell
+   .\.github\verify-no-leopardwm-daemon.ps1
+   $env:LEOPARDWM_REQUIRE_DUAL_MONITOR = '1'
+   $env:LEOPARDWM_REQUIRE_PHYSICAL_CLICK = '1'
+   cargo test -p leopardwm-platform-win32 --features integration-probes --test preview_lifecycle_windows --locked -- --nocapture --test-threads=1
+   Remove-Item Env:LEOPARDWM_REQUIRE_DUAL_MONITOR, Env:LEOPARDWM_REQUIRE_PHYSICAL_CLICK
+   ```
+5. Commit the release preparation and independently review the exact diff from the prior release.
+6. Push the candidate to `main` without force and wait for the required `check` workflow.
+7. Confirm `origin/main` still equals the reviewed candidate and that the tag does not already exist.
+8. Create and push the tag only after those checks. Do not retag a changed candidate.
+9. Monitor the release workflow and verify the GitHub Release, ZIP/MSI contents, checksums, and release notes.
+10. Update the repository Scoop manifest and submit any Winget update manually from the published MSI.
 
 Any candidate change after verification or review requires the complete gate and review again before publication.
 

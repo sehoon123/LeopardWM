@@ -5,7 +5,9 @@ use leopardwm_platform_win32::tab_strip::{
     TabCloseAction, TabLabel, TabStripColors, TabStripOverlay,
 };
 use leopardwm_platform_win32::thumbnail::integration_probe;
-use leopardwm_platform_win32::{apply_placements_with_regions, PlatformConfig, WindowRegionClip};
+use leopardwm_platform_win32::{
+    apply_placements_with_regions, MonitorInfo, PlatformConfig, WindowRegionClip,
+};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -23,6 +25,72 @@ use windows::Win32::UI::WindowsAndMessaging::{
     UnregisterClassW, CW_USEDEFAULT, MSG, WINDOWPOS, WM_PAINT, WM_QUIT, WM_RBUTTONUP,
     WM_WINDOWPOSCHANGING, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
+
+fn dual_gate_destination(monitor: &MonitorInfo, monitors: &[MonitorInfo]) -> Option<Rect> {
+    monitors.iter().find_map(|other| {
+        let top = monitor.work_area.y.max(other.work_area.y);
+        let bottom = monitor.work_area.bottom().min(other.work_area.bottom());
+        let destination_y = top + 20;
+        let sample_y = destination_y + 60;
+        if other.id == monitor.id || bottom - top < 160 || monitor.work_area.width < 160 {
+            return None;
+        }
+        [
+            (
+                monitor.work_area.right() - 160,
+                monitor.work_area.right().saturating_add(2),
+            ),
+            (monitor.work_area.x, monitor.work_area.x.saturating_sub(2)),
+        ]
+        .into_iter()
+        .find_map(|(destination_x, outside_x)| {
+            (!monitor.contains_point(outside_x, sample_y)
+                && other.contains_point(outside_x, sample_y))
+            .then_some(Rect::new(destination_x, destination_y, 160, 120))
+        })
+    })
+}
+
+#[test]
+fn dual_gate_requires_the_outside_sample_on_a_distinct_monitor() {
+    let make_monitor = |id, rect, work_area| MonitorInfo {
+        id,
+        rect,
+        work_area,
+        is_primary: id == 1,
+        device_name: format!("DISPLAY{id}"),
+        scale_factor: 1.0,
+    };
+    let primary = make_monitor(1, Rect::new(0, 0, 1000, 800), Rect::new(0, 0, 1000, 760));
+    let adjacent = make_monitor(
+        2,
+        Rect::new(1000, 100, 800, 600),
+        Rect::new(1000, 100, 800, 560),
+    );
+    assert_eq!(
+        dual_gate_destination(&primary, std::slice::from_ref(&adjacent)),
+        Some(Rect::new(840, 120, 160, 120))
+    );
+    assert_eq!(
+        dual_gate_destination(&adjacent, std::slice::from_ref(&primary)),
+        Some(Rect::new(1000, 120, 160, 120))
+    );
+
+    let gap = make_monitor(
+        2,
+        Rect::new(1010, 100, 800, 600),
+        Rect::new(1010, 100, 800, 560),
+    );
+    assert_eq!(dual_gate_destination(&primary, &[gap]), None);
+
+    let inset_primary = make_monitor(1, primary.rect, Rect::new(0, 0, 960, 760));
+    let adjacent = make_monitor(
+        2,
+        Rect::new(1000, 100, 800, 600),
+        Rect::new(1000, 100, 800, 560),
+    );
+    assert_eq!(dual_gate_destination(&inset_primary, &[adjacent]), None);
+}
 
 unsafe extern "system" fn source_window_proc(
     hwnd: HWND,
@@ -416,11 +484,30 @@ fn ordered_real_preview_lifecycle_contract() {
         "one failed monitor callback must reject the entire safety snapshot"
     );
     let monitors = leopardwm_platform_win32::enumerate_monitors().expect("monitor enumeration");
-    let monitor = monitors
+    let primary = monitors
         .iter()
         .find(|monitor| monitor.is_primary)
         .cloned()
         .expect("primary monitor");
+    let require_physical_click = std::env::var_os("LEOPARDWM_REQUIRE_PHYSICAL_CLICK").is_some();
+    let foreground_rect = require_physical_click
+        .then(|| unsafe { GetForegroundWindow() })
+        .and_then(|foreground| {
+            leopardwm_platform_win32::get_window_chrome_rect(foreground.0 as isize as u64)
+        });
+    let monitor = if require_physical_click {
+        monitors
+            .iter()
+            .find(|monitor| {
+                foreground_rect
+                    .as_ref()
+                    .is_none_or(|foreground| !monitor.rect.intersects(foreground))
+            })
+            .cloned()
+            .unwrap_or(primary)
+    } else {
+        primary
+    };
 
     verify_rejected_visible_float_return(&monitor);
 
@@ -445,12 +532,14 @@ fn ordered_real_preview_lifecycle_contract() {
             windows::Win32::UI::WindowsAndMessaging::SWP_SHOWWINDOW,
         )
         .expect("probe source placement");
-        assert!(
-            leopardwm_platform_win32::set_foreground_window(source.hwnd as u64)
-                .expect("probe foreground transfer"),
-            "probe source must become foreground"
-        );
-        assert_eq!(GetForegroundWindow(), source_hwnd);
+        if !require_physical_click {
+            assert!(
+                leopardwm_platform_win32::set_foreground_window(source.hwnd as u64)
+                    .expect("probe foreground transfer"),
+                "probe source must become foreground"
+            );
+            assert_eq!(GetForegroundWindow(), source_hwnd);
+        }
     }
     let actual_source = leopardwm_platform_win32::get_window_chrome_rect(source.hwnd as u64)
         .expect("positioned probe source rect");
@@ -525,28 +614,21 @@ fn ordered_real_preview_lifecycle_contract() {
     );
 
     let colored_source = SourceWindow::new_colored();
-    let neighbor_overlap_y = monitors
-        .iter()
-        .filter(|other| other.id != monitor.id && other.rect.x >= monitor.rect.right())
-        .filter_map(|other| {
-            let top = monitor.work_area.y.max(other.work_area.y);
-            let bottom = monitor.work_area.bottom().min(other.work_area.bottom());
-            (bottom - top >= 160).then_some(top + 20)
-        })
-        .next();
+    let dual_destination = dual_gate_destination(&monitor, &monitors);
     if std::env::var_os("LEOPARDWM_REQUIRE_DUAL_MONITOR").is_some() {
         assert!(
-            neighbor_overlap_y.is_some(),
-            "dual-monitor gate requires a horizontally adjacent output with physical vertical overlap"
+            dual_destination.is_some(),
+            "dual-monitor gate requires a physically adjacent output at the sampled edge"
         );
     }
-    let neighbor_overlap_y = neighbor_overlap_y.unwrap_or(monitor.work_area.y + 20);
-    let colored_destination = Rect::new(
-        monitor.work_area.right() - 160,
-        neighbor_overlap_y,
-        160,
-        120,
-    );
+    let colored_destination = dual_destination.unwrap_or_else(|| {
+        Rect::new(
+            monitor.work_area.right() - 160,
+            monitor.work_area.y + 20,
+            160,
+            120,
+        )
+    });
     unsafe {
         windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
             HWND(colored_source.hwnd as *mut c_void),

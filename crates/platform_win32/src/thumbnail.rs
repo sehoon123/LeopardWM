@@ -3068,15 +3068,34 @@ pub mod integration_probe {
             // center cross avoids claiming a proof from one stale edge pixel.
             // Screen-DC visibility can trail DwmFlush by a few compositor ticks;
             // retry the same strict physical samples for a bounded second.
-            let outside_point = (
-                destination.right().saturating_add(2),
-                destination.y + destination.height / 2,
-            );
-            let verify_neighbor_isolation = crate::enumerate_monitors().is_ok_and(|monitors| {
-                monitors
-                    .iter()
-                    .any(|monitor| monitor.contains_point(outside_point.0, outside_point.1))
+            let center_y = destination.y + destination.height / 2;
+            let fallback_outside_point = (destination.right().saturating_add(2), center_y);
+            let neighbor_outside_point = crate::enumerate_monitors().ok().and_then(|monitors| {
+                let destination_monitor = monitors.iter().find(|monitor| {
+                    monitor.contains_point(destination.x + destination.width / 2, center_y)
+                })?;
+                [
+                    fallback_outside_point,
+                    (destination.x.saturating_sub(2), center_y),
+                ]
+                .into_iter()
+                .find(|point| {
+                    monitors.iter().any(|monitor| {
+                        monitor.id != destination_monitor.id
+                            && monitor.contains_point(point.0, point.1)
+                    })
+                })
             });
+            let verify_neighbor_isolation = neighbor_outside_point.is_some();
+            let outside_point = neighbor_outside_point.unwrap_or(fallback_outside_point);
+            if std::env::var_os("LEOPARDWM_REQUIRE_DUAL_MONITOR").is_some()
+                && !verify_neighbor_isolation
+            {
+                return Err(Win32Error::SetPositionFailed(
+                    "dual-monitor pixel gate has no distinct output immediately outside the preview"
+                        .into(),
+                ));
+            }
             let deadline = Instant::now() + Duration::from_secs(1);
             loop {
                 let screen_dc = unsafe { GetDC(None) };
@@ -3530,36 +3549,50 @@ pub mod integration_probe {
         let target_above_host = target_index < host_index;
         let (click_tx, click_rx) = mpsc::channel();
         crate::preview_input::set_click_sender(click_tx);
+        let require_physical_click = std::env::var_os("LEOPARDWM_REQUIRE_PHYSICAL_CLICK").is_some();
         let mut previous_cursor = POINT::default();
-        let cursor_saved = unsafe { GetCursorPos(&mut previous_cursor) }.is_ok();
-        let routed_input_sent = point_hits_target
-            && unsafe { SetCursorPos(point.x, point.y) }.is_ok()
-            && unsafe {
-                let inputs = [
-                    INPUT {
-                        r#type: INPUT_MOUSE,
-                        Anonymous: INPUT_0 {
-                            mi: MOUSEINPUT {
-                                dwFlags: MOUSEEVENTF_LEFTDOWN,
-                                ..Default::default()
+        let cursor_saved =
+            !require_physical_click && unsafe { GetCursorPos(&mut previous_cursor) }.is_ok();
+        let routed_input_sent = if require_physical_click {
+            eprintln!(
+                "PHYSICAL_CLICK_REQUIRED: left-click the preview at screen coordinate ({}, {}) within 60 seconds",
+                point.x, point.y
+            );
+            point_hits_target
+        } else {
+            point_hits_target
+                && unsafe { SetCursorPos(point.x, point.y) }.is_ok()
+                && unsafe {
+                    let inputs = [
+                        INPUT {
+                            r#type: INPUT_MOUSE,
+                            Anonymous: INPUT_0 {
+                                mi: MOUSEINPUT {
+                                    dwFlags: MOUSEEVENTF_LEFTDOWN,
+                                    ..Default::default()
+                                },
                             },
                         },
-                    },
-                    INPUT {
-                        r#type: INPUT_MOUSE,
-                        Anonymous: INPUT_0 {
-                            mi: MOUSEINPUT {
-                                dwFlags: MOUSEEVENTF_LEFTUP,
-                                ..Default::default()
+                        INPUT {
+                            r#type: INPUT_MOUSE,
+                            Anonymous: INPUT_0 {
+                                mi: MOUSEINPUT {
+                                    dwFlags: MOUSEEVENTF_LEFTUP,
+                                    ..Default::default()
+                                },
                             },
                         },
-                    },
-                ];
-                SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) == inputs.len() as u32
-            };
+                    ];
+                    SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) == inputs.len() as u32
+                }
+        };
         let click_event_delivered = routed_input_sent
             && click_rx
-                .recv_timeout(Duration::from_secs(1))
+                .recv_timeout(if require_physical_click {
+                    Duration::from_secs(60)
+                } else {
+                    Duration::from_secs(1)
+                })
                 .is_ok_and(|event| {
                     event.window_id == source_window_id
                         && event.gesture == crate::preview_input::PreviewGesture::Click
