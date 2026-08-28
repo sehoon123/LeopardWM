@@ -3051,24 +3051,6 @@ pub mod integration_probe {
             if live != 1 || unsafe { windows::Win32::Graphics::Dwm::DwmFlush() }.is_err() {
                 return Ok(false);
             }
-            let screen_dc = unsafe { GetDC(None) };
-            if screen_dc.0.is_null() {
-                return Err(Win32Error::SetPositionFailed(
-                    "controlled preview pixel proof could not acquire screen DC".into(),
-                ));
-            }
-            let center_x = destination.x + destination.width / 2;
-            let center_y = destination.y + destination.height / 2;
-            let samples = [
-                unsafe { GetPixel(screen_dc, center_x, center_y) },
-                unsafe { GetPixel(screen_dc, center_x - 2, center_y) },
-                unsafe { GetPixel(screen_dc, center_x + 2, center_y) },
-                unsafe { GetPixel(screen_dc, center_x, center_y - 2) },
-                unsafe { GetPixel(screen_dc, center_x, center_y + 2) },
-            ];
-            unsafe {
-                ReleaseDC(None, screen_dc);
-            }
             let channel_distance = |actual: COLORREF, wanted: COLORREF| {
                 let channels = |color: COLORREF| {
                     (
@@ -3084,11 +3066,42 @@ pub mod integration_probe {
             // The invisible 1/255 input target and desktop color management can
             // perturb one channel slightly. Requiring a majority of a tiny
             // center cross avoids claiming a proof from one stale edge pixel.
-            Ok(samples
-                .into_iter()
-                .filter(|sample| channel_distance(*sample, expected) <= 20)
-                .count()
-                >= 3)
+            // Screen-DC visibility can trail DwmFlush by a few compositor ticks;
+            // retry the same strict physical samples for a bounded second.
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                let screen_dc = unsafe { GetDC(None) };
+                if screen_dc.0.is_null() {
+                    return Err(Win32Error::SetPositionFailed(
+                        "controlled preview pixel proof could not acquire screen DC".into(),
+                    ));
+                }
+                let center_x = destination.x + destination.width / 2;
+                let center_y = destination.y + destination.height / 2;
+                let samples = [
+                    unsafe { GetPixel(screen_dc, center_x, center_y) },
+                    unsafe { GetPixel(screen_dc, center_x - 2, center_y) },
+                    unsafe { GetPixel(screen_dc, center_x + 2, center_y) },
+                    unsafe { GetPixel(screen_dc, center_x, center_y - 2) },
+                    unsafe { GetPixel(screen_dc, center_x, center_y + 2) },
+                ];
+                unsafe {
+                    ReleaseDC(None, screen_dc);
+                }
+                if samples
+                    .into_iter()
+                    .filter(|sample| channel_distance(*sample, expected) <= 20)
+                    .count()
+                    >= 3
+                {
+                    break Ok(true);
+                }
+                if Instant::now() >= deadline {
+                    break Ok(false);
+                }
+                std::thread::sleep(Duration::from_millis(16));
+                let _ = unsafe { windows::Win32::Graphics::Dwm::DwmFlush() };
+            }
         })();
         let clear = clear_persistent_previews();
         match (result, clear) {
