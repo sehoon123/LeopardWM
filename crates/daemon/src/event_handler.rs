@@ -55,6 +55,19 @@ pub(crate) fn fullscreen_focus_guard(
     fullscreen.filter(|&fs| fs != focused_hwnd)
 }
 
+const FOCUS_INPUT_RECENT_MS: u32 = 1500;
+
+/// A same-column foreground event is safe to suppress only when it has neither
+/// a matching deliberate tab intent nor evidence of recent user input. Callers
+/// that suppress it must actively restore the prior foreground HWND; otherwise
+/// Windows and the model diverge.
+pub(crate) fn suppress_rapid_same_column_focus(
+    user_initiated: bool,
+    consumed_tab_intent: bool,
+) -> bool {
+    !user_initiated && !consumed_tab_intent
+}
+
 /// Choose and latch one drag contract at MoveSizeStart. Shift retains priority
 /// over the Ctrl+Alt standalone-window override.
 pub(crate) fn select_drag_mode(
@@ -485,6 +498,11 @@ impl AppState {
                 rule_workspace.unwrap_or(active_idx)
             };
             let opens_in_background = target_idx != active_idx;
+            // Retain the pre-insert model until the background HWND has been
+            // physically parked. A failed park must leave it unmanaged/visible,
+            // not logically hidden on an inactive workspace.
+            let workspaces_before_background_open =
+                opens_in_background.then(|| self.workspaces.clone());
             if opens_in_background {
                 self.ensure_workspace_exists(monitor_id, target_idx);
             }
@@ -594,6 +612,7 @@ impl AppState {
                     // born maximized is protected from the settling snap-back
                     // even if its first event is a transient restore (before any
                     // maximized location event is observed).
+                    #[cfg(not(test))]
                     if leopardwm_platform_win32::is_window_maximized(hwnd) {
                         self.window_last_maximized_at.insert(hwnd, now);
                     }
@@ -621,14 +640,31 @@ impl AppState {
                         workspace.ensure_focused_visible_animated(viewport_width);
                     }
                     if opens_in_background {
-                        // Target workspace is not active: hide the window and
-                        // remove its taskbar button until that workspace is
-                        // switched to.
-                        let _ = leopardwm_platform_win32::move_window_offscreen(hwnd);
+                        // Target workspace is not active: prove the park before
+                        // committing taskbar hiding or metadata. Keeping the
+                        // source visible and unmanaged on failure is safer than
+                        // an invisible taskbar button for an on-screen HWND.
+                        if let Err(error) = self.park_window_for_inactive_workspace(hwnd) {
+                            if let Some(workspaces) = workspaces_before_background_open {
+                                self.workspaces = workspaces;
+                            }
+                            self.window_managed_at.remove(&hwnd);
+                            self.window_last_maximized_at.remove(&hwnd);
+                            warn!(
+                                "Rejected background management of window {} because parking failed: {}",
+                                hwnd, error
+                            );
+                            return;
+                        }
                         leopardwm_platform_win32::taskbar::taskbar_hide(hwnd);
                     }
                     if let Some(snapshot) = snapshot {
-                        self.start_layout_transition(snapshot);
+                        if let Err(error) = self.start_layout_transition(snapshot) {
+                            warn!(
+                                "Window {} was added but its layout transition could not start safely: {}",
+                                hwnd, error
+                            );
+                        }
                     }
                     // Disable snap layouts for tiled windows (after workspace borrow)
                     if matches!(action, config::WindowAction::Tile) {
@@ -829,7 +865,9 @@ impl AppState {
             self.restore_snap_for_window(hwnd);
 
             if was_tiled {
-                self.start_layout_transition(snapshot);
+                if let Err(error) = self.start_layout_transition(snapshot) {
+                    warn!("Could not safely start transition after {event_name}: {error}");
+                }
             }
             if let Err(e) = self.apply_layout() {
                 warn!("Failed to apply layout after window {}: {}", event_name, e);
@@ -952,7 +990,9 @@ impl AppState {
         if let Err(e) = leopardwm_platform_win32::set_foreground_window(hwnd) {
             debug!("Could not foreground pulled window {}: {:?}", hwnd, e);
         }
-        self.start_layout_transition(snapshot);
+        if let Err(error) = self.start_layout_transition(snapshot) {
+            warn!("Could not safely start transition after Edit Config pull: {error}");
+        }
         if let Err(e) = self.apply_layout() {
             warn!("Failed to apply layout after Edit Config pull: {}", e);
         }
@@ -967,6 +1007,11 @@ impl AppState {
 
     fn on_window_focused(&mut self, hwnd: u64) {
         let now = std::time::Instant::now();
+        // Determine user origin before any rapid same-column suppression. The
+        // OS has already made `hwnd` foreground when this event arrives.
+        let user_initiated = leopardwm_platform_win32::ms_since_last_user_input()
+            .map(|ms| ms <= FOCUS_INPUT_RECENT_MS)
+            .unwrap_or(false);
         // Reconcile before same-focus deduplication. A missed Destroy event can
         // otherwise survive forever while sync_foreground_window repeatedly
         // generates the already-focused event that returns below.
@@ -1024,7 +1069,22 @@ impl AppState {
                                     // expected, not noisy churn).
                                     let consumed =
                                         self.consume_pending_tab_focus_for(mon_a, ws_a, hwnd);
-                                    if !consumed {
+                                    if suppress_rapid_same_column_focus(
+                                        user_initiated,
+                                        consumed,
+                                    ) {
+                                        // Deliberately reject only unproven
+                                        // churn, and undo the already-applied
+                                        // OS foreground change before returning.
+                                        #[cfg(not(test))]
+                                        if let Err(error) =
+                                            leopardwm_platform_win32::set_foreground_window(prev_hwnd)
+                                        {
+                                            warn!(
+                                                "Could not reassert prior same-column focus {} after rejecting {}: {}",
+                                                prev_hwnd, hwnd, error
+                                            );
+                                        }
                                         debug!(
                                             "Suppressed rapid same-column focus switch: {} -> {}",
                                             prev_hwnd, hwnd
@@ -1032,7 +1092,7 @@ impl AppState {
                                         return;
                                     }
                                     debug!(
-                                        "Same-column focus switch allowed (tab intent): {} -> {}",
+                                        "Same-column focus switch allowed (user/tab intent): {} -> {}",
                                         prev_hwnd, hwnd
                                     );
                                 }
@@ -1156,7 +1216,15 @@ impl AppState {
                 let animating = !start_rects.is_empty() && !self.reduce_motion;
                 if animating {
                     let duration = self.config.animation.workspace_switch_duration_ms;
-                    self.start_workspace_switch_transition(start_rects, exit_rects, duration);
+                    if let Err(error) =
+                        self.start_workspace_switch_transition(start_rects, exit_rects, duration)
+                    {
+                        self.active_workspace.insert(monitor_id, active_idx);
+                        warn!(
+                            "Auto workspace switch retained prior transition ownership: {error}"
+                        );
+                        return;
+                    }
                 } else {
                     let failures: Vec<_> = old_placements
                         .iter()
@@ -1201,10 +1269,6 @@ impl AppState {
             // scroll. The user can still hotkey the focus shift,
             // which goes through `command_handler` and bypasses
             // this gate entirely.
-            const FOCUS_INPUT_RECENT_MS: u32 = 1500;
-            let user_initiated = leopardwm_platform_win32::ms_since_last_user_input()
-                .map(|ms| ms <= FOCUS_INPUT_RECENT_MS)
-                .unwrap_or(false);
 
             // A physical click is a new owner of layout intent. Letting it
             // mutate focus under an older structural/workspace transition makes
@@ -1471,7 +1535,9 @@ impl AppState {
                         }
                     }
 
-                    self.start_layout_transition(snapshot);
+                    if let Err(error) = self.start_layout_transition(snapshot) {
+                        warn!("Could not safely start transition after minimize: {error}");
+                    }
                     if let Err(e) = self.apply_layout() {
                         warn!("Failed to apply layout after minimize: {}", e);
                     }
@@ -1520,7 +1586,9 @@ impl AppState {
                 }
             }
             if was_tiled_restore {
-                self.start_layout_transition(snapshot);
+                if let Err(error) = self.start_layout_transition(snapshot) {
+                    warn!("Could not safely start transition after restore: {error}");
+                }
             }
             if let Err(e) = self.apply_layout() {
                 warn!("Failed to apply layout after window restore: {}", e);
@@ -2290,6 +2358,65 @@ impl AppState {
 mod snapback_settle_tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn rapid_same_column_policy_accepts_user_focus_and_requires_reassert_for_noise() {
+        assert!(!suppress_rapid_same_column_focus(true, false));
+        assert!(!suppress_rapid_same_column_focus(false, true));
+        assert!(suppress_rapid_same_column_focus(false, false));
+    }
+
+    #[test]
+    fn background_rule_create_rolls_back_when_parking_fails() {
+        use crate::config::{Config, WindowAction, WindowRule};
+        use leopardwm_platform_win32::MonitorInfo;
+
+        let config = Config {
+            window_rules: vec![WindowRule {
+                match_class: Some("BackgroundRule".into()),
+                match_title: None,
+                match_executable: None,
+                action: WindowAction::Tile,
+                width: None,
+                height: None,
+                corner_style: None,
+                open_on_workspace: Some(2),
+                open_maximized: false,
+                column_width: None,
+                open_in_column: None,
+                sticky: false,
+            }],
+            ..Config::default()
+        };
+        let mut state = AppState::new_with_config(
+            config,
+            vec![MonitorInfo {
+                id: 1,
+                rect: Rect::new(0, 0, 1920, 1080),
+                work_area: Rect::new(0, 0, 1920, 1040),
+                is_primary: true,
+                device_name: "DISPLAY1".into(),
+                scale_factor: 1.0,
+            }],
+        );
+        state.injected_window_info.insert(
+            10,
+            leopardwm_platform_win32::WindowInfo {
+                hwnd: 10,
+                title: "background".into(),
+                class_name: "BackgroundRule".into(),
+                process_id: 10,
+                rect: Rect::new(0, 0, 700, 500),
+                visible: true,
+            },
+        );
+        state.injected_scratchpad_park_failure = true;
+
+        state.handle_window_event(WindowEvent::Created(10));
+        assert!(state.find_window_workspace(10).is_none());
+        assert_eq!(state.workspaces[&1].len(), 1);
+        assert!(!state.window_managed_at.contains_key(&10));
+    }
 
     #[test]
     fn defers_only_while_recently_created_and_recently_maximized() {

@@ -6,7 +6,7 @@ use leopardwm_core_layout::{Rect, Workspace};
 use leopardwm_ipc::{IpcCommand, IpcResponse};
 use leopardwm_platform_win32::{
     enumerate_windows, get_process_executable, monitor_above, monitor_below, monitor_to_left,
-    monitor_to_right, move_window_offscreen, MonitorId, MonitorInfo,
+    monitor_to_right, MonitorId, MonitorInfo,
 };
 use std::collections::HashMap;
 use tracing::{debug, info};
@@ -116,12 +116,29 @@ impl AppState {
         sync_focus: bool,
         f: impl FnOnce(&mut Workspace, i32),
     ) -> IpcResponse {
+        let monitor = self.focused_monitor;
+        let workspace_idx = self.active_workspace_idx(monitor);
+        let workspace_backup = self
+            .workspaces
+            .get(&monitor)
+            .and_then(|workspaces| workspaces.get(workspace_idx))
+            .cloned();
+        let previous_focus = self.previous_focused_hwnd;
+
+        // A structural command must not mutate its target and only then discover
+        // that an old workspace-switch transition cannot release its exits.
+        // Fence that ownership before the mutation so a failed fence leaves both
+        // the old transition and the command model untouched.
+        if animated && self.layout_transition.is_some() {
+            if let Err(error) = self.cancel_layout_transition_for_exact_landing() {
+                return IpcResponse::error(format!(
+                    "Cannot change workspace layout until transition exits are safe: {error}"
+                ));
+            }
+        }
+
         let viewport_width = self.focused_viewport().width;
-        let snapshot = if animated {
-            Some(self.snapshot_layout())
-        } else {
-            None
-        };
+        let snapshot = animated.then(|| self.snapshot_layout());
         if let Some(workspace) = self.focused_workspace_mut() {
             f(workspace, viewport_width);
         }
@@ -129,11 +146,43 @@ impl AppState {
             sync_focus && self.settle_focused_compositor_scroll();
         if !focused_live_animation_is_unsafe {
             if let Some(snapshot) = snapshot {
-                self.start_layout_transition(snapshot);
+                if let Err(error) = self.start_layout_transition(snapshot) {
+                    if let Some(workspace_backup) = workspace_backup {
+                        if let Some(workspaces) = self.workspaces.get_mut(&monitor) {
+                            if let Some(workspace) = workspaces.get_mut(workspace_idx) {
+                                *workspace = workspace_backup;
+                            }
+                        }
+                    }
+                    self.previous_focused_hwnd = previous_focus;
+                    return IpcResponse::error(format!(
+                        "Failed to start layout transition; command was rolled back: {error}"
+                    ));
+                }
             }
         }
-        if let Err(e) = self.apply_layout() {
-            return IpcResponse::error(format!("Failed to apply layout: {}", e));
+        if let Err(error) = self.apply_layout() {
+            if let Some(workspace_backup) = workspace_backup {
+                if let Some(workspaces) = self.workspaces.get_mut(&monitor) {
+                    if let Some(workspace) = workspaces.get_mut(workspace_idx) {
+                        *workspace = workspace_backup;
+                    }
+                }
+            }
+            self.previous_focused_hwnd = previous_focus;
+            self.settle_scroll_animations();
+            self.last_placed_layout_rects.clear();
+            let rollback = if self.paused {
+                Err(anyhow::anyhow!("tiling paused by failed placement"))
+            } else {
+                self.apply_layout()
+            };
+            if rollback.is_err() {
+                self.paused = true;
+            }
+            return IpcResponse::error(format!(
+                "Failed to apply layout: {error}; command model rolled back; rollback={rollback:?}"
+            ));
         }
         // The command may have scrolled a column off-viewport (or back in);
         // update taskbar buttons to match the new visibility.
@@ -177,24 +226,51 @@ impl AppState {
     }
 
     /// Exit fullscreen on the focused workspace if active, restoring the tiled
-    /// strip (un-cloaking the other windows) and the focus border. Returns
-    /// whether fullscreen was cleared. Called before focus/structural commands
-    /// so they apply to the visible layout instead of the hidden one.
-    fn exit_fullscreen_if_active(&mut self) -> bool {
+    /// strip (un-cloaking the other windows) and the focus border. The physical
+    /// landing is a prerequisite for a dependent structural command: do not
+    /// swallow its failure and then mutate a layout hidden behind fullscreen.
+    fn exit_fullscreen_if_active(&mut self) -> anyhow::Result<bool> {
         let Some(fs_wid) = self
             .focused_workspace()
             .and_then(|ws| ws.fullscreen_window_id())
         else {
-            return false;
+            return Ok(false);
         };
+        let monitor = self.focused_monitor;
+        let workspace_idx = self.active_workspace_idx(monitor);
+        let workspace_backup = self
+            .workspaces
+            .get(&monitor)
+            .and_then(|workspaces| workspaces.get(workspace_idx))
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("fullscreen workspace disappeared"))?;
+
         // Clear unconditionally — `toggle_fullscreen` would re-enter on the
         // focused window when the fullscreen pointer is stale.
         if let Some(ws) = self.focused_workspace_mut() {
             ws.clear_fullscreen_if_window(fs_wid);
         }
-        let _ = self.apply_layout();
+        if let Err(error) = self.apply_layout() {
+            if let Some(workspaces) = self.workspaces.get_mut(&monitor) {
+                if let Some(workspace) = workspaces.get_mut(workspace_idx) {
+                    *workspace = workspace_backup;
+                }
+            }
+            self.last_placed_layout_rects.clear();
+            let rollback = if self.paused {
+                Err(anyhow::anyhow!("tiling paused by fullscreen-exit placement failure"))
+            } else {
+                self.apply_layout()
+            };
+            if rollback.is_err() {
+                self.paused = true;
+            }
+            return Err(anyhow::anyhow!(
+                "fullscreen exit placement failed: {error}; rollback={rollback:?}"
+            ));
+        }
         self.sync_foreground_window();
-        true
+        Ok(true)
     }
 
     /// Handle a focus command while fullscreen: move focus and carry fullscreen
@@ -398,10 +474,12 @@ impl AppState {
             return None;
         }
         match fullscreen_policy(cmd) {
-            FullscreenPolicy::Exit => {
-                self.exit_fullscreen_if_active();
-                None
-            }
+            FullscreenPolicy::Exit => match self.exit_fullscreen_if_active() {
+                Ok(_) => None,
+                Err(error) => Some(IpcResponse::error(format!(
+                    "Cannot run {cmd:?}: {error}"
+                ))),
+            },
             FullscreenPolicy::FollowFocus => {
                 if self.config.behavior.fullscreen_follows_focus {
                     Some(self.focus_in_fullscreen(cmd))
@@ -409,8 +487,12 @@ impl AppState {
                     // Monocle-follow disabled: navigating away drops fullscreen
                     // and applies the focus command to the visible tiled layout,
                     // so fullscreen only ever affects the one window.
-                    self.exit_fullscreen_if_active();
-                    None
+                    match self.exit_fullscreen_if_active() {
+                        Ok(_) => None,
+                        Err(error) => Some(IpcResponse::error(format!(
+                            "Cannot run {cmd:?}: {error}"
+                        ))),
+                    }
                 }
             }
             FullscreenPolicy::Suppress => {
@@ -566,9 +648,9 @@ impl AppState {
                 Ok(()) => IpcResponse::Ok,
                 Err(error) => IpcResponse::error(format!("Scratchpad toggle failed: {error}")),
             },
-            IpcCommand::ToggleSticky => {
-                self.toggle_sticky();
-                IpcResponse::Ok
+            IpcCommand::ToggleSticky => match self.toggle_sticky() {
+                Ok(()) => IpcResponse::Ok,
+                Err(error) => IpcResponse::error(format!("Sticky toggle failed: {error}")),
             }
             IpcCommand::ToggleNewWindowPlacement => self.handle_toggle_new_window_placement(),
             IpcCommand::ToggleFullscreen => self.handle_toggle_fullscreen(),
@@ -690,11 +772,24 @@ impl AppState {
     ) -> IpcResponse {
         let monitors: Vec<_> = self.monitors.values().cloned().collect();
         if let Some(target) = select(&monitors, self.focused_monitor) {
+            let previous_monitor = self.focused_monitor;
             let target_id = target.id;
             self.focused_monitor = target_id;
             info!("Focused monitor {} -> {}", dir, target_id);
-            if let Err(e) = self.apply_layout() {
-                return IpcResponse::error(format!("Failed to apply layout: {}", e));
+            if let Err(error) = self.apply_layout() {
+                self.focused_monitor = previous_monitor;
+                self.last_placed_layout_rects.clear();
+                let rollback = if self.paused {
+                    Err(anyhow::anyhow!("tiling paused by monitor-focus placement failure"))
+                } else {
+                    self.apply_layout()
+                };
+                if rollback.is_err() {
+                    self.paused = true;
+                }
+                return IpcResponse::error(format!(
+                    "Failed to focus monitor {target_id}: {error}; monitor focus rolled back; rollback={rollback:?}"
+                ));
             }
             self.sync_foreground_window();
         } else {
@@ -1368,11 +1463,23 @@ impl AppState {
         let animating = !start_rects.is_empty() && !self.reduce_motion;
         if animating {
             let duration = self.config.animation.workspace_switch_duration_ms;
-            self.start_workspace_switch_transition(start_rects, exit_rects, duration);
+            if let Err(error) =
+                self.start_workspace_switch_transition(start_rects, exit_rects, duration)
+            {
+                self.active_workspace.insert(monitor, current_idx);
+                self.rehome_sticky_windows();
+                return IpcResponse::error(format!(
+                    "Workspace switch aborted before replacing transition ownership: {error}"
+                ));
+            }
         } else {
             let failures: Vec<_> = old_placements
                 .iter()
-                .filter_map(|(wid, _)| move_window_offscreen(*wid).err().map(|error| (*wid, error)))
+                .filter_map(|(wid, _)| {
+                    self.park_window_for_inactive_workspace(*wid)
+                        .err()
+                        .map(|error| (*wid, error))
+                })
                 .collect();
             if !failures.is_empty() {
                 self.active_workspace.insert(monitor, current_idx);
@@ -1461,6 +1568,14 @@ impl AppState {
             }
         };
 
+        if let Err(error) = self.prepare_workspace_ownership_change() {
+            return IpcResponse::error(format!(
+                "Cannot move a window between workspaces until queued layout work lands: {error}"
+            ));
+        }
+        let workspaces_backup = self.workspaces.clone();
+        let move_origins_backup = self.move_origins.clone();
+        let previous_focus = self.previous_focused_hwnd;
         let snapshot = self.snapshot_layout();
 
         // Ensure target workspace exists (lazy creation)
@@ -1632,13 +1747,32 @@ impl AppState {
         }
 
         // Target workspace is not active — hide the moved window
-        // (capture-on-hide first for the overview's snapshot mode).
+        // (capture-on-hide first for the overview's snapshot mode). Parking is
+        // part of the ownership transaction: dropping the source owner before a
+        // valid HWND is physically absent leaks inactive content onto the active
+        // desktop.
         if self.config.overview.render == crate::config::OverviewRender::Snapshot {
             let _ = leopardwm_platform_win32::snapshot::snapshot_capture(focused_hwnd);
         }
-        let _ = move_window_offscreen(focused_hwnd);
+        if let Err(error) = self.park_window_for_inactive_workspace(focused_hwnd) {
+            self.workspaces = workspaces_backup;
+            self.move_origins = move_origins_backup;
+            self.previous_focused_hwnd = previous_focus;
+            self.last_placed_layout_rects.clear();
+            let rollback = if self.paused {
+                Err(anyhow::anyhow!("tiling paused before inactive-window rollback"))
+            } else {
+                self.apply_layout()
+            };
+            if rollback.is_err() {
+                self.paused = true;
+            }
+            return IpcResponse::error(format!(
+                "Failed to park window {focused_hwnd} on inactive workspace; move rolled back: {error}; rollback={rollback:?}"
+            ));
+        }
 
-        // Ensure the source workspace scrolls to show its new focused window
+        // Ensure the source workspace scrolls to show its new focused window.
         let viewport_width = self.viewport_width_for(monitor);
         if let Some(workspace) = self
             .workspaces
@@ -1648,9 +1782,31 @@ impl AppState {
             workspace.ensure_focused_visible_animated(viewport_width);
         }
 
-        self.start_layout_transition(snapshot);
-        if let Err(e) = self.apply_layout() {
-            return IpcResponse::error(format!("Failed to apply layout: {}", e));
+        if let Err(error) = self.start_layout_transition(snapshot) {
+            self.workspaces = workspaces_backup;
+            self.move_origins = move_origins_backup;
+            self.previous_focused_hwnd = previous_focus;
+            self.last_placed_layout_rects.clear();
+            return IpcResponse::error(format!(
+                "Move to workspace rolled back before transition replacement: {error}"
+            ));
+        }
+        if let Err(error) = self.apply_layout() {
+            self.workspaces = workspaces_backup;
+            self.move_origins = move_origins_backup;
+            self.previous_focused_hwnd = previous_focus;
+            self.last_placed_layout_rects.clear();
+            let rollback = if self.paused {
+                Err(anyhow::anyhow!("tiling paused by move-to-workspace placement failure"))
+            } else {
+                self.apply_layout()
+            };
+            if rollback.is_err() {
+                self.paused = true;
+            }
+            return IpcResponse::error(format!(
+                "Move to workspace rolled back after placement failure: {error}; rollback={rollback:?}"
+            ));
         }
         // The moved window now lives on an inactive workspace; cloak it so its
         // taskbar button goes too.
@@ -1722,6 +1878,11 @@ impl AppState {
         // squashed as redundant intra-column churn.
         let monitor = self.focused_monitor;
         let ws_idx = self.active_workspace_idx(monitor);
+        let workspace_backup = self
+            .workspaces
+            .get(&monitor)
+            .and_then(|workspaces| workspaces.get(ws_idx))
+            .cloned();
         self.pending_tab_focus = Some(crate::state::PendingTabFocus {
             monitor,
             workspace_idx: ws_idx,
@@ -1730,18 +1891,130 @@ impl AppState {
             set_at: std::time::Instant::now(),
         });
         let Some(workspace) = self.focused_workspace_mut() else {
+            self.pending_tab_focus = None;
             return IpcResponse::error("No focused workspace");
         };
         if let Err(e) = workspace.set_active_tab(column, tab) {
             self.pending_tab_focus = None;
             return IpcResponse::error(format!("set_active_tab failed: {}", e));
         }
-        if let Err(e) = self.apply_layout() {
-            return IpcResponse::error(format!("apply_layout failed: {}", e));
+        if let Err(error) = self.apply_layout() {
+            if let Some(workspace_backup) = workspace_backup {
+                if let Some(workspaces) = self.workspaces.get_mut(&monitor) {
+                    if let Some(workspace) = workspaces.get_mut(ws_idx) {
+                        *workspace = workspace_backup;
+                    }
+                }
+            }
+            self.pending_tab_focus = None;
+            self.last_placed_layout_rects.clear();
+            let rollback = if self.paused {
+                Err(anyhow::anyhow!("tiling paused by active-tab placement failure"))
+            } else {
+                self.apply_layout()
+            };
+            if rollback.is_err() {
+                self.paused = true;
+            }
+            return IpcResponse::error(format!(
+                "apply_layout failed: {error}; active tab rolled back; rollback={rollback:?}"
+            ));
         }
         self.sync_foreground_window();
         info!("Set active tab: column={}, tab={}", column, tab);
         IpcResponse::Ok
+    }
+}
+
+#[cfg(test)]
+mod transaction_tests {
+    use super::*;
+    use crate::state::TestApplyPlacementsBehavior;
+    use leopardwm_platform_win32::MonitorInfo;
+    use std::time::Duration;
+
+    fn monitor(id: MonitorId, x: i32) -> MonitorInfo {
+        MonitorInfo {
+            id,
+            rect: Rect::new(x, 0, 1920, 1080),
+            work_area: Rect::new(x, 0, 1920, 1040),
+            is_primary: id == 1,
+            device_name: format!("DISPLAY{id}"),
+            scale_factor: 1.0,
+        }
+    }
+
+    fn state_with_monitors(monitors: Vec<MonitorInfo>) -> AppState {
+        AppState::new_with_config(Config::default(), monitors)
+    }
+
+    #[test]
+    fn failed_generic_workspace_command_restores_its_model() {
+        let mut state = state_with_monitors(vec![monitor(1, 0)]);
+        state.paused = false;
+        state.reduce_motion = true;
+        state.workspaces.get_mut(&1).unwrap()[0]
+            .insert_window(10, Some(700))
+            .unwrap();
+        let width_before = state.workspaces[&1][0].columns()[0].width();
+        state.injected_apply_placements_behavior =
+            Some(TestApplyPlacementsBehavior::SleepAndFail(Duration::ZERO));
+
+        assert!(matches!(
+            state.handle_command(IpcCommand::Resize { delta: 125 }),
+            IpcResponse::Error { .. }
+        ));
+        assert_eq!(state.workspaces[&1][0].columns()[0].width(), width_before);
+    }
+
+    #[test]
+    fn fullscreen_prerequisite_failure_blocks_structural_command() {
+        let mut state = state_with_monitors(vec![monitor(1, 0)]);
+        state.paused = false;
+        {
+            let workspace = &mut state.workspaces.get_mut(&1).unwrap()[0];
+            workspace.insert_window(10, Some(700)).unwrap();
+            workspace.insert_window(11, Some(700)).unwrap();
+            workspace.toggle_fullscreen();
+        }
+        state.injected_apply_placements_behavior =
+            Some(TestApplyPlacementsBehavior::SleepAndFail(Duration::ZERO));
+
+        assert!(matches!(
+            state.handle_command(IpcCommand::MoveColumnRight),
+            IpcResponse::Error { .. }
+        ));
+        assert!(state.workspaces[&1][0].is_fullscreen());
+    }
+
+    #[test]
+    fn failed_monitor_focus_restores_previous_monitor() {
+        let mut state = state_with_monitors(vec![monitor(1, 0), monitor(2, 1920)]);
+        state.paused = false;
+        state.injected_apply_placements_behavior =
+            Some(TestApplyPlacementsBehavior::SleepAndFail(Duration::ZERO));
+
+        assert!(matches!(
+            state.handle_command(IpcCommand::FocusMonitorRight),
+            IpcResponse::Error { .. }
+        ));
+        assert_eq!(state.focused_monitor, 1);
+    }
+
+    #[test]
+    fn inactive_workspace_park_failure_restores_source_ownership() {
+        let mut state = state_with_monitors(vec![monitor(1, 0)]);
+        state.workspaces.get_mut(&1).unwrap()[0]
+            .insert_window(10, Some(700))
+            .unwrap();
+        state.injected_scratchpad_park_failure = true;
+
+        assert!(matches!(
+            state.handle_command(IpcCommand::MoveToWorkspace { index: 2 }),
+            IpcResponse::Error { .. }
+        ));
+        assert_eq!(state.find_window_workspace(10), Some((1, 0)));
+        assert_eq!(state.workspaces[&1].len(), 1);
     }
 }
 

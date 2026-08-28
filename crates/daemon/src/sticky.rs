@@ -18,7 +18,7 @@ impl AppState {
     /// Toggle "sticky" for the OS-focused window. Pinning floats the window
     /// (so it can overlay any workspace) and adds it to the sticky set;
     /// un-pinning removes it from the set and leaves it floating in place.
-    pub(crate) fn toggle_sticky(&mut self) {
+    pub(crate) fn toggle_sticky(&mut self) -> anyhow::Result<()> {
         // Use the OS-foreground window: a sticky window is floating, which
         // `Workspace::focused_window` does not report.
         let Some(wid) = self
@@ -26,11 +26,24 @@ impl AppState {
             .or_else(|| self.focused_workspace().and_then(|ws| ws.focused_window()))
         else {
             info!("Sticky: no focused window");
-            return;
+            return Ok(());
         };
 
-        if self.sticky_windows.remove(&wid) {
-            // Un-pin: stop following workspaces, but leave it floating.
+        #[cfg(not(test))]
+        if !leopardwm_platform_win32::is_window_valid(wid) {
+            info!("Sticky: focused window {} is no longer valid", wid);
+            return Ok(());
+        }
+
+        // Pinning changes both the set and, for floats, its fullscreen-overlay
+        // bit. Retain a complete model receipt until placement succeeds so an
+        // IPC success never describes an invisible, unlanded sticky change.
+        let workspaces_backup = self.workspaces.clone();
+        let sticky_backup = self.sticky_windows.clone();
+        let was_sticky = self.sticky_windows.remove(&wid);
+        if was_sticky {
+            // Un-pin: stop following workspaces, but leave it in its current
+            // mode and workspace.
             if let Some((mon, ws_idx)) = self.find_window_workspace(wid) {
                 if let Some(ws) = self
                     .workspaces
@@ -40,28 +53,41 @@ impl AppState {
                     ws.set_floating_pinned(wid, false);
                 }
             }
-            info!("Sticky: unpinned window {}", wid);
-            return;
-        }
-
-        #[cfg(not(test))]
-        if !leopardwm_platform_win32::is_window_valid(wid) {
-            info!("Sticky: focused window {} is no longer valid", wid);
-            return;
-        }
-
-        // Stick in the window's CURRENT mode — never force a mode change. A
-        // floating window is pinned so it overlays any workspace; a tiled
-        // window stays tiled and is re-homed as a column on each switch.
-        if let Some(ws) = self.focused_workspace_mut() {
-            if ws.is_floating(wid) {
-                ws.set_floating_pinned(wid, true);
+        } else {
+            // Stick in the window's CURRENT mode — never force a mode change. A
+            // floating window is pinned so it overlays any workspace; a tiled
+            // window stays tiled and is re-homed as a column on each switch.
+            if let Some(ws) = self.focused_workspace_mut() {
+                if ws.is_floating(wid) {
+                    ws.set_floating_pinned(wid, true);
+                }
             }
+            self.sticky_windows.insert(wid);
         }
-        self.sticky_windows.insert(wid);
-        let _ = self.apply_layout();
+
+        if let Err(error) = self.apply_layout() {
+            self.workspaces = workspaces_backup;
+            self.sticky_windows = sticky_backup;
+            self.last_placed_layout_rects.clear();
+            let rollback = if self.paused {
+                Err(anyhow::anyhow!("tiling paused by sticky placement failure"))
+            } else {
+                self.apply_layout()
+            };
+            if rollback.is_err() {
+                self.paused = true;
+            }
+            return Err(anyhow::anyhow!(
+                "sticky change rolled back after placement failure: {error}; rollback={rollback:?}"
+            ));
+        }
         self.sync_foreground_window();
-        info!("Sticky: pinned window {}", wid);
+        info!(
+            "Sticky: {} window {}",
+            if was_sticky { "unpinned" } else { "pinned" },
+            wid
+        );
+        Ok(())
     }
 
     /// Move every sticky window onto the focused monitor's active workspace
@@ -261,5 +287,39 @@ impl AppState {
         if self.sticky_windows.remove(&wid) {
             info!("Sticky: pinned window {} closed; unpinned", wid);
         }
+    }
+}
+
+#[cfg(test)]
+mod transaction_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::state::TestApplyPlacementsBehavior;
+    use leopardwm_core_layout::Rect;
+    use leopardwm_platform_win32::MonitorInfo;
+    use std::time::Duration;
+
+    #[test]
+    fn sticky_apply_failure_restores_pin_state() {
+        let mut state = AppState::new_with_config(
+            Config::default(),
+            vec![MonitorInfo {
+                id: 1,
+                rect: Rect::new(0, 0, 1920, 1080),
+                work_area: Rect::new(0, 0, 1920, 1040),
+                is_primary: true,
+                device_name: "DISPLAY1".into(),
+                scale_factor: 1.0,
+            }],
+        );
+        state.paused = false;
+        state.workspaces.get_mut(&1).unwrap()[0]
+            .insert_window(10, Some(700))
+            .unwrap();
+        state.injected_apply_placements_behavior =
+            Some(TestApplyPlacementsBehavior::SleepAndFail(Duration::ZERO));
+
+        assert!(state.toggle_sticky().is_err());
+        assert!(!state.sticky_windows.contains(&10));
     }
 }

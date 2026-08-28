@@ -1401,6 +1401,11 @@ impl AppState {
             return false;
         };
         let clamped_rect = clamp_rect_to_work_area(visible_rect, target_work_area);
+        // A cross-monitor drop has two model owners plus focus/geometry state.
+        // Keep all of them until the required physical clamp/re-home lands.
+        let workspaces_backup = self.workspaces.clone();
+        let floating_history_backup = self.floating_size_history.clone();
+        let focused_monitor_backup = self.focused_monitor;
         let mut transferred = false;
 
         if target_monitor != drag.source_monitor {
@@ -1445,16 +1450,35 @@ impl AppState {
         }
 
         let updated = self.update_floating_geometry(hwnd, clamped_rect);
-        if updated && (transferred || clamped_rect != visible_rect) {
+        if !updated {
+            self.workspaces = workspaces_backup;
+            self.floating_size_history = floating_history_backup;
+            self.focused_monitor = focused_monitor_backup;
+            return false;
+        }
+        if transferred || clamped_rect != visible_rect {
             self.last_placed_layout_rects.remove(&hwnd);
             if let Err(error) = self.apply_layout() {
+                self.workspaces = workspaces_backup;
+                self.floating_size_history = floating_history_backup;
+                self.focused_monitor = focused_monitor_backup;
+                self.last_placed_layout_rects.clear();
+                let rollback = if self.paused {
+                    Err(anyhow::anyhow!("tiling paused by floating drag placement failure"))
+                } else {
+                    self.apply_layout()
+                };
+                if rollback.is_err() {
+                    self.paused = true;
+                }
                 warn!(
-                    "Failed to clamp/re-home floating window {}: {}",
+                    "Rolled back floating drag {} after clamp/re-home failure: {}; rollback={rollback:?}",
                     hwnd, error
                 );
+                return false;
             }
         }
-        updated
+        true
     }
 
     /// Move a column to a different monitor after cross-monitor drag-drop.
@@ -1801,5 +1825,49 @@ mod tests {
 
         assert_eq!(bounds.len(), 1);
         assert_eq!(bounds[0].column_index, 0);
+    }
+
+    #[test]
+    fn cross_monitor_float_reports_failure_and_restores_ownership() {
+        use crate::config::Config;
+        use crate::state::TestApplyPlacementsBehavior;
+        use leopardwm_platform_win32::MonitorInfo;
+        use std::time::Duration;
+
+        let monitor = |id, x| MonitorInfo {
+            id,
+            rect: Rect::new(x, 0, 1920, 1080),
+            work_area: Rect::new(x, 0, 1920, 1040),
+            is_primary: id == 1,
+            device_name: format!("DISPLAY{id}"),
+            scale_factor: 1.0,
+        };
+        let mut state = AppState::new_with_config(Config::default(), vec![monitor(1, 0), monitor(2, 1920)]);
+        state.paused = false;
+        state.workspaces.get_mut(&1).unwrap()[0]
+            .add_floating(10, Rect::new(100, 100, 600, 400))
+            .unwrap();
+        state.injected_apply_placements_behavior =
+            Some(TestApplyPlacementsBehavior::SleepAndFail(Duration::ZERO));
+        let drag = DragState {
+            hwnd: 10,
+            is_tiled: false,
+            mode: DragMode::Window,
+            source_monitor: 1,
+            source_workspace_idx: 0,
+            source_column_index: 0,
+            source_window_index: 0,
+            source_sibling: None,
+            source_column_width: 0,
+            current_column_index: 0,
+            last_drop_target: None,
+            last_hint_update: None,
+            removed_from_source: false,
+        };
+
+        assert!(!state.finish_floating_drag(10, &drag, 2, Rect::new(2000, 100, 600, 400)));
+        assert!(state.workspaces[&1][0].is_floating(10));
+        assert!(!state.workspaces[&2][0].contains_window(10));
+        assert_eq!(state.focused_monitor, 1);
     }
 }

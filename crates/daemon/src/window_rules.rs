@@ -14,6 +14,13 @@ impl AppState {
     ///
     /// Moves windows between tiled/floating/ignored states based on current rules.
     pub(crate) fn reapply_window_rules(&mut self) {
+        // Rules can change ownership, so no transition frame may still be
+        // placing the pre-rule model when the new model is committed.
+        if let Err(error) = self.prepare_workspace_ownership_change() {
+            warn!("Deferring rule reapplication until layout ownership is safe: {error}");
+            return;
+        }
+
         // Collect all managed windows with their current state
         let mut transitions: Vec<(u64, MonitorId, usize, config::WindowAction, bool)> = Vec::new();
 
@@ -58,8 +65,6 @@ impl AppState {
         for (wid, monitor_id, ws_idx, action, is_floating) in transitions {
             match action {
                 config::WindowAction::Float if !is_floating => {
-                    // Currently tiled, should be floating — restore snap before moving
-                    self.restore_snap_for_window(wid);
                     let viewport = self
                         .monitors
                         .get(&monitor_id)
@@ -75,48 +80,148 @@ impl AppState {
                             600,
                         )
                     });
-                    if let Some(workspace) = self
-                        .workspaces
-                        .get_mut(&monitor_id)
-                        .and_then(|v| v.get_mut(ws_idx))
-                    {
-                        let _ = workspace.remove_window(wid);
-                        let _ = workspace.add_floating(wid, rect);
+                    if self.rule_tile_to_float_transaction(monitor_id, ws_idx, wid, rect) {
+                        // `toggle_floating` recorded the core float origin before
+                        // detaching, so a later Tile rule restores the chosen
+                        // column width/position rather than a default insertion.
+                        self.restore_snap_for_window(wid);
                         info!("Rule change: moved window {} to floating", wid);
+                    } else {
+                        warn!("Rule change could not move window {} to floating", wid);
                     }
                 }
                 config::WindowAction::Tile if is_floating => {
-                    // Currently floating, should be tiled
-                    if let Some(workspace) = self
-                        .workspaces
-                        .get_mut(&monitor_id)
-                        .and_then(|v| v.get_mut(ws_idx))
-                    {
-                        workspace.unfloat_window(wid);
+                    if self.rule_float_to_tile_transaction(monitor_id, ws_idx, wid) {
                         self.disable_snap_for_window(wid);
                         info!("Rule change: moved window {} to tiled", wid);
+                    } else {
+                        warn!("Rule change could not move window {} to tiled", wid);
                     }
                 }
                 config::WindowAction::Ignore => {
-                    // Should no longer be managed — restore snap and remove from workspace
+                    // Release every physical receipt while model ownership still
+                    // exists. Dropping the workspace entry first made a parked /
+                    // cloaked / clipped HWND permanently unreachable by layout
+                    // recovery and shutdown.
+                    if let Err(error) = self.release_window_for_ignore(wid) {
+                        warn!(
+                            "Rule change retained management for {} because physical release failed: {}",
+                            wid, error
+                        );
+                        continue;
+                    }
                     self.restore_snap_for_window(wid);
-                    if let Some(workspace) = self
+                    leopardwm_platform_win32::taskbar::taskbar_show(wid);
+                    let removed = self
                         .workspaces
                         .get_mut(&monitor_id)
                         .and_then(|v| v.get_mut(ws_idx))
-                    {
-                        if is_floating {
-                            workspace.remove_floating(wid);
-                        } else {
-                            let _ = workspace.remove_window(wid);
-                        }
+                        .is_some_and(|workspace| {
+                            if is_floating {
+                                workspace.remove_floating(wid)
+                            } else {
+                                workspace.remove_window(wid).is_ok()
+                            }
+                        });
+                    if removed {
                         self.window_managed_at.remove(&wid);
                         self.window_last_maximized_at.remove(&wid);
                         info!("Rule change: unmanaged window {} (ignore)", wid);
+                    } else {
+                        warn!("Rule change retained bookkeeping for {} after removal failed", wid);
                     }
                 }
                 _ => {} // No change needed
             }
+        }
+    }
+
+    /// Move a tiled window to floating on a cloned workspace. The core
+    /// `toggle_floating` transaction captures its origin before removal; direct
+    /// remove/add calls cannot reconstruct that information later.
+    fn rule_tile_to_float_transaction(
+        &mut self,
+        monitor_id: MonitorId,
+        workspace_idx: usize,
+        wid: u64,
+        rect: Rect,
+    ) -> bool {
+        let Some(mut candidate) = self
+            .workspaces
+            .get(&monitor_id)
+            .and_then(|workspaces| workspaces.get(workspace_idx))
+            .cloned()
+        else {
+            return false;
+        };
+        let prior_focus = candidate.focused_window();
+        if candidate.focus_window(wid).is_err() || candidate.toggle_floating(rect) != Some(wid) {
+            return false;
+        }
+        if let Some(prior_focus) = prior_focus.filter(|focused| *focused != wid) {
+            let _ = candidate.focus_window(prior_focus);
+        }
+        if let Some(workspaces) = self.workspaces.get_mut(&monitor_id) {
+            if let Some(workspace) = workspaces.get_mut(workspace_idx) {
+                *workspace = candidate;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Reverse a rule-driven float using the origin recorded by the matching
+    /// tiled-to-float transaction, while preserving unrelated tiled focus.
+    fn rule_float_to_tile_transaction(
+        &mut self,
+        monitor_id: MonitorId,
+        workspace_idx: usize,
+        wid: u64,
+    ) -> bool {
+        let Some(mut candidate) = self
+            .workspaces
+            .get(&monitor_id)
+            .and_then(|workspaces| workspaces.get(workspace_idx))
+            .cloned()
+        else {
+            return false;
+        };
+        let prior_focus = candidate.focused_window();
+        if !candidate.unfloat_window(wid) {
+            return false;
+        }
+        if let Some(prior_focus) = prior_focus.filter(|focused| *focused != wid) {
+            let _ = candidate.focus_window(prior_focus);
+        }
+        if let Some(workspaces) = self.workspaces.get_mut(&monitor_id) {
+            if let Some(workspace) = workspaces.get_mut(workspace_idx) {
+                *workspace = candidate;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Physically release a window before an Ignore rule drops the model record
+    /// that owns its recovery receipts. `restore_window_moved_offscreen` also
+    /// clears a LeopardWM-owned region for this HWND.
+    fn release_window_for_ignore(&self, wid: u64) -> Result<()> {
+        #[cfg(test)]
+        {
+            if self.injected_scratchpad_park_failure {
+                return Err(anyhow::anyhow!("injected ignore release failure"));
+            }
+            let _ = wid;
+            return Ok(());
+        }
+        #[cfg(not(test))]
+        {
+            leopardwm_platform_win32::dwm_uncloak_window(wid);
+            leopardwm_platform_win32::restore_window_moved_offscreen(wid)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            leopardwm_platform_win32::show_window_no_activate(wid)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+            Ok(())
         }
     }
 
@@ -358,5 +463,93 @@ impl AppState {
             }
         }
         *original_rect
+    }
+}
+
+#[cfg(test)]
+mod transaction_tests {
+    use super::*;
+    use crate::config::Config;
+    use leopardwm_platform_win32::MonitorInfo;
+
+    fn monitor() -> MonitorInfo {
+        MonitorInfo {
+            id: 1,
+            rect: Rect::new(0, 0, 1920, 1080),
+            work_area: Rect::new(0, 0, 1920, 1040),
+            is_primary: true,
+            device_name: "DISPLAY1".into(),
+            scale_factor: 1.0,
+        }
+    }
+
+    fn rule(action: config::WindowAction) -> config::WindowRule {
+        config::WindowRule {
+            match_class: Some("RuleTarget".into()),
+            match_title: None,
+            match_executable: None,
+            action,
+            width: Some(800),
+            height: Some(600),
+            corner_style: None,
+            open_on_workspace: None,
+            open_maximized: false,
+            column_width: None,
+            open_in_column: None,
+            sticky: false,
+        }
+    }
+
+    fn inject_target(state: &mut AppState) {
+        state.injected_window_info.insert(
+            10,
+            leopardwm_platform_win32::WindowInfo {
+                hwnd: 10,
+                title: "target".into(),
+                class_name: "RuleTarget".into(),
+                process_id: 10,
+                rect: Rect::new(0, 0, 700, 500),
+                visible: true,
+            },
+        );
+    }
+
+    #[test]
+    fn rule_float_then_tile_uses_origin_and_preserves_other_focus() {
+        let mut state = AppState::new_with_config(Config::default(), vec![monitor()]);
+        {
+            let workspace = &mut state.workspaces.get_mut(&1).unwrap()[0];
+            workspace.insert_window(10, Some(777)).unwrap();
+            workspace.insert_window_in_column(11, 0).unwrap();
+            workspace.focus_window(11).unwrap();
+        }
+        inject_target(&mut state);
+        state.config.window_rules = vec![rule(config::WindowAction::Float)];
+        state.compiled_rules = state.config.compile_window_rules();
+        state.reapply_window_rules();
+        assert!(state.workspaces[&1][0].is_floating(10));
+
+        state.config.window_rules = vec![rule(config::WindowAction::Tile)];
+        state.compiled_rules = state.config.compile_window_rules();
+        state.reapply_window_rules();
+        let workspace = &state.workspaces[&1][0];
+        let (column, _) = workspace.find_window_location(10).unwrap();
+        assert_eq!(workspace.columns()[column].width(), 777);
+        assert_eq!(workspace.focused_window(), Some(11));
+    }
+
+    #[test]
+    fn failed_ignore_release_retains_model_ownership() {
+        let mut state = AppState::new_with_config(Config::default(), vec![monitor()]);
+        state.workspaces.get_mut(&1).unwrap()[0]
+            .insert_window(10, Some(700))
+            .unwrap();
+        inject_target(&mut state);
+        state.config.window_rules = vec![rule(config::WindowAction::Ignore)];
+        state.compiled_rules = state.config.compile_window_rules();
+        state.injected_scratchpad_park_failure = true;
+
+        state.reapply_window_rules();
+        assert!(state.workspaces[&1][0].contains_window(10));
     }
 }

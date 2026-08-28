@@ -175,9 +175,15 @@ impl AppState {
             return Err(anyhow!("scratchpad source {wid} is no longer valid"));
         }
 
-        // Never strand an older designation. Its release is itself verified
-        // before ownership of the newly selected source is recorded.
-        if let Some(previous) = self.scratchpad {
+        // Replacing a designation is one transaction. Keep a full receipt of
+        // the old hidden/shown state before releasing it: if hiding the new
+        // source fails, the old designation must be put back rather than being
+        // silently converted into an ordinary tiled window.
+        let previous_designation = self.scratchpad;
+        let workspaces_before_replacement = self.workspaces.clone();
+        let move_origins_before_replacement = self.move_origins.clone();
+        let focus_before_replacement = self.previous_focused_hwnd;
+        if let Some(previous) = previous_designation {
             let _ = self.snapshot_managed_floating_geometry(previous.window_id);
             self.release_to_tiling(previous)?;
             self.scratchpad = None;
@@ -211,7 +217,6 @@ impl AppState {
                     None,
                 )
             });
-        let previous_designation = self.scratchpad;
         self.scratchpad = Some(ScratchpadState {
             window_id: wid,
             shown: false,
@@ -222,8 +227,39 @@ impl AppState {
         });
         self.move_origins.remove(&wid);
         if let Err(error) = self.hide_window_to_holding(wid) {
+            self.workspaces = workspaces_before_replacement;
+            self.move_origins = move_origins_before_replacement;
+            self.previous_focused_hwnd = focus_before_replacement;
             self.scratchpad = previous_designation;
-            return Err(error);
+            self.last_placed_layout_rects.clear();
+
+            // `release_to_tiling` made an old hidden scratchpad visible before
+            // the new source failed. Restore its direct physical ownership
+            // before reapplying the saved model; a shown designation instead
+            // belongs to the saved floating model and only needs uncloaking.
+            let compensation = match previous_designation {
+                Some(previous) if !previous.shown => {
+                    self.cloak_scratchpad_window(previous.window_id);
+                    self.park_scratchpad_window(previous.window_id)
+                }
+                Some(previous) => {
+                    self.uncloak_scratchpad_window(previous.window_id);
+                    Ok(())
+                }
+                None => Ok(()),
+            };
+            let relayout = if self.paused {
+                Err(anyhow!("tiling paused before scratchpad replacement rollback"))
+            } else {
+                self.apply_layout()
+            };
+            if compensation.is_err() || relayout.is_err() {
+                self.paused = true;
+            }
+            self.sync_taskbar_buttons();
+            return Err(anyhow!(
+                "scratchpad replacement rolled back after hiding {wid} failed: {error}; compensation={compensation:?}; relayout={relayout:?}"
+            ));
         }
         self.sync_taskbar_buttons();
         self.sync_foreground_window();
@@ -520,5 +556,60 @@ impl AppState {
         {
             let _ = leopardwm_platform_win32::set_foreground_window(wid);
         }
+    }
+}
+
+#[cfg(test)]
+mod replacement_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::state::TestApplyPlacementsBehavior;
+    use leopardwm_platform_win32::MonitorInfo;
+    use std::time::Duration;
+
+    #[test]
+    fn failed_replacement_preserves_old_hidden_designation() {
+        let mut state = AppState::new_with_config(
+            Config::default(),
+            vec![MonitorInfo {
+                id: 1,
+                rect: Rect::new(0, 0, 1920, 1080),
+                work_area: Rect::new(0, 0, 1920, 1040),
+                is_primary: true,
+                device_name: "DISPLAY1".into(),
+                scale_factor: 1.0,
+            }],
+        );
+        state.paused = false;
+        state.workspaces.get_mut(&1).unwrap()[0]
+            .insert_window(20, Some(700))
+            .unwrap();
+        state.injected_window_info.insert(
+            20,
+            leopardwm_platform_win32::WindowInfo {
+                hwnd: 20,
+                title: "source".into(),
+                class_name: "Test".into(),
+                process_id: 20,
+                rect: Rect::new(0, 0, 700, 500),
+                visible: true,
+            },
+        );
+        state.scratchpad = Some(ScratchpadState {
+            window_id: 10,
+            shown: false,
+            origin_column: 0,
+            origin_sibling: None,
+            origin_width: Some(700),
+            last_size: None,
+        });
+        state.injected_apply_placements_behavior =
+            Some(TestApplyPlacementsBehavior::SleepAndSucceed(Duration::ZERO));
+        state.injected_scratchpad_park_failure = true;
+
+        assert!(state.scratchpad_stash().is_err());
+        assert_eq!(state.scratchpad.map(|scratchpad| scratchpad.window_id), Some(10));
+        assert!(!state.workspaces[&1][0].contains_window(10));
+        assert!(state.workspaces[&1][0].contains_window(20));
     }
 }

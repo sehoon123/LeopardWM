@@ -104,12 +104,8 @@ impl AppState {
 
         let mut failures = Vec::new();
         for window_id in exit_windows {
-            if let Err(error) = leopardwm_platform_win32::move_window_offscreen(window_id) {
-                // A destroyed HWND has no pixels to strand and is therefore
-                // already a safe terminal state.
-                if leopardwm_platform_win32::is_valid_window(window_id) {
-                    failures.push(format!("{window_id:#x}: {error}"));
-                }
+            if let Err(error) = self.park_window_for_inactive_workspace(window_id) {
+                failures.push(format!("{window_id:#x}: {error}"));
             }
         }
         if !failures.is_empty() {
@@ -295,22 +291,31 @@ impl AppState {
     /// Start a layout transition animation from a pre-change snapshot.
     /// Call this *after* the structural change and ensure_focused_visible_animated.
     /// No-op when reduce_motion is active.
+    ///
+    /// Replacing a workspace-switch transition is an ownership change, not a
+    /// cosmetic update: its `exit_rects` are the only record that tells us which
+    /// old-workspace HWNDs still need parking. Fence and release that ownership
+    /// before installing the replacement, or leave the old transition intact on
+    /// failure.
     pub(crate) fn start_layout_transition(
         &mut self,
         start_rects: std::collections::HashMap<u64, leopardwm_core_layout::Rect>,
-    ) {
+    ) -> anyhow::Result<()> {
         if self.reduce_motion {
-            return;
+            return Ok(());
         }
         let duration = self.config.animation.layout_duration_ms;
-        self.start_layout_transition_with_duration(start_rects, duration);
+        self.start_layout_transition_with_duration(start_rects, duration)
     }
 
     pub(crate) fn start_layout_transition_with_duration(
         &mut self,
         start_rects: std::collections::HashMap<u64, leopardwm_core_layout::Rect>,
         duration_ms: u64,
-    ) {
+    ) -> anyhow::Result<()> {
+        if self.layout_transition.is_some() {
+            self.cancel_layout_transition_for_exact_landing()?;
+        }
         // Any prior ghost transition or in-flight crossfade is invalidated
         // by a new transition starting. Drops handles via Drop, uncloaks
         // sources, and tells the worker to abort the fade.
@@ -318,7 +323,9 @@ impl AppState {
         if !self.ghost_handles.is_empty() {
             // The abort fence timed out and paused tiling. Never overlap a new
             // registration with frame-owned registrations for the same source.
-            return;
+            return Err(anyhow::anyhow!(
+                "cannot start transition while prior ghost registrations remain owned"
+            ));
         }
 
         let targets = self.collect_transition_targets();
@@ -360,6 +367,7 @@ impl AppState {
             ghosted_wids,
             exit_park_failures: 0,
         });
+        Ok(())
     }
 
     /// Start a workspace switch transition that animates both entering and
@@ -375,13 +383,18 @@ impl AppState {
         start_rects: std::collections::HashMap<u64, leopardwm_core_layout::Rect>,
         exit_rects: std::collections::HashMap<u64, leopardwm_core_layout::Rect>,
         duration_ms: u64,
-    ) {
+    ) -> anyhow::Result<()> {
         if self.reduce_motion {
-            return;
+            return Ok(());
+        }
+        if self.layout_transition.is_some() {
+            self.cancel_layout_transition_for_exact_landing()?;
         }
         self.abort_active_ghost_transition();
         if !self.ghost_handles.is_empty() {
-            return;
+            return Err(anyhow::anyhow!(
+                "cannot start workspace transition while prior ghost registrations remain owned"
+            ));
         }
         let requires_compositor_safe_snap = self.config.behavior.compositor_safe_mode
             && start_rects
@@ -412,6 +425,31 @@ impl AppState {
             ghosted_wids: std::collections::HashSet::new(),
             exit_park_failures: 0,
         });
+        Ok(())
+    }
+
+    /// Park a window whose logical owner is not part of an active layout.
+    /// A dead HWND is already physically absent, while a valid HWND must prove
+    /// its off-screen move before callers may release ownership.
+    pub(crate) fn park_window_for_inactive_workspace(&self, window_id: u64) -> anyhow::Result<()> {
+        #[cfg(test)]
+        {
+            if self.injected_scratchpad_park_failure {
+                return Err(anyhow::anyhow!(
+                    "injected inactive-workspace parking failure"
+                ));
+            }
+            let _ = window_id;
+            return Ok(());
+        }
+        #[cfg(not(test))]
+        {
+            match leopardwm_platform_win32::move_window_offscreen(window_id) {
+                Ok(()) => Ok(()),
+                Err(_) if !leopardwm_platform_win32::is_valid_window(window_id) => Ok(()),
+                Err(error) => Err(anyhow::anyhow!(error.to_string())),
+            }
+        }
     }
 
     /// Drop any in-flight ghost-animation handles and uncloak their
@@ -862,5 +900,43 @@ mod tests {
         assert!(!reduce_motion_enabled(true, false, true));
         assert!(reduce_motion_enabled(false, false, false));
         assert!(reduce_motion_enabled(false, true, false));
+    }
+
+    #[test]
+    fn replacement_keeps_exit_ownership_when_parking_fails() {
+        use crate::config::Config;
+        use crate::state::{AppState, LayoutTransition};
+        use leopardwm_platform_win32::MonitorInfo;
+
+        let mut state = AppState::new_with_config(
+            Config::default(),
+            vec![MonitorInfo {
+                id: 1,
+                rect: Rect::new(0, 0, 1920, 1080),
+                work_area: Rect::new(0, 0, 1920, 1040),
+                is_primary: true,
+                device_name: "DISPLAY1".into(),
+                scale_factor: 1.0,
+            }],
+        );
+        state.reduce_motion = false;
+        state.layout_transition = Some(LayoutTransition {
+            start_rects: HashMap::from([(41, Rect::new(0, 0, 800, 600))]),
+            exit_rects: HashMap::from([(41, Rect::new(0, -1040, 800, 600))]),
+            exit_column_indices: HashMap::new(),
+            elapsed_ms: 16,
+            duration_ms: 150,
+            easing: leopardwm_core_layout::Easing::default(),
+            requires_compositor_safe_snap: false,
+            ghosted_wids: HashSet::new(),
+            exit_park_failures: 0,
+        });
+        state.injected_scratchpad_park_failure = true;
+
+        assert!(state.start_layout_transition(HashMap::new()).is_err());
+        assert!(state
+            .layout_transition
+            .as_ref()
+            .is_some_and(|transition| transition.exit_rects.contains_key(&41)));
     }
 }
