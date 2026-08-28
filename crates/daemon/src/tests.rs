@@ -110,12 +110,16 @@ fn test_live_destroyed_event_never_cleans_a_recycled_incarnation() {
         .insert_window(100, None)
         .unwrap();
     let old = WindowIncarnation {
-        process_id: 1,
-        class_name: "OldWindow".to_string(),
+        token: 1,
+        process_id: 7,
+        thread_id: 9,
+        class_name: "SameWindowClass".to_string(),
     };
     let replacement = WindowIncarnation {
-        process_id: 2,
-        class_name: "ReplacementWindow".to_string(),
+        token: 2,
+        process_id: 7,
+        thread_id: 9,
+        class_name: "SameWindowClass".to_string(),
     };
     state.window_incarnations.insert(100, old);
 
@@ -1143,6 +1147,7 @@ fn test_state_snapshot_serialization() {
         focused_monitor_name: "DISPLAY1".to_string(),
         active_workspace: HashMap::new(),
         tab_title_overrides: HashMap::new(),
+        tab_title_override_identities: HashMap::new(),
     };
     let json = serde_json::to_string(&snapshot).expect("serialize");
     let parsed: StateSnapshot = serde_json::from_str(&json).expect("deserialize");
@@ -1176,6 +1181,7 @@ fn test_save_and_load_roundtrip() {
         focused_monitor_name: "DISPLAY1".to_string(),
         active_workspace: HashMap::new(),
         tab_title_overrides: HashMap::new(),
+        tab_title_override_identities: HashMap::new(),
     };
     let json = serde_json::to_string_pretty(&snapshot).expect("serialize");
     let parsed: StateSnapshot = serde_json::from_str(&json).expect("deserialize");
@@ -1188,16 +1194,27 @@ fn test_state_snapshot_with_tab_title_overrides_roundtrip() {
     let mut overrides = HashMap::new();
     overrides.insert(0xDEAD_BEEFu64, "My Notes".to_string());
     overrides.insert(0xCAFE_F00Du64, "Build Log".to_string());
+    let identities = HashMap::from([(
+        0xDEAD_BEEFu64,
+        crate::state::PersistedWindowIdentity {
+            token: 7,
+            process_id: 8,
+            thread_id: 9,
+            class_name: "EditorWindow".into(),
+        },
+    )]);
     let snapshot = StateSnapshot {
         saved_at: "2026-05-13T12:00:00".to_string(),
         workspaces: vec![],
         focused_monitor_name: "DISPLAY1".to_string(),
         active_workspace: HashMap::new(),
         tab_title_overrides: overrides.clone(),
+        tab_title_override_identities: identities.clone(),
     };
     let json = serde_json::to_string(&snapshot).expect("serialize");
     let parsed: StateSnapshot = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(parsed.tab_title_overrides, overrides);
+    assert_eq!(parsed.tab_title_override_identities, identities);
 }
 
 #[test]
@@ -1213,6 +1230,7 @@ fn test_state_snapshot_v0_1_14_backward_compat() {
     }"#;
     let parsed: StateSnapshot = serde_json::from_str(legacy_json).expect("deserialize");
     assert!(parsed.tab_title_overrides.is_empty());
+    assert!(parsed.tab_title_override_identities.is_empty());
     assert_eq!(parsed.focused_monitor_name, "DISPLAY1");
 }
 
@@ -4062,6 +4080,7 @@ fn test_restore_state_preserves_scroll_offset() {
         focused_monitor_name: "DISPLAY1".to_string(),
         active_workspace: HashMap::new(),
         tab_title_overrides: HashMap::new(),
+        tab_title_override_identities: HashMap::new(),
     };
 
     let restored = state.restore_state(&snapshot);
@@ -4092,6 +4111,7 @@ fn test_restore_state_on_empty_workspace_safe() {
         focused_monitor_name: "DISPLAY1".to_string(),
         active_workspace: HashMap::new(),
         tab_title_overrides: HashMap::new(),
+        tab_title_override_identities: HashMap::new(),
     };
 
     // Should not panic even on empty workspace
@@ -4142,6 +4162,7 @@ fn test_restore_state_returns_restored_monitor_ids() {
         focused_monitor_name: "DISPLAY1".to_string(),
         active_workspace: HashMap::new(),
         tab_title_overrides: HashMap::new(),
+        tab_title_override_identities: HashMap::new(),
     };
 
     let restored = state.restore_state(&snapshot);
@@ -4163,6 +4184,7 @@ fn test_restore_state_returns_restored_monitor_ids() {
         focused_monitor_name: "DISPLAY1".to_string(),
         active_workspace: HashMap::new(),
         tab_title_overrides: HashMap::new(),
+        tab_title_override_identities: HashMap::new(),
     };
 
     let restored2 = state.restore_state(&snapshot2);
@@ -5798,6 +5820,21 @@ fn test_snap_disable_on_tile() {
 }
 
 #[test]
+fn test_snap_restore_retains_daemon_receipt_after_transient_failure() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.snap_disabled_hwnds.insert(43);
+    state.restore_snap_for_window_with(43, |_| {
+        Err(leopardwm_platform_win32::Win32Error::SetPositionFailed(
+            "injected frame commit failure".into(),
+        ))
+    });
+    assert!(state.snap_disabled_hwnds.contains(&43));
+
+    state.restore_snap_for_window_with(43, |_| Ok(true));
+    assert!(!state.snap_disabled_hwnds.contains(&43));
+}
+
+#[test]
 fn test_snap_restore_on_float() {
     let mut config = test_config();
     config.behavior.disable_snap_layouts = true;
@@ -7197,6 +7234,7 @@ fn test_restore_structure_preserves_columns_widths_grouping_scroll() {
         focused_monitor_name: "DISPLAY1".to_string(),
         active_workspace: std::collections::HashMap::new(),
         tab_title_overrides: std::collections::HashMap::new(),
+        tab_title_override_identities: std::collections::HashMap::new(),
     };
 
     // Fake all four HWNDs alive so none are pruned (avoids the real Win32
@@ -7237,6 +7275,7 @@ fn test_restore_structure_prunes_dead_windows() {
         focused_monitor_name: "DISPLAY1".to_string(),
         active_workspace: std::collections::HashMap::new(),
         tab_title_overrides: std::collections::HashMap::new(),
+        tab_title_override_identities: std::collections::HashMap::new(),
     };
 
     // Window 100 and 201 closed while the daemon was down; 200 survives.
@@ -7273,6 +7312,7 @@ fn test_state_snapshot_deserialization_rejects_invalid_focus_indices() {
         focused_monitor_name: "DISPLAY1".to_string(),
         active_workspace: std::collections::HashMap::new(),
         tab_title_overrides: std::collections::HashMap::new(),
+        tab_title_override_identities: std::collections::HashMap::new(),
     };
     let mut encoded = serde_json::to_value(snapshot).unwrap();
     encoded["workspaces"][0]["workspace"]["focused_column"] = serde_json::json!(99);
@@ -7305,6 +7345,7 @@ fn test_restore_structure_drops_duplicate_hwnd_from_later_workspace() {
         focused_monitor_name: "DISPLAY1".to_string(),
         active_workspace: std::collections::HashMap::new(),
         tab_title_overrides: std::collections::HashMap::new(),
+        tab_title_override_identities: std::collections::HashMap::new(),
     };
 
     state.restore_workspace_structure_with(&snapshot, |_| true);
@@ -7348,6 +7389,7 @@ fn test_restore_structure_rejects_out_of_range_workspace_index() {
         focused_monitor_name: "DISPLAY1".to_string(),
         active_workspace: std::collections::HashMap::new(),
         tab_title_overrides: std::collections::HashMap::new(),
+        tab_title_override_identities: std::collections::HashMap::new(),
     };
 
     let restored = state.restore_workspace_structure_with(&snapshot, |_| true);
@@ -7387,6 +7429,7 @@ fn test_restore_structure_skips_unknown_monitor() {
         focused_monitor_name: "DISPLAY1".to_string(),
         active_workspace: std::collections::HashMap::new(),
         tab_title_overrides: std::collections::HashMap::new(),
+        tab_title_override_identities: std::collections::HashMap::new(),
     };
 
     let restored = state.restore_workspace_structure_with(&snapshot, |_| true);

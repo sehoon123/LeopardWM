@@ -1,6 +1,7 @@
 //! Touchpad gesture detection via low-level mouse hook.
 
 use crate::{recover_poisoned_mutex, Win32Error, WM_QUIT_LLHOOK_THREAD};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
@@ -276,12 +277,29 @@ struct GestureAccumState {
 static SCROLL_MODIFIER_FLAGS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0x03); // default: Ctrl + Alt
 
 /// Global sender for gesture events.
-static GESTURE_SENDER: std::sync::Mutex<Option<mpsc::Sender<GestureEvent>>> =
+static GESTURE_SENDER: std::sync::Mutex<Option<mpsc::SyncSender<GestureEvent>>> =
     std::sync::Mutex::new(None);
 
 /// Global gesture accumulator state.
 /// Initialized to `None`; `register_gestures()` sets it to `Some(...)`.
 static GESTURE_STATE: std::sync::Mutex<Option<GestureAccumState>> = std::sync::Mutex::new(None);
+static ACTIVE_GESTURE_THREAD: AtomicU32 = AtomicU32::new(0);
+static GESTURE_DELIVERY_CONNECTED: AtomicBool = AtomicBool::new(false);
+
+fn clear_gesture_globals() {
+    *GESTURE_SENDER.lock().unwrap_or_else(recover_poisoned_mutex) = None;
+    *GESTURE_STATE.lock().unwrap_or_else(recover_poisoned_mutex) = None;
+    GESTURE_DELIVERY_CONNECTED.store(false, Ordering::Release);
+}
+
+fn retire_gesture_thread(thread_id: u32) {
+    if ACTIVE_GESTURE_THREAD
+        .compare_exchange(thread_id, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        clear_gesture_globals();
+    }
+}
 
 /// Handle for gesture detection.
 ///
@@ -294,34 +312,33 @@ pub struct GestureHandle {
 
 impl Drop for GestureHandle {
     fn drop(&mut self) {
-        // Signal the thread to exit
-        unsafe {
-            let _ = PostThreadMessageW(
+        let posted = unsafe {
+            PostThreadMessageW(
                 self.thread_id,
                 WM_QUIT_LLHOOK_THREAD,
                 windows::Win32::Foundation::WPARAM(0),
                 windows::Win32::Foundation::LPARAM(0),
-            );
-        }
+            )
+            .is_ok()
+        };
         if let Some(thread) = self.thread.take() {
-            // Give the thread a moment to clean up
-            for _ in 0..30 {
-                if thread.is_finished() {
-                    let _ = thread.join();
-                    break;
+            if posted {
+                for _ in 0..30 {
+                    if thread.is_finished() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
                 }
-                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if thread.is_finished() {
+                let _ = thread.join();
+                tracing::debug!("Gesture detection stopped");
+            } else {
+                tracing::warn!(
+                    "Gesture hook did not acknowledge shutdown; retaining singleton globals until unhook"
+                );
             }
         }
-
-        // Clear the global sender and state (recover from mutex poisoning)
-        let mut sender = GESTURE_SENDER.lock().unwrap_or_else(recover_poisoned_mutex);
-        *sender = None;
-        drop(sender);
-        let mut state = GESTURE_STATE.lock().unwrap_or_else(recover_poisoned_mutex);
-        *state = None;
-
-        tracing::debug!("Gesture detection stopped");
     }
 }
 
@@ -361,8 +378,8 @@ pub fn set_scroll_modifier(modifier_str: &str) {
 /// Returns a handle that must be kept alive to receive gesture events,
 /// and a channel receiver for gesture events.
 pub fn register_gestures() -> Result<(GestureHandle, mpsc::Receiver<GestureEvent>), Win32Error> {
-    // Create channel for events
-    let (tx, rx) = mpsc::channel();
+    // Bound low-level callback ingress; a full queue passes the wheel through.
+    let (tx, rx) = mpsc::sync_channel(64);
 
     // Store sender globally
     {
@@ -376,17 +393,23 @@ pub fn register_gestures() -> Result<(GestureHandle, mpsc::Receiver<GestureEvent
             ));
         }
         *sender = Some(tx);
+        GESTURE_DELIVERY_CONNECTED.store(true, Ordering::Release);
     }
 
-    // Initialize accumulator state
-    {
-        let mut state = GESTURE_STATE.lock().map_err(|_| {
-            Win32Error::HookInstallFailed("Gesture state mutex poisoned".to_string())
-        })?;
-        *state = Some(GestureAccumState {
-            engine: WheelGestureEngine::new(),
-            started_at: std::time::Instant::now(),
+    // Initialize accumulator state. If any setup after sender publication
+    // fails, roll every singleton back before returning.
+    let setup_result = GESTURE_STATE
+        .lock()
+        .map_err(|_| Win32Error::HookInstallFailed("Gesture state mutex poisoned".to_string()))
+        .map(|mut state| {
+            *state = Some(GestureAccumState {
+                engine: WheelGestureEngine::new(),
+                started_at: std::time::Instant::now(),
+            });
         });
+    if let Err(error) = setup_result {
+        clear_gesture_globals();
+        return Err(error);
     }
 
     // Channel to receive init result from the dedicated thread
@@ -397,6 +420,7 @@ pub fn register_gestures() -> Result<(GestureHandle, mpsc::Receiver<GestureEvent
         .spawn(move || {
             unsafe {
                 let thread_id = GetCurrentThreadId();
+                ACTIVE_GESTURE_THREAD.store(thread_id, Ordering::Release);
 
                 // Ensure message queue exists before signalling init
                 let mut msg = MSG::default();
@@ -411,6 +435,7 @@ pub fn register_gestures() -> Result<(GestureHandle, mpsc::Receiver<GestureEvent
                                 "SetWindowsHookExW for gesture hook failed: {}",
                                 e
                             ))));
+                            retire_gesture_thread(thread_id);
                             return;
                         }
                     };
@@ -430,16 +455,30 @@ pub fn register_gestures() -> Result<(GestureHandle, mpsc::Receiver<GestureEvent
                 }
 
                 let _ = UnhookWindowsHookEx(hook);
+                retire_gesture_thread(thread_id);
             }
         })
         .map_err(|e| {
+            clear_gesture_globals();
             Win32Error::HookInstallFailed(format!("Failed to spawn gesture thread: {}", e))
         })?;
 
     // Wait for initialization
-    let thread_id = init_rx.recv().map_err(|_| {
-        Win32Error::HookInstallFailed("Gesture thread initialization failed".to_string())
-    })??;
+    let thread_id = match init_rx.recv() {
+        Ok(Ok(thread_id)) => thread_id,
+        Ok(Err(error)) => {
+            let _ = thread.join();
+            return Err(error);
+        }
+        Err(_) => {
+            if thread.is_finished() {
+                let _ = thread.join();
+            }
+            return Err(Win32Error::HookInstallFailed(
+                "Gesture thread initialization failed".to_string(),
+            ));
+        }
+    };
 
     tracing::info!("Gesture detection registered (low-level mouse hook)");
 
@@ -468,11 +507,15 @@ fn scroll_modifiers_held(flags: u8) -> bool {
             || unsafe { GetAsyncKeyState(VK_RWIN) } < 0)
 }
 
-fn send_gesture_event(event: GestureEvent) {
+fn send_gesture_event(event: GestureEvent) -> bool {
     let sender_guard = GESTURE_SENDER.lock().unwrap_or_else(recover_poisoned_mutex);
-    if let Some(sender) = sender_guard.as_ref() {
-        let _ = sender.send(event);
+    let delivered = sender_guard
+        .as_ref()
+        .is_some_and(|sender| sender.try_send(event).is_ok());
+    if !delivered {
+        GESTURE_DELIVERY_CONNECTED.store(false, Ordering::Release);
     }
+    delivered
 }
 
 /// Low-level mouse hook callback for gesture detection.
@@ -484,7 +527,7 @@ unsafe extern "system" fn gesture_mouse_hook_proc(
     wparam: windows::Win32::Foundation::WPARAM,
     lparam: windows::Win32::Foundation::LPARAM,
 ) -> windows::Win32::Foundation::LRESULT {
-    if ncode >= 0 {
+    if ncode >= 0 && ACTIVE_GESTURE_THREAD.load(Ordering::Acquire) == GetCurrentThreadId() {
         let msg = wparam.0 as u32;
         let axis = match msg {
             WM_MOUSEHWHEEL => Some(WheelAxis::Horizontal),
@@ -547,6 +590,7 @@ unsafe extern "system" fn gesture_mouse_hook_proc(
                         "Wheel gesture suppressed during cooldown"
                     );
                 }
+                let mut delivery_available = GESTURE_DELIVERY_CONNECTED.load(Ordering::Acquire);
                 if let Some(event) = result.event {
                     tracing::debug!(
                         ?event,
@@ -555,9 +599,9 @@ unsafe extern "system" fn gesture_mouse_hook_proc(
                         hook_flags = mouse_struct.flags,
                         "Wheel gesture emitted"
                     );
-                    send_gesture_event(event);
+                    delivery_available = send_gesture_event(event);
                 }
-                if result.consume {
+                if result.consume && delivery_available {
                     return windows::Win32::Foundation::LRESULT(1);
                 }
             }
@@ -570,6 +614,8 @@ unsafe extern "system" fn gesture_mouse_hook_proc(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static GESTURE_GLOBAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn input(
         now_ms: u128,
@@ -780,5 +826,45 @@ mod tests {
 
         assert_eq!(unflagged_events, injected_events);
         assert_eq!(unflagged.navigation_mode, injected.navigation_mode);
+    }
+
+    #[test]
+    fn disconnected_delivery_disarms_wheel_consumption_without_releasing_singleton() {
+        let _guard = GESTURE_GLOBAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex);
+        let (tx, rx) = mpsc::sync_channel(1);
+        drop(rx);
+        *GESTURE_SENDER.lock().unwrap_or_else(recover_poisoned_mutex) = Some(tx);
+        GESTURE_DELIVERY_CONNECTED.store(true, Ordering::Release);
+
+        assert!(!send_gesture_event(GestureEvent::ScrollUp));
+        assert!(!GESTURE_DELIVERY_CONNECTED.load(Ordering::Acquire));
+        assert!(GESTURE_SENDER
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex)
+            .is_some());
+        clear_gesture_globals();
+    }
+
+    #[test]
+    fn stale_generation_cannot_clear_active_gesture_state() {
+        let _guard = GESTURE_GLOBAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex);
+        let (tx, _rx) = mpsc::sync_channel(1);
+        *GESTURE_SENDER.lock().unwrap_or_else(recover_poisoned_mutex) = Some(tx);
+        ACTIVE_GESTURE_THREAD.store(32, Ordering::Release);
+
+        retire_gesture_thread(31);
+        assert!(GESTURE_SENDER
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex)
+            .is_some());
+        retire_gesture_thread(32);
+        assert!(GESTURE_SENDER
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex)
+            .is_none());
     }
 }

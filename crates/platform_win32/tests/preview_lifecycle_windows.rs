@@ -7,12 +7,14 @@ use leopardwm_platform_win32::tab_strip::{
 use leopardwm_platform_win32::thumbnail::integration_probe;
 use leopardwm_platform_win32::{apply_placements_with_regions, PlatformConfig, WindowRegionClip};
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, PAINTSTRUCT,
+    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, InvalidateRect, UpdateWindow,
+    PAINTSTRUCT,
 };
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -64,6 +66,8 @@ unsafe extern "system" fn return_rejecting_source_window_proc(
     DefWindowProcW(hwnd, message, wparam, lparam)
 }
 
+static COLORED_SOURCE_PAINTED: AtomicBool = AtomicBool::new(false);
+
 /// A controlled paint source lets the integration probe distinguish DWM's
 /// successful property API from a real sampled thumbnail pixel.
 unsafe extern "system" fn colored_source_window_proc(
@@ -87,6 +91,7 @@ unsafe extern "system" fn colored_source_window_proc(
             let _ = DeleteObject(brush.into());
         }
         let _ = EndPaint(hwnd, &paint);
+        COLORED_SOURCE_PAINTED.store(true, Ordering::Release);
         return LRESULT(0);
     }
     DefWindowProcW(hwnd, message, wparam, lparam)
@@ -140,6 +145,7 @@ impl SourceWindow {
     }
 
     fn new_colored() -> Self {
+        COLORED_SOURCE_PAINTED.store(false, Ordering::Release);
         Self::new_with_mode(4)
     }
 
@@ -197,6 +203,19 @@ impl SourceWindow {
                         return;
                     }
                 };
+                if constraint_mode == 4 {
+                    let _ = InvalidateRect(Some(hwnd), None, true);
+                    if !UpdateWindow(hwnd).as_bool()
+                        || !COLORED_SOURCE_PAINTED.load(Ordering::Acquire)
+                    {
+                        let _ = ready_tx.send(Err(
+                            "colored source did not complete WM_PAINT before readiness".into(),
+                        ));
+                        let _ = DestroyWindow(hwnd);
+                        let _ = UnregisterClassW(PCWSTR(class.as_ptr()), None);
+                        return;
+                    }
+                }
                 let thread_id = GetCurrentThreadId();
                 if ready_tx.send(Ok((hwnd.0 as isize, thread_id))).is_err() {
                     let _ = DestroyWindow(hwnd);
@@ -447,7 +466,8 @@ fn ordered_real_preview_lifecycle_contract() {
     assert!(report.host_visible && report.target_above_host);
     assert!(
         report.point_hits_target,
-        "physical point must resolve to target"
+        "physical point must resolve to target; owner={:?}, target/host-visible={}/{}",
+        report.point_hit_owner, report.target_above_host, report.host_visible
     );
     assert!(report.armed_hit_test && report.click_event_delivered);
     assert!(report.source_destroy_target_inert);
@@ -492,6 +512,14 @@ fn ordered_real_preview_lifecycle_contract() {
         )
         .expect("retry exhaustion must retain desired preview state"),
         "a bounded retry burst must self-heal without another placement"
+    );
+    assert!(
+        integration_probe::registration_exhaustion_retains_relayout_obligation(
+            retry_source.hwnd as u64,
+            destination,
+        )
+        .expect("registration exhaustion recovery probe"),
+        "registration recovery must preserve desire and require a fresh physical relayout"
     );
 
     let colored_source = SourceWindow::new_colored();
@@ -539,6 +567,49 @@ fn ordered_real_preview_lifecycle_contract() {
             .expect("thumbnail unregister retry probe"),
         "failed unregister must retain and later release its ownership receipt"
     );
+
+    assert!(
+        leopardwm_platform_win32::dwm_cloak_window(ownership_source.hwnd as u64),
+        "same-process source must accept a durably marked cloak"
+    );
+    assert!(
+        leopardwm_platform_win32::dwm_uncloak_all_marked_best_effort() >= 1,
+        "hard-crash cloak recovery must find the durable HWND marker"
+    );
+    let mut physically_cloaked = 1u32;
+    unsafe {
+        windows::Win32::Graphics::Dwm::DwmGetWindowAttribute(
+            HWND(ownership_source.hwnd as *mut c_void),
+            windows::Win32::Graphics::Dwm::DWMWA_CLOAKED,
+            &mut physically_cloaked as *mut u32 as *mut c_void,
+            std::mem::size_of::<u32>() as u32,
+        )
+        .expect("DWM cloak recovery readback");
+    }
+    assert_eq!(physically_cloaked, 0);
+    leopardwm_platform_win32::dwm_uncloak_window(ownership_source.hwnd as u64);
+
+    assert!(
+        leopardwm_platform_win32::remove_maximizebox(ownership_source.hwnd as u64)
+            .expect("snap style removal"),
+        "controlled source must create a durable snap-style receipt"
+    );
+    assert!(
+        leopardwm_platform_win32::restore_marked_maximizeboxes_best_effort() >= 1,
+        "hard-crash snap recovery must consume the durable HWND marker"
+    );
+    let style = unsafe {
+        windows::Win32::UI::WindowsAndMessaging::GetWindowLongW(
+            HWND(ownership_source.hwnd as *mut c_void),
+            windows::Win32::UI::WindowsAndMessaging::GWL_STYLE,
+        )
+    };
+    assert_ne!(
+        style & windows::Win32::UI::WindowsAndMessaging::WS_MAXIMIZEBOX.0 as i32,
+        0,
+        "hard-crash recovery must restore WS_MAXIMIZEBOX physically"
+    );
+    let _ = leopardwm_platform_win32::restore_maximizebox(ownership_source.hwnd as u64);
 
     let (action_tx, _action_rx) = mpsc::channel();
     let strip = TabStripOverlay::new(action_tx).expect("tab strip probe creation");

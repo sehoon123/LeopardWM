@@ -247,7 +247,7 @@ pub(crate) fn safe_mode_existing_daemon_message() -> &'static str {
 }
 
 pub(crate) fn hard_crash_recovery_unavailable_message() -> &'static str {
-    "Automatic cross-process recovery was not attempted because the daemon's window-style ownership cannot be verified after a hard crash. Run `leopardwm-cli emergency-uncloak` only if you explicitly want a global visibility restore; maximize-box state cannot be safely restored without a durable owned recovery record."
+    "Cross-process recovery is limited to HWNDs carrying durable LeopardWM properties. Unmarked windows are never modified by numeric handle alone."
 }
 
 pub(crate) fn panic_revert_not_running_message() -> &'static str {
@@ -310,11 +310,17 @@ pub(crate) fn stop_unconfirmed_message() -> &'static str {
     "Daemon stop was not confirmed. Treat this as unconfirmed shutdown: run 'leopardwm-cli status'. Use `leopardwm-cli emergency-uncloak` only if you explicitly want a global visibility restore."
 }
 
-/// Fail closed after an unconfirmed cross-process failure. The daemon's
-/// in-memory style ledger vanished with the process, so blindly touching HWNDs
-/// could mutate a recycled or foreign window instead of recovering one it owned.
+/// Recover only crash-surviving HWND-property receipts after an unconfirmed
+/// cross-process failure. Numeric HWNDs without a marker remain untouched.
 fn report_unproven_cross_process_recovery(reason: &str) -> Result<()> {
+    let uncloaked = leopardwm_platform_win32::dwm_uncloak_all_marked_best_effort();
+    let regions = leopardwm_platform_win32::restore_all_marked_window_regions_best_effort();
+    let parked = leopardwm_platform_win32::restore_all_windows_moved_offscreen_best_effort();
+    let snap_styles = leopardwm_platform_win32::restore_marked_maximizeboxes_best_effort();
     println!("{}", hard_crash_recovery_unavailable_message());
+    println!(
+        "Recovered durable receipts: cloaks={uncloaked}, regions={regions}, parked={parked}, snap-styles={snap_styles}"
+    );
     println!("Recovery trigger: {}", reason);
     Ok(())
 }

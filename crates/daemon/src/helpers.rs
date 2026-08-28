@@ -841,28 +841,54 @@ impl AppState {
         }
     }
 
-    /// Restore WS_MAXIMIZEBOX on a window when it leaves tiled management.
-    pub(crate) fn restore_snap_for_window(&mut self, hwnd: u64) {
-        if !self.snap_disabled_hwnds.remove(&hwnd) {
+    pub(crate) fn restore_snap_for_window_with<F>(&mut self, hwnd: u64, restore: F)
+    where
+        F: FnOnce(u64) -> Result<bool, leopardwm_platform_win32::Win32Error>,
+    {
+        if !self.snap_disabled_hwnds.contains(&hwnd) {
             return;
         }
-        match leopardwm_platform_win32::restore_maximizebox(hwnd) {
-            Ok(_) => {}
-            Err(e) => {
+        match restore(hwnd) {
+            Ok(_) | Err(leopardwm_platform_win32::Win32Error::WindowNotFound(_)) => {
+                // Success retired the platform receipt. A dead/recycled HWND is
+                // also terminal, and the identity-protected platform layer did
+                // not touch the replacement.
+                self.snap_disabled_hwnds.remove(&hwnd);
+            }
+            Err(error) => {
+                // Keep daemon ownership so pause/reload/shutdown retries a
+                // transient style/frame failure instead of losing the only
+                // ordinary recovery path.
                 debug!(
                     "Failed to restore WS_MAXIMIZEBOX for window {}: {}",
-                    hwnd, e
+                    hwnd, error
                 );
             }
         }
     }
 
-    /// Restore WS_MAXIMIZEBOX on all tracked windows (bulk).
+    /// Restore WS_MAXIMIZEBOX on a window when it leaves tiled management.
+    pub(crate) fn restore_snap_for_window(&mut self, hwnd: u64) {
+        self.restore_snap_for_window_with(hwnd, leopardwm_platform_win32::restore_maximizebox);
+    }
+
+    /// Restore WS_MAXIMIZEBOX on all tracked windows (bulk). Each receipt is
+    /// retired independently only after verified physical success or terminal
+    /// disappearance of its original HWND incarnation.
     pub(crate) fn restore_snap_for_all_windows(&mut self) {
-        let hwnds: Vec<u64> = self.snap_disabled_hwnds.drain().collect();
-        if !hwnds.is_empty() {
-            leopardwm_platform_win32::restore_maximizebox_all(&hwnds);
-            info!("Restored WS_MAXIMIZEBOX for {} window(s)", hwnds.len());
+        let hwnds: Vec<u64> = self.snap_disabled_hwnds.iter().copied().collect();
+        for hwnd in &hwnds {
+            self.restore_snap_for_window(*hwnd);
+        }
+        let restored = hwnds.len().saturating_sub(self.snap_disabled_hwnds.len());
+        if restored != 0 {
+            info!("Restored WS_MAXIMIZEBOX for {} window(s)", restored);
+        }
+        if !self.snap_disabled_hwnds.is_empty() {
+            warn!(
+                "Retaining {} WS_MAXIMIZEBOX recovery receipt(s) for retry",
+                self.snap_disabled_hwnds.len()
+            );
         }
     }
 

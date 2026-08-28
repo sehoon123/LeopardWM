@@ -23,29 +23,48 @@ pub(crate) struct SubscribeStartup {
     pub(crate) receiver: broadcast::Receiver<IpcEvent>,
 }
 
-/// Process/class identity observed for a live HWND.
+/// Callback-generation and process/thread/class identity observed for an HWND.
 ///
 /// Numeric HWND values are recycled. Lifecycle work may wait behind a bounded
 /// daemon queue, so a later dispatch must not apply old-incarnation cleanup to
 /// a replacement window that inherited the same numeric handle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WindowIncarnation {
+    pub(crate) token: u64,
     pub(crate) process_id: u32,
+    pub(crate) thread_id: u32,
     pub(crate) class_name: String,
 }
 
 impl WindowIncarnation {
-    pub(crate) fn from_window_info(info: &WindowInfo) -> Self {
+    fn from_platform(identity: leopardwm_platform_win32::WindowEventIdentity) -> Self {
         Self {
-            process_id: info.process_id,
-            class_name: info.class_name.clone(),
+            token: identity.token,
+            process_id: identity.process_id,
+            thread_id: identity.thread_id,
+            class_name: identity.class_name,
         }
     }
 
+    pub(crate) fn from_window_info(info: &WindowInfo) -> Self {
+        leopardwm_platform_win32::current_window_event_identity(info.hwnd)
+            .map(Self::from_platform)
+            .unwrap_or_else(|| Self {
+                token: 0,
+                process_id: info.process_id,
+                thread_id: 0,
+                class_name: info.class_name.clone(),
+            })
+    }
+
     pub(crate) fn capture(hwnd: u64) -> Option<Self> {
-        leopardwm_platform_win32::get_window_info(hwnd)
-            .as_ref()
-            .map(Self::from_window_info)
+        leopardwm_platform_win32::current_window_event_identity(hwnd)
+            .map(Self::from_platform)
+            .or_else(|| {
+                leopardwm_platform_win32::get_window_info(hwnd)
+                    .as_ref()
+                    .map(Self::from_window_info)
+            })
     }
 }
 
@@ -61,6 +80,8 @@ pub(crate) struct DaemonWindowEvent {
 
 impl DaemonWindowEvent {
     pub(crate) fn capture(event: WindowEvent) -> Self {
+        let callback_incarnation = leopardwm_platform_win32::take_window_event_identity(&event)
+            .map(WindowIncarnation::from_platform);
         let hwnd = match &event {
             WindowEvent::Created(hwnd)
             | WindowEvent::Destroyed(hwnd)
@@ -82,13 +103,13 @@ impl DaemonWindowEvent {
         // on the forwarding thread. Creation, restore, hide, and destroy are
         // the lifecycle edges that can alter ownership; those alone carry a
         // source identity for recycled-HWND fencing.
-        let source_incarnation = match &event {
+        let source_incarnation = callback_incarnation.or_else(|| match &event {
             WindowEvent::Created(_)
             | WindowEvent::Destroyed(_)
             | WindowEvent::Hidden(_)
             | WindowEvent::Restored(_) => hwnd.and_then(WindowIncarnation::capture),
             _ => None,
-        };
+        });
         Self {
             source_incarnation,
             event,

@@ -698,6 +698,35 @@ pub(crate) struct WorkspaceSnapshot {
     pub(crate) workspace: Workspace,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct PersistedWindowIdentity {
+    pub(crate) token: u64,
+    pub(crate) process_id: u32,
+    pub(crate) thread_id: u32,
+    pub(crate) class_name: String,
+}
+
+impl PersistedWindowIdentity {
+    pub(crate) fn capture(hwnd: u64) -> Option<Self> {
+        let identity = leopardwm_platform_win32::current_window_event_identity(hwnd)?;
+        Some(Self {
+            token: identity.token,
+            process_id: identity.process_id,
+            thread_id: identity.thread_id,
+            class_name: identity.class_name,
+        })
+    }
+
+    pub(crate) fn still_matches(&self, hwnd: u64) -> bool {
+        leopardwm_platform_win32::current_window_event_identity(hwnd).is_some_and(|identity| {
+            self.token == identity.token
+                && self.process_id == identity.process_id
+                && self.thread_id == identity.thread_id
+                && self.class_name == identity.class_name
+        })
+    }
+}
+
 /// Full daemon state snapshot for persistence.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct StateSnapshot {
@@ -715,6 +744,11 @@ pub(crate) struct StateSnapshot {
     /// empty so older snapshots without this field load cleanly.
     #[serde(default)]
     pub(crate) tab_title_overrides: HashMap<u64, String>,
+    /// Incarnation proof paired with each persisted title. Legacy snapshots
+    /// without this field load, but their raw-HWND titles are discarded rather
+    /// than attaching to an unrelated replacement window.
+    #[serde(default)]
+    pub(crate) tab_title_override_identities: HashMap<u64, PersistedWindowIdentity>,
 }
 
 impl AppState {

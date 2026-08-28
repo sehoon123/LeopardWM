@@ -18,8 +18,19 @@ function Invoke-TestGit {
         [string[]]$Arguments
     )
 
-    $output = & git -C $Repository @Arguments 2>&1
-    if ($LASTEXITCODE -ne 0) {
+    # Windows PowerShell 5 wraps native stderr as ErrorRecord objects. Git
+    # writes benign progress (for example checkout branch notices) to stderr,
+    # so collect it under Continue and decide solely from the native exit code.
+    $previousPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $output = & git -C $Repository @Arguments 2>&1
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousPreference
+    }
+    if ($exitCode -ne 0) {
         throw "git $($Arguments -join ' ') failed: $((@($output) -join [Environment]::NewLine))"
     }
 }

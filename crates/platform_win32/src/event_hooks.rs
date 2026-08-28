@@ -6,12 +6,17 @@ use crate::enumeration::{
 };
 use crate::recover_poisoned_mutex;
 use leopardwm_core_layout::WindowId;
+use std::collections::{HashMap, VecDeque};
+use std::ffi::c_void;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
-use windows::Win32::Foundation::HWND;
+use windows::core::w;
+use windows::Win32::Foundation::{HANDLE, HWND};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetForegroundWindow, GetMessageW, PeekMessageW, PostThreadMessageW, MSG,
+    DispatchMessageW, GetClassNameW, GetForegroundWindow, GetMessageW, GetPropW,
+    GetWindowThreadProcessId, IsWindow, PeekMessageW, PostThreadMessageW, SetPropW, MSG,
     PM_NOREMOVE, WM_USER,
 };
 
@@ -79,14 +84,180 @@ pub enum WindowEvent {
     TitleChanged(WindowId),
 }
 
+/// Callback-captured HWND incarnation. The token is stored as a window
+/// property, so a newly created same-process/same-thread/same-class HWND cannot
+/// inherit an older numeric handle's ownership.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowEventIdentity {
+    pub token: u64,
+    pub process_id: u32,
+    pub thread_id: u32,
+    pub class_name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum IdentityEventKind {
+    Created,
+    Destroyed,
+    Hidden,
+    Restored,
+}
+
+static NEXT_WINDOW_INCARNATION: AtomicU64 = AtomicU64::new(1);
+static WINDOW_IDENTITIES: std::sync::Mutex<Option<HashMap<WindowId, WindowEventIdentity>>> =
+    std::sync::Mutex::new(None);
+type PendingIdentityQueues = HashMap<(IdentityEventKind, WindowId), VecDeque<WindowEventIdentity>>;
+static PENDING_EVENT_IDENTITIES: std::sync::Mutex<Option<PendingIdentityQueues>> =
+    std::sync::Mutex::new(None);
+
+fn next_window_incarnation() -> u64 {
+    NEXT_WINDOW_INCARNATION
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            Some(value.wrapping_add(1).max(1))
+        })
+        .unwrap_or_else(|value| value)
+        .max(1)
+}
+
+fn identity_property_token(hwnd: HWND) -> u64 {
+    unsafe { GetPropW(hwnd, w!("LeopardWM.WindowIncarnation.v1")) }.0 as u64
+}
+
+fn capture_live_window_identity(
+    window_id: WindowId,
+    force_new_if_unmarked: bool,
+) -> Option<WindowEventIdentity> {
+    let hwnd = HWND(window_id as *mut c_void);
+    if !unsafe { IsWindow(Some(hwnd)).as_bool() } {
+        return None;
+    }
+    let mut process_id = 0u32;
+    let thread_id = unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process_id)) };
+    let mut class = [0u16; 256];
+    let class_len = unsafe { GetClassNameW(hwnd, &mut class) };
+    if process_id == 0 || thread_id == 0 || class_len <= 0 {
+        return None;
+    }
+    let class_name = String::from_utf16_lossy(&class[..class_len as usize]);
+    let property_token = identity_property_token(hwnd);
+    let existing = WINDOW_IDENTITIES
+        .lock()
+        .unwrap_or_else(recover_poisoned_mutex)
+        .as_ref()
+        .and_then(|identities| identities.get(&window_id).cloned());
+    let token = if property_token != 0 {
+        property_token
+    } else if !force_new_if_unmarked {
+        existing
+            .filter(|identity| {
+                identity.process_id == process_id
+                    && identity.thread_id == thread_id
+                    && identity.class_name == class_name
+            })
+            .map(|identity| identity.token)
+            .unwrap_or_else(next_window_incarnation)
+    } else {
+        next_window_incarnation()
+    };
+    if property_token == 0 {
+        // SetPropW may be denied for a higher-integrity foreign HWND. Those
+        // windows are not managed, but retain the in-process token as a bounded
+        // fallback so callback ordering remains explicit.
+        let _ = unsafe {
+            SetPropW(
+                hwnd,
+                w!("LeopardWM.WindowIncarnation.v1"),
+                Some(HANDLE(token as usize as *mut c_void)),
+            )
+        };
+    }
+    let identity = WindowEventIdentity {
+        token,
+        process_id,
+        thread_id,
+        class_name,
+    };
+    WINDOW_IDENTITIES
+        .lock()
+        .unwrap_or_else(recover_poisoned_mutex)
+        .get_or_insert_with(HashMap::new)
+        .insert(window_id, identity.clone());
+    Some(identity)
+}
+
+/// Ensure and return the nonzero token for a currently live HWND.
+pub fn ensure_window_incarnation_token(window_id: WindowId) -> Option<u64> {
+    capture_live_window_identity(window_id, false).map(|identity| identity.token)
+}
+
+/// Return the complete current live identity, assigning a property token when
+/// this is the first observation in the process.
+pub fn current_window_event_identity(window_id: WindowId) -> Option<WindowEventIdentity> {
+    capture_live_window_identity(window_id, false)
+}
+
+fn identity_event_kind(event: &WindowEvent) -> Option<(IdentityEventKind, WindowId)> {
+    match event {
+        WindowEvent::Created(window_id) => Some((IdentityEventKind::Created, *window_id)),
+        WindowEvent::Destroyed(window_id) => Some((IdentityEventKind::Destroyed, *window_id)),
+        WindowEvent::Hidden(window_id) => Some((IdentityEventKind::Hidden, *window_id)),
+        WindowEvent::Restored(window_id) => Some((IdentityEventKind::Restored, *window_id)),
+        _ => None,
+    }
+}
+
+fn queue_window_event_identity(event: &WindowEvent) {
+    let Some((kind, window_id)) = identity_event_kind(event) else {
+        return;
+    };
+    let identity = match kind {
+        IdentityEventKind::Created => capture_live_window_identity(window_id, true),
+        IdentityEventKind::Destroyed => WINDOW_IDENTITIES
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex)
+            .get_or_insert_with(HashMap::new)
+            .remove(&window_id),
+        IdentityEventKind::Hidden | IdentityEventKind::Restored => {
+            capture_live_window_identity(window_id, false)
+        }
+    };
+    if let Some(identity) = identity {
+        PENDING_EVENT_IDENTITIES
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex)
+            .get_or_insert_with(HashMap::new)
+            .entry((kind, window_id))
+            .or_default()
+            .push_back(identity);
+    }
+}
+
+/// Consume the exact callback identity queued with this lifecycle event.
+/// Synthetic/test events and non-WinEvent sources simply return `None`.
+pub fn take_window_event_identity(event: &WindowEvent) -> Option<WindowEventIdentity> {
+    let key = identity_event_kind(event)?;
+    let mut pending = PENDING_EVENT_IDENTITIES
+        .lock()
+        .unwrap_or_else(recover_poisoned_mutex);
+    let queue = pending.as_mut()?.get_mut(&key)?;
+    let identity = queue.pop_front();
+    if queue.is_empty() {
+        pending.as_mut()?.remove(&key);
+    }
+    identity
+}
+
 /// Global sender for window events from WinEvent callbacks.
 ///
 /// This uses a thread-safe channel because WinEvent callbacks run on Windows'
 /// internal thread pool and we need to forward events to the async runtime.
-static EVENT_SENDER: std::sync::Mutex<Option<mpsc::Sender<WindowEvent>>> =
+static EVENT_SENDER: std::sync::Mutex<Option<mpsc::SyncSender<WindowEvent>>> =
     std::sync::Mutex::new(None);
+static ACTIVE_EVENT_THREAD: AtomicU32 = AtomicU32::new(0);
 
-pub(crate) fn set_event_sender(sender: mpsc::Sender<WindowEvent>) -> Result<(), crate::Win32Error> {
+pub(crate) fn set_event_sender(
+    sender: mpsc::SyncSender<WindowEvent>,
+) -> Result<(), crate::Win32Error> {
     let mut guard = EVENT_SENDER.lock().map_err(|_| {
         crate::Win32Error::HookInstallFailed("Event sender mutex poisoned".to_string())
     })?;
@@ -104,9 +275,18 @@ pub(crate) fn clear_event_sender() {
     *guard = None;
 }
 
-pub(crate) fn clone_event_sender() -> Option<mpsc::Sender<WindowEvent>> {
+pub(crate) fn clone_event_sender() -> Option<mpsc::SyncSender<WindowEvent>> {
     let guard = EVENT_SENDER.lock().unwrap_or_else(recover_poisoned_mutex);
     guard.as_ref().cloned()
+}
+
+fn retire_event_thread(thread_id: u32) {
+    if ACTIVE_EVENT_THREAD
+        .compare_exchange(thread_id, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        clear_event_sender();
+    }
 }
 
 /// Handle for installed event hooks.
@@ -119,20 +299,36 @@ pub struct EventHookHandle {
 
 impl Drop for EventHookHandle {
     fn drop(&mut self) {
-        // Signal the dedicated thread to exit
-        unsafe {
-            let _ = PostThreadMessageW(
+        let posted = unsafe {
+            PostThreadMessageW(
                 self.thread_id,
                 WM_QUIT_WINEVENT_THREAD,
                 windows::Win32::Foundation::WPARAM(0),
                 windows::Win32::Foundation::LPARAM(0),
-            );
-        }
+            )
+            .is_ok()
+        };
         if let Some(handle) = self._thread.take() {
-            let _ = handle.join();
+            if posted {
+                for _ in 0..30 {
+                    if handle.is_finished() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+            if handle.is_finished() {
+                let _ = handle.join();
+                tracing::debug!("WinEvent hook thread stopped");
+            } else {
+                // The owning thread clears globals only after unhooking. Until
+                // then reinstall remains fail-closed instead of letting a stale
+                // callback use replacement-generation state.
+                tracing::warn!(
+                    "WinEvent hook thread did not acknowledge shutdown; retaining singleton ownership"
+                );
+            }
         }
-        clear_event_sender();
-        tracing::debug!("WinEvent hook thread stopped");
     }
 }
 
@@ -155,7 +351,10 @@ impl Drop for EventHookHandle {
 pub fn install_event_hooks(
 ) -> Result<(EventHookHandle, mpsc::Receiver<WindowEvent>), crate::Win32Error> {
     // Create channel for events
-    let (tx, rx) = mpsc::channel();
+    // Bound callback ingress. Lifecycle/focus edges use bounded backpressure;
+    // high-frequency location/title noise is coalesced by dropping only when a
+    // prior backlog already occupies the queue.
+    let (tx, rx) = mpsc::sync_channel(512);
 
     // Store sender globally for callback access
     set_event_sender(tx)?;
@@ -168,6 +367,7 @@ pub fn install_event_hooks(
         .spawn(move || {
             unsafe {
                 let thread_id = GetCurrentThreadId();
+                ACTIVE_EVENT_THREAD.store(thread_id, Ordering::Release);
 
                 // Ensure message queue exists before installing hooks
                 let mut msg = MSG::default();
@@ -205,6 +405,7 @@ pub fn install_event_hooks(
                             "SetWinEventHook failed for events {}-{}",
                             min_event, max_event
                         ))));
+                        retire_event_thread(thread_id);
                         return;
                     }
 
@@ -232,9 +433,11 @@ pub fn install_event_hooks(
                         tracing::warn!("Failed to unhook WinEvent: {:?}", hook);
                     }
                 }
+                retire_event_thread(thread_id);
             }
         })
         .map_err(|e| {
+            clear_event_sender();
             crate::Win32Error::HookInstallFailed(format!(
                 "Failed to spawn winevent-pump thread: {}",
                 e
@@ -390,9 +593,33 @@ fn win_event_callback_inner(
         _ => return,
     };
 
-    // Send event through channel
+    // Capture the callback's exact incarnation before the event can wait in a
+    // forwarding queue. The daemon consumes the paired token on dispatch.
+    let priority = !matches!(
+        &window_event,
+        WindowEvent::MovedOrResized(_) | WindowEvent::TitleChanged(_)
+    );
+    queue_window_event_identity(&window_event);
     if let Some(sender) = clone_event_sender() {
-        let _ = sender.send(window_event);
+        match sender.try_send(window_event.clone()) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(event)) if priority => {
+                // Never drop lifecycle/focus/drag-final edges. The finite queue
+                // bounds memory; only a persistently stalled daemon can apply
+                // backpressure to this callback.
+                if sender.send(event).is_err() {
+                    let _ = take_window_event_identity(&window_event);
+                }
+            }
+            Err(mpsc::TrySendError::Full(_)) => {
+                tracing::trace!("Coalescing high-frequency WinEvent backlog");
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                let _ = take_window_event_identity(&window_event);
+            }
+        }
+    } else {
+        let _ = take_window_event_identity(&window_event);
     }
 }
 
@@ -407,19 +634,73 @@ mod tests {
         let _guard = GLOBAL_SENDER_TEST_LOCK
             .lock()
             .unwrap_or_else(recover_poisoned_mutex);
+        ACTIVE_EVENT_THREAD.store(0, Ordering::Release);
         clear_event_sender();
 
-        let (first_tx, _first_rx) = mpsc::channel::<WindowEvent>();
+        let (first_tx, _first_rx) = mpsc::sync_channel::<WindowEvent>(4);
         assert!(set_event_sender(first_tx).is_ok());
 
-        let (second_tx, _second_rx) = mpsc::channel::<WindowEvent>();
+        let (second_tx, _second_rx) = mpsc::sync_channel::<WindowEvent>(4);
         let err = set_event_sender(second_tx).unwrap_err();
         assert!(matches!(err, crate::Win32Error::HookInstallFailed(_)));
 
         clear_event_sender();
 
-        let (third_tx, _third_rx) = mpsc::channel::<WindowEvent>();
+        let (third_tx, _third_rx) = mpsc::sync_channel::<WindowEvent>(4);
         assert!(set_event_sender(third_tx).is_ok());
         clear_event_sender();
+    }
+
+    #[test]
+    fn stale_thread_cannot_clear_replacement_generation() {
+        let _guard = GLOBAL_SENDER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex);
+        clear_event_sender();
+        let (tx, _rx) = mpsc::sync_channel(4);
+        set_event_sender(tx).unwrap();
+        ACTIVE_EVENT_THREAD.store(22, Ordering::Release);
+
+        retire_event_thread(21);
+        assert!(clone_event_sender().is_some());
+        retire_event_thread(22);
+        assert!(clone_event_sender().is_none());
+    }
+
+    #[test]
+    fn queued_destroy_keeps_old_token_across_same_identity_reuse() {
+        let window_id = 0x1234;
+        let old = WindowEventIdentity {
+            token: 41,
+            process_id: 7,
+            thread_id: 8,
+            class_name: "SameClass".into(),
+        };
+        WINDOW_IDENTITIES
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex)
+            .get_or_insert_with(HashMap::new)
+            .insert(window_id, old.clone());
+
+        let event = WindowEvent::Destroyed(window_id);
+        queue_window_event_identity(&event);
+        WINDOW_IDENTITIES
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex)
+            .get_or_insert_with(HashMap::new)
+            .insert(
+                window_id,
+                WindowEventIdentity {
+                    token: 42,
+                    ..old.clone()
+                },
+            );
+
+        assert_eq!(take_window_event_identity(&event), Some(old));
+        WINDOW_IDENTITIES
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex)
+            .get_or_insert_with(HashMap::new)
+            .remove(&window_id);
     }
 }

@@ -3,7 +3,7 @@
 use crate::thumbnail::{
     commit_persistent_previews, forget_persistent_preview, has_persistent_preview,
     has_published_persistent_preview, lock_persistent_preview_transaction,
-    prepare_persistent_preview, PersistentPreviewRequest,
+    prepare_persistent_preview, retain_persistent_preview_desire, PersistentPreviewRequest,
 };
 use crate::types::{AnimationPlacementPolicy, PlatformConfig, Win32Error};
 use crate::window_id_to_hwnd;
@@ -13,21 +13,22 @@ use crate::window_region::{
 };
 use leopardwm_core_layout::{Rect, Visibility, WindowId, WindowPlacement};
 use std::collections::{HashMap, HashSet};
+use std::ffi::c_void;
 #[cfg(feature = "integration-probes")]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use windows::core::BOOL;
-use windows::Win32::Foundation::{HWND, RECT};
+use windows::core::{w, BOOL};
+use windows::Win32::Foundation::{HANDLE, HWND, RECT};
 use windows::Win32::Graphics::Dwm::{
     DwmFlush, DwmGetWindowAttribute, DwmSetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS,
     DWMWINDOWATTRIBUTE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, GetClassNameW, GetWindowRect,
-    GetWindowThreadProcessId, IsHungAppWindow, IsIconic, IsWindow, IsZoomed, SetWindowPos,
-    ShowWindow, SET_WINDOW_POS_FLAGS, SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-    SWP_NOSIZE, SWP_NOZORDER, SW_RESTORE,
+    BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, GetClassNameW, GetPropW, GetWindowRect,
+    GetWindowThreadProcessId, IsHungAppWindow, IsIconic, IsWindow, IsZoomed, RemovePropW, SetPropW,
+    SetWindowPos, ShowWindow, SET_WINDOW_POS_FLAGS, SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED,
+    SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_RESTORE,
 };
 
 /// Undocumented but well-known DWM attribute for cloaking windows.
@@ -78,6 +79,40 @@ unsafe fn dwm_set_cloak(hwnd: HWND, cloaked: bool) -> bool {
     .is_ok()
 }
 
+const DWM_CLOAK_OWNER_MAGIC: usize = 0x4c57_4d43; // "LWMC"
+
+fn has_dwm_cloak_marker(hwnd: HWND) -> bool {
+    unsafe { GetPropW(hwnd, w!("LeopardWM.DwmCloak.v1")) }.0 as usize == DWM_CLOAK_OWNER_MAGIC
+}
+
+/// Commit DWM cloak state together with a crash-surviving HWND property. A
+/// cloak without durable ownership is rolled back immediately; an uncloak
+/// removes the marker only after DWM accepted the physical write.
+fn set_owned_dwm_cloak(hwnd: HWND, cloaked: bool) -> bool {
+    if !unsafe { dwm_set_cloak(hwnd, cloaked) } {
+        return false;
+    }
+    if cloaked {
+        if unsafe {
+            SetPropW(
+                hwnd,
+                w!("LeopardWM.DwmCloak.v1"),
+                Some(HANDLE(DWM_CLOAK_OWNER_MAGIC as *mut c_void)),
+            )
+        }
+        .is_err()
+        {
+            let _ = unsafe { dwm_set_cloak(hwnd, false) };
+            return false;
+        }
+    } else {
+        unsafe {
+            let _ = RemovePropW(hwnd, w!("LeopardWM.DwmCloak.v1"));
+        }
+    }
+    true
+}
+
 /// Serialize logical cloak-set mutations with the physical DWM commit. The
 /// animation worker and daemon thread can otherwise race and leave DWM in the
 /// opposite state from the final logical OR.
@@ -99,7 +134,7 @@ fn apply_cloak_state_locked(wid: WindowId) -> bool {
     if !unsafe { IsWindow(Some(hwnd)).as_bool() } {
         return false;
     }
-    unsafe { dwm_set_cloak(hwnd, should_cloak) }
+    set_owned_dwm_cloak(hwnd, should_cloak)
 }
 
 fn global_cloaked_contains(wid: WindowId) -> bool {
@@ -194,7 +229,18 @@ pub fn try_mark_ghost_cloaked(wid: WindowId) -> bool {
 pub fn unmark_ghost_cloaked(wid: WindowId) {
     let _commit = lock_cloak_commit();
     unmark_ghost_cloaked_locked(wid);
+    if apply_cloak_state_locked(wid) || !crate::is_valid_window(wid) {
+        return;
+    }
+
+    // A live source that rejected physical uncloak still needs an owner. Put
+    // the ghost receipt back and reassert the OR-cloak state so a later exact
+    // landing/shutdown can retry instead of permanently losing recovery.
+    lock_ghost_cloaked()
+        .get_or_insert_with(HashSet::new)
+        .insert(wid);
     let _ = apply_cloak_state_locked(wid);
+    tracing::warn!("Retaining ghost-cloak recovery receipt for window {wid:#x}");
 }
 
 fn unmark_ghost_cloaked_locked(wid: WindowId) {
@@ -266,7 +312,7 @@ pub fn dwm_cloak_window(window_id: WindowId) -> bool {
     let Ok(hwnd) = window_id_to_hwnd(window_id) else {
         return false;
     };
-    if !unsafe { IsWindow(Some(hwnd)).as_bool() } || !unsafe { dwm_set_cloak(hwnd, true) } {
+    if !unsafe { IsWindow(Some(hwnd)).as_bool() } || !set_owned_dwm_cloak(hwnd, true) {
         // Do not create a recovery receipt for a cloak DWM rejected. Scratchpad
         // callers park first, so the verified sentinel remains the safety
         // mechanism for foreign HWNDs rather than a false logical cloak.
@@ -309,7 +355,7 @@ pub fn dwm_uncloak_window(window_id: WindowId) {
     let uncloaked = window_id_to_hwnd(window_id)
         .ok()
         .is_some_and(|hwnd| unsafe {
-            IsWindow(Some(hwnd)).as_bool() && dwm_set_cloak(hwnd, false)
+            IsWindow(Some(hwnd)).as_bool() && set_owned_dwm_cloak(hwnd, false)
         });
     if uncloaked {
         return;
@@ -355,7 +401,7 @@ pub fn dwm_uncloak_all() {
         let uncloaked = window_id_to_hwnd(window_id)
             .ok()
             .is_some_and(|hwnd| unsafe {
-                IsWindow(Some(hwnd)).as_bool() && dwm_set_cloak(hwnd, false)
+                IsWindow(Some(hwnd)).as_bool() && set_owned_dwm_cloak(hwnd, false)
             });
         if !uncloaked {
             // Keep all receipts for a later recovery pass. Draining them before
@@ -372,6 +418,23 @@ pub fn dwm_uncloak_all() {
             set.remove(&window_id);
         }
     }
+}
+
+/// Cross-process hard-crash recovery for DWM cloaks. Only HWNDs carrying the
+/// durable LeopardWM property are touched; a recycled replacement cannot
+/// inherit that property from the destroyed original window.
+pub fn dwm_uncloak_all_marked_best_effort() -> usize {
+    let _commit = lock_cloak_commit();
+    let mut restored = 0usize;
+    for window_id in crate::enumeration::collect_all_top_level_window_ids() {
+        let Ok(hwnd) = window_id_to_hwnd(window_id) else {
+            continue;
+        };
+        if has_dwm_cloak_marker(hwnd) && set_owned_dwm_cloak(hwnd, false) {
+            restored += 1;
+        }
+    }
+    restored
 }
 
 /// Check if a window is currently cloaked by the placement system OR the
@@ -692,6 +755,7 @@ pub fn apply_placements_with_regions(
     let DeferBuild {
         entries,
         preview_requests,
+        desired_preview_requests,
         new_preview_count,
         skipped,
         safe_fallbacks,
@@ -814,6 +878,11 @@ pub fn apply_placements_with_regions(
         &mut failed_window_ids,
         &committed_preview_requests,
     );
+    let retained_preview_desire: Vec<_> = desired_preview_requests
+        .into_iter()
+        .filter(|request| !failed_window_ids.contains(&request.window_id))
+        .collect();
+    retain_persistent_preview_desire(&retained_preview_desire, config.preview_lifecycle_epoch);
 
     // Update cache only after every visibility side effect committed. In
     // particular, a foreign HWND whose cloak was denied must retry rather than
@@ -1060,7 +1129,11 @@ fn persistent_preview_request(
 
 struct DeferBuild {
     entries: Vec<DeferEntry>,
+    /// Handles already registered and safe to unprotect/publish in this pass.
     preview_requests: Vec<PersistentPreviewRequest>,
+    /// Full verified parked intent, including sources whose DWM registration
+    /// failed transiently and must trigger a future exact relayout.
+    desired_preview_requests: Vec<PersistentPreviewRequest>,
     new_preview_count: usize,
     skipped: u32,
     safe_fallbacks: u32,
@@ -1081,6 +1154,7 @@ fn build_defer_entries(
     let mut safe_fallbacks = 0u32;
     let mut entries: Vec<DeferEntry> = Vec::with_capacity(placements.len());
     let mut preview_requests = Vec::with_capacity(region_clips.len());
+    let mut desired_preview_requests = Vec::with_capacity(region_clips.len());
     let mut new_preview_count = 0usize;
     let mut unsafe_hung_sensitive = Vec::new();
     let mut unavailable_window_ids = Vec::new();
@@ -1100,6 +1174,7 @@ fn build_defer_entries(
         return DeferBuild {
             entries,
             preview_requests,
+            desired_preview_requests,
             new_preview_count,
             skipped,
             safe_fallbacks,
@@ -1155,17 +1230,26 @@ fn build_defer_entries(
             if clip.fallback_visibility != Visibility::Visible
                 && !ghost_cloaked_contains(requested.window_id)
             {
-                preview_request =
-                    persistent_preview_request(requested.window_id, target_outer, clip.clip_bounds);
-                let preview_existed = has_persistent_preview(requested.window_id);
-                preview_was_published = has_published_persistent_preview(requested.window_id);
-                if preview_request.is_some() && prepare_persistent_preview(requested.window_id) {
-                    preview_source = true;
-                    if !preview_existed {
-                        new_preview_count += 1;
+                if let Some(request) =
+                    persistent_preview_request(requested.window_id, target_outer, clip.clip_bounds)
+                {
+                    desired_preview_requests.push(request);
+                    let preview_existed = has_persistent_preview(requested.window_id);
+                    preview_was_published = has_published_persistent_preview(requested.window_id);
+                    if prepare_persistent_preview(requested.window_id) {
+                        preview_request = Some(request);
+                        preview_source = true;
+                        if !preview_existed {
+                            new_preview_count += 1;
+                        }
+                    } else {
+                        // Keep the source in its verified safe fallback. The
+                        // desired request survives so registration recovery can
+                        // request a fresh exact pass; it is not yet eligible for
+                        // cloak/region release or DWM publication.
+                        safe_fallbacks += 1;
                     }
                 } else {
-                    preview_request = None;
                     safe_fallbacks += 1;
                 }
             }
@@ -1306,6 +1390,7 @@ fn build_defer_entries(
     DeferBuild {
         entries,
         preview_requests,
+        desired_preview_requests,
         new_preview_count,
         skipped,
         safe_fallbacks,

@@ -231,31 +231,40 @@ pub fn monitors_by_position(monitors: &[MonitorInfo]) -> Vec<&MonitorInfo> {
     sorted
 }
 
-/// Find the monitor to the left of the given monitor.
+/// Center point of a monitor's rect in widened coordinates.
+fn monitor_center(m: &MonitorInfo) -> (i64, i64) {
+    (
+        i64::from(m.rect.x) + i64::from(m.rect.width) / 2,
+        i64::from(m.rect.y) + i64::from(m.rect.height) / 2,
+    )
+}
+
+/// Find the nearest monitor whose center is genuinely left of the current
+/// center. Vertically stacked outputs with the same x are never horizontal
+/// neighbors.
 pub fn monitor_to_left(monitors: &[MonitorInfo], current_id: MonitorId) -> Option<&MonitorInfo> {
-    let sorted = monitors_by_position(monitors);
-    let current_idx = sorted.iter().position(|m| m.id == current_id)?;
-    if current_idx > 0 {
-        Some(sorted[current_idx - 1])
-    } else {
-        None
-    }
+    let (cx, cy) = monitor_center(monitors.iter().find(|monitor| monitor.id == current_id)?);
+    monitors
+        .iter()
+        .filter(|monitor| monitor.id != current_id && monitor_center(monitor).0 < cx)
+        .min_by_key(|monitor| {
+            let (mx, my) = monitor_center(monitor);
+            (cx - mx, (my - cy).abs())
+        })
 }
 
-/// Find the monitor to the right of the given monitor.
+/// Find the nearest monitor whose center is genuinely right of the current
+/// center. Vertically stacked outputs with the same x are never horizontal
+/// neighbors.
 pub fn monitor_to_right(monitors: &[MonitorInfo], current_id: MonitorId) -> Option<&MonitorInfo> {
-    let sorted = monitors_by_position(monitors);
-    let current_idx = sorted.iter().position(|m| m.id == current_id)?;
-    if current_idx + 1 < sorted.len() {
-        Some(sorted[current_idx + 1])
-    } else {
-        None
-    }
-}
-
-/// Center point of a monitor's rect.
-fn monitor_center(m: &MonitorInfo) -> (i32, i32) {
-    (m.rect.x + m.rect.width / 2, m.rect.y + m.rect.height / 2)
+    let (cx, cy) = monitor_center(monitors.iter().find(|monitor| monitor.id == current_id)?);
+    monitors
+        .iter()
+        .filter(|monitor| monitor.id != current_id && monitor_center(monitor).0 > cx)
+        .min_by_key(|monitor| {
+            let (mx, my) = monitor_center(monitor);
+            (mx - cx, (my - cy).abs())
+        })
 }
 
 /// Find the monitor above the given one: of those whose center sits higher
@@ -1062,6 +1071,10 @@ mod tests {
         assert_eq!(monitor_above(&monitors, 2).unwrap().id, 1);
         assert!(monitor_above(&monitors, 1).is_none());
         assert!(monitor_below(&monitors, 2).is_none());
+        assert!(monitor_to_left(&monitors, 1).is_none());
+        assert!(monitor_to_right(&monitors, 1).is_none());
+        assert!(monitor_to_left(&monitors, 2).is_none());
+        assert!(monitor_to_right(&monitors, 2).is_none());
 
         // Side-by-side monitors have nothing above or below each other.
         let side = vec![

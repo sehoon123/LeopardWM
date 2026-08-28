@@ -58,7 +58,10 @@ pub use enumeration::{
     get_window_info, is_excluded_tool_window_hwnd, monitor_above, monitor_below, monitor_to_left,
     monitor_to_right, monitors_by_position,
 };
-pub use event_hooks::{install_event_hooks, EventHookHandle, WindowEvent};
+pub use event_hooks::{
+    current_window_event_identity, ensure_window_incarnation_token, install_event_hooks,
+    take_window_event_identity, EventHookHandle, WindowEvent, WindowEventIdentity,
+};
 pub use focus::{
     begin_window_move_drag, close_window, get_foreground_window, ms_since_last_user_input,
     set_foreground_window, warp_cursor_to_window,
@@ -66,10 +69,10 @@ pub use focus::{
 pub use placement::clear_suspected_oversize;
 pub use placement::{
     apply_placements, apply_placements_with_regions, clear_inset_cache, dwm_cloak_window,
-    dwm_uncloak_all, dwm_uncloak_window, forget_recycled_ghost_cloak, get_window_invisible_insets,
-    is_placement_cloaked, set_dwm_transitions_disabled, try_mark_ghost_cloaked,
-    unmark_ghost_cloaked, ApplyPlacementsResult, HeightViolation, PlacementCache, WidthViolation,
-    EDGE_EPSILON_PX,
+    dwm_uncloak_all, dwm_uncloak_all_marked_best_effort, dwm_uncloak_window,
+    forget_recycled_ghost_cloak, get_window_invisible_insets, is_placement_cloaked,
+    set_dwm_transitions_disabled, try_mark_ghost_cloaked, unmark_ghost_cloaked,
+    ApplyPlacementsResult, HeightViolation, PlacementCache, WidthViolation, EDGE_EPSILON_PX,
 };
 pub use system::{
     are_animations_enabled, get_system_highlight_color_bgr, is_high_contrast_enabled,
@@ -92,10 +95,14 @@ pub use window_query::{
     is_window_alive_and_visible, is_window_maximized, is_window_shell_cloaked, is_window_valid,
     is_window_visible, window_minimized_state,
 };
-pub use window_region::{forget_window_region, restore_all_window_regions, WindowRegionClip};
+pub use window_region::{
+    forget_window_region, restore_all_marked_window_regions_best_effort,
+    restore_all_window_regions, WindowRegionClip,
+};
 pub use window_style::{
-    remove_maximizebox, reset_window_border_color, restore_maximizebox, restore_maximizebox_all,
-    restore_maximizebox_panic_recovery, set_window_border_color,
+    remove_maximizebox, reset_window_border_color, restore_marked_maximizeboxes_best_effort,
+    restore_maximizebox, restore_maximizebox_all, restore_maximizebox_panic_recovery,
+    set_window_border_color,
 };
 
 use leopardwm_core_layout::WindowId;

@@ -103,7 +103,13 @@ fn current_user_sid_string() -> Option<String> {
         let _ = CloseHandle(token);
         res.ok()?;
 
-        let token_user = &*(buf.as_ptr() as *const TOKEN_USER);
+        if buf.len() < std::mem::size_of::<TOKEN_USER>() {
+            return None;
+        }
+        // `Vec<u8>` only guarantees byte alignment. Read the fixed header
+        // unaligned; the SID pointer inside it still points into the token
+        // buffer owned for the remainder of this function.
+        let token_user = std::ptr::read_unaligned(buf.as_ptr().cast::<TOKEN_USER>());
         let mut psid = PWSTR::null();
         ConvertSidToStringSidW(token_user.User.Sid, &mut psid).ok()?;
         let s = psid.to_string().ok();

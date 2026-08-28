@@ -22,8 +22,11 @@ impl AppState {
     /// Doing this after the mutation would make rollback ambiguous if parking an
     /// exiting workspace window fails.
     fn prepare_drag_layout_change(&mut self, context: &str) -> bool {
-        match self.cancel_layout_transition_for_exact_landing() {
-            Ok(_) => true,
+        match self.prepare_workspace_ownership_change() {
+            Ok(()) => {
+                self.abort_active_ghost_transition();
+                true
+            }
             Err(error) => {
                 warn!("{context}: could not release prior transition ownership: {error}");
                 self.enter_paused_state(context);
@@ -973,6 +976,19 @@ impl AppState {
             .and_then(|ws| ws.find_window_location(DRAG_PLACEHOLDER_HWND));
 
         if let Some((ph_col, ph_slot)) = placeholder_location {
+            // Fence transition exits and plain scroll frames before removing
+            // either the placeholder or source window. On failure the complete
+            // pre-drop model and caller-owned DragState remain recoverable.
+            if !self.prepare_drag_layout_change("finalize drag merge") {
+                self.clear_drag_placeholder();
+                if !self.restore_drag_source_state(hwnd, drag, true) {
+                    warn!(
+                        "Failed to restore drag source after finalize preflight failure for {hwnd}"
+                    );
+                }
+                self.pending_drag_hint = Some(DragHintAction::Hide);
+                return;
+            }
             // Capture source column info BEFORE any removals.
             let src_ws_idx = drag.source_workspace_idx;
             let src_info = if !drag.removed_from_source && target_monitor == source_monitor {
@@ -1081,14 +1097,6 @@ impl AppState {
             }
             self.focused_monitor = target_monitor;
 
-            // Never discard transition-owned exit HWNDs at an intermediate
-            // position. A dead exit is already safe; a live parking failure keeps
-            // ownership and defers this physical landing.
-            if let Err(error) = self.cancel_layout_transition_for_exact_landing() {
-                warn!("Drag merge transition cancellation failed: {error}");
-                return;
-            }
-            self.abort_active_ghost_transition();
             // Evict the dragged hwnd from last_placed_layout_rects: when the
             // user drops it back in its original column, the layout is
             // unchanged and apply_layout's fast-path would skip repositioning,

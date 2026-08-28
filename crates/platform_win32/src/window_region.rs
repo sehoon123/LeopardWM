@@ -691,6 +691,23 @@ pub fn restore_all_window_regions() {
     }
 }
 
+/// Recover regions after a daemon hard crash by enumerating only HWNDs carrying
+/// LeopardWM's durable owner marker. A replacement HWND cannot inherit window
+/// properties, so this never clears an unrelated application's region merely
+/// because its numeric handle was recycled.
+pub fn restore_all_marked_window_regions_best_effort() -> usize {
+    let mut restored = 0usize;
+    for window_id in crate::enumeration::collect_all_top_level_window_ids() {
+        let Ok(hwnd) = window_id_to_hwnd(window_id) else {
+            continue;
+        };
+        if has_owner_marker(hwnd) && restore_window_region(window_id, true) {
+            restored += 1;
+        }
+    }
+    restored
+}
+
 /// Forget a destroyed HWND without issuing Win32 calls that could affect a new
 /// window reusing the same numeric handle.
 pub fn forget_window_region(window_id: WindowId) {

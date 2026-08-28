@@ -244,12 +244,28 @@ impl AppState {
             }
         };
 
+        let tab_title_override_identities: HashMap<_, _> = self
+            .tab_title_overrides
+            .keys()
+            .filter_map(|&hwnd| {
+                crate::state::PersistedWindowIdentity::capture(hwnd)
+                    .map(|identity| (hwnd, identity))
+            })
+            .collect();
+        let tab_title_overrides = self
+            .tab_title_overrides
+            .iter()
+            .filter(|(hwnd, _)| tab_title_override_identities.contains_key(hwnd))
+            .map(|(&hwnd, title)| (hwnd, title.clone()))
+            .collect();
+
         let snapshot = StateSnapshot {
             saved_at,
             workspaces: snapshots,
             focused_monitor_name: focused_name,
             active_workspace: active_ws_map,
-            tab_title_overrides: self.tab_title_overrides.clone(),
+            tab_title_overrides,
+            tab_title_override_identities,
         };
 
         let json = serde_json::to_string_pretty(&snapshot)?;
@@ -696,19 +712,19 @@ impl AppState {
             self.focused_monitor = id;
         }
 
-        // Restore tab title overrides, pruning entries whose HWND is no
-        // longer live. Guards against HWND reuse across daemon-offline
-        // window closures: if the original window was destroyed while
-        // the daemon was down, Windows can re-issue the same HWND to a
-        // different process and the persisted override would silently
-        // attach. The `IsWindow` check is cheap and catches the common
-        // case; we don't bother with class/exe tagging.
+        // A live numeric HWND is not sufficient: Windows can recycle it while
+        // the daemon is offline. Restore a title only when the callback token
+        // and process/thread/class identity still match the saved incarnation.
         for (&hwnd, title) in &snapshot.tab_title_overrides {
-            if leopardwm_platform_win32::is_valid_window(hwnd) {
+            if snapshot
+                .tab_title_override_identities
+                .get(&hwnd)
+                .is_some_and(|identity| identity.still_matches(hwnd))
+            {
                 self.tab_title_overrides.insert(hwnd, title.clone());
             } else {
                 debug!(
-                    "Pruning stale tab title override for dead HWND {}: {:?}",
+                    "Pruning stale or identity-unproven tab title override for HWND {}: {:?}",
                     hwnd, title
                 );
             }

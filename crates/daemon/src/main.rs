@@ -495,19 +495,32 @@ fn setup_hotkeys(config: &Config, event_tx: mpsc::Sender<DaemonEvent>) -> Hotkey
 
     let requested_count = binds.len();
 
-    // An F13–F24 key used as a modifier is swallowed by the hook, so any bind
-    // whose trigger is that same F-key can never fire. Warn rather than fail.
-    let fn_mod_mask = binds.iter().fold(0u16, |m, b| m | b.modifiers.fn_mods);
-    for (_, key_str, _, vk) in &bind_labels {
-        if let Some(bit) = fn_mod_bit(*vk) {
-            if bit & fn_mod_mask != 0 {
-                warn!(
-                    "Hotkey {} uses an F-key that is also configured as a modifier; it will never fire",
-                    key_str
-                );
-            }
-        }
+    // An F13–F24 key used as a modifier is swallowed by the hook, so a bind
+    // using that same key as its trigger is unreachable. Reject only those
+    // conflicting binds instead of letting one bad mapping disable the entire
+    // keyboard-hook generation.
+    let fn_mod_mask = binds
+        .iter()
+        .fold(0u16, |mask, bind| mask | bind.modifiers.fn_mods);
+    let conflicting_ids: HashSet<HotkeyId> = binds
+        .iter()
+        .filter_map(|bind| {
+            fn_mod_bit(bind.vk)
+                .is_some_and(|bit| bit & fn_mod_mask != 0)
+                .then_some(bind.id)
+        })
+        .collect();
+    let mut failed_binds: Vec<String> = bind_labels
+        .iter()
+        .filter(|(id, _, _, _)| conflicting_ids.contains(id))
+        .map(|(_, label, _, _)| format!("{label} (F-key trigger/modifier conflict)"))
+        .collect();
+    for failed in &failed_binds {
+        warn!("Rejecting unreachable hotkey binding: {failed}");
     }
+    binds.retain(|bind| !conflicting_ids.contains(&bind.id));
+    mapping.retain(|id, _| !conflicting_ids.contains(id));
+    bind_labels.retain(|(id, _, _, _)| !conflicting_ids.contains(id));
 
     // The system-event window (display/work-area/power/session-end) is
     // independent of hotkeys; create it regardless so notifications arrive.
@@ -520,31 +533,33 @@ fn setup_hotkeys(config: &Config, event_tx: mpsc::Sender<DaemonEvent>) -> Hotkey
             hook: None,
             forwarder: None,
             mapping,
-            requested_count: 0,
+            requested_count,
             registered_count: 0,
-            failed_binds: Vec::new(),
+            failed_binds,
             recording: false,
         };
     }
 
-    let failed_binds = protected_binds(&bind_labels);
-    if !failed_binds.is_empty() {
+    let protected = protected_binds(&bind_labels);
+    if !protected.is_empty() {
         warn!(
             "These hotkeys are reserved by Windows and can't be intercepted: {}",
-            failed_binds.join(", ")
+            protected.join(", ")
         );
+        failed_binds.extend(protected);
     }
 
+    let accepted_count = binds.len();
     let installed = install_hotkey_hook(binds, event_tx);
     let registered_count = if installed.is_some() {
-        requested_count
+        accepted_count
     } else {
         0
     };
     if installed.is_some() {
         info!(
             "Matching {} global hotkeys via the keyboard hook",
-            requested_count
+            accepted_count
         );
     } else {
         warn!("Keyboard hook unavailable; global shortcuts are disabled.");
@@ -1376,7 +1391,7 @@ fn setup_window_hooks(
     // Register display change sender for WM_DISPLAYCHANGE events
     // This allows the hotkey window to forward display changes to our event loop
     {
-        let (display_tx, display_rx) = std::sync::mpsc::channel::<WindowEvent>();
+        let (display_tx, display_rx) = std::sync::mpsc::sync_channel::<WindowEvent>(32);
         match spawn_forwarding_thread("display-fwd", display_rx, event_tx.clone(), |event| {
             DaemonEvent::WindowEvent(DaemonWindowEvent::capture(event))
         }) {
@@ -1397,15 +1412,15 @@ fn setup_window_hooks(
     // Register power state sender for WM_POWERBROADCAST events
     // Forwards AC/battery and power saver state changes to the daemon event loop
     {
-        let (power_tx, power_rx) = std::sync::mpsc::channel::<bool>();
-        match spawn_forwarding_thread(
-            "power-fwd",
-            power_rx,
-            event_tx.clone(),
-            |on_battery_or_saver| DaemonEvent::PowerStateChanged {
-                on_battery_or_saver,
-            },
-        ) {
+        let (power_tx, power_rx) = std::sync::mpsc::sync_channel::<bool>(8);
+        match spawn_forwarding_thread("power-fwd", power_rx, event_tx.clone(), |_| {
+            DaemonEvent::PowerStateChanged {
+                // Treat the bounded source message as a wake signal. Querying
+                // here means coalesced rapid transitions still publish the
+                // current physical power state, not a stale queued boolean.
+                on_battery_or_saver: leopardwm_platform_win32::is_on_battery_or_power_saver(),
+            }
+        }) {
             Ok(handle) => match set_power_state_sender(power_tx) {
                 Ok(()) => {
                     thread_handles.push(handle);
@@ -1431,7 +1446,7 @@ fn install_ffm_hook(
     event_tx: &mpsc::Sender<DaemonEvent>,
     thread_handles: &mut Vec<ForwardingThreadHandle>,
 ) -> Option<MouseHookHandle> {
-    let (mouse_tx, mouse_rx) = std::sync::mpsc::channel::<WindowEvent>();
+    let (mouse_tx, mouse_rx) = std::sync::mpsc::sync_channel::<WindowEvent>(128);
     match install_mouse_hook(mouse_tx) {
         Ok(handle) => {
             info!("Focus-follows-mouse enabled");
@@ -3967,7 +3982,13 @@ async fn run_daemon_event_loop(
 
         sync_pending_layout_apply_timeout_ui(ctx.state, ctx.tray_manager, &*ctx.hotkey_state).await;
         schedule_pending_apply_worker_reap(ctx.state, ctx.event_tx).await;
-        leopardwm_platform_win32::thumbnail::service_pending_preview_retry();
+        if leopardwm_platform_win32::thumbnail::service_pending_preview_retry() {
+            let mut state = ctx.state.lock().await;
+            if !state.paused {
+                let _ =
+                    land_animation_exactly(&mut state, "preview registration recovery relayout");
+            }
+        }
     }
     (preview_event_rx, animation_event_rx, event_rx)
 }

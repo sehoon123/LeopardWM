@@ -3,11 +3,16 @@
 use crate::types::Win32Error;
 use crate::window_id_to_hwnd;
 use leopardwm_core_layout::WindowId;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
+use windows::core::w;
+use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Graphics::Dwm::DwmSetWindowAttribute;
-use windows::Win32::UI::WindowsAndMessaging::IsWindow;
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetClassNameW, GetPropW, GetWindowThreadProcessId, IsWindow, RemovePropW, SetPropW,
+};
 
 // ============================================================================
 // Border color
@@ -73,19 +78,88 @@ fn is_border_color_unsupported_hresult(code: windows::core::HRESULT) -> bool {
 
 const WS_MAXIMIZEBOX_STYLE: i32 = 0x0001_0000;
 
-/// Global set of window IDs whose WS_MAXIMIZEBOX style has been removed.
-/// Used for panic recovery when AppState may be poisoned/unavailable.
-static SNAP_DISABLED_HWNDS: Mutex<Option<HashSet<WindowId>>> = Mutex::new(None);
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SnapWindowIdentity {
+    process_id: u32,
+    thread_id: u32,
+    class_name: String,
+}
 
-fn lock_snap_disabled() -> std::sync::MutexGuard<'static, Option<HashSet<WindowId>>> {
+#[derive(Debug, Clone)]
+struct SnapReceipt {
+    identity: SnapWindowIdentity,
+    token: usize,
+}
+
+/// Identity-protected recovery receipts. Numeric HWND values are recyclable;
+/// both the captured identity and a per-HWND property must match before a
+/// restore may touch the current window.
+static SNAP_DISABLED_HWNDS: Mutex<Option<HashMap<WindowId, SnapReceipt>>> = Mutex::new(None);
+static SNAP_COMMIT: Mutex<()> = Mutex::new(());
+static NEXT_SNAP_TOKEN: AtomicUsize = AtomicUsize::new(1);
+
+fn lock_snap_disabled() -> std::sync::MutexGuard<'static, Option<HashMap<WindowId, SnapReceipt>>> {
     SNAP_DISABLED_HWNDS
         .lock()
         .unwrap_or_else(crate::recover_poisoned_mutex)
 }
 
+fn snap_identity(hwnd: windows::Win32::Foundation::HWND) -> Option<SnapWindowIdentity> {
+    if !unsafe { IsWindow(Some(hwnd)).as_bool() } {
+        return None;
+    }
+    let mut process_id = 0u32;
+    let thread_id = unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process_id)) };
+    let mut class = [0u16; 256];
+    let class_len = unsafe { GetClassNameW(hwnd, &mut class) };
+    if process_id == 0 || thread_id == 0 || class_len <= 0 {
+        return None;
+    }
+    Some(SnapWindowIdentity {
+        process_id,
+        thread_id,
+        class_name: String::from_utf16_lossy(&class[..class_len as usize]),
+    })
+}
+
+fn next_snap_token() -> usize {
+    NEXT_SNAP_TOKEN
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            Some(value.wrapping_add(1).max(1))
+        })
+        .unwrap_or_else(|value| value)
+        .max(1)
+}
+
+fn snap_property_token(hwnd: windows::Win32::Foundation::HWND) -> usize {
+    unsafe { GetPropW(hwnd, w!("LeopardWM.SnapStyle.v1")) }.0 as usize
+}
+
+fn install_snap_property(hwnd: windows::Win32::Foundation::HWND, token: usize) -> bool {
+    unsafe {
+        SetPropW(
+            hwnd,
+            w!("LeopardWM.SnapStyle.v1"),
+            Some(HANDLE(token as *mut c_void)),
+        )
+    }
+    .is_ok()
+}
+
+fn clear_snap_property_if_owned(hwnd: windows::Win32::Foundation::HWND, token: usize) {
+    if snap_property_token(hwnd) == token {
+        unsafe {
+            let _ = RemovePropW(hwnd, w!("LeopardWM.SnapStyle.v1"));
+        }
+    }
+}
+
 fn remove_snap_receipt(window_id: WindowId) {
-    if let Some(receipts) = lock_snap_disabled().as_mut() {
-        receipts.remove(&window_id);
+    let receipt = lock_snap_disabled()
+        .as_mut()
+        .and_then(|receipts| receipts.remove(&window_id));
+    if let (Some(receipt), Ok(hwnd)) = (receipt, window_id_to_hwnd(window_id)) {
+        clear_snap_property_if_owned(hwnd, receipt.token);
     }
 }
 
@@ -223,31 +297,70 @@ fn set_maximizebox_state<A: SnapStyleApi>(
 }
 
 fn update_maximizebox(window_id: WindowId, want_maximizebox: bool) -> Result<bool, Win32Error> {
+    let _commit = SNAP_COMMIT
+        .lock()
+        .unwrap_or_else(crate::recover_poisoned_mutex);
     let hwnd = window_id_to_hwnd(window_id)?;
-    unsafe {
-        if !IsWindow(Some(hwnd)).as_bool() {
-            // There is no live target left to restore, so retaining a numeric
-            // receipt would risk applying it to a later recycled HWND.
+    let Some(identity) = snap_identity(hwnd) else {
+        remove_snap_receipt(window_id);
+        return Err(Win32Error::WindowNotFound(window_id));
+    };
+
+    let existing = lock_snap_disabled()
+        .as_ref()
+        .and_then(|receipts| receipts.get(&window_id).cloned());
+    if let Some(receipt) = existing.as_ref() {
+        if receipt.identity != identity || snap_property_token(hwnd) != receipt.token {
             remove_snap_receipt(window_id);
             return Err(Win32Error::WindowNotFound(window_id));
         }
+    } else if want_maximizebox {
+        // No platform ownership receipt means this call cannot prove that it
+        // removed the style from the current HWND incarnation.
+        return Ok(false);
     }
 
-    let result = {
-        let mut receipts = lock_snap_disabled();
-        let receipts = receipts.get_or_insert_with(HashSet::new);
-        let mut api = Win32SnapStyleApi { hwnd };
-        set_maximizebox_state(&mut api, receipts, window_id, want_maximizebox)
+    let prepared_receipt = if let Some(receipt) = existing {
+        receipt
+    } else {
+        let token = next_snap_token();
+        if !install_snap_property(hwnd, token) {
+            return Err(Win32Error::SetPositionFailed(format!(
+                "Could not publish snap-style ownership for {window_id:#x}"
+            )));
+        }
+        SnapReceipt { identity, token }
     };
 
+    let mut receipt_ids: HashSet<WindowId> = lock_snap_disabled()
+        .as_ref()
+        .map(|receipts| receipts.keys().copied().collect())
+        .unwrap_or_default();
+    let mut api = Win32SnapStyleApi { hwnd };
+    let result = set_maximizebox_state(&mut api, &mut receipt_ids, window_id, want_maximizebox);
+    let receipt_still_owned = receipt_ids.contains(&window_id);
+    if receipt_still_owned {
+        lock_snap_disabled()
+            .get_or_insert_with(HashMap::new)
+            .insert(window_id, prepared_receipt.clone());
+    } else {
+        lock_snap_disabled()
+            .get_or_insert_with(HashMap::new)
+            .remove(&window_id);
+        clear_snap_property_if_owned(hwnd, prepared_receipt.token);
+    }
+
     match result {
-        Ok(changed) => Ok(changed),
+        // An already-removed style with a retained platform receipt still
+        // represents LeopardWM ownership. Report it as active so the daemon
+        // re-arms its ordinary pause/shutdown retry set.
+        Ok(changed) => Ok(changed || (!want_maximizebox && receipt_still_owned)),
         Err(error) => {
-            unsafe {
-                if !IsWindow(Some(hwnd)).as_bool() {
-                    remove_snap_receipt(window_id);
-                    return Err(Win32Error::WindowNotFound(window_id));
-                }
+            if snap_identity(hwnd).as_ref() != Some(&prepared_receipt.identity)
+                || snap_property_token(hwnd) != prepared_receipt.token
+            {
+                remove_snap_receipt(window_id);
+                return Err(Win32Error::WindowNotFound(window_id));
             }
             Err(Win32Error::SetPositionFailed(format!(
                 "WS_MAXIMIZEBOX {} failed for {:?}: {}",
@@ -306,7 +419,7 @@ pub fn restore_maximizebox_all(window_ids: &[WindowId]) {
 pub fn restore_maximizebox_panic_recovery() {
     let window_ids: Vec<WindowId> = lock_snap_disabled()
         .as_ref()
-        .map(|set| set.iter().copied().collect())
+        .map(|receipts| receipts.keys().copied().collect())
         .unwrap_or_default();
 
     if window_ids.is_empty() {
@@ -324,6 +437,40 @@ pub fn restore_maximizebox_panic_recovery() {
         "[leopardwm] WS_MAXIMIZEBOX panic recovery complete ({} windows processed)",
         window_ids.len()
     );
+}
+
+/// Cross-process hard-crash recovery for snap styles. The HWND property is the
+/// durable ownership receipt: properties disappear with the original HWND, so
+/// a recycled numeric handle cannot inherit this marker.
+pub fn restore_marked_maximizeboxes_best_effort() -> usize {
+    let mut restored = 0usize;
+    for window_id in crate::enumeration::collect_all_top_level_window_ids() {
+        let Ok(hwnd) = window_id_to_hwnd(window_id) else {
+            continue;
+        };
+        let token = snap_property_token(hwnd);
+        if token == 0 {
+            continue;
+        }
+        let _commit = SNAP_COMMIT
+            .lock()
+            .unwrap_or_else(crate::recover_poisoned_mutex);
+        let mut receipt_ids = HashSet::from([window_id]);
+        let mut api = Win32SnapStyleApi { hwnd };
+        match set_maximizebox_state(&mut api, &mut receipt_ids, window_id, true) {
+            Ok(_) if !receipt_ids.contains(&window_id) => {
+                clear_snap_property_if_owned(hwnd, token);
+                restored += 1;
+            }
+            Ok(_) => tracing::warn!(
+                "Marked snap-style recovery retained an unexpected receipt for {window_id:#x}"
+            ),
+            Err(error) => {
+                tracing::warn!("Marked snap-style recovery failed for {window_id:#x}: {error}")
+            }
+        }
+    }
+    restored
 }
 
 #[cfg(test)]

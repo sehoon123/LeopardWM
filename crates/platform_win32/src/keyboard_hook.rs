@@ -13,6 +13,7 @@ use crate::{
     fn_mod_bit, recover_poisoned_mutex, HotkeyEvent, HotkeyId, Modifiers, Win32Error,
     WM_QUIT_LLHOOK_THREAD,
 };
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
@@ -36,7 +37,7 @@ pub struct HotkeyBind {
 }
 
 /// Sender the hook proc uses to deliver matched binds to the daemon.
-static HOOK_SENDER: std::sync::Mutex<Option<mpsc::Sender<HotkeyEvent>>> =
+static HOOK_SENDER: std::sync::Mutex<Option<mpsc::SyncSender<HotkeyEvent>>> =
     std::sync::Mutex::new(None);
 /// The set of binds the hook should match.
 static HOOK_BINDS: std::sync::Mutex<Vec<HotkeyBind>> = std::sync::Mutex::new(Vec::new());
@@ -44,6 +45,10 @@ static HOOK_BINDS: std::sync::Mutex<Vec<HotkeyBind>> = std::sync::Mutex::new(Vec
 /// physical press and swallow auto-repeat, tracking each key independently so a
 /// second matched key held at the same time can't reset the first.
 static HOOK_HELD: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+/// Matched main keys whose command was successfully queued. Only these are
+/// swallowed on autorepeat; a full/disconnected bounded ingress passes the
+/// physical key through instead of consuming an action that was never sent.
+static HOOK_CLAIMED: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
 /// Which F13–F24 keys any bind uses as a modifier (union of `fn_mods` across
 /// all binds). Keys in this mask are swallowed and tracked rather than passed
 /// through, so they act purely as modifiers and never reach the foreground app.
@@ -51,6 +56,7 @@ static HOOK_FN_MOD_MASK: std::sync::Mutex<u16> = std::sync::Mutex::new(0);
 /// Which masked F13–F24 modifiers are currently held. Maintained from the hook's
 /// own key-down/up events (a swallowed key never updates `GetAsyncKeyState`).
 static HOOK_FN_HELD: std::sync::Mutex<u16> = std::sync::Mutex::new(0);
+static ACTIVE_KEYBOARD_THREAD: AtomicU32 = AtomicU32::new(0);
 
 // Modifier virtual-key codes (both the generic and left/right variants the
 // low-level hook reports).
@@ -93,6 +99,35 @@ fn find_bind(binds: &[HotkeyBind], held: Modifiers, vk: u32) -> Option<HotkeyBin
         .copied()
 }
 
+fn clear_keyboard_globals() {
+    *HOOK_SENDER.lock().unwrap_or_else(recover_poisoned_mutex) = None;
+    HOOK_BINDS
+        .lock()
+        .unwrap_or_else(recover_poisoned_mutex)
+        .clear();
+    HOOK_HELD
+        .lock()
+        .unwrap_or_else(recover_poisoned_mutex)
+        .clear();
+    HOOK_CLAIMED
+        .lock()
+        .unwrap_or_else(recover_poisoned_mutex)
+        .clear();
+    *HOOK_FN_MOD_MASK
+        .lock()
+        .unwrap_or_else(recover_poisoned_mutex) = 0;
+    *HOOK_FN_HELD.lock().unwrap_or_else(recover_poisoned_mutex) = 0;
+}
+
+fn retire_keyboard_thread(thread_id: u32) {
+    if ACTIVE_KEYBOARD_THREAD
+        .compare_exchange(thread_id, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        clear_keyboard_globals();
+    }
+}
+
 /// Handle for the keyboard hook. Dropping it signals the dedicated thread to
 /// unhook and exit, then clears the global state.
 pub struct KeyboardHookHandle {
@@ -102,35 +137,27 @@ pub struct KeyboardHookHandle {
 
 impl Drop for KeyboardHookHandle {
     fn drop(&mut self) {
-        unsafe {
-            let _ = PostThreadMessageW(self.thread_id, WM_QUIT_LLHOOK_THREAD, WPARAM(0), LPARAM(0));
-        }
+        let posted = unsafe {
+            PostThreadMessageW(self.thread_id, WM_QUIT_LLHOOK_THREAD, WPARAM(0), LPARAM(0)).is_ok()
+        };
         if let Some(thread) = self.thread.take() {
-            for _ in 0..30 {
-                if thread.is_finished() {
-                    let _ = thread.join();
-                    break;
+            if posted {
+                for _ in 0..30 {
+                    if thread.is_finished() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
                 }
-                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if thread.is_finished() {
+                let _ = thread.join();
+                tracing::debug!("Keyboard hook stopped");
+            } else {
+                tracing::warn!(
+                    "Keyboard hook did not acknowledge shutdown; retaining singleton globals until unhook"
+                );
             }
         }
-        let mut sender = HOOK_SENDER.lock().unwrap_or_else(recover_poisoned_mutex);
-        *sender = None;
-        drop(sender);
-        let mut binds = HOOK_BINDS.lock().unwrap_or_else(recover_poisoned_mutex);
-        binds.clear();
-        drop(binds);
-        let mut held = HOOK_HELD.lock().unwrap_or_else(recover_poisoned_mutex);
-        held.clear();
-        drop(held);
-        let mut mask = HOOK_FN_MOD_MASK
-            .lock()
-            .unwrap_or_else(recover_poisoned_mutex);
-        *mask = 0;
-        drop(mask);
-        let mut fn_held = HOOK_FN_HELD.lock().unwrap_or_else(recover_poisoned_mutex);
-        *fn_held = 0;
-        tracing::debug!("Keyboard hook stopped");
     }
 }
 
@@ -141,7 +168,33 @@ pub fn install_keyboard_hook(
     binds: Vec<HotkeyBind>,
 ) -> Result<(KeyboardHookHandle, mpsc::Receiver<HotkeyEvent>), Win32Error> {
     let count = binds.len();
-    let (tx, rx) = mpsc::channel();
+    let fn_mod_mask = binds
+        .iter()
+        .fold(0u16, |mask, bind| mask | bind.modifiers.fn_mods);
+    if let Some(conflict_vk) = binds.iter().find_map(|bind| {
+        fn_mod_bit(bind.vk)
+            .filter(|bit| fn_mod_mask & bit != 0)
+            .map(|_| bind.vk)
+    }) {
+        return Err(Win32Error::HookInstallFailed(format!(
+            "F13-F24 key {conflict_vk:#x} cannot be both a trigger and a modifier"
+        )));
+    }
+    let physically_held: Vec<i32> = binds
+        .iter()
+        .map(|bind| bind.vk as i32)
+        .filter(|vk| unsafe { GetAsyncKeyState(*vk) } < 0)
+        .collect();
+    let physically_held_fn = (0..12).fold(0u16, |held, index| {
+        let bit = 1u16 << index;
+        let vk = 0x7c + index;
+        if fn_mod_mask & bit != 0 && unsafe { GetAsyncKeyState(vk) } < 0 {
+            held | bit
+        } else {
+            held
+        }
+    });
+    let (tx, rx) = mpsc::sync_channel(128);
 
     {
         let mut sender = HOOK_SENDER
@@ -154,32 +207,28 @@ pub fn install_keyboard_hook(
         }
         *sender = Some(tx);
     }
-    let fn_mod_mask = binds
-        .iter()
-        .fold(0u16, |mask, b| mask | b.modifiers.fn_mods);
-    {
-        let mut b = HOOK_BINDS
-            .lock()
-            .map_err(|_| Win32Error::HookInstallFailed("Hook binds mutex poisoned".to_string()))?;
-        *b = binds;
-    }
-    {
-        let mut mask = HOOK_FN_MOD_MASK.lock().map_err(|_| {
+    let setup_result = (|| {
+        *HOOK_BINDS.lock().map_err(|_| {
+            Win32Error::HookInstallFailed("Hook binds mutex poisoned".to_string())
+        })? = binds;
+        *HOOK_FN_MOD_MASK.lock().map_err(|_| {
             Win32Error::HookInstallFailed("Hook fn-mod mask mutex poisoned".to_string())
-        })?;
-        *mask = fn_mod_mask;
-    }
-    {
-        let mut held = HOOK_HELD
+        })? = fn_mod_mask;
+        *HOOK_HELD
             .lock()
-            .map_err(|_| Win32Error::HookInstallFailed("Hook held mutex poisoned".to_string()))?;
-        held.clear();
-    }
-    {
-        let mut fn_held = HOOK_FN_HELD.lock().map_err(|_| {
+            .map_err(|_| Win32Error::HookInstallFailed("Hook held mutex poisoned".to_string()))? =
+            physically_held.clone();
+        *HOOK_CLAIMED.lock().map_err(|_| {
+            Win32Error::HookInstallFailed("Hook claimed mutex poisoned".to_string())
+        })? = physically_held;
+        *HOOK_FN_HELD.lock().map_err(|_| {
             Win32Error::HookInstallFailed("Hook fn-held mutex poisoned".to_string())
-        })?;
-        *fn_held = 0;
+        })? = physically_held_fn;
+        Ok::<(), Win32Error>(())
+    })();
+    if let Err(error) = setup_result {
+        clear_keyboard_globals();
+        return Err(error);
     }
 
     let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<u32, Win32Error>>();
@@ -188,6 +237,7 @@ pub fn install_keyboard_hook(
         .name("hotkey-hook".into())
         .spawn(move || unsafe {
             let thread_id = GetCurrentThreadId();
+            ACTIVE_KEYBOARD_THREAD.store(thread_id, Ordering::Release);
 
             // Ensure the message queue exists before signalling init.
             let mut msg = MSG::default();
@@ -201,6 +251,7 @@ pub fn install_keyboard_hook(
                         "SetWindowsHookExW for keyboard hook failed: {}",
                         e
                     ))));
+                    retire_keyboard_thread(thread_id);
                     return;
                 }
             };
@@ -220,14 +271,28 @@ pub fn install_keyboard_hook(
             }
 
             let _ = UnhookWindowsHookEx(hook);
+            retire_keyboard_thread(thread_id);
         })
         .map_err(|e| {
+            clear_keyboard_globals();
             Win32Error::HookInstallFailed(format!("Failed to spawn hotkey hook thread: {}", e))
         })?;
 
-    let thread_id = init_rx.recv().map_err(|_| {
-        Win32Error::HookInstallFailed("Keyboard hook thread initialization failed".to_string())
-    })??;
+    let thread_id = match init_rx.recv() {
+        Ok(Ok(thread_id)) => thread_id,
+        Ok(Err(error)) => {
+            let _ = thread.join();
+            return Err(error);
+        }
+        Err(_) => {
+            if thread.is_finished() {
+                let _ = thread.join();
+            }
+            return Err(Win32Error::HookInstallFailed(
+                "Keyboard hook thread initialization failed".to_string(),
+            ));
+        }
+    };
 
     tracing::info!("Keyboard hook installed ({} hotkeys)", count);
 
@@ -260,7 +325,7 @@ unsafe extern "system" fn keyboard_ll_hook_proc(
 }
 
 unsafe fn keyboard_ll_hook_inner(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if ncode < 0 {
+    if ncode < 0 || ACTIVE_KEYBOARD_THREAD.load(Ordering::Acquire) != GetCurrentThreadId() {
         return CallNextHookEx(None, ncode, wparam, lparam);
     }
 
@@ -286,6 +351,10 @@ unsafe fn keyboard_ll_hook_inner(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> 
         let mut held = HOOK_HELD.lock().unwrap_or_else(recover_poisoned_mutex);
         held.retain(|&k| k != vk);
         drop(held);
+        HOOK_CLAIMED
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex)
+            .retain(|&key| key != vk);
         return CallNextHookEx(None, ncode, wparam, lparam);
     }
 
@@ -354,24 +423,36 @@ unsafe fn keyboard_ll_hook_inner(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> 
     };
 
     if let Some(bind) = matched {
-        // Fire once per physical press; swallow auto-repeat without re-firing.
-        // Always swallow so the OS action (e.g. desktop switch) never leaks.
         if is_new_press {
-            let sender = HOOK_SENDER.lock().unwrap_or_else(recover_poisoned_mutex);
-            if let Some(s) = sender.as_ref() {
-                let _ = s.send(HotkeyEvent { id: bind.id });
+            let delivered = HOOK_SENDER
+                .lock()
+                .unwrap_or_else(recover_poisoned_mutex)
+                .as_ref()
+                .is_some_and(|sender| sender.try_send(HotkeyEvent { id: bind.id }).is_ok());
+            if !delivered {
+                return CallNextHookEx(None, ncode, wparam, lparam);
             }
+            HOOK_CLAIMED
+                .lock()
+                .unwrap_or_else(recover_poisoned_mutex)
+                .push(vk);
             // For a bare-Win bind, swallowing the main key leaves Windows seeing
             // Win pressed and released with nothing in between, which pops the
             // Start menu on key-up. Inject a no-op modifier tap so the OS treats
-            // the Win press as part of a chord and suppresses the menu. Combos
-            // with another modifier already use up the Win press, so skip them.
+            // the Win press as part of a chord and suppresses the menu.
             let m = bind.modifiers;
             if m.win && !m.ctrl && !m.alt && !m.shift {
                 send_start_menu_mask();
             }
+            return LRESULT(1);
         }
-        return LRESULT(1);
+        if HOOK_CLAIMED
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex)
+            .contains(&vk)
+        {
+            return LRESULT(1);
+        }
     }
 
     CallNextHookEx(None, ncode, wparam, lparam)
@@ -400,6 +481,8 @@ unsafe fn send_start_menu_mask() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static KEYBOARD_GLOBAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn bind(modifiers: Modifiers, vk: u32) -> HotkeyBind {
         HotkeyBind {
@@ -491,5 +574,53 @@ mod tests {
             0x48
         )
         .is_none());
+    }
+
+    #[test]
+    fn fn_key_cannot_be_both_global_modifier_and_trigger() {
+        let _guard = KEYBOARD_GLOBAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex);
+        clear_keyboard_globals();
+        let f13 = fn_mod_bit(0x7c).unwrap();
+        let error = install_keyboard_hook(vec![
+            bind(Modifiers::default(), 0x7c),
+            bind(
+                Modifiers {
+                    fn_mods: f13,
+                    ..Default::default()
+                },
+                0x48,
+            ),
+        ])
+        .err()
+        .expect("conflicting F-key binding must fail before hook installation");
+        assert!(error.to_string().contains("both a trigger and a modifier"));
+        assert!(HOOK_SENDER
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex)
+            .is_none());
+    }
+
+    #[test]
+    fn stale_keyboard_generation_cannot_clear_active_globals() {
+        let _guard = KEYBOARD_GLOBAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex);
+        clear_keyboard_globals();
+        let (tx, _rx) = mpsc::sync_channel(4);
+        *HOOK_SENDER.lock().unwrap_or_else(recover_poisoned_mutex) = Some(tx);
+        ACTIVE_KEYBOARD_THREAD.store(52, Ordering::Release);
+
+        retire_keyboard_thread(51);
+        assert!(HOOK_SENDER
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex)
+            .is_some());
+        retire_keyboard_thread(52);
+        assert!(HOOK_SENDER
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex)
+            .is_none());
     }
 }

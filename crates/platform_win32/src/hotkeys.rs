@@ -7,7 +7,7 @@
 
 use crate::{recover_poisoned_mutex, Win32Error, WindowEvent};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{mpsc, Arc};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::System::Threading::GetCurrentThreadId;
@@ -157,12 +157,12 @@ pub struct HotkeyEvent {
 /// lives for the whole session. Clearing it on window drop silently stopped
 /// display-change (and power) events from reaching the daemon after the first
 /// reload, so resolution/work-area changes no longer reconciled.
-static DISPLAY_CHANGE_SENDER: std::sync::Mutex<Option<mpsc::Sender<WindowEvent>>> =
+static DISPLAY_CHANGE_SENDER: std::sync::Mutex<Option<mpsc::SyncSender<WindowEvent>>> =
     std::sync::Mutex::new(None);
 
 /// Global sender for power state change events. Same lifetime as
 /// [`DISPLAY_CHANGE_SENDER`]: set once at startup, survives window recreation.
-static POWER_STATE_SENDER: std::sync::Mutex<Option<mpsc::Sender<bool>>> =
+static POWER_STATE_SENDER: std::sync::Mutex<Option<mpsc::SyncSender<bool>>> =
     std::sync::Mutex::new(None);
 
 /// Process-lifetime callback for committed interactive session end. Like the
@@ -172,6 +172,17 @@ static SESSION_END_HANDLER: std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync +
 
 /// Ensures duplicate committed WM_ENDSESSION messages run recovery only once.
 static SESSION_END_LATCHED: AtomicBool = AtomicBool::new(false);
+static SYSEVENT_ACTIVE: AtomicBool = AtomicBool::new(false);
+static ACTIVE_SYSEVENT_THREAD: AtomicU32 = AtomicU32::new(0);
+
+fn retire_sysevent_thread(thread_id: u32) {
+    if ACTIVE_SYSEVENT_THREAD
+        .compare_exchange(thread_id, 0, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        SYSEVENT_ACTIVE.store(false, Ordering::Release);
+    }
+}
 
 /// Custom message to signal the system-event thread to stop.
 const WM_QUIT_SYSEVENT_THREAD: u32 = WM_USER + 1;
@@ -259,7 +270,7 @@ impl Drop for SystemEventHandle {
 ///
 /// This allows the system-event window to forward relevant Windows messages
 /// to the window event channel. Call this before `register_system_events`.
-pub fn set_display_change_sender(sender: mpsc::Sender<WindowEvent>) -> Result<(), Win32Error> {
+pub fn set_display_change_sender(sender: mpsc::SyncSender<WindowEvent>) -> Result<(), Win32Error> {
     let mut guard = DISPLAY_CHANGE_SENDER.lock().map_err(|_| {
         Win32Error::HookInstallFailed("Display change sender mutex poisoned".to_string())
     })?;
@@ -271,7 +282,7 @@ pub fn set_display_change_sender(sender: mpsc::Sender<WindowEvent>) -> Result<()
 ///
 /// This allows the hotkey window to forward `WM_POWERBROADCAST` notifications
 /// to the daemon event loop. Call this before `register_system_events`.
-pub fn set_power_state_sender(sender: mpsc::Sender<bool>) -> Result<(), Win32Error> {
+pub fn set_power_state_sender(sender: mpsc::SyncSender<bool>) -> Result<(), Win32Error> {
     let mut guard = POWER_STATE_SENDER.lock().map_err(|_| {
         Win32Error::HookInstallFailed("Power state sender mutex poisoned".to_string())
     })?;
@@ -303,13 +314,20 @@ pub fn set_session_end_handler(
 /// # Returns
 /// * Handle to keep the window alive (drop to tear it down)
 pub fn register_system_events() -> Result<SystemEventHandle, Win32Error> {
+    if SYSEVENT_ACTIVE.swap(true, Ordering::AcqRel) {
+        return Err(Win32Error::HotkeyRegistrationFailed(
+            "System-event window is still owned by an existing generation".into(),
+        ));
+    }
     // Create the message window on a separate thread.
     // We send isize (raw pointer value) instead of HWND because HWND is !Send
     let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<(isize, u32), Win32Error>>();
 
-    let thread = std::thread::spawn(move || {
-        unsafe {
+    let thread = std::thread::Builder::new()
+        .name("leopardwm-system-events".into())
+        .spawn(move || unsafe {
             let thread_id = GetCurrentThreadId();
+            ACTIVE_SYSEVENT_THREAD.store(thread_id, Ordering::Release);
 
             // Register window class
             let class_name: Vec<u16> = "LeopardWMSysEventClass\0".encode_utf16().collect();
@@ -341,12 +359,15 @@ pub fn register_system_events() -> Result<SystemEventHandle, Win32Error> {
                 let _ = init_tx.send(Err(Win32Error::HotkeyRegistrationFailed(
                     "Failed to create message window".to_string(),
                 )));
+                retire_sysevent_thread(thread_id);
                 return;
             }
 
             let hwnd = hwnd.unwrap();
 
-            // Register for power state notifications on this window
+            // Register for power state notifications on this window and retain
+            // every successful handle for symmetric teardown.
+            let mut power_notifications = Vec::new();
             {
                 use windows::Win32::System::Power::RegisterPowerSettingNotification;
                 use windows::Win32::UI::WindowsAndMessaging::REGISTER_NOTIFICATION_FLAGS;
@@ -359,25 +380,27 @@ pub fn register_system_events() -> Result<SystemEventHandle, Win32Error> {
                     windows::core::GUID::from_u128(0xe00958c0_c213_4ace_ac77_fecced2eeea5);
 
                 let handle = windows::Win32::Foundation::HANDLE(hwnd.0);
-                if let Err(e) = RegisterPowerSettingNotification(
+                match RegisterPowerSettingNotification(
                     handle,
                     &GUID_ACDC_POWER_SOURCE,
                     REGISTER_NOTIFICATION_FLAGS(0),
                 ) {
-                    tracing::warn!(
+                    Ok(notification) => power_notifications.push(notification),
+                    Err(e) => tracing::warn!(
                         "Failed to register GUID_ACDC_POWER_SOURCE notification: {}",
                         e
-                    );
+                    ),
                 }
-                if let Err(e) = RegisterPowerSettingNotification(
+                match RegisterPowerSettingNotification(
                     handle,
                     &GUID_POWER_SAVING_STATUS,
                     REGISTER_NOTIFICATION_FLAGS(0),
                 ) {
-                    tracing::warn!(
+                    Ok(notification) => power_notifications.push(notification),
+                    Err(e) => tracing::warn!(
                         "Failed to register GUID_POWER_SAVING_STATUS notification: {}",
                         e
-                    );
+                    ),
                 }
                 tracing::debug!("Registered power setting notifications");
             }
@@ -399,10 +422,23 @@ pub fn register_system_events() -> Result<SystemEventHandle, Win32Error> {
                 let _ = DispatchMessageW(&msg);
             }
 
+            for notification in power_notifications {
+                if let Err(error) =
+                    windows::Win32::System::Power::UnregisterPowerSettingNotification(notification)
+                {
+                    tracing::warn!("Failed to unregister power notification: {error}");
+                }
+            }
             let _ = DestroyWindow(hwnd);
             let _ = UnregisterClassW(windows::core::PCWSTR(class_name.as_ptr()), None);
-        }
-    });
+            retire_sysevent_thread(thread_id);
+        })
+        .map_err(|error| {
+            SYSEVENT_ACTIVE.store(false, Ordering::Release);
+            Win32Error::HotkeyRegistrationFailed(format!(
+                "Failed to spawn system-event thread: {error}"
+            ))
+        })?;
 
     // Wait for initialization
     let init_result = init_rx.recv().map_err(|_| {
@@ -484,7 +520,7 @@ fn sysevent_window_proc_inner(
                 .lock()
                 .unwrap_or_else(recover_poisoned_mutex);
             if let Some(sender) = sender_guard.as_ref() {
-                let _ = sender.send(WindowEvent::DisplayChange);
+                let _ = sender.try_send(WindowEvent::DisplayChange);
             }
 
             windows::Win32::Foundation::LRESULT(0)
@@ -500,7 +536,7 @@ fn sysevent_window_proc_inner(
                 .lock()
                 .unwrap_or_else(recover_poisoned_mutex);
             if let Some(sender) = sender_guard.as_ref() {
-                let _ = sender.send(WindowEvent::WorkAreaChanged);
+                let _ = sender.try_send(WindowEvent::WorkAreaChanged);
             }
             windows::Win32::Foundation::LRESULT(0)
         }
@@ -509,7 +545,7 @@ fn sysevent_window_proc_inner(
                 .lock()
                 .unwrap_or_else(recover_poisoned_mutex);
             if let Some(sender) = sender_guard.as_ref() {
-                let _ = sender.send(WindowEvent::AppearanceChanged);
+                let _ = sender.try_send(WindowEvent::AppearanceChanged);
             }
             windows::Win32::Foundation::LRESULT(0)
         }
@@ -518,7 +554,7 @@ fn sysevent_window_proc_inner(
                 .lock()
                 .unwrap_or_else(recover_poisoned_mutex);
             if let Some(sender) = sender_guard.as_ref() {
-                let _ = sender.send(WindowEvent::AppearanceChanged);
+                let _ = sender.try_send(WindowEvent::AppearanceChanged);
             }
             windows::Win32::Foundation::LRESULT(0)
         }
@@ -534,7 +570,7 @@ fn sysevent_window_proc_inner(
                     .lock()
                     .unwrap_or_else(recover_poisoned_mutex);
                 if let Some(sender) = sender_guard.as_ref() {
-                    let _ = sender.send(on_battery_or_saver);
+                    let _ = sender.try_send(on_battery_or_saver);
                 }
 
                 windows::Win32::Foundation::LRESULT(1) // TRUE = processed
@@ -806,8 +842,8 @@ mod tests {
             .lock()
             .unwrap_or_else(recover_poisoned_mutex);
 
-        let (display_tx, _display_rx) = mpsc::channel::<WindowEvent>();
-        let (power_tx, _power_rx) = mpsc::channel::<bool>();
+        let (display_tx, _display_rx) = mpsc::sync_channel::<WindowEvent>(8);
+        let (power_tx, _power_rx) = mpsc::sync_channel::<bool>(8);
         {
             let mut g = DISPLAY_CHANGE_SENDER
                 .lock()
@@ -943,7 +979,7 @@ mod tests {
             .lock()
             .unwrap_or_else(recover_poisoned_mutex);
 
-        let (tx, rx) = mpsc::channel::<WindowEvent>();
+        let (tx, rx) = mpsc::sync_channel::<WindowEvent>(8);
         set_display_change_sender(tx).unwrap();
 
         let lresult = sysevent_window_proc_inner(
@@ -971,7 +1007,7 @@ mod tests {
             .lock()
             .unwrap_or_else(recover_poisoned_mutex);
 
-        let (tx, rx) = mpsc::channel::<WindowEvent>();
+        let (tx, rx) = mpsc::sync_channel::<WindowEvent>(8);
         set_display_change_sender(tx).unwrap();
         let hwnd = HWND(std::ptr::null_mut());
         let lparam = windows::Win32::Foundation::LPARAM(0);

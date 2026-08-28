@@ -193,7 +193,7 @@ fn run(log_paths: &WatchdogLogPaths) -> Result<()> {
                 // thread so we don't delay the daemon restart.
                 leopardwm_platform_win32::toast::show_toast(
                     "LeopardWM restarted after a crash",
-                    "Automatic cross-process window recovery was not attempted because ownership could not be verified. Verify window visibility; hard-crash style recovery requires a future owned recovery record.",
+                    "Recovered only crash-surviving LeopardWM HWND receipts; unmarked windows were left untouched. Verify window visibility after restart.",
                 );
                 info!(attempt, "Restarting daemon after crash");
             }
@@ -277,16 +277,26 @@ fn spawn_daemon(path: &Path, args: &[String], error_log_path: &Path) -> Result<E
     child.wait().context("failed to wait on daemon child")
 }
 
-fn hard_crash_recovery_unavailable_message() -> &'static str {
-    "Hard-crash recovery did not modify windows: the daemon's process-local style ledger is gone, so ownership of a HWND cannot be proven safely. Visibility and maximize-box recovery require a durable record that validates the original window identity before mutation."
+fn hard_crash_recovery_policy_message() -> &'static str {
+    "Hard-crash recovery touches only HWNDs carrying durable LeopardWM properties; unmarked windows fail closed and are never changed by numeric handle alone."
 }
 
 fn recover_from_crash() {
-    // A hard kill bypasses the daemon's in-process panic hook and destroys its
-    // style ledger. Do not call global uncloak or style APIs from this process:
-    // HWND values can be recycled and the watchdog cannot prove which windows
-    // LeopardWM owned. Fail closed and make the limitation explicit instead.
-    warn!("{}", hard_crash_recovery_unavailable_message());
+    // HWND properties die with their owning window and therefore cannot cross a
+    // recycled numeric handle. Recover only these durable receipts; never use a
+    // global uncloak/style sweep from the watchdog.
+    let uncloaked = leopardwm_platform_win32::dwm_uncloak_all_marked_best_effort();
+    let regions = leopardwm_platform_win32::restore_all_marked_window_regions_best_effort();
+    let parked = leopardwm_platform_win32::restore_all_windows_moved_offscreen_best_effort();
+    let snap_styles = leopardwm_platform_win32::restore_marked_maximizeboxes_best_effort();
+    warn!(
+        uncloaked,
+        regions,
+        parked,
+        snap_styles,
+        "{}",
+        hard_crash_recovery_policy_message()
+    );
 }
 
 fn install_kill_on_close_job() -> Result<()> {
@@ -396,10 +406,10 @@ mod tests {
     }
 
     #[test]
-    fn hard_crash_recovery_fails_closed_without_owned_ledger() {
-        let message = hard_crash_recovery_unavailable_message();
-        assert!(message.contains("did not modify windows"));
-        assert!(message.contains("ownership"));
-        assert!(message.contains("durable record"));
+    fn hard_crash_recovery_requires_durable_hwnd_properties() {
+        let message = hard_crash_recovery_policy_message();
+        assert!(message.contains("durable LeopardWM properties"));
+        assert!(message.contains("unmarked windows fail closed"));
+        assert!(message.contains("numeric handle"));
     }
 }

@@ -32,8 +32,19 @@ function Invoke-RepositoryGit {
         [string[]]$Arguments
     )
 
-    $output = & git -C $RepoRoot @Arguments 2>&1
-    if ($LASTEXITCODE -ne 0) {
+    $previousPreference = $ErrorActionPreference
+    try {
+        # Git progress is written to stderr even on success. PowerShell 5 turns
+        # that into non-terminating ErrorRecord objects; the native exit code is
+        # the authoritative result.
+        $ErrorActionPreference = 'Continue'
+        $output = & git -C $RepoRoot @Arguments 2>&1
+        $exitCode = $LASTEXITCODE
+    }
+    finally {
+        $ErrorActionPreference = $previousPreference
+    }
+    if ($exitCode -ne 0) {
         $text = (@($output) | ForEach-Object { "$_" }) -join [Environment]::NewLine
         throw "git $($Arguments -join ' ') failed: $text"
     }

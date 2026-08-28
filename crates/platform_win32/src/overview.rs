@@ -2834,7 +2834,7 @@ unsafe fn paint_frame(hwnd: HWND) {
             thumb_wids: &thumb_wids,
         };
         if let Some(cache) = build_hover_cache(rect.width, rect.height, &input) {
-            install_hover_cache_and_blit(hdc, cache);
+            install_hover_cache_and_blit(hwnd, hdc, cache);
         }
     }
     let _ = EndPaint(hwnd, &ps);
@@ -2843,8 +2843,8 @@ unsafe fn paint_frame(hwnd: HWND) {
 /// Install a freshly-built hover cache, re-apply the live hover state
 /// (the cache base is hover-free), and blit the working frame — all
 /// under one state lock so a concurrent hide can't free it mid-blit.
-unsafe fn install_hover_cache_and_blit(hdc: HDC, mut cache: HoverCache) {
-    let stale = {
+unsafe fn install_hover_cache_and_blit(hwnd: HWND, hdc: HDC, mut cache: HoverCache) {
+    let (stale, copied) = {
         let mut guard = state();
         let s = &mut *guard;
         if s.visible {
@@ -2855,7 +2855,7 @@ unsafe fn install_hover_cache_and_blit(hdc: HDC, mut cache: HoverCache) {
                 let covered = body_is_covered(card, &s.thumbnails);
                 repaint_card_in_cache(&mut cache, card, true, covered, s.model.accent_bgr);
             }
-            let _ = BitBlt(
+            let copied = BitBlt(
                 hdc,
                 0,
                 0,
@@ -2865,16 +2865,21 @@ unsafe fn install_hover_cache_and_blit(hdc: HDC, mut cache: HoverCache) {
                 0,
                 0,
                 SRCCOPY,
-            );
-            s.needs_full_render = false;
-            s.hover_cache.replace(cache)
+            )
+            .is_ok();
+            s.needs_full_render = !copied;
+            (s.hover_cache.replace(cache), copied)
         } else {
             // Hidden while rendering: don't resurrect 28MB of cache.
-            Some(cache)
+            (Some(cache), true)
         }
     };
     if let Some(old) = stale {
         free_hover_cache(old);
+    }
+    if !copied {
+        tracing::warn!("Overview full-frame blit failed; scheduling a fresh paint");
+        let _ = InvalidateRect(Some(hwnd), None, false);
     }
 }
 
