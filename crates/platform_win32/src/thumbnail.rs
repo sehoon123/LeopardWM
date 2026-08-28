@@ -3068,6 +3068,15 @@ pub mod integration_probe {
             // center cross avoids claiming a proof from one stale edge pixel.
             // Screen-DC visibility can trail DwmFlush by a few compositor ticks;
             // retry the same strict physical samples for a bounded second.
+            let outside_point = (
+                destination.right().saturating_add(2),
+                destination.y + destination.height / 2,
+            );
+            let verify_neighbor_isolation = crate::enumerate_monitors().is_ok_and(|monitors| {
+                monitors
+                    .iter()
+                    .any(|monitor| monitor.contains_point(outside_point.0, outside_point.1))
+            });
             let deadline = Instant::now() + Duration::from_secs(1);
             loop {
                 let screen_dc = unsafe { GetDC(None) };
@@ -3085,6 +3094,8 @@ pub mod integration_probe {
                     unsafe { GetPixel(screen_dc, center_x, center_y - 2) },
                     unsafe { GetPixel(screen_dc, center_x, center_y + 2) },
                 ];
+                let outside_sample =
+                    unsafe { GetPixel(screen_dc, outside_point.0, outside_point.1) };
                 unsafe {
                     ReleaseDC(None, screen_dc);
                 }
@@ -3093,6 +3104,8 @@ pub mod integration_probe {
                     .filter(|sample| channel_distance(*sample, expected) <= 20)
                     .count()
                     >= 3
+                    && (!verify_neighbor_isolation
+                        || channel_distance(outside_sample, expected) > 20)
                 {
                     break Ok(true);
                 }

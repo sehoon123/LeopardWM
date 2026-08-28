@@ -415,10 +415,11 @@ fn ordered_real_preview_lifecycle_contract() {
         leopardwm_platform_win32::integration_probe_incomplete_monitor_snapshot_fails_closed(),
         "one failed monitor callback must reject the entire safety snapshot"
     );
-    let monitor = leopardwm_platform_win32::enumerate_monitors()
-        .expect("monitor enumeration")
-        .into_iter()
+    let monitors = leopardwm_platform_win32::enumerate_monitors().expect("monitor enumeration");
+    let monitor = monitors
+        .iter()
         .find(|monitor| monitor.is_primary)
+        .cloned()
         .expect("primary monitor");
 
     verify_rejected_visible_float_return(&monitor);
@@ -524,9 +525,25 @@ fn ordered_real_preview_lifecycle_contract() {
     );
 
     let colored_source = SourceWindow::new_colored();
+    let neighbor_overlap_y = monitors
+        .iter()
+        .filter(|other| other.id != monitor.id && other.rect.x >= monitor.rect.right())
+        .filter_map(|other| {
+            let top = monitor.work_area.y.max(other.work_area.y);
+            let bottom = monitor.work_area.bottom().min(other.work_area.bottom());
+            (bottom - top >= 160).then_some(top + 20)
+        })
+        .next();
+    if std::env::var_os("LEOPARDWM_REQUIRE_DUAL_MONITOR").is_some() {
+        assert!(
+            neighbor_overlap_y.is_some(),
+            "dual-monitor gate requires a horizontally adjacent output with physical vertical overlap"
+        );
+    }
+    let neighbor_overlap_y = neighbor_overlap_y.unwrap_or(monitor.work_area.y + 20);
     let colored_destination = Rect::new(
-        monitor.work_area.right() - 180,
-        monitor.work_area.y + 20,
+        monitor.work_area.right() - 160,
+        neighbor_overlap_y,
         160,
         120,
     );
