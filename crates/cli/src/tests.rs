@@ -676,24 +676,23 @@ fn test_panic_revert_unconfirmed_message_is_actionable() {
     let message = panic_revert_unconfirmed_message();
     assert!(message.contains("before confirming"));
     assert!(message.contains("leopardwm-cli status"));
-    assert!(message.contains("Local emergency visibility restore"));
+    assert!(message.contains("No automatic cross-process recovery"));
 }
 
 #[test]
 fn test_panic_revert_timeout_recovery_message_is_actionable() {
     let message = panic_revert_timeout_recovery_message();
     assert!(message.contains("Timed out"));
-    assert!(message.contains("Local emergency visibility restore"));
+    assert!(message.contains("No automatic cross-process recovery"));
     assert!(message.contains("leopardwm-cli status"));
 }
 
 #[test]
-fn test_stop_timeout_recovery_message_is_actionable() {
+fn test_stop_timeout_recovery_message_reports_unproven_recovery() {
     let message = stop_timeout_recovery_message();
     assert!(message.contains("Timed out"));
+    assert!(message.contains("No automatic cross-process recovery"));
     assert!(message.contains("leopardwm-cli status"));
-    assert!(message.contains("leopardwm-cli panic-revert"));
-    assert!(message.contains("leopardwm-cli emergency-uncloak"));
 }
 
 #[test]
@@ -704,18 +703,18 @@ fn test_apply_not_running_message_is_actionable() {
 }
 
 #[test]
-fn test_apply_timeout_recovery_message_is_actionable() {
+fn test_apply_timeout_recovery_message_reports_unproven_recovery() {
     let message = apply_timeout_recovery_message();
     assert!(message.contains("Timed out"));
-    assert!(message.contains("leopardwm-cli panic-revert"));
-    assert!(message.contains("leopardwm-cli emergency-uncloak"));
+    assert!(message.contains("No automatic cross-process recovery"));
+    assert!(message.contains("leopardwm-cli status"));
 }
 
 #[test]
 fn test_apply_unconfirmed_recovery_message_is_actionable() {
     let message = apply_unconfirmed_recovery_message();
     assert!(message.contains("not confirmed"));
-    assert!(message.contains("Local emergency visibility restore"));
+    assert!(message.contains("No automatic cross-process recovery"));
     assert!(message.contains("leopardwm-cli status"));
 }
 
@@ -723,7 +722,7 @@ fn test_apply_unconfirmed_recovery_message_is_actionable() {
 fn test_apply_error_response_recovery_message_is_actionable() {
     let message = apply_error_response_recovery_message();
     assert!(message.contains("non-success apply response"));
-    assert!(message.contains("Local emergency visibility restore"));
+    assert!(message.contains("No automatic cross-process recovery"));
     assert!(message.contains("leopardwm-cli status"));
 }
 
@@ -731,7 +730,7 @@ fn test_apply_error_response_recovery_message_is_actionable() {
 fn test_stop_error_response_recovery_message_is_actionable() {
     let message = stop_error_response_recovery_message();
     assert!(message.contains("non-success stop response"));
-    assert!(message.contains("Local emergency visibility restore"));
+    assert!(message.contains("No automatic cross-process recovery"));
     assert!(message.contains("leopardwm-cli status"));
 }
 
@@ -739,7 +738,7 @@ fn test_stop_error_response_recovery_message_is_actionable() {
 fn test_panic_revert_error_response_recovery_message_is_actionable() {
     let message = panic_revert_error_response_recovery_message();
     assert!(message.contains("non-success panic-revert response"));
-    assert!(message.contains("Local emergency visibility restore"));
+    assert!(message.contains("No automatic cross-process recovery"));
     assert!(message.contains("leopardwm-cli status"));
 }
 
@@ -1016,4 +1015,42 @@ fn test_all_profile_configs_are_valid_toml() {
             result.err()
         );
     }
+}
+
+#[test]
+fn target_binary_candidates_follow_configured_target_triple() {
+    let target_dir = std::path::Path::new("workspace/target");
+    let candidates = target_binary_candidates(
+        target_dir,
+        Some("x86_64-pc-windows-msvc"),
+        "leopardwm.exe",
+    );
+    assert_eq!(
+        candidates,
+        vec![
+            target_dir
+                .join("x86_64-pc-windows-msvc")
+                .join("debug")
+                .join("leopardwm.exe"),
+            target_dir
+                .join("x86_64-pc-windows-msvc")
+                .join("release")
+                .join("leopardwm.exe"),
+        ]
+    );
+    assert!(candidates
+        .iter()
+        .all(|path| path.to_string_lossy().contains("x86_64-pc-windows-msvc")));
+}
+
+#[test]
+fn watchdog_daemon_sibling_uses_the_watchdog_directory() {
+    let watchdog = PathBuf::from("workspace/target/triple/debug/leopardwm-watchdog.exe");
+    let daemon = daemon_sibling_for_watchdog(&watchdog).expect("watchdog has a parent");
+    assert_eq!(daemon.parent(), watchdog.parent());
+    assert!(daemon
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .contains("leopardwm"));
 }

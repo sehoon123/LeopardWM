@@ -2,7 +2,7 @@
 
 use super::DaemonEvent;
 use crate::events::SubscribeStartup;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use leopardwm_ipc::{
     preferred_pipe_name, EventKind, IpcCommand, IpcEvent, IpcResponse, MAX_IPC_MESSAGE_SIZE,
 };
@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::windows::named_pipe::{PipeMode, ServerOptions};
+use tokio::net::windows::named_pipe::{NamedPipeServer, PipeMode, ServerOptions};
 use tokio::sync::{broadcast, mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, error, warn};
 
@@ -24,81 +24,137 @@ pub(crate) const IPC_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const STREAM_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 /// Poll interval for cooperative timed thread joins.
 const JOIN_WITH_TIMEOUT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// Maximum number of ordinary IPC handlers allowed at once.
+pub(crate) const MAX_IPC_COMMAND_HANDLERS: usize = 32;
+/// Maximum number of long-lived IPC event streams allowed at once.
+pub(crate) const MAX_IPC_SUBSCRIBERS: usize = 32;
 
-pub(crate) fn response_for_ipc_wait_failure(cmd: &IpcCommand, timed_out: bool) -> IpcResponse {
-    if matches!(cmd, IpcCommand::Stop | IpcCommand::PanicRevert) {
-        // Stop/panic_revert semantics are "shutdown initiated"; don't report as a hard failure
-        // if the responder channel closes or cleanup outlives the client timeout.
-        IpcResponse::Ok
-    } else if timed_out {
+/// The atomically-created first pipe instance that establishes daemon
+/// ownership before any window-management initialization begins.
+///
+/// The first server is retained until the regular accept loop begins, so a
+/// second daemon cannot pass a probe race and initialize before discovering
+/// that it lost ownership. The pipe security descriptor is deliberately held
+/// for the process lifetime because Tokio's raw security-attributes API only
+/// borrows it while creating later pipe instances.
+pub(crate) struct IpcServerOwnership {
+    pipe_name: String,
+    first_server: NamedPipeServer,
+    pipe_security_ptr: Option<usize>,
+}
+
+fn create_pipe_server(
+    pipe_name: &str,
+    first_pipe_instance: bool,
+    pipe_security_ptr: Option<usize>,
+) -> std::io::Result<NamedPipeServer> {
+    let mut options = ServerOptions::new();
+    options
+        .first_pipe_instance(first_pipe_instance)
+        .pipe_mode(PipeMode::Byte);
+    match pipe_security_ptr {
+        Some(ptr) => unsafe {
+            options
+                .create_with_security_attributes_raw(pipe_name, ptr as *mut std::ffi::c_void)
+        },
+        None => options.create(pipe_name),
+    }
+}
+
+/// Atomically acquire the daemon's IPC endpoint before daemon initialization.
+///
+/// `first_pipe_instance(true)` is the ownership primitive: creation succeeds
+/// for exactly one server generation. Callers must retain the returned value
+/// until passing it to [`run_ipc_server_with_ownership`]; dropping it releases
+/// ownership again.
+pub(crate) fn acquire_ipc_server_ownership() -> Result<IpcServerOwnership> {
+    let pipe_name = preferred_pipe_name();
+    let pipe_security = leopardwm_platform_win32::ipc_security::PipeSecurityAttributes::new();
+    if pipe_security.is_none() {
+        warn!("Could not build IPC pipe security attributes; using defaults (a non-elevated client may not reach an elevated daemon)");
+    }
+    let pipe_security_ptr = pipe_security.as_ref().map(|security| security.as_ptr() as usize);
+
+    let first_server = create_pipe_server(&pipe_name, true, pipe_security_ptr).with_context(|| {
+        format!(
+            "Failed to atomically acquire IPC ownership for '{}'; another daemon may already own it",
+            pipe_name
+        )
+    })?;
+
+    // `create_with_security_attributes_raw` borrows this descriptor. Later
+    // pipe instances need the same descriptor, so retain it for the daemon
+    // process lifetime rather than letting the backing allocation disappear.
+    if let Some(security) = pipe_security {
+        std::mem::forget(security);
+    }
+
+    Ok(IpcServerOwnership {
+        pipe_name,
+        first_server,
+        pipe_security_ptr,
+    })
+}
+
+pub(crate) fn response_for_ipc_wait_failure(_cmd: &IpcCommand, timed_out: bool) -> IpcResponse {
+    if timed_out {
         IpcResponse::error("Timed out waiting for daemon response")
     } else {
         IpcResponse::error("Failed to get response from daemon")
     }
 }
 
-/// Run the IPC server, accepting connections and dispatching commands.
+/// Backward-compatible server entry point. New daemon startup must acquire
+/// [`IpcServerOwnership`] before any state, hooks, or layout work, then call
+/// [`run_ipc_server_with_ownership`] with that retained ownership value.
 pub(crate) async fn run_ipc_server(event_tx: mpsc::Sender<DaemonEvent>) {
-    let mut is_first_instance = true;
-    let pipe_name = preferred_pipe_name();
-    // Held as a usize and leaked for the daemon's lifetime so the async server
-    // future stays Send without an `unsafe impl Send`.
-    let pipe_security_ptr: Option<usize> =
-        match leopardwm_platform_win32::ipc_security::PipeSecurityAttributes::new() {
-            Some(sec) => {
-                let ptr = sec.as_ptr() as usize;
-                std::mem::forget(sec);
-                Some(ptr)
-            }
-            None => {
-                warn!("Could not build IPC pipe security attributes; using defaults (a non-elevated client may not reach an elevated daemon)");
-                None
-            }
-        };
-    // Bound concurrent IPC handlers to avoid local task-exhaustion DoS.
-    // Stream-mode (Subscribe) connections drop their permit on entry so
-    // long-lived subscribers don't starve normal command handlers.
-    let connection_limit = Arc::new(Semaphore::new(32));
+    match crate::startup::acquire_daemon_instance_ownership() {
+        Ok(ownership) => run_ipc_server_with_ownership(event_tx, ownership).await,
+        Err(error) => error!(%error, "IPC server did not acquire daemon ownership"),
+    }
+}
+
+/// Run the IPC server after startup has atomically acquired its first pipe
+/// instance with [`acquire_ipc_server_ownership`].
+pub(crate) async fn run_ipc_server_with_ownership(
+    event_tx: mpsc::Sender<DaemonEvent>,
+    ownership: IpcServerOwnership,
+) {
+    let IpcServerOwnership {
+        pipe_name,
+        first_server,
+        pipe_security_ptr,
+    } = ownership;
+    let mut first_server = Some(first_server);
+    let command_limit = Arc::new(Semaphore::new(MAX_IPC_COMMAND_HANDLERS));
+    let subscriber_limit = Arc::new(Semaphore::new(MAX_IPC_SUBSCRIBERS));
 
     loop {
-        let permit = match connection_limit.clone().acquire_owned().await {
+        let permit = match command_limit.clone().acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => {
-                warn!("IPC connection limiter closed while accepting client");
+                warn!("IPC command limiter closed while accepting client");
                 return;
             }
         };
 
-        let mut opts = ServerOptions::new();
-        opts.first_pipe_instance(is_first_instance)
-            .pipe_mode(PipeMode::Byte);
-        let create_result = match pipe_security_ptr {
-            Some(ptr) => unsafe {
-                opts.create_with_security_attributes_raw(&pipe_name, ptr as *mut std::ffi::c_void)
-            },
-            None => opts.create(&pipe_name),
-        };
-        let server = match create_result {
-            Ok(s) => {
-                is_first_instance = false; // Subsequent instances don't need this flag
-                s
-            }
-            Err(e) => {
-                error!("Failed to create named pipe server: {}", e);
-                if is_first_instance {
-                    // If we can't create the first instance, maybe another daemon is running
-                    error!("Is another leopardwm daemon already running?");
+        let server = match first_server.take() {
+            Some(server) => server,
+            None => match create_pipe_server(&pipe_name, false, pipe_security_ptr) {
+                Ok(server) => server,
+                Err(error) => {
+                    error!(%error, "Failed to create additional named-pipe server instance");
+                    drop(permit);
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
                 }
-                drop(permit);
-                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                continue;
-            }
+            },
         };
 
         debug!("Waiting for client connection on {}", pipe_name);
 
-        if let Err(e) = server.connect().await {
-            error!("Failed to accept client connection: {}", e);
+        if let Err(error) = server.connect().await {
+            error!(%error, "Failed to accept client connection");
             drop(permit);
             continue;
         }
@@ -106,9 +162,10 @@ pub(crate) async fn run_ipc_server(event_tx: mpsc::Sender<DaemonEvent>) {
         debug!("Client connected");
 
         let event_tx = event_tx.clone();
+        let subscriber_limit = subscriber_limit.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_client(server, event_tx, permit).await {
-                warn!("Client handler error: {}", e);
+            if let Err(error) = handle_client(server, event_tx, permit, subscriber_limit).await {
+                warn!(%error, "Client handler error");
             }
         });
     }
@@ -161,11 +218,18 @@ where
     Ok(())
 }
 
+/// Whether an event belongs on a subscriber's stream. `Lagged` remains an
+/// unconditional control frame so a client knows its snapshot is stale.
+fn stream_event_matches_subscription(requested: &BTreeSet<EventKind>, event: &IpcEvent) -> bool {
+    matches!(event, IpcEvent::Lagged { .. }) || requested.contains(&event.kind())
+}
+
 /// Handle a single client connection.
 async fn handle_client(
-    pipe: tokio::net::windows::named_pipe::NamedPipeServer,
+    pipe: NamedPipeServer,
     event_tx: mpsc::Sender<DaemonEvent>,
     permit: OwnedSemaphorePermit,
+    subscriber_limit: Arc<Semaphore>,
 ) -> Result<()> {
     let (reader, mut writer) = tokio::io::split(pipe);
     let limited_reader = reader.take(MAX_IPC_MESSAGE_SIZE as u64);
@@ -215,7 +279,7 @@ async fn handle_client(
     // creation + snapshot read happen in one atomic critical section —
     // no event between handoff and receiver-creation can be lost.
     if let IpcCommand::Subscribe { events } = cmd {
-        return handle_subscribe(writer, event_tx, events, permit).await;
+        return handle_subscribe(writer, event_tx, events, permit, subscriber_limit).await;
     }
 
     // Everything else: existing oneshot path through the daemon main loop.
@@ -269,10 +333,27 @@ async fn handle_subscribe<W>(
     event_tx: mpsc::Sender<DaemonEvent>,
     requested_raw: BTreeSet<EventKind>,
     permit: OwnedSemaphorePermit,
+    subscriber_limit: Arc<Semaphore>,
 ) -> Result<()>
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
+    // Reserve a distinct stream permit before asking the main loop to create
+    // a broadcast receiver. This keeps both pipe handles and stream tasks
+    // bounded while immediately releasing ordinary command capacity.
+    let _stream_permit = match subscriber_limit.try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            write_response_frame(
+                &mut writer,
+                &IpcResponse::error("Too many active IPC subscribers; retry later"),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    drop(permit);
+
     // Empty-set means "all kinds" so users can do `Subscribe { events: {} }`
     // as a "give me everything" shortcut.
     let requested = if requested_raw.is_empty() {
@@ -323,11 +404,6 @@ where
         mut receiver,
     } = startup;
 
-    // Stream-mode connections release the connection-limiter permit
-    // before entering the long-lived loop. Otherwise 32 long-lived
-    // subscribers would starve all other IPC commands.
-    drop(permit);
-
     // Write ack
     if write_response_frame(&mut writer, &ack).await.is_err() {
         return Ok(());
@@ -356,7 +432,7 @@ where
         tokio::select! {
             recv = receiver.recv() => match recv {
                 Ok(ev) => {
-                    if !requested.contains(&ev.kind()) {
+                    if !stream_event_matches_subscription(&requested, &ev) {
                         continue;
                     }
                     if write_event_frame(&mut writer, &ev).await.is_err() {
@@ -374,7 +450,9 @@ where
             _ = heartbeat.tick() => {
                 let uptime = stream_started.elapsed().as_secs();
                 let hb = IpcEvent::Heartbeat { uptime_seconds: uptime };
-                if write_event_frame(&mut writer, &hb).await.is_err() {
+                if stream_event_matches_subscription(&requested, &hb)
+                    && write_event_frame(&mut writer, &hb).await.is_err()
+                {
                     return Ok(());
                 }
             }
@@ -488,5 +566,43 @@ pub(crate) fn join_with_timeout(
             return false;
         }
         std::thread::sleep(JOIN_WITH_TIMEOUT_POLL_INTERVAL);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn heartbeat_respects_subscription_filter() {
+        let requested = BTreeSet::from([EventKind::Workspace]);
+        let heartbeat = IpcEvent::Heartbeat { uptime_seconds: 1 };
+        assert!(!stream_event_matches_subscription(&requested, &heartbeat));
+
+        let requested = BTreeSet::from([EventKind::Heartbeat]);
+        assert!(stream_event_matches_subscription(&requested, &heartbeat));
+    }
+
+    #[test]
+    fn lagged_is_delivered_as_unconditional_stream_control() {
+        let requested = BTreeSet::from([EventKind::Workspace]);
+        assert!(stream_event_matches_subscription(
+            &requested,
+            &IpcEvent::Lagged { skipped: 1 }
+        ));
+    }
+
+    #[test]
+    fn subscriber_limit_is_independent_from_command_limit() {
+        let subscriber_limit = Arc::new(Semaphore::new(1));
+        let command_limit = Arc::new(Semaphore::new(1));
+        let stream_permit = subscriber_limit
+            .clone()
+            .try_acquire_owned()
+            .expect("first subscriber fits");
+        assert!(subscriber_limit.clone().try_acquire_owned().is_err());
+        assert!(command_limit.clone().try_acquire_owned().is_ok());
+        drop(stream_permit);
+        assert!(subscriber_limit.clone().try_acquire_owned().is_ok());
     }
 }

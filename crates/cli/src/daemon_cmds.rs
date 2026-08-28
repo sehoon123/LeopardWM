@@ -5,18 +5,19 @@ use crate::ipc_client::{
     error_chain_has_command_timeout, error_chain_has_connect_timeout,
     error_chain_has_disconnected_before_response, error_chain_has_pipe_not_found,
     error_chain_indicates_pipe_not_found_timeout, is_non_success_response, open_pipe_with_retry,
-    probe_daemon_running, send_command, wait_for_daemon, wait_for_daemon_shutdown,
-    IPC_CONNECT_TIMEOUT, IPC_NOT_FOUND_FAST_FAIL_AFTER, SHUTDOWN_CONFIRM_TIMEOUT,
+    parse_ipc_response_frame, probe_daemon_running, read_ipc_frame_bounded, send_command,
+    wait_for_daemon, wait_for_daemon_shutdown, IPC_CONNECT_TIMEOUT, IPC_NOT_FOUND_FAST_FAIL_AFTER,
+    SHUTDOWN_CONFIRM_TIMEOUT,
 };
 use crate::output::print_response;
 use anyhow::{Context, Result};
-use leopardwm_ipc::{IpcCommand, IpcResponse};
+use leopardwm_ipc::{IpcCommand, IpcResponse, MAX_IPC_MESSAGE_SIZE};
 use leopardwm_platform_win32::uncloak_all_visible_windows;
 use std::fs::File;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 
 fn watchdog_binary_name() -> &'static str {
     if cfg!(windows) {
@@ -34,28 +35,77 @@ fn daemon_binary_name() -> &'static str {
     }
 }
 
-pub(crate) fn find_daemon_binary() -> Option<PathBuf> {
+fn configured_cargo_target(cwd: &Path) -> Option<String> {
+    if let Ok(target) = std::env::var("CARGO_BUILD_TARGET") {
+        if !target.trim().is_empty() {
+            return Some(target);
+        }
+    }
+
+    cwd.ancestors().find_map(|dir| {
+        let config_path = dir.join(".cargo").join("config.toml");
+        let content = std::fs::read_to_string(config_path).ok()?;
+        let config = content.parse::<toml::Value>().ok()?;
+        config
+            .get("build")?
+            .get("target")?
+            .as_str()
+            .filter(|target| !target.trim().is_empty())
+            .map(str::to_owned)
+    })
+}
+
+fn cargo_target_dir(cwd: &Path) -> PathBuf {
+    match std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from) {
+        Some(path) if path.is_absolute() => path,
+        Some(path) => cwd.join(path),
+        None => cwd.join("target"),
+    }
+}
+
+/// Candidate paths Cargo uses for a binary when a configured target triple is
+/// present. Do not fall back to an unqualified target directory in that case:
+/// it may contain a binary for a different target or an older build.
+pub(crate) fn target_binary_candidates(
+    target_dir: &Path,
+    target_triple: Option<&str>,
+    binary_name: &str,
+) -> Vec<PathBuf> {
+    let profiles = ["debug", "release"];
+    match target_triple {
+        Some(target) => profiles
+            .into_iter()
+            .map(|profile| target_dir.join(target).join(profile).join(binary_name))
+            .collect(),
+        None => profiles
+            .into_iter()
+            .map(|profile| target_dir.join(profile).join(binary_name))
+            .collect(),
+    }
+}
+
+fn find_binary_in_source_tree(cwd: &Path, binary_name: &str) -> Option<PathBuf> {
+    let target_dir = cargo_target_dir(cwd);
+    let target_triple = configured_cargo_target(cwd);
+    target_binary_candidates(&target_dir, target_triple.as_deref(), binary_name)
+        .into_iter()
+        .find(|candidate| candidate.exists())
+}
+
+fn find_binary(binary_name: &str) -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let exe_dir = exe.parent()?;
-    let candidate = exe_dir.join(daemon_binary_name());
-    if candidate.exists() {
-        return Some(candidate);
+    let sibling = exe_dir.join(binary_name);
+    if sibling.exists() {
+        return Some(sibling);
     }
 
     let cwd = std::env::current_dir().ok()?;
-    let debug = cwd.join("target").join("debug").join(daemon_binary_name());
-    if debug.exists() {
-        return Some(debug);
-    }
-    let release = cwd
-        .join("target")
-        .join("release")
-        .join(daemon_binary_name());
-    if release.exists() {
-        return Some(release);
-    }
+    find_binary_in_source_tree(&cwd, binary_name)
+}
 
-    None
+pub(crate) fn find_daemon_binary() -> Option<PathBuf> {
+    find_binary(daemon_binary_name())
 }
 
 fn ensure_daemon_binary() -> Result<PathBuf> {
@@ -122,30 +172,12 @@ fn spawn_daemon(safe_mode: bool) -> Result<u32> {
     Ok(child.id())
 }
 
-fn find_watchdog_binary() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let exe_dir = exe.parent()?;
-    let candidate = exe_dir.join(watchdog_binary_name());
-    if candidate.exists() {
-        return Some(candidate);
-    }
+pub(crate) fn find_watchdog_binary() -> Option<PathBuf> {
+    find_binary(watchdog_binary_name())
+}
 
-    let cwd = std::env::current_dir().ok()?;
-    let debug = cwd
-        .join("target")
-        .join("debug")
-        .join(watchdog_binary_name());
-    if debug.exists() {
-        return Some(debug);
-    }
-    let release = cwd
-        .join("target")
-        .join("release")
-        .join(watchdog_binary_name());
-    if release.exists() {
-        return Some(release);
-    }
-    None
+pub(crate) fn daemon_sibling_for_watchdog(watchdog_path: &Path) -> Option<PathBuf> {
+    watchdog_path.parent().map(|dir| dir.join(daemon_binary_name()))
 }
 
 fn spawn_watchdog(safe_mode: bool) -> Result<u32> {
@@ -160,10 +192,18 @@ fn spawn_watchdog(safe_mode: bool) -> Result<u32> {
         return spawn_daemon(safe_mode);
     };
 
-    // Make sure the daemon binary is buildable / present too — the watchdog
-    // looks for it next to itself, so resolve it via the same search the
-    // direct-spawn path uses (covers the "ran from cargo target/" case).
-    ensure_daemon_binary()?;
+    // The watchdog resolves the daemon strictly beside its own executable.
+    // Validate that exact sibling instead of accepting a daemon from another
+    // target/profile directory that the watchdog could never launch.
+    let daemon_sibling = daemon_sibling_for_watchdog(&watchdog_path)
+        .context("Watchdog binary has no parent directory")?;
+    if !daemon_sibling.is_file() {
+        anyhow::bail!(
+            "Watchdog at '{}' requires daemon sibling '{}'. Build/package leopardwm and leopardwm-watchdog together for the same target/profile.",
+            watchdog_path.display(),
+            daemon_sibling.display(),
+        );
+    }
 
     let log_dir = leopardwm_ipc::log_dir();
     std::fs::create_dir_all(&log_dir).context("Failed to create log directory")?;
@@ -204,20 +244,24 @@ pub(crate) fn safe_mode_existing_daemon_message() -> &'static str {
     "Daemon is already running. '--safe-mode' only applies when starting a new daemon. Stop it with 'leopardwm-cli stop', then run 'leopardwm-cli run --safe-mode'."
 }
 
+pub(crate) fn hard_crash_recovery_unavailable_message() -> &'static str {
+    "Automatic cross-process recovery was not attempted because the daemon's window-style ownership cannot be verified after a hard crash. Run `leopardwm-cli emergency-uncloak` only if you explicitly want a global visibility restore; maximize-box state cannot be safely restored without a durable owned recovery record."
+}
+
 pub(crate) fn panic_revert_not_running_message() -> &'static str {
-    "Daemon is not running. Local emergency visibility restore was executed (same action as `leopardwm-cli emergency-uncloak`)."
+    "Daemon is not running. No automatic cross-process recovery was attempted; ownership cannot be verified. Run `leopardwm-cli emergency-uncloak` only if you explicitly want a global visibility restore."
 }
 
 pub(crate) fn panic_revert_unconfirmed_message() -> &'static str {
-    "Daemon disconnected before confirming panic-revert completion. Local emergency visibility restore was executed. Verify windows are visible, run 'leopardwm-cli status' (it should fail if daemon exited), and run 'leopardwm-cli stop' if the daemon still responds."
+    "Daemon disconnected before confirming panic-revert completion. No automatic cross-process recovery was attempted because ownership cannot be verified. Run `leopardwm-cli status` (it should fail if daemon exited), and use `leopardwm-cli emergency-uncloak` only if you explicitly want a global visibility restore."
 }
 
 pub(crate) fn panic_revert_timeout_recovery_message() -> &'static str {
-    "Timed out waiting for panic-revert response. Local emergency visibility restore was executed. Run 'leopardwm-cli status' to confirm daemon shutdown."
+    "Timed out waiting for panic-revert response. No automatic cross-process recovery was attempted because ownership cannot be verified. Run `leopardwm-cli status` to confirm daemon shutdown."
 }
 
 pub(crate) fn stop_timeout_recovery_message() -> &'static str {
-    "Timed out waiting for daemon stop confirmation. Run 'leopardwm-cli status' to verify shutdown; if windows remain hidden, run 'leopardwm-cli panic-revert' or `leopardwm-cli emergency-uncloak`."
+    "Timed out waiting for daemon stop confirmation. No automatic cross-process recovery was attempted; run `leopardwm-cli status` to verify shutdown. Use `leopardwm-cli emergency-uncloak` only if you explicitly want a global visibility restore."
 }
 
 pub(crate) fn apply_not_running_message() -> &'static str {
@@ -225,23 +269,23 @@ pub(crate) fn apply_not_running_message() -> &'static str {
 }
 
 pub(crate) fn apply_timeout_recovery_message() -> &'static str {
-    "Timed out waiting for `apply` response. If desktop control degrades, run `leopardwm-cli panic-revert` first, or run `leopardwm-cli emergency-uncloak` from any reachable terminal."
+    "Timed out waiting for `apply` response. No automatic cross-process recovery was attempted because ownership cannot be verified. Run `leopardwm-cli status` before retrying."
 }
 
 pub(crate) fn apply_unconfirmed_recovery_message() -> &'static str {
-    "Apply completion was not confirmed. Local emergency visibility restore was executed. Verify windows are visible, then run `leopardwm-cli status` before retrying."
+    "Apply completion was not confirmed. No automatic cross-process recovery was attempted because ownership cannot be verified. Verify daemon status before retrying."
 }
 
 pub(crate) fn apply_error_response_recovery_message() -> &'static str {
-    "Daemon returned a non-success apply response. Local emergency visibility restore was executed. Verify windows are visible, then run `leopardwm-cli status` before retrying."
+    "Daemon returned a non-success apply response. No automatic cross-process recovery was attempted because ownership cannot be verified. Verify daemon status before retrying."
 }
 
 pub(crate) fn stop_error_response_recovery_message() -> &'static str {
-    "Daemon returned a non-success stop response. Local emergency visibility restore was executed. Treat shutdown as unconfirmed and run `leopardwm-cli status`."
+    "Daemon returned a non-success stop response. No automatic cross-process recovery was attempted; treat shutdown as unconfirmed and run `leopardwm-cli status`."
 }
 
 pub(crate) fn panic_revert_error_response_recovery_message() -> &'static str {
-    "Daemon returned a non-success panic-revert response. Local emergency visibility restore was executed. Verify windows are visible and run `leopardwm-cli status`."
+    "Daemon returned a non-success panic-revert response. No automatic cross-process recovery was attempted because ownership cannot be verified. Run `leopardwm-cli status`."
 }
 
 pub(crate) fn apply_non_success_recovery_reason() -> &'static str {
@@ -261,17 +305,21 @@ pub(crate) fn stop_race_shutdown_message() -> &'static str {
 }
 
 pub(crate) fn stop_unconfirmed_message() -> &'static str {
-    "Daemon stop was not confirmed. Treat this as unconfirmed shutdown: run 'leopardwm-cli status', and if windows remain hidden run 'leopardwm-cli panic-revert' or `leopardwm-cli emergency-uncloak`."
+    "Daemon stop was not confirmed. Treat this as unconfirmed shutdown: run 'leopardwm-cli status'. Use `leopardwm-cli emergency-uncloak` only if you explicitly want a global visibility restore."
 }
 
-fn local_emergency_restore_success_message() -> &'static str {
-    "Executed local emergency visibility restore (best-effort)."
-}
-
-fn run_local_emergency_visibility_restore(reason: &str) -> Result<()> {
-    uncloak_all_visible_windows();
-    println!("{}", local_emergency_restore_success_message());
+/// Fail closed after an unconfirmed cross-process failure. The daemon's
+/// in-memory style ledger vanished with the process, so blindly touching HWNDs
+/// could mutate a recycled or foreign window instead of recovering one it owned.
+fn report_unproven_cross_process_recovery(reason: &str) -> Result<()> {
+    println!("{}", hard_crash_recovery_unavailable_message());
     println!("Recovery trigger: {}", reason);
+    Ok(())
+}
+
+fn run_explicit_global_visibility_restore() -> Result<()> {
+    uncloak_all_visible_windows();
+    println!("Executed explicit global visibility restore (best-effort). Only cloaking was addressed; maximize-box state remains unavailable without a durable owned recovery record.");
     Ok(())
 }
 
@@ -307,8 +355,8 @@ pub(crate) async fn handle_run(
     let response = send_apply_with_recovery().await?;
     print_response(&response);
     if is_non_success_response(&response) {
-        run_local_emergency_visibility_restore(apply_non_success_recovery_reason())
-            .context("Failed to execute local emergency visibility restore")?;
+        report_unproven_cross_process_recovery(apply_non_success_recovery_reason())
+            .context("Failed to report unproven cross-process recovery")?;
         anyhow::bail!(apply_error_response_recovery_message());
     }
 
@@ -325,23 +373,23 @@ async fn send_apply_with_recovery() -> Result<IpcResponse> {
             anyhow::bail!(apply_not_running_message());
         }
         Err(err) if error_chain_has_command_timeout(&err) => {
-            run_local_emergency_visibility_restore("apply response timeout")
-                .context("Failed to execute local emergency visibility restore")?;
+            report_unproven_cross_process_recovery("apply response timeout")
+                .context("Failed to report unproven cross-process recovery")?;
             anyhow::bail!(apply_timeout_recovery_message());
         }
         Err(err) if error_chain_has_disconnected_before_response(&err) => {
-            run_local_emergency_visibility_restore("apply daemon disconnected before response")
-                .context("Failed to execute local emergency visibility restore")?;
+            report_unproven_cross_process_recovery("apply daemon disconnected before response")
+                .context("Failed to report unproven cross-process recovery")?;
             anyhow::bail!(apply_unconfirmed_recovery_message());
         }
         Err(err) if error_chain_has_connect_timeout(&err) => {
-            run_local_emergency_visibility_restore("apply IPC connect timeout")
-                .context("Failed to execute local emergency visibility restore")?;
+            report_unproven_cross_process_recovery("apply IPC connect timeout")
+                .context("Failed to report unproven cross-process recovery")?;
             anyhow::bail!(apply_unconfirmed_recovery_message());
         }
         Err(err) => {
-            run_local_emergency_visibility_restore("apply unexpected IPC failure")
-                .context("Failed to execute local emergency visibility restore")?;
+            report_unproven_cross_process_recovery("apply unexpected IPC failure")
+                .context("Failed to report unproven cross-process recovery")?;
             anyhow::bail!(
                 "{}\nUnderlying IPC error: {}",
                 apply_unconfirmed_recovery_message(),
@@ -355,8 +403,8 @@ pub(crate) async fn handle_stop() -> Result<()> {
     let daemon_running = probe_daemon_running()?;
 
     if !daemon_running {
-        run_local_emergency_visibility_restore("stop requested while daemon not running")
-            .context("Failed to execute local emergency visibility restore")?;
+        report_unproven_cross_process_recovery("stop requested while daemon not running")
+            .context("Failed to report unproven cross-process recovery")?;
         println!("Daemon not running.");
         return Ok(());
     }
@@ -364,8 +412,8 @@ pub(crate) async fn handle_stop() -> Result<()> {
     let response = match send_command(IpcCommand::Stop).await {
         Ok(response) => response,
         Err(err) if error_chain_has_pipe_not_found(&err) => {
-            run_local_emergency_visibility_restore("stop lost daemon connection before response")
-                .context("Failed to execute local emergency visibility restore")?;
+            report_unproven_cross_process_recovery("stop lost daemon connection before response")
+                .context("Failed to report unproven cross-process recovery")?;
             anyhow::bail!(
                 "{}\n{}",
                 stop_race_shutdown_message(),
@@ -373,8 +421,8 @@ pub(crate) async fn handle_stop() -> Result<()> {
             );
         }
         Err(err) if error_chain_has_disconnected_before_response(&err) => {
-            run_local_emergency_visibility_restore("stop daemon disconnected before response")
-                .context("Failed to execute local emergency visibility restore")?;
+            report_unproven_cross_process_recovery("stop daemon disconnected before response")
+                .context("Failed to report unproven cross-process recovery")?;
             anyhow::bail!(
                 "{}\n{}",
                 stop_race_shutdown_message(),
@@ -382,8 +430,8 @@ pub(crate) async fn handle_stop() -> Result<()> {
             );
         }
         Err(err) if error_chain_has_command_timeout(&err) => {
-            run_local_emergency_visibility_restore("stop response timeout")
-                .context("Failed to execute local emergency visibility restore")?;
+            report_unproven_cross_process_recovery("stop response timeout")
+                .context("Failed to report unproven cross-process recovery")?;
             anyhow::bail!(
                 "{}\n{}",
                 stop_timeout_recovery_message(),
@@ -391,8 +439,8 @@ pub(crate) async fn handle_stop() -> Result<()> {
             );
         }
         Err(err) if error_chain_has_connect_timeout(&err) => {
-            run_local_emergency_visibility_restore("stop IPC connect timeout")
-                .context("Failed to execute local emergency visibility restore")?;
+            report_unproven_cross_process_recovery("stop IPC connect timeout")
+                .context("Failed to report unproven cross-process recovery")?;
             anyhow::bail!(
                 "{}\n{}",
                 stop_timeout_recovery_message(),
@@ -400,8 +448,8 @@ pub(crate) async fn handle_stop() -> Result<()> {
             );
         }
         Err(err) => {
-            run_local_emergency_visibility_restore("stop unexpected IPC failure")
-                .context("Failed to execute local emergency visibility restore")?;
+            report_unproven_cross_process_recovery("stop unexpected IPC failure")
+                .context("Failed to report unproven cross-process recovery")?;
             anyhow::bail!(
                 "{}\nUnderlying IPC error: {}",
                 stop_unconfirmed_message(),
@@ -412,8 +460,8 @@ pub(crate) async fn handle_stop() -> Result<()> {
 
     print_response(&response);
     if is_non_success_response(&response) {
-        run_local_emergency_visibility_restore(stop_non_success_recovery_reason())
-            .context("Failed to execute local emergency visibility restore")?;
+        report_unproven_cross_process_recovery(stop_non_success_recovery_reason())
+            .context("Failed to report unproven cross-process recovery")?;
         anyhow::bail!(
             "{}\n{}",
             stop_error_response_recovery_message(),
@@ -424,8 +472,8 @@ pub(crate) async fn handle_stop() -> Result<()> {
     match wait_for_daemon_shutdown(SHUTDOWN_CONFIRM_TIMEOUT).await {
         Ok(true) => {}
         Ok(false) => {
-            run_local_emergency_visibility_restore("stop shutdown confirmation timeout")
-                .context("Failed to execute local emergency visibility restore")?;
+            report_unproven_cross_process_recovery("stop shutdown confirmation timeout")
+                .context("Failed to report unproven cross-process recovery")?;
             anyhow::bail!(
                 "{}\n{}",
                 stop_timeout_recovery_message(),
@@ -433,8 +481,8 @@ pub(crate) async fn handle_stop() -> Result<()> {
             );
         }
         Err(err) => {
-            run_local_emergency_visibility_restore("stop shutdown confirmation probe failed")
-                .context("Failed to execute local emergency visibility restore")?;
+            report_unproven_cross_process_recovery("stop shutdown confirmation probe failed")
+                .context("Failed to report unproven cross-process recovery")?;
             anyhow::bail!(
                 "Failed to confirm daemon shutdown after stop: {}.\n{}",
                 err,
@@ -448,8 +496,8 @@ pub(crate) async fn handle_stop() -> Result<()> {
 pub(crate) async fn handle_panic_revert() -> Result<()> {
     let daemon_running = probe_daemon_running()?;
     if !daemon_running {
-        run_local_emergency_visibility_restore("panic-revert requested while daemon not running")
-            .context("Failed to execute local emergency visibility restore")?;
+        report_unproven_cross_process_recovery("panic-revert requested while daemon not running")
+            .context("Failed to report unproven cross-process recovery")?;
         println!("{}", panic_revert_not_running_message());
         return Ok(());
     }
@@ -457,32 +505,32 @@ pub(crate) async fn handle_panic_revert() -> Result<()> {
     let response = match send_command(IpcCommand::PanicRevert).await {
         Ok(response) => response,
         Err(err) if error_chain_has_pipe_not_found(&err) => {
-            run_local_emergency_visibility_restore(
+            report_unproven_cross_process_recovery(
                 "panic-revert lost daemon connection before response",
             )
-            .context("Failed to execute local emergency visibility restore")?;
+            .context("Failed to report unproven cross-process recovery")?;
             anyhow::bail!(panic_revert_unconfirmed_message());
         }
         Err(err) if error_chain_has_disconnected_before_response(&err) => {
-            run_local_emergency_visibility_restore(
+            report_unproven_cross_process_recovery(
                 "panic-revert daemon disconnected before response",
             )
-            .context("Failed to execute local emergency visibility restore")?;
+            .context("Failed to report unproven cross-process recovery")?;
             anyhow::bail!(panic_revert_unconfirmed_message());
         }
         Err(err) if error_chain_has_command_timeout(&err) => {
-            run_local_emergency_visibility_restore("panic-revert response timeout")
-                .context("Failed to execute local emergency visibility restore")?;
+            report_unproven_cross_process_recovery("panic-revert response timeout")
+                .context("Failed to report unproven cross-process recovery")?;
             anyhow::bail!(panic_revert_timeout_recovery_message());
         }
         Err(err) if error_chain_has_connect_timeout(&err) => {
-            run_local_emergency_visibility_restore("panic-revert IPC connect timeout")
-                .context("Failed to execute local emergency visibility restore")?;
+            report_unproven_cross_process_recovery("panic-revert IPC connect timeout")
+                .context("Failed to report unproven cross-process recovery")?;
             anyhow::bail!(panic_revert_timeout_recovery_message());
         }
         Err(err) => {
-            run_local_emergency_visibility_restore("panic-revert unexpected IPC failure")
-                .context("Failed to execute local emergency visibility restore")?;
+            report_unproven_cross_process_recovery("panic-revert unexpected IPC failure")
+                .context("Failed to report unproven cross-process recovery")?;
             anyhow::bail!(
                 "{}\nUnderlying IPC error: {}",
                 panic_revert_unconfirmed_message(),
@@ -493,8 +541,8 @@ pub(crate) async fn handle_panic_revert() -> Result<()> {
 
     print_response(&response);
     if is_non_success_response(&response) {
-        run_local_emergency_visibility_restore(panic_revert_non_success_recovery_reason())
-            .context("Failed to execute local emergency visibility restore")?;
+        report_unproven_cross_process_recovery(panic_revert_non_success_recovery_reason())
+            .context("Failed to report unproven cross-process recovery")?;
         anyhow::bail!(
             "{}\n{}",
             panic_revert_error_response_recovery_message(),
@@ -505,15 +553,15 @@ pub(crate) async fn handle_panic_revert() -> Result<()> {
     match wait_for_daemon_shutdown(SHUTDOWN_CONFIRM_TIMEOUT).await {
         Ok(true) => {}
         Ok(false) => {
-            run_local_emergency_visibility_restore("panic-revert shutdown confirmation timeout")
-                .context("Failed to execute local emergency visibility restore")?;
+            report_unproven_cross_process_recovery("panic-revert shutdown confirmation timeout")
+                .context("Failed to report unproven cross-process recovery")?;
             anyhow::bail!(panic_revert_unconfirmed_message());
         }
         Err(_) => {
-            run_local_emergency_visibility_restore(
+            report_unproven_cross_process_recovery(
                 "panic-revert shutdown confirmation probe failed",
             )
-            .context("Failed to execute local emergency visibility restore")?;
+            .context("Failed to report unproven cross-process recovery")?;
             anyhow::bail!(panic_revert_unconfirmed_message());
         }
     }
@@ -536,8 +584,8 @@ pub(crate) async fn handle_status() -> Result<()> {
 }
 
 pub(crate) fn handle_emergency_uncloak() -> Result<()> {
-    run_local_emergency_visibility_restore("explicit emergency-uncloak request")
-        .context("Failed to execute local emergency visibility restore")
+    run_explicit_global_visibility_restore()
+        .context("Failed to execute explicit global visibility restore")
 }
 
 /// Subscribe to daemon events and stream them as newline-delimited JSON
@@ -592,23 +640,15 @@ pub(crate) async fn handle_subscribe(events: Option<Vec<String>>) -> Result<()> 
         .await
         .context("Failed to send Subscribe command")?;
 
-    // Read the Subscribed ack as IpcResponse — last frame parsed via
-    // that type. After this, the parser switches to IpcEvent. We
-    // intentionally do NOT use `reader.take(MAX_IPC_MESSAGE_SIZE)` here
-    // (that would cap *total* bytes, killing long-lived subscribers
-    // after ~64 KiB of events). Per-frame size guarding is the daemon's
-    // responsibility (write_event_frame caps each frame at 64 KiB).
+    // The subscription is long-lived, so bound each individual frame rather
+    // than wrapping the reader in a lifetime-sized `take`. This rejects a
+    // malicious ack/event without preventing many valid frames from flowing.
     let mut buf = tokio::io::BufReader::new(reader);
-    let mut line = String::new();
-    let bytes = buf
-        .read_line(&mut line)
-        .await
-        .context("Failed to read Subscribed ack")?;
-    if bytes == 0 {
-        anyhow::bail!("Daemon disconnected before sending Subscribed ack");
-    }
-    let ack: IpcResponse = serde_json::from_str(line.trim())
-        .with_context(|| format!("Failed to parse Subscribed ack: {}", line.trim()))?;
+    let ack_frame = read_ipc_frame_bounded(&mut buf, MAX_IPC_MESSAGE_SIZE)
+        .await?
+        .context("Daemon disconnected before sending Subscribed ack")?;
+    let ack = parse_ipc_response_frame(&ack_frame, MAX_IPC_MESSAGE_SIZE)
+        .context("Failed to parse Subscribed ack")?;
     match ack {
         IpcResponse::Subscribed { .. } => {}
         IpcResponse::Error { message } => anyhow::bail!("Subscribe rejected: {}", message),
@@ -618,17 +658,11 @@ pub(crate) async fn handle_subscribe(events: Option<Vec<String>>) -> Result<()> 
     // Each frame is a single line of JSON; raw passthrough to stdout so
     // users can pipe into `jq` etc.
     let mut stdout = tokio::io::stdout();
-    let mut event_line = Vec::new();
     loop {
-        event_line.clear();
-        let bytes = buf
-            .read_until(b'\n', &mut event_line)
-            .await
-            .context("Failed to read event frame")?;
-        if bytes == 0 {
+        let Some(event_line) = read_ipc_frame_bounded(&mut buf, MAX_IPC_MESSAGE_SIZE).await? else {
             // Daemon closed the pipe (shutdown, restart, etc.)
             break;
-        }
+        };
         // Validate as IpcEvent so we surface daemon-side bugs noisily,
         // but pass the raw bytes through to stdout to preserve any
         // formatting subtleties for jq consumers.

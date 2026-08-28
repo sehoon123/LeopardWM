@@ -1328,15 +1328,19 @@ fn test_ipc_response_timeout_is_reasonable() {
 }
 
 #[test]
-fn test_response_for_ipc_wait_failure_shutdown_commands_return_ok() {
-    assert_eq!(
-        response_for_ipc_wait_failure(&IpcCommand::Stop, true),
-        IpcResponse::Ok
-    );
-    assert_eq!(
-        response_for_ipc_wait_failure(&IpcCommand::PanicRevert, false),
-        IpcResponse::Ok
-    );
+fn test_response_for_ipc_wait_failure_shutdown_commands_require_acknowledgement() {
+    match response_for_ipc_wait_failure(&IpcCommand::Stop, true) {
+        IpcResponse::Error { message } => {
+            assert!(message.contains("Timed out waiting for daemon response"));
+        }
+        other => panic!("Expected stop timeout error response, got {other:?}"),
+    }
+    match response_for_ipc_wait_failure(&IpcCommand::PanicRevert, false) {
+        IpcResponse::Error { message } => {
+            assert!(message.contains("Failed to get response from daemon"));
+        }
+        other => panic!("Expected panic-revert responder error response, got {other:?}"),
+    }
 }
 
 #[test]

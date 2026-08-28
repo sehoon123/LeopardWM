@@ -3,7 +3,7 @@
 //! LeopardWM Watchdog
 //!
 //! Spawns the daemon (`leopardwm.exe`) as a child process, monitors its
-//! exit code, runs the panic-revert recovery path on abnormal exit, and
+//! exit code, reports fail-closed recovery limits on abnormal exit, and
 //! optionally auto-restarts within a crash-loop budget. Designed to be
 //! invoked transparently by `lwm run`; can also be run directly by users
 //! who want the supervision layer.
@@ -192,8 +192,8 @@ fn run(log_paths: &WatchdogLogPaths) -> Result<()> {
                 // Fire-and-forget: the toast renders on the shared worker
                 // thread so we don't delay the daemon restart.
                 leopardwm_platform_win32::toast::show_toast(
-                    "LeopardWM recovered",
-                    "The daemon crashed and was restarted automatically. Your windows are visible again.",
+                    "LeopardWM restarted after a crash",
+                    "Automatic cross-process window recovery was not attempted because ownership could not be verified. Verify window visibility; hard-crash style recovery requires a future owned recovery record.",
                 );
                 info!(attempt, "Restarting daemon after crash");
             }
@@ -277,15 +277,16 @@ fn spawn_daemon(path: &Path, args: &[String], error_log_path: &Path) -> Result<E
     child.wait().context("failed to wait on daemon child")
 }
 
+fn hard_crash_recovery_unavailable_message() -> &'static str {
+    "Hard-crash recovery did not modify windows: the daemon's process-local style ledger is gone, so ownership of a HWND cannot be proven safely. Visibility and maximize-box recovery require a durable record that validates the original window identity before mutation."
+}
+
 fn recover_from_crash() {
-    // Only call uncloak — `restore_maximizebox_panic_recovery()` reads
-    // a process-local set populated by the daemon, so calling it from
-    // the watchdog process is a no-op. The daemon's own panic hook
-    // handles maximizebox restore in-process when a Rust panic fires;
-    // a hard kill (taskkill /F) skips that and leaves maximizebox state
-    // unrestored — the user can run `lwm panic-revert` if needed.
-    info!("Running emergency uncloak");
-    leopardwm_platform_win32::uncloak_all_visible_windows();
+    // A hard kill bypasses the daemon's in-process panic hook and destroys its
+    // style ledger. Do not call global uncloak or style APIs from this process:
+    // HWND values can be recycled and the watchdog cannot prove which windows
+    // LeopardWM owned. Fail closed and make the limitation explicit instead.
+    warn!("{}", hard_crash_recovery_unavailable_message());
 }
 
 fn install_kill_on_close_job() -> Result<()> {
@@ -392,5 +393,13 @@ mod tests {
                 record_crash_and_decide(&mut crashes, t(i * 120), Duration::from_secs(60), 3);
             assert_eq!(decision, CrashDecision::Restart { attempt: 1 });
         }
+    }
+
+    #[test]
+    fn hard_crash_recovery_fails_closed_without_owned_ledger() {
+        let message = hard_crash_recovery_unavailable_message();
+        assert!(message.contains("did not modify windows"));
+        assert!(message.contains("ownership"));
+        assert!(message.contains("durable record"));
     }
 }

@@ -3,8 +3,10 @@
 use crate::args::ConfigAction;
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
-use std::fs;
-use std::path::PathBuf;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Generate default configuration content.
 pub(crate) fn generate_default_config() -> String {
@@ -83,6 +85,96 @@ pub(crate) fn config_backup_path(config_path: &std::path::Path) -> PathBuf {
     config_path.with_extension("toml.bak")
 }
 
+static CONFIG_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn create_config_temp_file(destination: &Path) -> io::Result<(PathBuf, File)> {
+    let parent = destination.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let file_name = destination.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "config destination must include a file name",
+        )
+    })?;
+
+    for _ in 0..128 {
+        let sequence = CONFIG_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let temporary = parent.join(format!(
+            ".{}.{}.{}.tmp",
+            file_name.to_string_lossy(),
+            std::process::id(),
+            sequence
+        ));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+        {
+            Ok(file) => return Ok((temporary, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique temporary config file",
+    ))
+}
+
+/// Write a complete sibling temporary file, flush it, then atomically replace
+/// the live config. A failed write or rename leaves the old destination intact.
+fn atomic_replace_config_with<F>(destination: &Path, write_contents: F) -> Result<()>
+where
+    F: FnOnce(&mut File) -> io::Result<()>,
+{
+    let (temporary, mut file) = create_config_temp_file(destination).with_context(|| {
+        format!(
+            "Failed to create temporary config near {}",
+            destination.display()
+        )
+    })?;
+
+    let write_result = write_contents(&mut file)
+        .and_then(|()| file.flush())
+        .and_then(|()| file.sync_all());
+    drop(file);
+
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temporary);
+        return Err(error).with_context(|| {
+            format!(
+                "Failed to write temporary config for {}",
+                destination.display()
+            )
+        });
+    }
+
+    if let Err(error) = fs::rename(&temporary, destination) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error).with_context(|| {
+            format!(
+                "Failed to atomically replace config destination {}",
+                destination.display()
+            )
+        });
+    }
+
+    Ok(())
+}
+
+fn atomic_write_config(destination: &Path, content: &[u8]) -> Result<()> {
+    atomic_replace_config_with(destination, |file| file.write_all(content))
+}
+
+fn atomic_copy_config(source: &Path, destination: &Path) -> Result<()> {
+    let mut source_file = File::open(source)
+        .with_context(|| format!("Failed to open config source {}", source.display()))?;
+    atomic_replace_config_with(destination, |destination_file| {
+        io::copy(&mut source_file, destination_file).map(|_| ())
+    })
+}
+
 /// Handle config subcommands (init, reset, backup, restore).
 pub(crate) fn handle_config(action: ConfigAction) -> Result<()> {
     let config_path = default_config_path().context("Could not determine config path.")?;
@@ -98,16 +190,13 @@ pub(crate) fn handle_config(action: ConfigAction) -> Result<()> {
         }
         ConfigAction::Reset => {
             if config_path.exists() {
-                fs::copy(&config_path, &backup_path)
+                atomic_copy_config(&config_path, &backup_path)
                     .with_context(|| format!("Failed to backup to {}", backup_path.display()))?;
                 println!("Backed up current config to: {}", backup_path.display());
             }
             let config_content = generate_default_config();
-            if let Some(parent) = config_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            fs::write(&config_path, config_content)
-                .with_context(|| format!("Failed to write: {}", config_path.display()))?;
+            atomic_write_config(&config_path, config_content.as_bytes())
+                .with_context(|| format!("Failed to reset: {}", config_path.display()))?;
             println!("Config reset to defaults: {}", config_path.display());
             println!("Run 'leopardwm-cli reload' to apply if daemon is running.");
         }
@@ -115,7 +204,7 @@ pub(crate) fn handle_config(action: ConfigAction) -> Result<()> {
             if !config_path.exists() {
                 anyhow::bail!("No config file found at: {}", config_path.display());
             }
-            fs::copy(&config_path, &backup_path)
+            atomic_copy_config(&config_path, &backup_path)
                 .with_context(|| format!("Failed to backup to {}", backup_path.display()))?;
             println!("Config backed up to: {}", backup_path.display());
         }
@@ -123,11 +212,61 @@ pub(crate) fn handle_config(action: ConfigAction) -> Result<()> {
             if !backup_path.exists() {
                 anyhow::bail!("No backup found at: {}", backup_path.display());
             }
-            fs::copy(&backup_path, &config_path)
+            atomic_copy_config(&backup_path, &config_path)
                 .with_context(|| format!("Failed to restore from {}", backup_path.display()))?;
             println!("Config restored from: {}", backup_path.display());
             println!("Run 'leopardwm-cli reload' to apply if daemon is running.");
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod atomic_tests {
+    use super::*;
+
+    fn test_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "leopardwm-config-atomic-{name}-{}-{}",
+            std::process::id(),
+            CONFIG_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
+
+    #[test]
+    fn failed_atomic_write_keeps_live_config_bytes() {
+        let dir = test_dir("failed-write");
+        fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("config.toml");
+        fs::write(&config, b"old = true\n").unwrap();
+
+        let error = atomic_replace_config_with(&config, |_| {
+            Err(io::Error::new(io::ErrorKind::Other, "injected write failure"))
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("injected write failure"));
+        assert_eq!(fs::read(&config).unwrap(), b"old = true\n");
+        assert!(
+            fs::read_dir(&dir)
+                .unwrap()
+                .all(|entry| !entry.unwrap().file_name().to_string_lossy().ends_with(".tmp")),
+            "failed replacement leaves no temporary config behind"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn atomic_copy_replaces_only_after_complete_source_write() {
+        let dir = test_dir("copy");
+        fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("config.toml.bak");
+        let destination = dir.join("config.toml");
+        fs::write(&source, b"restored = true\n").unwrap();
+        fs::write(&destination, b"old = true\n").unwrap();
+
+        atomic_copy_config(&source, &destination).unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"restored = true\n");
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

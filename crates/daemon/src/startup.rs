@@ -1,5 +1,7 @@
 //! Startup utilities: banner, crash report, and duplicate-instance detection.
 
+use crate::ipc_server::{acquire_ipc_server_ownership, IpcServerOwnership};
+use anyhow::{Context, Result};
 use leopardwm_ipc::pipe_name_candidates;
 use tracing::warn;
 
@@ -147,6 +149,18 @@ pub(crate) fn format_crash_report(info: &std::panic::PanicHookInfo<'_>) -> Strin
 
 pub(crate) const ERROR_PIPE_BUSY: i32 = 231;
 pub(crate) const ERROR_FILE_NOT_FOUND: i32 = 2;
+
+/// Acquire the daemon's atomic IPC ownership before constructing state,
+/// enumerating windows, installing hooks, or applying a layout.
+///
+/// The returned owner must remain alive until it is moved into
+/// `run_ipc_server_with_ownership`; dropping it before then releases the
+/// first pipe instance and reintroduces a startup race.
+pub(crate) fn acquire_daemon_instance_ownership() -> Result<IpcServerOwnership> {
+    acquire_ipc_server_ownership().context(
+        "Another LeopardWM daemon may already be running, or IPC ownership could not be acquired",
+    )
+}
 
 pub(crate) fn pipe_probe_error_indicates_running(error: &std::io::Error) -> bool {
     match error.raw_os_error() {

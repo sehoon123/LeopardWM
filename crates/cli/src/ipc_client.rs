@@ -3,7 +3,7 @@
 use anyhow::{Context, Result};
 use leopardwm_ipc::{pipe_name_candidates, IpcCommand, IpcResponse, MAX_IPC_MESSAGE_SIZE};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::net::windows::named_pipe::ClientOptions;
 use tokio::time::{sleep, timeout};
 
@@ -166,6 +166,17 @@ pub(crate) fn probe_daemon_running() -> Result<bool> {
     Ok(false)
 }
 
+/// Whether trying the legacy endpoint preserves daemon identity after a
+/// preferred-endpoint failure. Once the preferred endpoint has ever reported
+/// busy, it is known to exist and a legacy endpoint must never be selected for
+/// this connection attempt.
+pub(crate) fn legacy_fallback_is_safe(
+    preferred_endpoint_seen: bool,
+    preferred_error: &std::io::Error,
+) -> bool {
+    !preferred_endpoint_seen && is_pipe_not_found(preferred_error)
+}
+
 pub(crate) async fn open_pipe_with_retry(
     timeout: Duration,
     not_found_fast_fail_after: Option<Duration>,
@@ -174,27 +185,51 @@ pub(crate) async fn open_pipe_with_retry(
     let mut saw_busy = false;
     let mut saw_not_found = false;
     let pipe_names = pipe_name_candidates();
+    let preferred_pipe = pipe_names
+        .first()
+        .expect("pipe_name_candidates always returns a preferred endpoint");
+    let legacy_pipe = pipe_names.get(1);
+    let mut preferred_endpoint_seen = false;
+
     loop {
-        let mut hard_error: Option<anyhow::Error> = None;
-        for pipe_name in &pipe_names {
-            match ClientOptions::new().open(pipe_name) {
-                Ok(client) => return Ok(client),
-                Err(e) if is_pipe_busy(&e) || is_pipe_not_found(&e) => {
-                    saw_busy |= is_pipe_busy(&e);
-                    saw_not_found |= is_pipe_not_found(&e);
-                }
-                Err(e) => {
-                    hard_error = Some(anyhow::Error::new(e).context(format!(
-                        "Failed to connect to daemon IPC pipe '{}'",
-                        pipe_name
-                    )));
-                    break;
+        let preferred_error = match ClientOptions::new().open(preferred_pipe) {
+            Ok(client) => return Ok(client),
+            Err(error) if is_pipe_busy(&error) => {
+                // A busy preferred pipe proves that this endpoint exists. Do
+                // not probe the legacy name now or on a later retry: it could
+                // address a stale daemon generation with a different identity.
+                preferred_endpoint_seen = true;
+                saw_busy = true;
+                None
+            }
+            Err(error) if is_pipe_not_found(&error) => {
+                saw_not_found = true;
+                Some(error)
+            }
+            Err(error) => {
+                return Err(anyhow::Error::new(error).context(format!(
+                    "Failed to connect to preferred daemon IPC pipe '{}'",
+                    preferred_pipe
+                )));
+            }
+        };
+
+        if let (Some(legacy_pipe), Some(preferred_error)) = (legacy_pipe, preferred_error) {
+            if legacy_fallback_is_safe(preferred_endpoint_seen, &preferred_error) {
+                match ClientOptions::new().open(legacy_pipe) {
+                    Ok(client) => return Ok(client),
+                    Err(error) if is_pipe_busy(&error) => saw_busy = true,
+                    Err(error) if is_pipe_not_found(&error) => saw_not_found = true,
+                    Err(error) => {
+                        return Err(anyhow::Error::new(error).context(format!(
+                            "Failed to connect to legacy daemon IPC pipe '{}'",
+                            legacy_pipe
+                        )));
+                    }
                 }
             }
         }
-        if let Some(err) = hard_error {
-            return Err(err);
-        }
+
         if let Some(cutoff) = not_found_fast_fail_after {
             if saw_not_found && !saw_busy && start.elapsed() >= cutoff {
                 return Err(anyhow::anyhow!(pipe_connect_not_found_fast_fail_message(
@@ -235,21 +270,68 @@ pub(crate) fn parse_ipc_response_frame(frame: &[u8], max_bytes: usize) -> Result
     parse_ipc_response_line(raw)
 }
 
+/// Read one newline-delimited IPC frame without imposing a lifetime byte cap
+/// on a long-lived `BufReader`. The extra byte distinguishes an exact-limit
+/// frame from an oversized or unterminated one.
+pub(crate) async fn read_ipc_frame_bounded<R>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> Result<Option<Vec<u8>>>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let limit = max_bytes
+        .checked_add(1)
+        .context("IPC frame size limit overflow")?;
+    let mut frame = Vec::new();
+
+    loop {
+        let buffer = reader
+            .fill_buf()
+            .await
+            .context("Failed to read IPC frame")?;
+        if buffer.is_empty() {
+            if frame.is_empty() {
+                return Ok(None);
+            }
+            anyhow::bail!(
+                "IPC frame exceeded {} bytes or was not newline-terminated",
+                max_bytes
+            );
+        }
+
+        let available = (limit - frame.len()).min(buffer.len());
+        let newline = buffer[..available].iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(available, |position| position + 1);
+        frame.extend_from_slice(&buffer[..consumed]);
+        reader.consume(consumed);
+
+        if newline.is_some() {
+            if frame.len() > max_bytes {
+                anyhow::bail!(
+                    "IPC frame exceeded {} bytes or was not newline-terminated",
+                    max_bytes
+                );
+            }
+            return Ok(Some(frame));
+        }
+        if frame.len() == limit {
+            anyhow::bail!(
+                "IPC frame exceeded {} bytes or was not newline-terminated",
+                max_bytes
+            );
+        }
+    }
+}
+
 async fn read_ipc_response_bounded<R>(reader: R, max_bytes: usize) -> Result<IpcResponse>
 where
     R: AsyncRead + Unpin,
 {
-    let mut reader = BufReader::new(reader).take((max_bytes + 1) as u64);
-    let mut frame = Vec::new();
-    let bytes_read = reader
-        .read_until(b'\n', &mut frame)
-        .await
-        .context("Failed to read response")?;
-
-    if bytes_read == 0 {
-        anyhow::bail!(PIPE_DISCONNECTED_BEFORE_RESPONSE_MESSAGE);
-    }
-
+    let mut reader = BufReader::new(reader);
+    let frame = read_ipc_frame_bounded(&mut reader, max_bytes)
+        .await?
+        .context(PIPE_DISCONNECTED_BEFORE_RESPONSE_MESSAGE)?;
     parse_ipc_response_frame(&frame, max_bytes)
 }
 
@@ -296,4 +378,106 @@ async fn send_command_inner(
             response_timeout.as_millis()
         )
     })?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn reader_with_bytes(bytes: Vec<u8>) -> BufReader<tokio::io::DuplexStream> {
+        let (mut writer, reader) = tokio::io::duplex(bytes.len() + 1);
+        writer.write_all(&bytes).await.unwrap();
+        drop(writer);
+        BufReader::new(reader)
+    }
+
+    #[test]
+    fn busy_preferred_pipe_never_allows_legacy_fallback() {
+        let busy = std::io::Error::from_raw_os_error(231);
+        let not_found = std::io::Error::from_raw_os_error(2);
+        assert!(!legacy_fallback_is_safe(false, &busy));
+        assert!(!legacy_fallback_is_safe(true, &not_found));
+        assert!(legacy_fallback_is_safe(false, &not_found));
+    }
+
+    #[tokio::test]
+    async fn bounded_reader_rejects_oversized_subscribe_ack() {
+        let ack = format!(
+            "{{\"status\":\"subscribed\",\"events\":[],\"padding\":\"{}\"}}\n",
+            "x".repeat(MAX_IPC_MESSAGE_SIZE)
+        );
+        let mut reader = reader_with_bytes(ack.into_bytes()).await;
+        let error = read_ipc_frame_bounded(&mut reader, MAX_IPC_MESSAGE_SIZE)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeded"));
+    }
+
+    #[tokio::test]
+    async fn bounded_reader_rejects_oversized_subscribe_event() {
+        let event = format!(
+            "{{\"type\":\"heartbeat\",\"uptime_seconds\":0,\"padding\":\"{}\"}}\n",
+            "x".repeat(MAX_IPC_MESSAGE_SIZE)
+        );
+        let mut reader = reader_with_bytes(event.into_bytes()).await;
+        let error = read_ipc_frame_bounded(&mut reader, MAX_IPC_MESSAGE_SIZE)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("exceeded"));
+    }
+
+    #[tokio::test]
+    async fn bounded_reader_accepts_an_exact_limit_frame() {
+        let empty = IpcResponse::Error {
+            message: String::new(),
+        };
+        let overhead = serde_json::to_string(&empty).unwrap().len() + 1;
+        let frame = format!(
+            "{}\n",
+            serde_json::to_string(&IpcResponse::Error {
+                message: "x".repeat(MAX_IPC_MESSAGE_SIZE - overhead),
+            })
+            .unwrap()
+        );
+        assert_eq!(frame.len(), MAX_IPC_MESSAGE_SIZE);
+
+        let mut reader = reader_with_bytes(frame.into_bytes()).await;
+        let frame = read_ipc_frame_bounded(&mut reader, MAX_IPC_MESSAGE_SIZE)
+            .await
+            .unwrap()
+            .expect("exact-limit frame is present");
+        assert!(matches!(
+            parse_ipc_response_frame(&frame, MAX_IPC_MESSAGE_SIZE).unwrap(),
+            IpcResponse::Error { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn bounded_reader_allows_many_valid_frames_over_the_lifetime_limit() {
+        let event = serde_json::to_vec(&leopardwm_ipc::IpcEvent::Heartbeat {
+            uptime_seconds: 1,
+        })
+        .unwrap();
+        let mut frame = event;
+        frame.push(b'\n');
+        let count = MAX_IPC_MESSAGE_SIZE / frame.len() + 2;
+        let mut bytes = Vec::with_capacity(frame.len() * count);
+        for _ in 0..count {
+            bytes.extend_from_slice(&frame);
+        }
+        assert!(bytes.len() > MAX_IPC_MESSAGE_SIZE);
+
+        let mut reader = reader_with_bytes(bytes).await;
+        for _ in 0..count {
+            let received = read_ipc_frame_bounded(&mut reader, MAX_IPC_MESSAGE_SIZE)
+                .await
+                .unwrap()
+                .expect("each valid frame is available");
+            assert_eq!(received, frame);
+        }
+        assert!(read_ipc_frame_bounded(&mut reader, MAX_IPC_MESSAGE_SIZE)
+            .await
+            .unwrap()
+            .is_none());
+    }
 }
