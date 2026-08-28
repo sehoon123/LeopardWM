@@ -3496,17 +3496,28 @@ pub mod integration_probe {
         }
         let request = probe_request(source_window_id, destination)?;
         let initial_live_previews = commit_persistent_previews(&[request], true, expected_epoch)?;
+        if initial_live_previews != 1 {
+            clear_persistent_previews()?;
+            return Err(Win32Error::SetPositionFailed(
+                "integration probe preview did not reach its live activated state".into(),
+            ));
+        }
         let expected_click_target = {
             let state = lock_persistent_previews();
-            preview_click_targets(&published_preview_requests(&state))
-                .into_iter()
-                .find(|target| target.window_id == source_window_id)
-        }
-        .ok_or_else(|| {
-            Win32Error::SetPositionFailed(
-                "integration probe could not capture the published click identity".into(),
-            )
-        })?;
+            (state.host_anchored && state.lifecycle_epoch == expected_epoch)
+                .then(|| preview_click_targets(&published_preview_requests(&state)))
+                .and_then(|targets| {
+                    targets
+                        .into_iter()
+                        .find(|target| target.window_id == source_window_id)
+                })
+        };
+        let Some(expected_click_target) = expected_click_target else {
+            clear_persistent_previews()?;
+            return Err(Win32Error::SetPositionFailed(
+                "integration probe could not capture an active published click identity".into(),
+            ));
+        };
         let windows = probe_windows();
         let host_raw = host().hwnd().0 as isize;
         let host_index = windows
