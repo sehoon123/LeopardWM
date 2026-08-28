@@ -221,11 +221,7 @@ fn show_tab<A: TaskbarAdapter>(adapter: &mut A, hidden: &mut HashSet<WindowId>, 
     }
 }
 
-fn restore_tab<A: TaskbarAdapter>(
-    adapter: &mut A,
-    hidden: &mut HashSet<WindowId>,
-    wid: WindowId,
-) {
+fn restore_tab<A: TaskbarAdapter>(adapter: &mut A, hidden: &mut HashSet<WindowId>, wid: WindowId) {
     match adapter.add_tab(wid) {
         Ok(()) => {
             // Startup restore is unconditional, but it may also satisfy an
@@ -278,15 +274,18 @@ fn run_commands<A: TaskbarAdapter>(rx: mpsc::Receiver<TaskbarCmd>, adapter: &mut
 
 fn run(rx: mpsc::Receiver<TaskbarCmd>, ready_tx: mpsc::Sender<Result<(), String>>) {
     unsafe {
-        if let Err(error) = CoInitializeEx(None, COINIT_APARTMENTTHREADED) {
-            let _ = ready_tx.send(Err(format!("CoInitializeEx failed: {error}")));
+        let coinit = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        if coinit.is_err() {
+            let _ = ready_tx.send(Err(format!("CoInitializeEx failed: {coinit:?}")));
             return;
         }
 
         let taskbar: ITaskbarList = match CoCreateInstance(&TaskbarList, None, CLSCTX_ALL) {
             Ok(taskbar) => taskbar,
             Err(error) => {
-                let _ = ready_tx.send(Err(format!("CoCreateInstance(TaskbarList) failed: {error}")));
+                let _ = ready_tx.send(Err(format!(
+                    "CoCreateInstance(TaskbarList) failed: {error}"
+                )));
                 CoUninitialize();
                 return;
             }

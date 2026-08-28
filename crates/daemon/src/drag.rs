@@ -18,6 +18,38 @@ impl AppState {
         }
     }
 
+    /// Release any prior transition ownership before a drag mutates the model.
+    /// Doing this after the mutation would make rollback ambiguous if parking an
+    /// exiting workspace window fails.
+    fn prepare_drag_layout_change(&mut self, context: &str) -> bool {
+        match self.cancel_layout_transition_for_exact_landing() {
+            Ok(_) => true,
+            Err(error) => {
+                warn!("{context}: could not release prior transition ownership: {error}");
+                self.enter_paused_state(context);
+                false
+            }
+        }
+    }
+
+    /// Start the transition after a successful preflight. This should only fail
+    /// if a future caller bypasses `prepare_drag_layout_change`; fail closed
+    /// rather than applying a model mutation under an older transition owner.
+    fn start_drag_layout_transition(
+        &mut self,
+        snapshot: std::collections::HashMap<u64, Rect>,
+        context: &str,
+    ) -> bool {
+        match self.start_layout_transition(snapshot) {
+            Ok(()) => true,
+            Err(error) => {
+                warn!("{context}: could not start layout transition: {error}");
+                self.enter_paused_state(context);
+                false
+            }
+        }
+    }
+
     /// Remove the live-preview placeholder from the one workspace named by
     /// the previous drop target. Full-workspace cleanup remains the fallback
     /// for the first tick and drag-end recovery, but steady 60 Hz hint updates
@@ -266,6 +298,9 @@ impl AppState {
             } else {
                 // Different column: remove window from multi-window source so
                 // remaining windows expand, then insert placeholder at target.
+                if !self.prepare_drag_layout_change("live drag preview") {
+                    return;
+                }
                 let snapshot = self.snapshot_layout();
 
                 self.remove_drag_window_from_source(hwnd, source_monitor, source_ws_idx);
@@ -289,7 +324,9 @@ impl AppState {
                 // animate so the user sees where the dragged window
                 // will land.
                 if !target_is_tabbed_final {
-                    self.start_layout_transition(snapshot);
+                    if !self.start_drag_layout_transition(snapshot, "live drag preview") {
+                        return;
+                    }
                 } else {
                     let _ = snapshot;
                 }
@@ -424,6 +461,9 @@ impl AppState {
                 "Live drag reorder: column {} → {} on monitor {}",
                 current_col, target_idx, source_monitor
             );
+            if !self.prepare_drag_layout_change("live column reorder") {
+                return;
+            }
             let snapshot = self.snapshot_layout();
             if let Some(workspace) = self
                 .workspaces
@@ -435,7 +475,9 @@ impl AppState {
             if let Some(ref mut drag) = self.drag_state {
                 drag.current_column_index = target_idx;
             }
-            self.start_layout_transition(snapshot);
+            if !self.start_drag_layout_transition(snapshot, "live column reorder") {
+                return;
+            }
             if let Err(e) = self.apply_layout() {
                 warn!("Failed to apply layout during live drag reorder: {}", e);
             }
@@ -478,6 +520,9 @@ impl AppState {
             None => false,
         };
         if needs_move {
+            if !self.prepare_drag_layout_change("same-column live reorder") {
+                return;
+            }
             let snapshot = self.snapshot_layout();
             let idx = self.active_workspace_idx(target_monitor_id);
             if let Some(ws) = self
@@ -488,7 +533,9 @@ impl AppState {
                 let _ = ws.remove_window(hwnd);
                 let _ = ws.insert_window_in_column_at(hwnd, target_col, window_slot);
             }
-            self.start_layout_transition(snapshot);
+            if !self.start_drag_layout_transition(snapshot, "same-column live reorder") {
+                return;
+            }
             if let Err(e) = self.apply_layout() {
                 warn!("Failed to apply layout during live drag reorder: {}", e);
             }
@@ -784,6 +831,9 @@ impl AppState {
         }
 
         // Snapshot AFTER all early returns, right before structural changes.
+        if !self.prepare_drag_layout_change("window merge drop") {
+            return;
+        }
         let snapshot = self.snapshot_layout();
 
         // Remove the window from its source column (skip if already removed during drag).
@@ -884,7 +934,9 @@ impl AppState {
             hwnd, effective_target_col, window_slot, target_monitor
         );
 
-        self.start_layout_transition(snapshot);
+        if !self.start_drag_layout_transition(snapshot, "window merge drop") {
+            return;
+        }
         if let Err(e) = self.apply_layout() {
             warn!("Failed to apply layout after window merge: {}", e);
         }
@@ -1152,6 +1204,9 @@ impl AppState {
         }
         workspace.ensure_focused_visible_animated(viewport_width);
 
+        if !self.prepare_drag_layout_change("standalone window drop") {
+            return;
+        }
         let snapshot = self.snapshot_layout();
         self.workspaces.get_mut(&monitor).unwrap()[workspace_idx] = workspace;
         self.focused_monitor = monitor;
@@ -1168,8 +1223,8 @@ impl AppState {
             {
                 workspace.stop_animation();
             }
-        } else {
-            self.start_layout_transition(snapshot);
+        } else if !self.start_drag_layout_transition(snapshot, "standalone window drop") {
+            return;
         }
         if let Err(error) = self.apply_layout() {
             warn!("Failed to apply standalone window drag: {}", error);
@@ -1260,6 +1315,9 @@ impl AppState {
         source_workspace.ensure_focused_visible_animated(source_viewport_width);
         target_workspace.ensure_focused_visible_animated(target_viewport.width);
 
+        if !self.prepare_drag_layout_change("cross-monitor window drop") {
+            return;
+        }
         let snapshot = self.snapshot_layout();
         self.workspaces.get_mut(&source_monitor).unwrap()[source_idx] = source_workspace;
         self.workspaces.get_mut(&target_monitor).unwrap()[target_idx] = target_workspace;
@@ -1279,8 +1337,8 @@ impl AppState {
             {
                 target_workspace.stop_animation();
             }
-        } else {
-            self.start_layout_transition(snapshot);
+        } else if !self.start_drag_layout_transition(snapshot, "cross-monitor window drop") {
+            return;
         }
         if let Err(error) = self.apply_layout() {
             warn!("Failed to apply cross-monitor window drop: {}", error);
@@ -1464,7 +1522,9 @@ impl AppState {
                 self.focused_monitor = focused_monitor_backup;
                 self.last_placed_layout_rects.clear();
                 let rollback = if self.paused {
-                    Err(anyhow::anyhow!("tiling paused by floating drag placement failure"))
+                    Err(anyhow::anyhow!(
+                        "tiling paused by floating drag placement failure"
+                    ))
                 } else {
                     self.apply_layout()
                 };
@@ -1490,6 +1550,9 @@ impl AppState {
         win_rect: &Rect,
     ) {
         let source_monitor = drag.source_monitor;
+        if !self.prepare_drag_layout_change("cross-monitor column drop") {
+            return;
+        }
         let snapshot = self.snapshot_layout();
 
         // Use the workspace index from drag start — it's stable even if
@@ -1625,7 +1688,9 @@ impl AppState {
         self.last_placed_layout_rects.remove(&hwnd);
         leopardwm_platform_win32::clear_inset_cache();
 
-        self.start_layout_transition(snapshot);
+        if !self.start_drag_layout_transition(snapshot, "cross-monitor column drop") {
+            return;
+        }
         if let Err(e) = self.apply_layout() {
             warn!("Failed to apply layout after cross-monitor drag: {}", e);
         }
@@ -1636,6 +1701,9 @@ impl AppState {
     /// Uses the given workspace index instead of `active_workspace_idx` so that
     /// snap-back targets the workspace where the drag originated.
     pub(crate) fn snap_back_tiled(&mut self, monitor_id: MonitorId, ws_idx: usize) {
+        if !self.prepare_drag_layout_change("drag snap-back") {
+            return;
+        }
         let snapshot = self.snapshot_layout();
         let viewport_width = self.viewport_width_for(monitor_id);
         if let Some(workspace) = self
@@ -1645,7 +1713,9 @@ impl AppState {
         {
             workspace.ensure_focused_visible_animated(viewport_width);
         }
-        self.start_layout_transition(snapshot);
+        if !self.start_drag_layout_transition(snapshot, "drag snap-back") {
+            return;
+        }
         if let Err(e) = self.apply_layout() {
             warn!("Failed to snap back layout after drag: {}", e);
         }
@@ -1842,7 +1912,8 @@ mod tests {
             device_name: format!("DISPLAY{id}"),
             scale_factor: 1.0,
         };
-        let mut state = AppState::new_with_config(Config::default(), vec![monitor(1, 0), monitor(2, 1920)]);
+        let mut state =
+            AppState::new_with_config(Config::default(), vec![monitor(1, 0), monitor(2, 1920)]);
         state.paused = false;
         state.workspaces.get_mut(&1).unwrap()[0]
             .add_floating(10, Rect::new(100, 100, 600, 400))

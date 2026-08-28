@@ -195,9 +195,7 @@ fn set_maximizebox_state<A: SnapStyleApi>(
     let set_result = api.set_style(wanted_style);
     let observed = api.get_style()?;
     let observed_maximizebox = observed & WS_MAXIMIZEBOX_STYLE != 0;
-    if observed_maximizebox == want_maximizebox
-        && (!want_maximizebox || set_result.is_err())
-    {
+    if observed_maximizebox == want_maximizebox && (!want_maximizebox || set_result.is_err()) {
         receipts.insert(window_id);
     }
 
@@ -253,7 +251,11 @@ fn update_maximizebox(window_id: WindowId, want_maximizebox: bool) -> Result<boo
             }
             Err(Win32Error::SetPositionFailed(format!(
                 "WS_MAXIMIZEBOX {} failed for {:?}: {}",
-                if want_maximizebox { "restore" } else { "removal" },
+                if want_maximizebox {
+                    "restore"
+                } else {
+                    "removal"
+                },
                 hwnd,
                 error
             )))

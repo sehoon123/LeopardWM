@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicIsize, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::Duration;
 #[cfg(not(test))]
 use std::time::Instant;
@@ -72,7 +72,7 @@ struct ThumbnailOwnership {
     /// token after `into_isize`, preventing a stale worker drop from matching a
     /// reused DWM handle in a replacement host generation.
     dwm_handle: isize,
-    host_z:
+    host_z: bool,
     band: HostBand,
     /// The destination host incarnation. `0` denotes a non-host destination.
     host_generation: u64,
@@ -101,11 +101,13 @@ struct ZOrderState {
     /// registered them. Failed unregisters remain here as retry receipts.
     registrations: HashMap<isize, ThumbnailOwnership>,
 }
-static Z_ORDER_STATE: Mutex<ZOrderState> = Mutex::new(ZOrderState {
-    balance: 0,
-    topmost_balance: 0,
-    host_balance: 0,
-    registrations: HashMap::new(),
+static Z_ORDER_STATE: LazyLock<Mutex<ZOrderState>> = LazyLock::new(|| {
+    Mutex::new(ZOrderState {
+        balance: 0,
+        topmost_balance: 0,
+        host_balance: 0,
+        registrations: HashMap::new(),
+    })
 });
 
 /// Return the current outstanding-registration count. Should converge to 0
@@ -228,9 +230,11 @@ fn host_band_is_compatible(state: &ZOrderState, band: HostBand) -> bool {
 
 fn next_registration_token(state: &ZOrderState) -> isize {
     loop {
-        let token = NEXT_RAW_TRANSFER_TOKEN.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
-            Some(value.wrapping_add(1).max(1))
-        }).unwrap_or_else(|value| value);
+        let token = NEXT_RAW_TRANSFER_TOKEN
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                Some(value.wrapping_add(1).max(1))
+            })
+            .unwrap_or_else(|value| value);
         if token != 0 && !state.registrations.contains_key(&token) {
             return token;
         }
@@ -289,9 +293,7 @@ fn retain_failed_dwm_registration(
     host_generation: u64,
     host_claimed: bool,
 ) {
-    let retired = host_z
-        && host_generation != 0
-        && host_generation != host().generation();
+    let retired = host_z && host_generation != 0 && host_generation != host().generation();
     // A changed host generation is proof that this destination was retired.
     // There is no live destination left to unregister, and retaining its raw
     // value could collide with a future DWM registration.
@@ -336,8 +338,9 @@ fn unregister_dwm_handle(dwm_handle: isize) -> Result<(), Win32Error> {
             "injected DwmUnregisterThumbnail failure".into(),
         ));
     }
-    unsafe { DwmUnregisterThumbnail(dwm_handle) }
-        .map_err(|error| Win32Error::SetPositionFailed(format!("DwmUnregisterThumbnail({dwm_handle}): {error}")))
+    unsafe { DwmUnregisterThumbnail(dwm_handle) }.map_err(|error| {
+        Win32Error::SetPositionFailed(format!("DwmUnregisterThumbnail({dwm_handle}): {error}"))
+    })
 }
 
 /// Retry failed unregisters without touching the active replacement host's
@@ -361,6 +364,7 @@ pub fn service_pending_thumbnail_unregisters() {
     }
 }
 
+#[cfg_attr(test, allow(dead_code))]
 fn retire_host_generation_claims(host_generation: u64) {
     let mut state = Z_ORDER_STATE
         .lock()
@@ -369,10 +373,7 @@ fn retire_host_generation_claims(host_generation: u64) {
     let mut retired_host = 0i64;
     let mut retired_topmost = 0i64;
     for ownership in state.registrations.values_mut() {
-        if !ownership.retired
-            && ownership.host_z
-            && ownership.host_generation == host_generation
-        {
+        if !ownership.retired && ownership.host_z && ownership.host_generation == host_generation {
             ownership.retired = true;
             retired_total += 1;
             if ownership.host_claimed {
@@ -1260,7 +1261,9 @@ fn publish_preview_requests_locked(
             && state
                 .previews
                 .get(&request.window_id)
-                .is_none_or(|preview| preview.published.map(|published| published.request) != Some(*request))
+                .is_none_or(|preview| {
+                    preview.published.map(|published| published.request) != Some(*request)
+                })
     });
     let live = state
         .previews
@@ -2671,7 +2674,7 @@ pub mod integration_probe {
     use super::*;
     use windows::core::BOOL;
     use windows::Win32::Foundation::{COLORREF, LPARAM, POINT, WPARAM};
-    use windows::Win32::Graphics::Gdi::{GetPixel, GetDC, ReleaseDC};
+    use windows::Win32::Graphics::Gdi::{GetDC, GetPixel, ReleaseDC};
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
         MOUSEINPUT,
@@ -2935,10 +2938,7 @@ pub mod integration_probe {
         let retained_desire = {
             let state = lock_persistent_previews();
             state.desired.as_slice() == &[request]
-                && state
-                    .previews
-                    .get(&source_window_id)
-                    .is_some()
+                && state.previews.get(&source_window_id).is_some()
                 && !state.host_anchored
         };
         FORCE_PREVIEW_PUBLISH_FAILURES.store(0, Ordering::Release);
@@ -2987,12 +2987,8 @@ pub mod integration_probe {
             && !crate::placement::is_placement_cloaked(source_window_id)
             && crate::visibility::has_move_offscreen_ownership(source_window_id);
         crate::placement::integration_probe_fail_next_cloak();
-        let second = crate::placement::apply_placements(
-            &[placement],
-            &config,
-            Some(&mut cache),
-            false,
-        );
+        let second =
+            crate::placement::apply_placements(&[placement], &config, Some(&mut cache), false);
         let second_safe = second.is_err()
             && !crate::placement::is_placement_cloaked(source_window_id)
             && crate::visibility::has_move_offscreen_ownership(source_window_id);
@@ -3025,18 +3021,18 @@ pub mod integration_probe {
     /// Hold an old topmost registration across restart, then drop stale and new
     /// owners in both orders. Old-generation drops must never alter the new
     /// host's claims or prevent its promotion.
-    pub fn host_restart_claims_are_generation_safe(source_window_id: WindowId) -> Result<bool, Win32Error> {
+    pub fn host_restart_claims_are_generation_safe(
+        source_window_id: WindowId,
+    ) -> Result<bool, Win32Error> {
         invalidate_persistent_preview_surface();
         clear_persistent_previews()?;
         let baseline = host_claims();
         let old_first = register(source_window_id)?;
         force_host_restart_for_probe()?;
         let new_first = register(source_window_id)?;
-        let promoted = host_claims()
-            == (baseline.0 + 1, baseline.1 + 1, baseline.2 + 1);
+        let promoted = host_claims() == (baseline.0 + 1, baseline.1 + 1, baseline.2 + 1);
         drop(old_first);
-        let stale_drop_inert = host_claims()
-            == (baseline.0 + 1, baseline.1 + 1, baseline.2 + 1);
+        let stale_drop_inert = host_claims() == (baseline.0 + 1, baseline.1 + 1, baseline.2 + 1);
         drop(new_first);
         let first_order_restored = host_claims() == baseline;
 
@@ -3047,12 +3043,18 @@ pub mod integration_probe {
         let current_drop_restored = host_claims() == baseline;
         drop(old_second);
         let stale_after_current_inert = host_claims() == baseline;
-        Ok(promoted && stale_drop_inert && first_order_restored && current_drop_restored && stale_after_current_inert)
+        Ok(promoted
+            && stale_drop_inert
+            && first_order_restored
+            && current_drop_restored
+            && stale_after_current_inert)
     }
 
     /// Fail one DWM unregister, retain its accounting receipt, then service the
     /// retry and require the exact baseline balance/band to return.
-    pub fn unregister_failure_retains_ownership(source_window_id: WindowId) -> Result<bool, Win32Error> {
+    pub fn unregister_failure_retains_ownership(
+        source_window_id: WindowId,
+    ) -> Result<bool, Win32Error> {
         let baseline = host_claims();
         let handle = register(source_window_id)?;
         FORCE_NEXT_UNREGISTER_FAILURE.store(true, Ordering::Release);

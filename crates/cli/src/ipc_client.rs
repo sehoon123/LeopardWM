@@ -454,10 +454,8 @@ mod tests {
 
     #[tokio::test]
     async fn bounded_reader_allows_many_valid_frames_over_the_lifetime_limit() {
-        let event = serde_json::to_vec(&leopardwm_ipc::IpcEvent::Heartbeat {
-            uptime_seconds: 1,
-        })
-        .unwrap();
+        let event =
+            serde_json::to_vec(&leopardwm_ipc::IpcEvent::Heartbeat { uptime_seconds: 1 }).unwrap();
         let mut frame = event;
         frame.push(b'\n');
         let count = MAX_IPC_MESSAGE_SIZE / frame.len() + 2;

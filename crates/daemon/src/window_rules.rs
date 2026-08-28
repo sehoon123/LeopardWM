@@ -128,7 +128,10 @@ impl AppState {
                         self.window_last_maximized_at.remove(&wid);
                         info!("Rule change: unmanaged window {} (ignore)", wid);
                     } else {
-                        warn!("Rule change retained bookkeeping for {} after removal failed", wid);
+                        warn!(
+                            "Rule change retained bookkeeping for {} after removal failed",
+                            wid
+                        );
                     }
                 }
                 _ => {} // No change needed
@@ -212,7 +215,7 @@ impl AppState {
                 return Err(anyhow::anyhow!("injected ignore release failure"));
             }
             let _ = wid;
-            return Ok(());
+            Ok(())
         }
         #[cfg(not(test))]
         {

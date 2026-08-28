@@ -249,7 +249,9 @@ impl AppState {
                 None => Ok(()),
             };
             let relayout = if self.paused {
-                Err(anyhow!("tiling paused before scratchpad replacement rollback"))
+                Err(anyhow!(
+                    "tiling paused before scratchpad replacement rollback"
+                ))
             } else {
                 self.apply_layout()
             };
@@ -608,7 +610,10 @@ mod replacement_tests {
         state.injected_scratchpad_park_failure = true;
 
         assert!(state.scratchpad_stash().is_err());
-        assert_eq!(state.scratchpad.map(|scratchpad| scratchpad.window_id), Some(10));
+        assert_eq!(
+            state.scratchpad.map(|scratchpad| scratchpad.window_id),
+            Some(10)
+        );
         assert!(!state.workspaces[&1][0].contains_window(10));
         assert!(state.workspaces[&1][0].contains_window(20));
     }

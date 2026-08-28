@@ -31,8 +31,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, PostMessageW,
     PostThreadMessageW, RegisterClassW, SetWindowPos, ShowWindow, UnregisterClassW, HWND_TOPMOST,
     MSG, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNA, WM_CLOSE, WM_PAINT, WM_USER,
-    WNDCLASSW, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+    WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT,
+    WS_POPUP,
 };
 
 /// Custom message to quit the overlay thread.
@@ -364,9 +364,8 @@ impl OverlayWindow {
 
 impl Drop for OverlayWindow {
     fn drop(&mut self) {
-        let posted_via_window = unsafe {
-            PostMessageW(Some(self.hwnd), WM_QUIT_OVERLAY, WPARAM(0), LPARAM(0)).is_ok()
-        };
+        let posted_via_window =
+            unsafe { PostMessageW(Some(self.hwnd), WM_QUIT_OVERLAY, WPARAM(0), LPARAM(0)).is_ok() };
         if !posted_via_window {
             let _ = unsafe {
                 PostThreadMessageW(self.thread_id, WM_QUIT_OVERLAY, WPARAM(0), LPARAM(0))

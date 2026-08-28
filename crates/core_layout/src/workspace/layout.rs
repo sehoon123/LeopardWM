@@ -254,9 +254,9 @@ impl Workspace {
             }));
             // Sum widened minimums so two valid i32::MAX public inputs cannot
             // overflow in debug builds or wrap in release builds.
-            let total_min = min_heights.iter().fold(0i64, |sum, &height| {
-                sum.saturating_add(i64::from(height))
-            });
+            let total_min = min_heights
+                .iter()
+                .fold(0i64, |sum, &height| sum.saturating_add(i64::from(height)));
             let flex_height = (i64::from(available_height) - total_min).max(0);
 
             // Sum only finite non-negative weights. Persisted columns repair
@@ -266,7 +266,13 @@ impl Workspace {
                 .iter()
                 .zip(min_heights.iter())
                 .filter(|(_, minimum)| **minimum == 0)
-                .map(|(weight, _)| if weight.is_finite() && *weight > 0.0 { *weight } else { 0.0 })
+                .map(|(weight, _)| {
+                    if weight.is_finite() && *weight > 0.0 {
+                        *weight
+                    } else {
+                        0.0
+                    }
+                })
                 .sum();
             // If any flexible window exists, pinned windows get exactly their
             // minimum and flexible windows share flex_height. If every window

@@ -589,7 +589,9 @@ impl AppState {
     pub(crate) fn discard_stale_window_incarnation(&mut self, wid: u64) -> bool {
         let had_owner = self.find_window_workspace(wid).is_some()
             || self.window_incarnations.contains_key(&wid)
-            || self.scratchpad.is_some_and(|scratchpad| scratchpad.window_id == wid)
+            || self
+                .scratchpad
+                .is_some_and(|scratchpad| scratchpad.window_id == wid)
             || self.sticky_windows.contains(&wid);
         if !had_owner {
             return false;
@@ -615,7 +617,11 @@ impl AppState {
             self.previous_focused_hwnd = None;
             self.broadcast_focused_window_if_changed(self.focused_monitor as i64, None);
         }
-        if self.drag_state.as_ref().is_some_and(|drag| drag.hwnd == wid) {
+        if self
+            .drag_state
+            .as_ref()
+            .is_some_and(|drag| drag.hwnd == wid)
+        {
             self.drag_state = None;
             for ws_vec in self.workspaces.values_mut() {
                 for workspace in ws_vec.iter_mut() {
@@ -893,7 +899,9 @@ impl AppState {
         leopardwm_platform_win32::thumbnail::invalidate_persistent_preview_surface();
         match leopardwm_platform_win32::thumbnail::clear_persistent_previews_best_effort() {
             Ok(true) => {}
-            Ok(false) => warn!("Paused preview cleanup deferred behind active placement ({source})"),
+            Ok(false) => {
+                warn!("Paused preview cleanup deferred behind active placement ({source})")
+            }
             Err(error) => warn!("Paused preview cleanup degraded ({source}): {error}"),
         }
         self.hide_border();

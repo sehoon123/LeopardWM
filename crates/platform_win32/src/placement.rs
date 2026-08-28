@@ -13,9 +13,9 @@ use crate::window_region::{
 };
 use leopardwm_core_layout::{Rect, Visibility, WindowId, WindowPlacement};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "integration-probes")]
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use windows::core::BOOL;
 use windows::Win32::Foundation::{HWND, RECT};
@@ -308,7 +308,9 @@ pub fn dwm_uncloak_window(window_id: WindowId) {
 
     let uncloaked = window_id_to_hwnd(window_id)
         .ok()
-        .is_some_and(|hwnd| unsafe { IsWindow(Some(hwnd)).as_bool() && dwm_set_cloak(hwnd, false) });
+        .is_some_and(|hwnd| unsafe {
+            IsWindow(Some(hwnd)).as_bool() && dwm_set_cloak(hwnd, false)
+        });
     if uncloaked {
         return;
     }
@@ -1323,7 +1325,7 @@ fn uncloak_preview_sources(requests: &[PersistentPreviewRequest]) -> HashSet<Win
         .iter()
         .filter_map(|request| {
             global_cloaked_contains(request.window_id)
-                .then(|| request.window_id)
+                .then_some(request.window_id)
                 .filter(|window_id| !commit_global_cloak_state_locked(*window_id, false))
         })
         .collect()
@@ -1873,8 +1875,7 @@ fn sync_cloak_state(
     // transaction. Their global placement cloak must be removed only if DWM
     // confirms the corresponding uncloak.
     for window_id in preview_ids {
-        if global_cloaked_contains(window_id)
-            && !commit_global_cloak_state_locked(window_id, false)
+        if global_cloaked_contains(window_id) && !commit_global_cloak_state_locked(window_id, false)
         {
             failed_window_ids.insert(window_id);
         }

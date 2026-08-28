@@ -258,7 +258,9 @@ impl AppState {
             }
             self.last_placed_layout_rects.clear();
             let rollback = if self.paused {
-                Err(anyhow::anyhow!("tiling paused by fullscreen-exit placement failure"))
+                Err(anyhow::anyhow!(
+                    "tiling paused by fullscreen-exit placement failure"
+                ))
             } else {
                 self.apply_layout()
             };
@@ -476,9 +478,7 @@ impl AppState {
         match fullscreen_policy(cmd) {
             FullscreenPolicy::Exit => match self.exit_fullscreen_if_active() {
                 Ok(_) => None,
-                Err(error) => Some(IpcResponse::error(format!(
-                    "Cannot run {cmd:?}: {error}"
-                ))),
+                Err(error) => Some(IpcResponse::error(format!("Cannot run {cmd:?}: {error}"))),
             },
             FullscreenPolicy::FollowFocus => {
                 if self.config.behavior.fullscreen_follows_focus {
@@ -489,9 +489,9 @@ impl AppState {
                     // so fullscreen only ever affects the one window.
                     match self.exit_fullscreen_if_active() {
                         Ok(_) => None,
-                        Err(error) => Some(IpcResponse::error(format!(
-                            "Cannot run {cmd:?}: {error}"
-                        ))),
+                        Err(error) => {
+                            Some(IpcResponse::error(format!("Cannot run {cmd:?}: {error}")))
+                        }
                     }
                 }
             }
@@ -651,7 +651,7 @@ impl AppState {
             IpcCommand::ToggleSticky => match self.toggle_sticky() {
                 Ok(()) => IpcResponse::Ok,
                 Err(error) => IpcResponse::error(format!("Sticky toggle failed: {error}")),
-            }
+            },
             IpcCommand::ToggleNewWindowPlacement => self.handle_toggle_new_window_placement(),
             IpcCommand::ToggleFullscreen => self.handle_toggle_fullscreen(),
             IpcCommand::SetColumnWidth { fraction } => {
@@ -780,7 +780,9 @@ impl AppState {
                 self.focused_monitor = previous_monitor;
                 self.last_placed_layout_rects.clear();
                 let rollback = if self.paused {
-                    Err(anyhow::anyhow!("tiling paused by monitor-focus placement failure"))
+                    Err(anyhow::anyhow!(
+                        "tiling paused by monitor-focus placement failure"
+                    ))
                 } else {
                     self.apply_layout()
                 };
@@ -1760,7 +1762,9 @@ impl AppState {
             self.previous_focused_hwnd = previous_focus;
             self.last_placed_layout_rects.clear();
             let rollback = if self.paused {
-                Err(anyhow::anyhow!("tiling paused before inactive-window rollback"))
+                Err(anyhow::anyhow!(
+                    "tiling paused before inactive-window rollback"
+                ))
             } else {
                 self.apply_layout()
             };
@@ -1797,7 +1801,9 @@ impl AppState {
             self.previous_focused_hwnd = previous_focus;
             self.last_placed_layout_rects.clear();
             let rollback = if self.paused {
-                Err(anyhow::anyhow!("tiling paused by move-to-workspace placement failure"))
+                Err(anyhow::anyhow!(
+                    "tiling paused by move-to-workspace placement failure"
+                ))
             } else {
                 self.apply_layout()
             };
@@ -1909,7 +1915,9 @@ impl AppState {
             self.pending_tab_focus = None;
             self.last_placed_layout_rects.clear();
             let rollback = if self.paused {
-                Err(anyhow::anyhow!("tiling paused by active-tab placement failure"))
+                Err(anyhow::anyhow!(
+                    "tiling paused by active-tab placement failure"
+                ))
             } else {
                 self.apply_layout()
             };

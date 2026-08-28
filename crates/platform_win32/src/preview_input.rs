@@ -19,9 +19,9 @@
 use crate::Win32Error;
 use leopardwm_core_layout::{Rect, WindowId};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
 #[cfg(feature = "integration-probes")]
 use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use tracing::{debug, warn};
@@ -287,7 +287,7 @@ pub fn sync_preview_click_targets(targets: &[PreviewClickTarget]) -> Option<u64>
     // failed/lost wake leaves `applied_generation` behind, so an identical next
     // publish retries instead of becoming a permanent no-op (including clear).
     if generation_needs_reconcile(input.applied_generation.load(Ordering::Acquire), generation) {
-        post_sync(input);
+        post_sync(&input);
     }
     Some(generation)
 }
@@ -410,7 +410,9 @@ pub fn integration_probe_restart_input_pump() -> bool {
     }
     let (old_thread_id, old_alive) = {
         let slot = INPUT.lock().unwrap_or_else(crate::recover_poisoned_mutex);
-        let Some(input) = slot.as_ref() else { return false };
+        let Some(input) = slot.as_ref() else {
+            return false;
+        };
         (input.thread_id, input.alive.clone())
     };
     let _ = unsafe { PostThreadMessageW(old_thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) };

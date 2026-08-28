@@ -697,9 +697,7 @@ fn clear_resize_preview_active_if_owned(
     }
 }
 
-/// Lightweight DwmFlush-aligned animation loop for resize preview transitions.
-/// Directly repositions the overlay window via SetWindowPos — no channel round-trip.
-fn resize_preview_animation_loop(
+struct ResizePreviewAnimation {
     overlay_hwnd: isize,
     start: leopardwm_core_layout::Rect,
     target: leopardwm_core_layout::Rect,
@@ -708,9 +706,24 @@ fn resize_preview_animation_loop(
     current_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
     active_generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
     active: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) {
+}
+
+/// Lightweight DwmFlush-aligned animation loop for resize preview transitions.
+/// Directly repositions the overlay window via SetWindowPos — no channel round-trip.
+fn resize_preview_animation_loop(animation: ResizePreviewAnimation) {
     use std::sync::atomic::Ordering;
     use windows::Win32::Graphics::Dwm::DwmFlush;
+
+    let ResizePreviewAnimation {
+        overlay_hwnd,
+        start,
+        target,
+        generation,
+        cancel,
+        current_generation,
+        active_generation,
+        active,
+    } = animation;
 
     active_generation.store(generation, Ordering::Release);
     active.store(true, Ordering::Release);
@@ -747,11 +760,7 @@ fn resize_preview_animation_loop(
 
     // Only the generation that set active may clear it. A canceled A must
     // never clear B after B starts while A was blocked in DwmFlush.
-    let _ = clear_resize_preview_active_if_owned(
-        generation,
-        &active_generation,
-        &active,
-    );
+    let _ = clear_resize_preview_active_if_owned(generation, &active_generation, &active);
 }
 
 /// Borrowed event-loop state shared by the main-loop event handlers.
@@ -1368,12 +1377,9 @@ fn setup_window_hooks(
     // This allows the hotkey window to forward display changes to our event loop
     {
         let (display_tx, display_rx) = std::sync::mpsc::channel::<WindowEvent>();
-        match spawn_forwarding_thread(
-            "display-fwd",
-            display_rx,
-            event_tx.clone(),
-            |event| DaemonEvent::WindowEvent(DaemonWindowEvent::capture(event)),
-        ) {
+        match spawn_forwarding_thread("display-fwd", display_rx, event_tx.clone(), |event| {
+            DaemonEvent::WindowEvent(DaemonWindowEvent::capture(event))
+        }) {
             Ok(handle) => match set_display_change_sender(display_tx) {
                 Ok(()) => {
                     thread_handles.push(handle);
@@ -1429,12 +1435,9 @@ fn install_ffm_hook(
     match install_mouse_hook(mouse_tx) {
         Ok(handle) => {
             info!("Focus-follows-mouse enabled");
-            match spawn_forwarding_thread(
-                "mouse-fwd",
-                mouse_rx,
-                event_tx.clone(),
-                |event| DaemonEvent::WindowEvent(DaemonWindowEvent::capture(event)),
-            ) {
+            match spawn_forwarding_thread("mouse-fwd", mouse_rx, event_tx.clone(), |event| {
+                DaemonEvent::WindowEvent(DaemonWindowEvent::capture(event))
+            }) {
                 Ok(fwd) => {
                     thread_handles.push(fwd);
                     Some(handle)
@@ -1817,7 +1820,11 @@ async fn handle_ipc_command(
 
 /// Handle a platform window event, including display-change and focus-follows-mouse debouncing.
 fn display_settle_debounce_ms(needs_full: bool) -> u64 {
-    if needs_full { 500 } else { 180 }
+    if needs_full {
+        500
+    } else {
+        180
+    }
 }
 
 fn update_display_change_needs_full(previous: bool, event: &WindowEvent) -> bool {
@@ -1886,10 +1893,8 @@ async fn process_window_event(ctx: &mut EventLoopCtx<'_>, daemon_event: DaemonWi
             // A real topology/DPI change needs the full reconcile; a
             // work-area-only change (taskbar) does not. Sticky-true if a
             // DisplayChange occurs anywhere in the debounce window.
-            state.display_change_needs_full = update_display_change_needs_full(
-                state.display_change_needs_full,
-                &win_event,
-            );
+            state.display_change_needs_full =
+                update_display_change_needs_full(state.display_change_needs_full, &win_event);
             (
                 state.display_change_generation,
                 state.display_change_needs_full,
@@ -1989,7 +1994,9 @@ async fn process_window_event(ctx: &mut EventLoopCtx<'_>, daemon_event: DaemonWi
             let mut state = ctx.state.lock().await;
             if let Some(hwnd) = window_event_id(&win_event) {
                 let lifecycle_identity_needed = match &win_event {
-                    WindowEvent::Created(_) | WindowEvent::Restored(_) | WindowEvent::Destroyed(_) => true,
+                    WindowEvent::Created(_)
+                    | WindowEvent::Restored(_)
+                    | WindowEvent::Destroyed(_) => true,
                     _ => source_incarnation.is_some(),
                 };
                 let current_incarnation = lifecycle_identity_needed
@@ -2102,18 +2109,17 @@ async fn process_window_event(ctx: &mut EventLoopCtx<'_>, daemon_event: DaemonWi
                         match std::thread::Builder::new()
                             .name("leopardwm-resize-preview".to_string())
                             .spawn(move || {
-                                resize_preview_animation_loop(
+                                resize_preview_animation_loop(ResizePreviewAnimation {
                                     overlay_hwnd,
-                                    req.start_rect,
-                                    req.target_rect,
+                                    start: req.start_rect,
+                                    target: req.target_rect,
                                     generation,
                                     cancel,
                                     current_generation,
                                     active_generation,
                                     active,
-                                );
-                            })
-                        {
+                                });
+                            }) {
                             Ok(thread) => state.resize_preview_thread = Some(thread),
                             Err(error) => {
                                 warn!("Failed to spawn resize-preview animation: {error}");
@@ -3725,8 +3731,7 @@ async fn handle_display_change_settled(ctx: &mut EventLoopCtx<'_>, generation: u
     let new_monitors = match enumerate_monitors() {
         Ok(monitors) if !monitors.is_empty() => monitors,
         Ok(_) => {
-            reschedule_display_settle(ctx, generation, 100, "monitor enumeration was empty")
-                .await;
+            reschedule_display_settle(ctx, generation, 100, "monitor enumeration was empty").await;
             return;
         }
         Err(error) => {

@@ -1020,11 +1020,8 @@ fn test_all_profile_configs_are_valid_toml() {
 #[test]
 fn target_binary_candidates_follow_configured_target_triple() {
     let target_dir = std::path::Path::new("workspace/target");
-    let candidates = target_binary_candidates(
-        target_dir,
-        Some("x86_64-pc-windows-msvc"),
-        "leopardwm.exe",
-    );
+    let candidates =
+        target_binary_candidates(target_dir, Some("x86_64-pc-windows-msvc"), "leopardwm.exe");
     assert_eq!(
         candidates,
         vec![

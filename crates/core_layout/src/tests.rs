@@ -4441,7 +4441,10 @@ mod tests {
             r#"{"columns":[{"width":400,"windows":[1]},{"width":400,"windows":[1]}]}"#,
             r#"{"columns":[{"width":400,"windows":[1]}],"minimized_windows":[2]}"#,
         ] {
-            assert!(serde_json::from_str::<Workspace>(invalid).is_err(), "{invalid}");
+            assert!(
+                serde_json::from_str::<Workspace>(invalid).is_err(),
+                "{invalid}"
+            );
         }
 
         let repaired: Workspace = serde_json::from_str(
@@ -4504,6 +4507,8 @@ mod tests {
         widths.insert_window(11, Some(400)).unwrap();
         widths.set_window_min_width(10, i32::MAX);
         widths.set_window_min_width(11, i32::MAX);
-        assert!(!widths.compute_placements(Rect::new(0, 0, 500, 600)).is_empty());
+        assert!(!widths
+            .compute_placements(Rect::new(0, 0, 500, 600))
+            .is_empty());
     }
 }

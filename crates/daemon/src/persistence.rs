@@ -59,13 +59,13 @@ impl StateFileWriter {
     }
 
     fn write(&self, prepared: &PreparedStateWrite) -> Result<StateWriteOutcome> {
-        let mut highest_started = self
-            .highest_started_generation
-            .lock()
-            .unwrap_or_else(|poisoned| {
-                warn!("State-file writer lock was poisoned; recovering ownership");
-                poisoned.into_inner()
-            });
+        let mut highest_started =
+            self.highest_started_generation
+                .lock()
+                .unwrap_or_else(|poisoned| {
+                    warn!("State-file writer lock was poisoned; recovering ownership");
+                    poisoned.into_inner()
+                });
 
         if prepared.generation <= *highest_started {
             return Ok(StateWriteOutcome::SkippedStale);
@@ -140,7 +140,9 @@ fn validate_restored_workspace(workspace: &Workspace) -> std::result::Result<(),
         let weights = column.height_weights();
         if !weights.is_empty() {
             if weights.len() != column.len()
-                || weights.iter().any(|weight| !weight.is_finite() || *weight < 0.0)
+                || weights
+                    .iter()
+                    .any(|weight| !weight.is_finite() || *weight < 0.0)
             {
                 return Err("column has invalid height weights");
             }
@@ -194,9 +196,7 @@ impl AppState {
     /// has started first. Callers must pass the opaque value returned by
     /// [`Self::build_state_json`] unchanged; this preserves the generation
     /// assigned while the model lock was held.
-    pub(crate) fn write_state_file(
-        prepared: &PreparedStateWrite,
-    ) -> Result<StateWriteOutcome> {
+    pub(crate) fn write_state_file(prepared: &PreparedStateWrite) -> Result<StateWriteOutcome> {
         state_file_writer().write(prepared)
     }
 

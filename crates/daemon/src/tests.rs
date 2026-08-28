@@ -54,12 +54,17 @@ fn test_resize_preview_only_owning_generation_clears_active() {
     assert!(active.load(Ordering::SeqCst));
     assert_eq!(active_generation.load(Ordering::SeqCst), 2);
 
-    assert!(clear_resize_preview_active_if_owned(2, &active_generation, &active));
+    assert!(clear_resize_preview_active_if_owned(
+        2,
+        &active_generation,
+        &active
+    ));
     assert!(!active.load(Ordering::SeqCst));
     assert_eq!(active_generation.load(Ordering::SeqCst), 0);
 }
 
 #[test]
+#[allow(clippy::arc_with_non_send_sync)] // handle_tab_action intentionally mirrors the single-threaded production Arc API.
 fn test_stale_untab_does_not_mutate_the_current_workspace() {
     let mut app = AppState::new_with_config(test_config(), test_monitors());
     app.paused = true;
@@ -147,7 +152,10 @@ fn test_late_timeout_worker_reap_repeats_paused_cleanup() {
 
     assert_eq!(state.reap_finished_pending_apply_workers(), 1);
     assert!(!state.pause_cleanup_after_pending_apply);
-    assert!(matches!(state.pending_drag_hint, Some(DragHintAction::Hide)));
+    assert!(matches!(
+        state.pending_drag_hint,
+        Some(DragHintAction::Hide)
+    ));
 }
 
 #[test]
@@ -4553,7 +4561,10 @@ fn test_apply_layout_timeout_auto_pauses_and_records_batch() {
         state.snap_disabled_hwnds.is_empty(),
         "timeout pause must restore the same snap ownership as user pause"
     );
-    assert!(matches!(state.pending_drag_hint, Some(DragHintAction::Hide)));
+    assert!(matches!(
+        state.pending_drag_hint,
+        Some(DragHintAction::Hide)
+    ));
     assert!(
         state.pause_cleanup_after_pending_apply,
         "late worker completion must retain a second cleanup obligation"
@@ -6554,7 +6565,7 @@ fn test_sticky_floating_window_stays_floating() {
         .unwrap();
     float_focused_window(&mut state, 100);
 
-    state.toggle_sticky(); // pin
+    state.toggle_sticky().unwrap(); // pin
     assert!(
         state.sticky_windows.contains(&100),
         "pinned into sticky set"
@@ -6565,7 +6576,7 @@ fn test_sticky_floating_window_stays_floating() {
     );
 
     state.previous_focused_hwnd = Some(100);
-    state.toggle_sticky(); // un-pin
+    state.toggle_sticky().unwrap(); // un-pin
     assert!(
         !state.sticky_windows.contains(&100),
         "unpinned from sticky set"
@@ -6590,7 +6601,7 @@ fn test_sticky_tiled_window_stays_tiled() {
         .focus_window(100)
         .unwrap();
 
-    state.toggle_sticky(); // stick a TILED window
+    state.toggle_sticky().unwrap(); // stick a TILED window
     assert!(
         state.sticky_windows.contains(&100),
         "tiled window added to sticky set"
@@ -6600,7 +6611,7 @@ fn test_sticky_tiled_window_stays_tiled() {
         "a tiled window stays tiled when stuck (not force-floated)"
     );
 
-    state.toggle_sticky(); // un-stick (tiled focus still reports it)
+    state.toggle_sticky().unwrap(); // un-stick (tiled focus still reports it)
     assert!(!state.sticky_windows.contains(&100));
     assert!(
         !state.focused_workspace().unwrap().is_floating(100),
@@ -6618,7 +6629,7 @@ fn test_sticky_window_follows_workspace_switch() {
         .insert_window(100, Some(800))
         .unwrap();
     float_focused_window(&mut state, 100);
-    state.toggle_sticky(); // 100 floating + sticky on workspace 0
+    state.toggle_sticky().unwrap(); // 100 floating + sticky on workspace 0
     assert!(state.sticky_windows.contains(&100));
 
     // Move to workspace 1 and re-home sticky windows.
@@ -6651,7 +6662,7 @@ fn test_tiled_sticky_follows_switch_as_end_column() {
         .unwrap()
         .focus_window(100)
         .unwrap();
-    state.toggle_sticky(); // 100 tiled + sticky on workspace 0
+    state.toggle_sticky().unwrap(); // 100 tiled + sticky on workspace 0
 
     // Destination already has a tiled window so we can assert end placement.
     state.ensure_workspace_exists(mon, 1);
@@ -6698,7 +6709,7 @@ fn test_tiled_sticky_preserves_column_width_across_switch() {
         .unwrap()
         .focus_window(100)
         .unwrap();
-    state.toggle_sticky();
+    state.toggle_sticky().unwrap();
 
     state.ensure_workspace_exists(mon, 1);
     state.active_workspace.insert(mon, 1);
@@ -6725,7 +6736,7 @@ fn test_sticky_toggle_sets_floating_pinned() {
         .unwrap();
     float_focused_window(&mut state, 100);
 
-    state.toggle_sticky(); // pin
+    state.toggle_sticky().unwrap(); // pin
     let pinned = state
         .focused_workspace()
         .unwrap()
@@ -6740,7 +6751,7 @@ fn test_sticky_toggle_sets_floating_pinned() {
     );
 
     state.previous_focused_hwnd = Some(100);
-    state.toggle_sticky(); // un-pin
+    state.toggle_sticky().unwrap(); // un-pin
     let pinned = state
         .focused_workspace()
         .unwrap()
@@ -6761,7 +6772,7 @@ fn test_sticky_rehome_preserves_pinned() {
         .insert_window(100, Some(800))
         .unwrap();
     float_focused_window(&mut state, 100);
-    state.toggle_sticky(); // 100 floating + sticky + pinned on workspace 0
+    state.toggle_sticky().unwrap(); // 100 floating + sticky + pinned on workspace 0
 
     state.ensure_workspace_exists(mon, 1);
     state.active_workspace.insert(mon, 1);
@@ -6788,7 +6799,7 @@ fn test_sticky_cleared_when_window_destroyed() {
         .unwrap()
         .focus_window(100)
         .unwrap();
-    state.toggle_sticky();
+    state.toggle_sticky().unwrap();
     assert!(state.sticky_windows.contains(&100));
 
     state.sticky_on_window_destroyed(100);
@@ -6809,8 +6820,8 @@ fn switch_with_focused_sticky() -> AppState {
         .insert_window(100, Some(800))
         .unwrap();
     float_focused_window(&mut state, 100);
-    state.toggle_sticky(); // 100 floating + sticky on workspace 0
-                           // Destination workspace has its own tiled window (focus magnet).
+    state.toggle_sticky().unwrap(); // 100 floating + sticky on workspace 0
+                                    // Destination workspace has its own tiled window (focus magnet).
     state.ensure_workspace_exists(mon, 1);
     state.workspaces.get_mut(&mon).unwrap()[1]
         .insert_window(200, Some(800))
@@ -6883,9 +6894,9 @@ fn test_sticky_window_not_focused_does_not_steal_focus_on_switch() {
         .unwrap()
         .focus_window(100)
         .unwrap();
-    state.toggle_sticky(); // 100 tiled + sticky on workspace 0
-                           // User is focused on a different TILED window, not the sticky one. The
-                           // tiled rehome appends without stealing focus, so focus must not jump to it.
+    state.toggle_sticky().unwrap(); // 100 tiled + sticky on workspace 0
+                                    // User is focused on a different TILED window, not the sticky one. The
+                                    // tiled rehome appends without stealing focus, so focus must not jump to it.
     state
         .focused_workspace_mut()
         .unwrap()
@@ -6931,7 +6942,7 @@ fn test_tiled_sticky_focused_keeps_focus_across_switch() {
         .unwrap()
         .focus_window(100)
         .unwrap();
-    state.toggle_sticky(); // tiled sticky, focused
+    state.toggle_sticky().unwrap(); // tiled sticky, focused
     state.ensure_workspace_exists(mon, 1);
     state.workspaces.get_mut(&mon).unwrap()[1]
         .insert_window(200, Some(800))
@@ -6977,7 +6988,7 @@ fn test_refocus_sticky_window_tiled() {
         .unwrap()
         .focus_window(100)
         .unwrap();
-    state.toggle_sticky(); // 100 tiled-sticky
+    state.toggle_sticky().unwrap(); // 100 tiled-sticky
     state
         .focused_workspace_mut()
         .unwrap()
@@ -7009,8 +7020,8 @@ fn test_sticky_mode_transition_tiled_to_floating() {
         .unwrap()
         .focus_window(100)
         .unwrap();
-    state.toggle_sticky(); // tiled sticky
-                           // Float it mid-session (Ctrl+Alt+F equivalent); stickiness is preserved.
+    state.toggle_sticky().unwrap(); // tiled sticky
+                                    // Float it mid-session (Ctrl+Alt+F equivalent); stickiness is preserved.
     let rect = state.centered_rect_for_logical_floating_size(
         state.focused_monitor,
         state.default_floating_size(),
@@ -7251,8 +7262,7 @@ fn test_restore_structure_prunes_dead_windows() {
 }
 
 #[test]
-fn test_restore_structure_rejects_invalid_deserialized_focus_indices() {
-    let mut state = structure_restore_state();
+fn test_state_snapshot_deserialization_rejects_invalid_focus_indices() {
     let snapshot = crate::state::StateSnapshot {
         saved_at: "0".to_string(),
         workspaces: vec![crate::state::WorkspaceSnapshot {
@@ -7266,18 +7276,8 @@ fn test_restore_structure_rejects_invalid_deserialized_focus_indices() {
     };
     let mut encoded = serde_json::to_value(snapshot).unwrap();
     encoded["workspaces"][0]["workspace"]["focused_column"] = serde_json::json!(99);
-    let malformed = serde_json::from_value(encoded).unwrap();
 
-    let restored = state.restore_workspace_structure_with(&malformed, |_| true);
-
-    let display2_id = state
-        .monitors
-        .iter()
-        .find(|(_, monitor)| monitor.device_name == "DISPLAY2")
-        .map(|(&id, _)| id)
-        .unwrap();
-    assert!(!restored.contains(&(display2_id, 0)));
-    assert!(state.workspaces[&display2_id][0].is_empty());
+    assert!(serde_json::from_value::<crate::state::StateSnapshot>(encoded).is_err());
 }
 
 #[test]

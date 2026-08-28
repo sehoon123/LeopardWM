@@ -246,8 +246,8 @@ impl Workspace {
             .iter()
             .map(|c| self.is_column_active(c))
             .collect();
-        let active_count = i32::try_from(active_flags.iter().filter(|&&a| a).count())
-            .unwrap_or(i32::MAX);
+        let active_count =
+            i32::try_from(active_flags.iter().filter(|&&a| a).count()).unwrap_or(i32::MAX);
         if active_count == 0 {
             return;
         }
@@ -261,8 +261,7 @@ impl Workspace {
             .saturating_add(i64::from(outer_right));
         let minimum_total = i64::from(MIN_COLUMN_WIDTH).saturating_mul(i64::from(active_count));
         let per_column = i64_to_i32_saturating(
-            (i64::from(viewport_width).saturating_sub(total_gaps))
-                .max(minimum_total)
+            (i64::from(viewport_width).saturating_sub(total_gaps)).max(minimum_total)
                 / i64::from(active_count),
         );
         for (col, &is_active) in self.columns.iter_mut().zip(active_flags.iter()) {
@@ -304,9 +303,8 @@ impl Workspace {
 
         for col in &mut self.columns {
             let frac = width_fraction(col.width(), old_gap_c, old_base);
-            let new_width = nonnegative_f64_to_i32(
-                (f64::from(new_base) * frac - f64::from(new_gap)).round(),
-            );
+            let new_width =
+                nonnegative_f64_to_i32((f64::from(new_base) * frac - f64::from(new_gap)).round());
             col.set_width(new_width);
         }
     }

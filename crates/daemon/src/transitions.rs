@@ -440,7 +440,7 @@ impl AppState {
                 ));
             }
             let _ = window_id;
-            return Ok(());
+            Ok(())
         }
         #[cfg(not(test))]
         {

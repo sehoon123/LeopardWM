@@ -564,8 +564,13 @@ fn handle_ipc(body: &str, event_tx: &mpsc::Sender<SettingsEvent>, _hwnd: HWND) {
 
 #[derive(Debug)]
 enum SettingsSaveResult {
-    Saved { revision: String },
-    Conflict { current: Config, revision: String },
+    Saved {
+        revision: String,
+    },
+    Conflict {
+        current: Box<Config>,
+        revision: String,
+    },
     Failed,
 }
 

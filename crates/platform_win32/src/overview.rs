@@ -1786,14 +1786,16 @@ fn on_anim_tick(hwnd: HWND) {
                             0,
                             SRCCOPY,
                         )
-                        .as_bool();
+                        .is_ok();
                     if !hdc.0.is_null() {
                         ReleaseDC(Some(hwnd), hdc);
                     }
                     if record_frame_blit(&mut s, copied) {
                         s.chrome_last_step = Some(step);
                     } else {
-                        tracing::warn!("Overview animation frame blit failed; scheduling full render");
+                        tracing::warn!(
+                            "Overview animation frame blit failed; scheduling full render"
+                        );
                         let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                 }
@@ -2757,7 +2759,7 @@ unsafe fn paint_frame(hwnd: HWND) {
                     0,
                     SRCCOPY,
                 )
-                .as_bool();
+                .is_ok();
             if record_frame_blit(&mut s, copied) {
                 s.chrome_last_step = Some(step);
                 true
@@ -2797,7 +2799,7 @@ unsafe fn paint_frame(hwnd: HWND) {
                         0,
                         SRCCOPY,
                     )
-                    .as_bool();
+                    .is_ok();
                 if !record_frame_blit(&mut s, copied) {
                     tracing::warn!("Overview cached frame blit failed; rebuilding frame");
                 }
@@ -3082,7 +3084,7 @@ fn hover_repaint(hwnd: HWND, old: Option<(usize, usize)>, new: Option<(usize, us
                         r.y,
                         SRCCOPY,
                     )
-                    .as_bool()
+                    .is_ok()
                 });
             if !hdc.0.is_null() {
                 ReleaseDC(Some(hwnd), hdc);

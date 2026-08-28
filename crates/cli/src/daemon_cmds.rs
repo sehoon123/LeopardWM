@@ -177,7 +177,9 @@ pub(crate) fn find_watchdog_binary() -> Option<PathBuf> {
 }
 
 pub(crate) fn daemon_sibling_for_watchdog(watchdog_path: &Path) -> Option<PathBuf> {
-    watchdog_path.parent().map(|dir| dir.join(daemon_binary_name()))
+    watchdog_path
+        .parent()
+        .map(|dir| dir.join(daemon_binary_name()))
 }
 
 fn spawn_watchdog(safe_mode: bool) -> Result<u32> {
@@ -273,11 +275,11 @@ pub(crate) fn apply_timeout_recovery_message() -> &'static str {
 }
 
 pub(crate) fn apply_unconfirmed_recovery_message() -> &'static str {
-    "Apply completion was not confirmed. No automatic cross-process recovery was attempted because ownership cannot be verified. Verify daemon status before retrying."
+    "Apply completion was not confirmed. No automatic cross-process recovery was attempted because ownership cannot be verified. Run `leopardwm-cli status` before retrying."
 }
 
 pub(crate) fn apply_error_response_recovery_message() -> &'static str {
-    "Daemon returned a non-success apply response. No automatic cross-process recovery was attempted because ownership cannot be verified. Verify daemon status before retrying."
+    "Daemon returned a non-success apply response. No automatic cross-process recovery was attempted because ownership cannot be verified. Run `leopardwm-cli status` before retrying."
 }
 
 pub(crate) fn stop_error_response_recovery_message() -> &'static str {

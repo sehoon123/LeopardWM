@@ -1034,8 +1034,13 @@ pub struct ConfigWarning {
 /// immediately before writing it.
 #[derive(Debug, Clone)]
 pub(crate) enum ConditionalConfigSave {
-    Saved { revision: String },
-    Conflict { current: Config, revision: String },
+    Saved {
+        revision: String,
+    },
+    Conflict {
+        current: Box<Config>,
+        revision: String,
+    },
 }
 
 static CONFIG_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -1254,7 +1259,7 @@ impl Config {
         let current_revision = current.revision()?;
         if current_revision != expected_revision {
             return Ok(ConditionalConfigSave::Conflict {
-                current,
+                current: Box::new(current),
                 revision: current_revision,
             });
         }
@@ -1616,10 +1621,7 @@ impl Config {
             let width = match rule.width {
                 Some(width) if width > 0 => Some(width),
                 Some(width) => {
-                    tracing::warn!(
-                        "Window rule width = {} must be positive; ignoring",
-                        width
-                    );
+                    tracing::warn!("Window rule width = {} must be positive; ignoring", width);
                     None
                 }
                 None => None,
@@ -1627,10 +1629,7 @@ impl Config {
             let height = match rule.height {
                 Some(height) if height > 0 => Some(height),
                 Some(height) => {
-                    tracing::warn!(
-                        "Window rule height = {} must be positive; ignoring",
-                        height
-                    );
+                    tracing::warn!("Window rule height = {} must be positive; ignoring", height);
                     None
                 }
                 None => None,
@@ -3375,9 +3374,15 @@ height = 0
 
         let config = Config::load_from_path(&path).unwrap();
         assert_eq!(config.layout.gap, 0);
-        assert_eq!(config.layout.default_floating_width, default_floating_width());
+        assert_eq!(
+            config.layout.default_floating_width,
+            default_floating_width()
+        );
         assert_eq!(config.layout.width_presets, vec![0.5]);
-        assert_eq!(config.animation.layout_duration_ms, MAX_ANIMATION_DURATION_MS);
+        assert_eq!(
+            config.animation.layout_duration_ms,
+            MAX_ANIMATION_DURATION_MS
+        );
         assert_eq!(config.window_rules[0].width, None);
         assert_eq!(config.window_rules[0].height, None);
 

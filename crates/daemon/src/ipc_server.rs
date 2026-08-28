@@ -54,8 +54,7 @@ fn create_pipe_server(
         .pipe_mode(PipeMode::Byte);
     match pipe_security_ptr {
         Some(ptr) => unsafe {
-            options
-                .create_with_security_attributes_raw(pipe_name, ptr as *mut std::ffi::c_void)
+            options.create_with_security_attributes_raw(pipe_name, ptr as *mut std::ffi::c_void)
         },
         None => options.create(pipe_name),
     }
@@ -73,7 +72,9 @@ pub(crate) fn acquire_ipc_server_ownership() -> Result<IpcServerOwnership> {
     if pipe_security.is_none() {
         warn!("Could not build IPC pipe security attributes; using defaults (a non-elevated client may not reach an elevated daemon)");
     }
-    let pipe_security_ptr = pipe_security.as_ref().map(|security| security.as_ptr() as usize);
+    let pipe_security_ptr = pipe_security
+        .as_ref()
+        .map(|security| security.as_ptr() as usize);
 
     let first_server = create_pipe_server(&pipe_name, true, pipe_security_ptr).with_context(|| {
         format!(

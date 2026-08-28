@@ -1069,16 +1069,15 @@ impl AppState {
                                     // expected, not noisy churn).
                                     let consumed =
                                         self.consume_pending_tab_focus_for(mon_a, ws_a, hwnd);
-                                    if suppress_rapid_same_column_focus(
-                                        user_initiated,
-                                        consumed,
-                                    ) {
+                                    if suppress_rapid_same_column_focus(user_initiated, consumed) {
                                         // Deliberately reject only unproven
                                         // churn, and undo the already-applied
                                         // OS foreground change before returning.
                                         #[cfg(not(test))]
                                         if let Err(error) =
-                                            leopardwm_platform_win32::set_foreground_window(prev_hwnd)
+                                            leopardwm_platform_win32::set_foreground_window(
+                                                prev_hwnd,
+                                            )
                                         {
                                             warn!(
                                                 "Could not reassert prior same-column focus {} after rejecting {}: {}",
@@ -1220,9 +1219,7 @@ impl AppState {
                         self.start_workspace_switch_transition(start_rects, exit_rects, duration)
                     {
                         self.active_workspace.insert(monitor_id, active_idx);
-                        warn!(
-                            "Auto workspace switch retained prior transition ownership: {error}"
-                        );
+                        warn!("Auto workspace switch retained prior transition ownership: {error}");
                         return;
                     }
                 } else {

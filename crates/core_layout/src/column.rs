@@ -63,7 +63,11 @@ impl<'de> Deserialize<'de> for Column {
     {
         let persisted = PersistedColumn::deserialize(deserializer)?;
         let mut seen = std::collections::HashSet::new();
-        if persisted.windows.iter().any(|window_id| !seen.insert(*window_id)) {
+        if persisted
+            .windows
+            .iter()
+            .any(|window_id| !seen.insert(*window_id))
+        {
             return Err(<D::Error as DeError>::custom(
                 "persisted column duplicates a window",
             ));
@@ -367,7 +371,10 @@ impl Column {
             return;
         }
         if self.height_weights.len() != self.windows.len()
-            || self.height_weights.iter().any(|weight| !weight.is_finite() || *weight < 0.0)
+            || self
+                .height_weights
+                .iter()
+                .any(|weight| !weight.is_finite() || *weight < 0.0)
         {
             self.equalize_height_weights();
             return;

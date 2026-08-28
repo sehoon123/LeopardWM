@@ -239,7 +239,7 @@ impl<'de> Deserialize<'de> for Workspace {
         };
         workspace
             .validate_persisted_state()
-            .map_err(|error| <D::Error as DeError>::custom(error))?;
+            .map_err(<D::Error as DeError>::custom)?;
         Ok(workspace)
     }
 }
@@ -294,7 +294,10 @@ impl Workspace {
         }
         for floating in &self.floating_windows {
             if !seen.insert(floating.id) {
-                return Err(format!("persisted workspace duplicates window {}", floating.id));
+                return Err(format!(
+                    "persisted workspace duplicates window {}",
+                    floating.id
+                ));
             }
         }
 
@@ -356,8 +359,8 @@ impl Workspace {
             if !self.is_column_active(column) || widths[index] != column.width() {
                 continue;
             }
-            let requested = (f64::from(column.width()) / flexible_total as f64 * excess as f64)
-                .round();
+            let requested =
+                (f64::from(column.width()) / flexible_total as f64 * excess as f64).round();
             let proportional_share = if requested.is_finite() && requested > 0.0 {
                 requested.min(i64::MAX as f64) as i64
             } else {
@@ -385,9 +388,8 @@ impl Workspace {
         if active_count == 0 {
             return 0;
         }
-        let gaps = i64::from(self.gap.max(0)).saturating_mul(
-            i64::try_from(active_count.saturating_sub(1)).unwrap_or(i64::MAX),
-        );
+        let gaps = i64::from(self.gap.max(0))
+            .saturating_mul(i64::try_from(active_count.saturating_sub(1)).unwrap_or(i64::MAX));
         i64_to_i32_saturating(column_widths.saturating_add(gaps))
     }
 

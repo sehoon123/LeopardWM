@@ -241,16 +241,18 @@ mod atomic_tests {
         fs::write(&config, b"old = true\n").unwrap();
 
         let error = atomic_replace_config_with(&config, |_| {
-            Err(io::Error::new(io::ErrorKind::Other, "injected write failure"))
+            Err(io::Error::other("injected write failure"))
         })
         .unwrap_err();
 
-        assert!(error.to_string().contains("injected write failure"));
+        assert!(format!("{error:#}").contains("injected write failure"));
         assert_eq!(fs::read(&config).unwrap(), b"old = true\n");
         assert!(
-            fs::read_dir(&dir)
+            fs::read_dir(&dir).unwrap().all(|entry| !entry
                 .unwrap()
-                .all(|entry| !entry.unwrap().file_name().to_string_lossy().ends_with(".tmp")),
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")),
             "failed replacement leaves no temporary config behind"
         );
         let _ = fs::remove_dir_all(&dir);
