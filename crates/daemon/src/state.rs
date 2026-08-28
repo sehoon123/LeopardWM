@@ -693,13 +693,21 @@ impl AppState {
     pub(crate) fn new_with_config(config: Config, monitors: Vec<MonitorInfo>) -> Self {
         use crate::helpers::ScaledLayoutParams;
 
-        let animations_enabled = leopardwm_platform_win32::are_animations_enabled();
+        #[cfg(not(test))]
         let on_battery_or_saver = leopardwm_platform_win32::is_on_battery_or_power_saver();
+        #[cfg(not(test))]
         let initial_reduce_motion = crate::transitions::reduce_motion_enabled(
-            animations_enabled,
+            leopardwm_platform_win32::are_animations_enabled(),
             on_battery_or_saver,
             config.animation.reduce_motion_on_battery,
         );
+        // Unit tests use synthetic HWNDs and assert transition/model behavior.
+        // A CI runner with Windows animations disabled must not silently turn
+        // those tests into physical offscreen-placement paths for fake handles.
+        #[cfg(test)]
+        let on_battery_or_saver = false;
+        #[cfg(test)]
+        let initial_reduce_motion = false;
         let mut workspaces = HashMap::new();
         let mut active_workspace_map = HashMap::new();
         let mut monitor_map = HashMap::new();
@@ -819,7 +827,11 @@ impl AppState {
             snap_disabled_hwnds: HashSet::new(),
             on_battery_or_saver,
             reduce_motion: initial_reduce_motion,
-            high_contrast: leopardwm_platform_win32::is_high_contrast_enabled(),
+            high_contrast: if cfg!(test) {
+                false
+            } else {
+                leopardwm_platform_win32::is_high_contrast_enabled()
+            },
             layout_transition: None,
             ghost_handles: HashMap::new(),
             active_crossfade: None,

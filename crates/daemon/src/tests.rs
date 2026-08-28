@@ -474,6 +474,10 @@ fn test_app_state_startup_reduce_motion_matches_all_workspaces() {
 
     let state = AppState::new_with_config(test_config(), monitors);
 
+    assert!(
+        !state.reduce_motion,
+        "synthetic-HWND tests must not inherit the CI host's animation setting"
+    );
     for workspaces in state.workspaces.values() {
         for workspace in workspaces {
             assert_eq!(workspace.reduce_motion(), state.reduce_motion);
