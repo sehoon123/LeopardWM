@@ -10,13 +10,14 @@ use std::ffi::c_void;
 use std::sync::mpsc;
 use std::time::Duration;
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::{BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, PAINTSTRUCT};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW,
     GetForegroundWindow, GetMessageW, IsWindow, PostThreadMessageW, RegisterClassW, SendMessageW,
-    UnregisterClassW, CW_USEDEFAULT, MSG, WINDOWPOS, WM_QUIT, WM_RBUTTONUP, WM_WINDOWPOSCHANGING,
-    WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    UnregisterClassW, CW_USEDEFAULT, MSG, WINDOWPOS, WM_PAINT, WM_QUIT, WM_RBUTTONUP,
+    WM_WINDOWPOSCHANGING, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 
 unsafe extern "system" fn source_window_proc(
@@ -57,6 +58,34 @@ unsafe extern "system" fn return_rejecting_source_window_proc(
             position.x = 100;
             position.y = 100;
         }
+    }
+    DefWindowProcW(hwnd, message, wparam, lparam)
+}
+
+/// A controlled paint source lets the integration probe distinguish DWM's
+/// successful property API from a real sampled thumbnail pixel.
+unsafe extern "system" fn colored_source_window_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if message == WM_PAINT {
+        let mut paint = PAINTSTRUCT::default();
+        let hdc = BeginPaint(hwnd, &mut paint);
+        let brush = CreateSolidBrush(COLORREF(0x000000ff));
+        if !brush.is_invalid() {
+            let client = RECT {
+                left: 0,
+                top: 0,
+                right: 640,
+                bottom: 480,
+            };
+            let _ = FillRect(hdc, &client, brush);
+            let _ = DeleteObject(brush.into());
+        }
+        let _ = EndPaint(hwnd, &paint);
+        return LRESULT(0);
     }
     DefWindowProcW(hwnd, message, wparam, lparam)
 }
@@ -108,6 +137,10 @@ impl SourceWindow {
         Self::new_with_mode(3)
     }
 
+    fn new_colored() -> Self {
+        Self::new_with_mode(4)
+    }
+
     fn new_with_mode(constraint_mode: u8) -> Self {
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(isize, u32), String>>();
         let thread = std::thread::Builder::new()
@@ -125,6 +158,7 @@ impl SourceWindow {
                         1 => stubborn_source_window_proc,
                         2 => emergency_only_source_window_proc,
                         3 => return_rejecting_source_window_proc,
+                        4 => colored_source_window_proc,
                         _ => source_window_proc,
                     }),
                     lpszClassName: PCWSTR(class.as_ptr()),
@@ -448,6 +482,60 @@ fn ordered_real_preview_lifecycle_contract() {
         integration_probe::retry_spawn_failure_recovers(retry_source.hwnd as u64, destination,)
             .expect("real retry publication probe"),
         "spawn failure obligation must publish the real desired request"
+    );
+    assert!(
+        integration_probe::retry_exhaustion_keeps_desired_and_recovers(
+            retry_source.hwnd as u64,
+            destination,
+        )
+        .expect("retry exhaustion must retain desired preview state"),
+        "a bounded retry burst must self-heal without another placement"
+    );
+
+    let colored_source = SourceWindow::new_colored();
+    let colored_destination = Rect::new(
+        monitor.work_area.right() - 180,
+        monitor.work_area.y + 20,
+        160,
+        120,
+    );
+    unsafe {
+        windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
+            HWND(colored_source.hwnd as *mut c_void),
+            None,
+            monitor.work_area.x + 40,
+            monitor.work_area.y + 260,
+            640,
+            480,
+            windows::Win32::UI::WindowsAndMessaging::SWP_SHOWWINDOW,
+        )
+        .expect("colored source placement");
+    }
+    assert!(
+        integration_probe::controlled_colored_source_pixel_proof(
+            colored_source.hwnd as u64,
+            colored_destination,
+            COLORREF(0x000000ff),
+        )
+        .expect("controlled DWM pixel proof"),
+        "DWM API publication must produce the controlled source pixels"
+    );
+
+    let cloak_source = SourceWindow::new();
+    assert!(
+        integration_probe::placement_cloak_failure_is_not_cached(cloak_source.hwnd as u64),
+        "a failed cloak must remain retryable and use a verified sentinel fallback"
+    );
+    let ownership_source = SourceWindow::new();
+    assert!(
+        integration_probe::host_restart_claims_are_generation_safe(ownership_source.hwnd as u64)
+            .expect("host restart ownership probe"),
+        "old host-generation drops must not mutate replacement z-order claims"
+    );
+    assert!(
+        integration_probe::unregister_failure_retains_ownership(ownership_source.hwnd as u64)
+            .expect("thumbnail unregister retry probe"),
+        "failed unregister must retain and later release its ownership receipt"
     );
 
     let (action_tx, _action_rx) = mpsc::channel();

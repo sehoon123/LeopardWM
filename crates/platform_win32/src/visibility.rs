@@ -142,20 +142,47 @@ pub fn move_window_offscreen(window_id: WindowId) -> Result<(), Win32Error> {
         });
     if !clears_every_monitor || !set_move_offscreen_marker(hwnd, window_id) {
         // Without both physical proof and a crash-surviving ownership marker,
-        // retaining transition ownership is safer than claiming the park.
-        let _ = unsafe {
+        // retaining transition ownership is safer than claiming the park. A
+        // rollback request alone is not a receipt either: verify all edges so
+        // a rejected rollback cannot silently strand the HWND at the sentinel.
+        let rollback_requested = Rect::new(
+            original.left,
+            original.top,
+            original.right.saturating_sub(original.left).max(1),
+            original.bottom.saturating_sub(original.top).max(1),
+        );
+        let rollback_verified = unsafe {
             SetWindowPos(
                 hwnd,
                 None,
-                original.left,
-                original.top,
-                original.right.saturating_sub(original.left).max(1),
-                original.bottom.saturating_sub(original.top).max(1),
+                rollback_requested.x,
+                rollback_requested.y,
+                rollback_requested.width,
+                rollback_requested.height,
                 SWP_NOZORDER | SWP_NOACTIVATE,
             )
-        };
+        }
+        .is_ok()
+            && {
+                let mut restored = RECT::default();
+                unsafe { GetWindowRect(hwnd, &mut restored) }.is_ok()
+                    && positioned_rect_matches(
+                        Rect::new(
+                            restored.left,
+                            restored.top,
+                            restored.right.saturating_sub(restored.left),
+                            restored.bottom.saturating_sub(restored.top),
+                        ),
+                        rollback_requested,
+                    )
+            };
         return Err(Win32Error::SetPositionFailed(format!(
-            "window {window_id} did not accept a verifiable offscreen park"
+            "window {window_id} did not accept a verifiable offscreen park{}",
+            if rollback_verified {
+                " (rollback verified)"
+            } else {
+                " (rollback also unverified)"
+            }
         )));
     }
     // Release a monitor-overflow clip only after the window has reached the

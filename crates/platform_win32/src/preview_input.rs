@@ -20,6 +20,8 @@ use crate::Win32Error;
 use leopardwm_core_layout::{Rect, WindowId};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
+#[cfg(feature = "integration-probes")]
+use std::sync::atomic::AtomicUsize;
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use tracing::{debug, warn};
@@ -122,8 +124,20 @@ struct PreviewInput {
     thread_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
+impl Drop for PreviewInput {
+    fn drop(&mut self) {
+        #[cfg(feature = "integration-probes")]
+        LIVE_PREVIEW_INPUTS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 #[cfg_attr(test, allow(dead_code))]
-static INPUT: Mutex<Option<&'static PreviewInput>> = Mutex::new(None);
+static INPUT: Mutex<Option<Arc<PreviewInput>>> = Mutex::new(None);
+/// Joined preview-input generations must release their state before a restart
+/// publishes a replacement. The probe observes this directly instead of merely
+/// proving that a new pump can be spawned.
+#[cfg(feature = "integration-probes")]
+static LIVE_PREVIEW_INPUTS: AtomicUsize = AtomicUsize::new(0);
 /// Shared with the DWM host lifecycle. A nonzero value arms hit testing only
 /// while it exactly matches the current preview lifecycle epoch.
 static TARGETS_ARMED_EPOCH: AtomicU64 = AtomicU64::new(0);
@@ -252,7 +266,7 @@ pub fn sync_preview_click_targets(targets: &[PreviewClickTarget]) -> Option<u64>
     #[cfg(not(test))]
     if targets.is_empty() {
         let mut slot = INPUT.lock().unwrap_or_else(crate::recover_poisoned_mutex);
-        match *slot {
+        match slot.as_ref() {
             Some(input) if input.alive.load(Ordering::Acquire) => {}
             Some(_) => {
                 *slot = None;
@@ -396,7 +410,7 @@ pub fn integration_probe_restart_input_pump() -> bool {
     }
     let (old_thread_id, old_alive) = {
         let slot = INPUT.lock().unwrap_or_else(crate::recover_poisoned_mutex);
-        let Some(input) = *slot else { return false };
+        let Some(input) = slot.as_ref() else { return false };
         (input.thread_id, input.alive.clone())
     };
     let _ = unsafe { PostThreadMessageW(old_thread_id, WM_QUIT, WPARAM(0), LPARAM(0)) };
@@ -426,7 +440,9 @@ pub fn integration_probe_restart_input_pump() -> bool {
         .map(|input| input.thread_id);
     let clear_generation = sync_preview_click_targets(&[]).unwrap_or(0);
     let cleared = wait_for_applied_generation(clear_generation, std::time::Duration::from_secs(2));
-    cleared && new_thread_id.is_some_and(|thread_id| thread_id != old_thread_id)
+    cleared
+        && new_thread_id.is_some_and(|thread_id| thread_id != old_thread_id)
+        && LIVE_PREVIEW_INPUTS.load(Ordering::Acquire) == 1
 }
 
 pub fn wait_for_applied_raise_generation(generation: u64, timeout: std::time::Duration) -> bool {
@@ -458,7 +474,7 @@ fn post_sync(input: &PreviewInput) {
     }
 }
 
-fn input() -> Option<&'static PreviewInput> {
+fn input() -> Option<Arc<PreviewInput>> {
     #[cfg(test)]
     {
         None
@@ -466,9 +482,9 @@ fn input() -> Option<&'static PreviewInput> {
     #[cfg(not(test))]
     {
         let mut slot = INPUT.lock().unwrap_or_else(crate::recover_poisoned_mutex);
-        if let Some(input) = *slot {
+        if let Some(input) = slot.as_ref() {
             if input.alive.load(Ordering::Acquire) {
-                return Some(input);
+                return Some(Arc::clone(input));
             }
             warn!("Preview input pump exited; restarting");
             if let Some(handle) = input
@@ -479,12 +495,15 @@ fn input() -> Option<&'static PreviewInput> {
             {
                 let _ = handle.join();
             }
+            // Replacing the Arc releases the entire retired generation once
+            // this local borrow ends; unlike Box::leak it cannot accumulate
+            // mutexes, desired vectors, and lifecycle atomics across restarts.
             *slot = None;
         }
         match PreviewInput::spawn() {
             Ok(input) => {
-                let input = Box::leak(Box::new(input));
-                *slot = Some(input);
+                let input = Arc::new(input);
+                *slot = Some(Arc::clone(&input));
                 Some(input)
             }
             Err(error) => {
@@ -699,7 +718,7 @@ impl PreviewInput {
                 "preview input startup acknowledgement failed".into(),
             ));
         }
-        Ok(Self {
+        let input = Self {
             thread_id,
             desired: Mutex::new(DesiredTargets::default()),
             applied_generation: AtomicU64::new(0),
@@ -708,7 +727,10 @@ impl PreviewInput {
             raise_host_raw: AtomicIsize::new(0),
             alive,
             thread_handle: Mutex::new(Some(thread_handle)),
-        })
+        };
+        #[cfg(feature = "integration-probes")]
+        LIVE_PREVIEW_INPUTS.fetch_add(1, Ordering::AcqRel);
+        Ok(input)
     }
 }
 

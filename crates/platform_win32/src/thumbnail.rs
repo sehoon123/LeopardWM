@@ -53,6 +53,10 @@ pub(crate) const THUMBNAIL_HOST_CLASS: &str = "LeopardWMThumbnailHost";
 /// by tests and the `lwm health` IPC field to assert no leaks. Mirrors
 /// `Z_ORDER_STATE.balance` for lock-free reads.
 static REGISTER_BALANCE: AtomicI64 = AtomicI64::new(0);
+/// Opaque IDs returned by `ThumbnailHandle::into_isize`. They are resolved by
+/// this module before every DWM call and deliberately never alias a live raw
+/// registration key.
+static NEXT_RAW_TRANSFER_TOKEN: AtomicIsize = AtomicIsize::new(isize::MIN);
 
 /// Serializes register/unregister z-order side effects so concurrent
 /// register/unregister can't interleave between the atomic balance update
@@ -62,6 +66,26 @@ static REGISTER_BALANCE: AtomicI64 = AtomicI64::new(0);
 ///   T1 unregister: balance=1→0, about to call set_topmost(false)
 ///   T2 register:   balance=0→1, calls set_topmost(true) first
 ///   T1 unregister: calls set_topmost(false)  ← host left non-topmost with a live thumbnail
+#[derive(Debug, Clone, Copy)]
+struct ThumbnailOwnership {
+    /// Actual DWM `HTHUMBNAIL`. The map key can be a distinct raw-transfer
+    /// token after `into_isize`, preventing a stale worker drop from matching a
+    /// reused DWM handle in a replacement host generation.
+    dwm_handle: isize,
+    host_z:
+    band: HostBand,
+    /// The destination host incarnation. `0` denotes a non-host destination.
+    host_generation: u64,
+    /// Whether this registration reached host z-order accounting. A failed
+    /// setup can still leave a DWM handle that must be retried, but it must not
+    /// demote/promote a host band it never claimed.
+    host_claimed: bool,
+    /// The host HWND was proven destroyed during restart. DWM retires handles
+    /// targeting that destination; later stale drops must not affect the new
+    /// generation's balance or z-order.
+    retired: bool,
+}
+
 struct ZOrderState {
     /// Every handle we own, wherever it is composited (health metric).
     balance: i64,
@@ -72,11 +96,16 @@ struct ZOrderState {
     /// excluded: shuffling the host's z-order around the (itself topmost)
     /// overview window caused visible z churn at overview open/close.
     host_balance: i64,
+    /// Raw-handle ownership survives `ThumbnailHandle::into_isize`, allowing
+    /// both ordinary and raw drops to release the exact host generation that
+    /// registered them. Failed unregisters remain here as retry receipts.
+    registrations: HashMap<isize, ThumbnailOwnership>,
 }
 static Z_ORDER_STATE: Mutex<ZOrderState> = Mutex::new(ZOrderState {
     balance: 0,
     topmost_balance: 0,
     host_balance: 0,
+    registrations: HashMap::new(),
 });
 
 /// Return the current outstanding-registration count. Should converge to 0
@@ -85,15 +114,16 @@ pub fn current_register_balance() -> i64 {
     REGISTER_BALANCE.load(Ordering::Relaxed)
 }
 
-/// RAII wrapper around an `HTHUMBNAIL`. Unregisters on drop unless the
-/// handle has been transferred out via [`ThumbnailHandle::into_isize`].
+/// RAII wrapper around an `HTHUMBNAIL` ownership token. Unregisters on drop
+/// unless the token has been transferred out via [`ThumbnailHandle::into_isize`].
 ///
 /// `Send` + `Sync` safety: `HTHUMBNAIL` is a kernel-level handle managed
 /// by `dwm.exe`; it has no thread affinity post-registration. Cross-thread
 /// `DwmUpdateThumbnailProperties` is supported by design (Aero Flip 3D
 /// used the same pattern from worker threads).
 pub struct ThumbnailHandle {
-    /// Raw `HTHUMBNAIL` value. Set to 0 by `into_isize` to suppress Drop.
+    /// Opaque registration token. Set to 0 by `into_isize` to suppress Drop;
+    /// module-local DWM calls resolve it to the underlying HTHUMBNAIL.
     handle: isize,
     /// Whether this registration participates in the HOST z-order
     /// accounting (true only for host-destined thumbnails).
@@ -115,16 +145,16 @@ unsafe impl Sync for ThumbnailHandle {}
 impl Drop for ThumbnailHandle {
     fn drop(&mut self) {
         if self.handle != 0 {
-            unregister_impl(self.handle, self.host_z, self.band);
+            unregister_impl(self.handle, self.host_z, self.band, self.host_generation);
         }
     }
 }
 
 impl ThumbnailHandle {
-    /// Consume this handle without firing Drop, returning the raw `isize`.
-    /// The caller takes responsibility for eventually calling
-    /// [`unregister_raw`] on the returned value (or wrapping it in a new
-    /// owning type that does).
+    /// Consume this handle without firing Drop, returning its opaque `isize`
+    /// ownership token. The caller takes responsibility for eventually calling
+    /// [`unregister_raw`] on that token (or wrapping it in a new owning type
+    /// that does).
     ///
     /// Used at landing to transfer handle ownership from the daemon's
     /// `AppState.ghost_handles` into `WorkerCommand::Crossfade` entries
@@ -134,13 +164,14 @@ impl ThumbnailHandle {
         // host-destined handles may be transferred raw.
         debug_assert!(self.host_z, "into_isize on a non-host thumbnail handle");
         let raw = self.handle;
+        // Ownership metadata is retained in `Z_ORDER_STATE.registrations`, so
+        // the raw crossfade path can later release this exact host generation.
         self.handle = 0;
-        std::mem::forget(self);
         raw
     }
 
-    /// Raw `HTHUMBNAIL` for cross-thread `update` calls. Does NOT transfer
-    /// ownership — Drop still fires when `self` is dropped.
+    /// Opaque registration token for cross-thread `update` calls. Does NOT
+    /// transfer ownership — Drop still fires when `self` is dropped.
     pub fn as_isize(&self) -> isize {
         self.handle
     }
@@ -195,6 +226,171 @@ fn host_band_is_compatible(state: &ZOrderState, band: HostBand) -> bool {
     }
 }
 
+fn next_registration_token(state: &ZOrderState) -> isize {
+    loop {
+        let token = NEXT_RAW_TRANSFER_TOKEN.fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            Some(value.wrapping_add(1).max(1))
+        }).unwrap_or_else(|value| value);
+        if token != 0 && !state.registrations.contains_key(&token) {
+            return token;
+        }
+    }
+}
+
+fn record_registration_locked(
+    state: &mut ZOrderState,
+    token: isize,
+    ownership: ThumbnailOwnership,
+) {
+    state.registrations.insert(token, ownership);
+    if ownership.retired {
+        return;
+    }
+    state.balance += 1;
+    if ownership.host_claimed {
+        state.host_balance += 1;
+        if ownership.band == HostBand::Topmost {
+            state.topmost_balance += 1;
+        }
+    }
+    REGISTER_BALANCE.store(state.balance, Ordering::Relaxed);
+}
+
+fn release_registration_locked(
+    state: &mut ZOrderState,
+    token: isize,
+) -> Option<(ThumbnailOwnership, bool)> {
+    let ownership = state.registrations.remove(&token)?;
+    if ownership.retired {
+        return Some((ownership, false));
+    }
+    state.balance = (state.balance - 1).max(0);
+    let mut demote_host = false;
+    if ownership.host_claimed {
+        state.host_balance = (state.host_balance - 1).max(0);
+        if ownership.band == HostBand::Topmost {
+            let previous = state.topmost_balance;
+            state.topmost_balance = (state.topmost_balance - 1).max(0);
+            demote_host = previous >= 1 && state.topmost_balance == 0;
+        }
+    }
+    REGISTER_BALANCE.store(state.balance, Ordering::Relaxed);
+    Some((ownership, demote_host))
+}
+
+/// Keep a successful DWM registration owned after a later setup/unregister
+/// failure. It has no Rust handle any more, so this registry is the retry
+/// receipt; its unique token also prevents DWM raw-handle reuse from making a
+/// stale drop touch a replacement registration.
+fn retain_failed_dwm_registration(
+    dwm_handle: isize,
+    host_z: bool,
+    band: HostBand,
+    host_generation: u64,
+    host_claimed: bool,
+) {
+    let retired = host_z
+        && host_generation != 0
+        && host_generation != host().generation();
+    // A changed host generation is proof that this destination was retired.
+    // There is no live destination left to unregister, and retaining its raw
+    // value could collide with a future DWM registration.
+    if retired {
+        return;
+    }
+    let mut state = Z_ORDER_STATE
+        .lock()
+        .unwrap_or_else(crate::recover_poisoned_mutex);
+    let token = next_registration_token(&state);
+    record_registration_locked(
+        &mut state,
+        token,
+        ThumbnailOwnership {
+            dwm_handle,
+            host_z,
+            band,
+            host_generation,
+            host_claimed,
+            retired: false,
+        },
+    );
+}
+
+fn resolve_dwm_handle(handle: isize) -> isize {
+    Z_ORDER_STATE
+        .lock()
+        .unwrap_or_else(crate::recover_poisoned_mutex)
+        .registrations
+        .get(&handle)
+        .map(|ownership| ownership.dwm_handle)
+        // Preserve the public raw API for callers outside this crate. All
+        // LeopardWM-created handles have a token entry, so this fallback is
+        // never used by generation-sensitive ownership paths.
+        .unwrap_or(handle)
+}
+
+fn unregister_dwm_handle(dwm_handle: isize) -> Result<(), Win32Error> {
+    #[cfg(feature = "integration-probes")]
+    if FORCE_NEXT_UNREGISTER_FAILURE.swap(false, Ordering::AcqRel) {
+        return Err(Win32Error::SetPositionFailed(
+            "injected DwmUnregisterThumbnail failure".into(),
+        ));
+    }
+    unsafe { DwmUnregisterThumbnail(dwm_handle) }
+        .map_err(|error| Win32Error::SetPositionFailed(format!("DwmUnregisterThumbnail({dwm_handle}): {error}")))
+}
+
+/// Retry failed unregisters without touching the active replacement host's
+/// z-order claims. Normal preview activity calls this opportunistically; the
+/// integration probe calls it explicitly after a deterministic failure.
+pub fn service_pending_thumbnail_unregisters() {
+    let pending: Vec<(isize, ThumbnailOwnership)> = Z_ORDER_STATE
+        .lock()
+        .unwrap_or_else(crate::recover_poisoned_mutex)
+        .registrations
+        .iter()
+        .filter_map(|(token, ownership)| (!ownership.retired).then_some((*token, *ownership)))
+        .collect();
+    for (token, ownership) in pending {
+        unregister_impl(
+            token,
+            ownership.host_z,
+            ownership.band,
+            ownership.host_generation,
+        );
+    }
+}
+
+fn retire_host_generation_claims(host_generation: u64) {
+    let mut state = Z_ORDER_STATE
+        .lock()
+        .unwrap_or_else(crate::recover_poisoned_mutex);
+    let mut retired_total = 0i64;
+    let mut retired_host = 0i64;
+    let mut retired_topmost = 0i64;
+    for ownership in state.registrations.values_mut() {
+        if !ownership.retired
+            && ownership.host_z
+            && ownership.host_generation == host_generation
+        {
+            ownership.retired = true;
+            retired_total += 1;
+            if ownership.host_claimed {
+                retired_host += 1;
+                if ownership.band == HostBand::Topmost {
+                    retired_topmost += 1;
+                }
+            }
+        }
+    }
+    if retired_total != 0 {
+        state.balance = (state.balance - retired_total).max(0);
+        state.host_balance = (state.host_balance - retired_host).max(0);
+        state.topmost_balance = (state.topmost_balance - retired_topmost).max(0);
+        REGISTER_BALANCE.store(state.balance, Ordering::Relaxed);
+    }
+}
+
 fn register_on_host(wid: WindowId, band: HostBand) -> Result<ThumbnailHandle, Win32Error> {
     if !host().is_available() {
         return Err(Win32Error::SetPositionFailed(
@@ -237,6 +433,7 @@ fn register_to(
     band: HostBand,
     host_generation: u64,
 ) -> Result<ThumbnailHandle, Win32Error> {
+    service_pending_thumbnail_unregisters();
     let source = window_id_to_hwnd(wid)?;
     let raw = unsafe { DwmRegisterThumbnail(dest, source) }.map_err(|e| {
         Win32Error::SetPositionFailed(format!("DwmRegisterThumbnail({:?}): {}", source.0, e))
@@ -247,59 +444,72 @@ fn register_to(
         ));
     }
     if host_z && host().generation() != host_generation {
-        let _ = unsafe { DwmUnregisterThumbnail(raw) };
+        if unregister_dwm_handle(raw).is_err() {
+            retain_failed_dwm_registration(raw, host_z, band, host_generation, false);
+        }
         return Err(Win32Error::SetPositionFailed(
             "thumbnail host generation changed during registration".into(),
         ));
     }
+
     // Serialize the balance update with the z-order side effect so a
-    // concurrent unregister can't sneak its set_topmost(false) in
-    // between our increment and our set_topmost(true).
-    {
-        let mut z = Z_ORDER_STATE
-            .lock()
-            .unwrap_or_else(crate::recover_poisoned_mutex);
-        if host_z {
-            if !host_band_is_compatible(&z, band) {
-                drop(z);
-                let _ = unsafe { DwmUnregisterThumbnail(raw) };
-                return Err(Win32Error::SetPositionFailed(
-                    "shared thumbnail host cannot mix normal previews and topmost ghosts".into(),
-                ));
-            }
-            let band_change = if band == HostBand::Topmost && z.topmost_balance == 0 {
-                Some(true)
-            } else if band == HostBand::Normal && z.host_balance == 0 {
-                Some(false)
-            } else {
-                None
-            };
-            if let Some(topmost) = band_change {
-                if let Err(error) = host().set_topmost(topmost) {
-                    drop(z);
-                    let _ = unsafe { DwmUnregisterThumbnail(raw) };
-                    return Err(error);
-                }
-            }
+    // concurrent unregister can't sneak its set_topmost(false) in between our
+    // increment and its demotion. Re-check the generation while holding this
+    // lock; restart retires claims under the same lock.
+    let mut z = Z_ORDER_STATE
+        .lock()
+        .unwrap_or_else(crate::recover_poisoned_mutex);
+    if host_z && host().generation() != host_generation {
+        drop(z);
+        if unregister_dwm_handle(raw).is_err() {
+            retain_failed_dwm_registration(raw, host_z, band, host_generation, false);
         }
-        z.balance += 1;
-        REGISTER_BALANCE.store(z.balance, Ordering::Relaxed);
-        // First host thumbnail that *asks* for the topmost band promotes the
-        // host, so a transition ghost composites above ordinary windows. Edge
-        // previews ask for the normal band and never promote it, or they would
-        // cover floating windows. While no ghost is alive the host stays
-        // non-topmost so the Windows taskbar (also topmost) can animate without
-        // z-order interference. Non-host registrations (overview overlay) never
-        // move the host.
-        if host_z {
-            z.host_balance += 1;
-            if band == HostBand::Topmost {
-                z.topmost_balance += 1;
+        return Err(Win32Error::SetPositionFailed(
+            "thumbnail host generation changed during registration accounting".into(),
+        ));
+    }
+    if host_z && !host_band_is_compatible(&z, band) {
+        drop(z);
+        if unregister_dwm_handle(raw).is_err() {
+            retain_failed_dwm_registration(raw, host_z, band, host_generation, false);
+        }
+        return Err(Win32Error::SetPositionFailed(
+            "shared thumbnail host cannot mix normal previews and topmost ghosts".into(),
+        ));
+    }
+    if host_z {
+        let band_change = if band == HostBand::Topmost && z.topmost_balance == 0 {
+            Some(true)
+        } else if band == HostBand::Normal && z.host_balance == 0 {
+            Some(false)
+        } else {
+            None
+        };
+        if let Some(topmost) = band_change {
+            if let Err(error) = host().set_topmost(topmost) {
+                drop(z);
+                if unregister_dwm_handle(raw).is_err() {
+                    retain_failed_dwm_registration(raw, host_z, band, host_generation, false);
+                }
+                return Err(error);
             }
         }
     }
+    let token = next_registration_token(&z);
+    record_registration_locked(
+        &mut z,
+        token,
+        ThumbnailOwnership {
+            dwm_handle: raw,
+            host_z,
+            band,
+            host_generation,
+            host_claimed: host_z,
+            retired: false,
+        },
+    );
     Ok(ThumbnailHandle {
-        handle: raw,
+        handle: token,
         host_z,
         band,
         host_generation,
@@ -353,6 +563,7 @@ fn update_properties(
             "thumbnail::update called with null handle".into(),
         ));
     }
+    let dwm_handle = resolve_dwm_handle(handle);
     let mut flags = DWM_TNP_RECTDESTINATION | DWM_TNP_OPACITY | DWM_TNP_VISIBLE;
     let mut props = DWM_THUMBNAIL_PROPERTIES {
         dwFlags: flags,
@@ -377,7 +588,7 @@ fn update_properties(
             bottom: source.y + source.height,
         };
     }
-    unsafe { DwmUpdateThumbnailProperties(handle, &props) }.map_err(|error| {
+    unsafe { DwmUpdateThumbnailProperties(dwm_handle, &props) }.map_err(|error| {
         Win32Error::SetPositionFailed(format!("DwmUpdateThumbnailProperties: {error}"))
     })
 }
@@ -410,9 +621,11 @@ struct PersistentPreview {
     publication_generation: u64,
     source_size: Option<(i32, i32)>,
     expected_source_size: Option<(i32, i32)>,
-    /// Last request whose DWM property update succeeded. This, not registration,
-    /// is the only proof that pixels exist and where they are; input targets are
-    /// derived exclusively from it.
+    /// Last request whose DWM property update and flush succeeded. This is an
+    /// API-publication receipt, not a generic proof of sampled screen pixels:
+    /// arbitrary application content cannot be captured reliably in production.
+    /// Input targets are derived only from this receipt; the integration probe
+    /// performs a controlled colored-source capture proof separately.
     published: Option<PublishedPreview>,
     /// Consecutive autonomous attempts that could not publish the current
     /// request. Reset only by a successful DWM update.
@@ -472,7 +685,11 @@ static FORCE_RETRY_SPAWN_FAILURE: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "integration-probes")]
 static FORCE_HOST_SPAWN_FAILURE: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "integration-probes")]
+static FORCE_NEXT_UNREGISTER_FAILURE: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "integration-probes")]
 static FORCE_NEXT_PREVIEW_PUBLISH_FAILURE: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "integration-probes")]
+static FORCE_PREVIEW_PUBLISH_FAILURES: AtomicU32 = AtomicU32::new(0);
 #[cfg(feature = "integration-probes")]
 static SUPPRESS_RETRY_FOR_CAPTURE_PROBE: AtomicBool = AtomicBool::new(false);
 #[cfg(not(test))]
@@ -738,8 +955,10 @@ pub(crate) fn has_persistent_preview(window_id: WindowId) -> bool {
     }
 }
 
-/// Whether DWM has accepted at least one publication for this source. A handle
-/// that was only registered is not evidence that its HWND was safely parked.
+/// Whether DWM has accepted and flushed at least one publication for this
+/// source. This is deliberately an API receipt, not a generic pixel proof; a
+/// handle that was only registered is not evidence that its HWND was safely
+/// parked.
 pub(crate) fn has_published_persistent_preview(window_id: WindowId) -> bool {
     #[cfg(test)]
     {
@@ -860,9 +1079,12 @@ struct PreviewPublishOutcome {
 }
 
 /// Publish requests into already-registered thumbnails while preserving the
-/// distinction between a handle that merely exists and geometry DWM actually
-/// accepted. On failure, `published` stays at the last successful request so the
-/// input overlay remains aligned with the pixels DWM still owns.
+/// distinction between a handle that merely exists and geometry DWM accepted.
+/// `published` is an API publication receipt; controlled screen-capture proof
+/// exists only in the integration probe because arbitrary source pixels are not
+/// a reliable production postcondition. On failure, `published` stays at the
+/// last successful request so the input overlay remains aligned with the DWM
+/// surface it last acknowledged.
 #[cfg(not(test))]
 fn publish_preview_requests_locked(
     state: &mut PersistentPreviewState,
@@ -887,11 +1109,11 @@ fn publish_preview_requests_locked(
     }
 
     let origin = host().origin();
-    let mut give_up = Vec::new();
+    let mut invalidated_sources = Vec::new();
     let mut updated_any = false;
     for request in requests {
         if preview_source_is_invalidated(request.window_id) {
-            give_up.push(request.window_id);
+            invalidated_sources.push(request.window_id);
             continue;
         }
         let Some(preview) = state.previews.get_mut(&request.window_id) else {
@@ -914,7 +1136,12 @@ fn publish_preview_requests_locked(
         }
 
         #[cfg(feature = "integration-probes")]
-        let injected_failure = FORCE_NEXT_PREVIEW_PUBLISH_FAILURE.swap(false, Ordering::AcqRel);
+        let injected_failure = FORCE_NEXT_PREVIEW_PUBLISH_FAILURE.swap(false, Ordering::AcqRel)
+            || FORCE_PREVIEW_PUBLISH_FAILURES
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    (remaining != 0).then_some(remaining - 1)
+                })
+                .is_ok();
         #[cfg(not(feature = "integration-probes"))]
         let injected_failure = false;
         let update_result = if injected_failure {
@@ -957,11 +1184,15 @@ fn publish_preview_requests_locked(
                 // redirection surface has not caught up with its parked frame.
                 preview.source_size = None;
                 if preview.failed_publishes >= MAX_FAILED_PUBLISHES {
+                    // The bounded burst only controls immediate retries. Keep
+                    // both the registered handle and desired request so a
+                    // later service tick/backoff round can self-heal instead
+                    // of permanently abandoning an otherwise safely parked
+                    // source.
                     warn!(
-                        "Preview for {:#x} abandoned after {} publish attempts: {}",
+                        "Preview for {:#x} exhausted immediate retry budget after {} attempts; retaining desired state: {}",
                         request.window_id, preview.failed_publishes, error
                     );
-                    give_up.push(request.window_id);
                 } else {
                     warn!(
                         "Preview for {:#x} publish attempt {}/{} failed; retrying: {}",
@@ -981,11 +1212,14 @@ fn publish_preview_requests_locked(
             retry_needed: false,
         };
     }
-    for window_id in give_up {
-        // Dropping the handle is the authoritative way to remove stale pixels;
-        // the source remains safely parked by placement until another layout
-        // makes it visible or plans a fresh preview.
+    for window_id in invalidated_sources {
+        // A destroy fence is terminal for this incarnation. This is distinct
+        // from a publication failure: only a proven invalidation may retire
+        // its desired request and DWM handle.
         state.previews.remove(&window_id);
+        state
+            .desired
+            .retain(|request| request.window_id != window_id);
     }
     if updated_any && unsafe { windows::Win32::Graphics::Dwm::DwmFlush() }.is_err() {
         warn!("DWM could not commit preview publication; withdrawing the surface");
@@ -1022,13 +1256,11 @@ fn publish_preview_requests_locked(
     }
 
     let retry_needed = requests.iter().any(|request| {
-        state
-            .previews
-            .get(&request.window_id)
-            .is_some_and(|preview| {
-                preview.published.map(|published| published.request) != Some(*request)
-                    && preview.failed_publishes < MAX_FAILED_PUBLISHES
-            })
+        !preview_source_is_invalidated(request.window_id)
+            && state
+                .previews
+                .get(&request.window_id)
+                .is_none_or(|preview| preview.published.map(|published| published.request) != Some(*request))
     });
     let live = state
         .previews
@@ -1166,6 +1398,15 @@ fn schedule_preview_retry() {
                 retry_round += 1;
                 let _ = host().hide_surface();
                 crate::preview_input::set_preview_targets_armed(false);
+                // A host restart or a previous failed registration can leave a
+                // desired request without a handle. Re-attempt registration
+                // outside the state lock, then publish the exact newest desire.
+                let desired_for_registration = lock_persistent_previews().desired.clone();
+                for request in &desired_for_registration {
+                    if !preview_source_is_invalidated(request.window_id) {
+                        let _ = prepare_persistent_preview(request.window_id);
+                    }
+                }
                 let retry_state = {
                     let _transaction = lock_persistent_preview_transaction();
                     let mut state = lock_persistent_previews();
@@ -1195,30 +1436,24 @@ fn schedule_preview_retry() {
                     retry_needed = true;
                 }
                 if !retry_needed {
+                    PREVIEW_RETRY_PENDING.store(false, Ordering::Release);
                     break;
                 }
                 if retry_round >= MAX_FAILED_PUBLISHES {
-                    let _ = host().hide_surface();
-                    crate::preview_input::set_preview_targets_armed(false);
-                    let clear_generation = crate::preview_input::sync_preview_click_targets(&[]);
-                    let cleared = clear_generation.is_some_and(|generation| {
-                        crate::preview_input::wait_for_applied_generation(
-                            generation,
-                            Duration::from_millis(150),
-                        )
-                    });
-                    let _transaction = lock_persistent_preview_transaction();
-                    let mut state = lock_persistent_previews();
-                    if state.generation == preview_generation && cleared {
-                        // Input is gone before DWM handles are dropped.
-                        state.previews.clear();
-                        state.desired.clear();
-                        state.host_anchored = false;
-                    }
-                    warn!("Preview retry budget exhausted; retaining safe parked fallback");
-                    break;
+                    // Keep the desired request and registered-handle receipts.
+                    // The host/input stay hidden, but this is a backoff boundary
+                    // rather than an abandonment boundary: an eventual source,
+                    // DWM, or input recovery must republish without waiting for
+                    // an unrelated layout mutation.
+                    PREVIEW_RETRY_PENDING.store(true, Ordering::Release);
+                    warn!(
+                        "Preview retry burst exhausted for generation {preview_generation}; retaining desired state for self-healing backoff"
+                    );
+                    retry_round = 0;
+                    std::thread::sleep(Duration::from_millis(500));
+                } else {
+                    std::thread::sleep(Duration::from_millis(75));
                 }
-                std::thread::sleep(Duration::from_millis(75));
             }
         }
     };
@@ -1251,6 +1486,7 @@ fn schedule_preview_retry() {
 /// transient thread-spawn failure cannot leave a desired preview hidden until
 /// unrelated layout activity occurs.
 pub fn service_pending_preview_retry() {
+    service_pending_thumbnail_unregisters();
     #[cfg(not(test))]
     {
         if PREVIEW_CLEAR_PENDING.load(Ordering::Acquire) {
@@ -1637,65 +1873,104 @@ pub fn source_size(handle: isize) -> Option<(i32, i32)> {
     if handle == 0 {
         return None;
     }
-    let size = unsafe { DwmQueryThumbnailSourceSize(handle) }.ok()?;
+    let size = unsafe { DwmQueryThumbnailSourceSize(resolve_dwm_handle(handle)) }.ok()?;
     if size.cx <= 0 || size.cy <= 0 {
         return None;
     }
     Some((size.cx, size.cy))
 }
 
-/// Unregister a thumbnail by raw `HTHUMBNAIL` value. Used by the worker
+/// Unregister a thumbnail by its opaque transfer token. Used by the worker
 /// thread when consuming `CrossfadeEntry` values (whose Drop calls this).
-/// Raw transfers exist only on the HOST path, so this keeps the host
-/// z-order accounting; non-host handles unregister through their Drop.
+/// The token resolves to both the DWM handle and the host-generation claim;
+/// stale old-generation drops are therefore inert after a host restart.
 ///
 /// Idempotent on null/zero handles — does nothing.
 pub fn unregister_raw(handle: isize) {
-    // Only ghost handles are transferred raw (see `into_isize`), and a ghost
-    // always claims the topmost band.
-    unregister_impl(handle, true, HostBand::Topmost);
+    unregister_impl(handle, true, HostBand::Topmost, 0);
 }
 
-fn unregister_impl(handle: isize, host_z: bool, band: HostBand) {
+fn unregister_impl(
+    handle: isize,
+    fallback_host_z: bool,
+    fallback_band: HostBand,
+    expected_host_generation: u64,
+) {
     if handle == 0 {
         return;
     }
-    // Hide first. If unregister itself fails, the leaked handle no longer owns
-    // visible pixels and cannot leave a stale preview after input was withdrawn.
+    let ownership = Z_ORDER_STATE
+        .lock()
+        .unwrap_or_else(crate::recover_poisoned_mutex)
+        .registrations
+        .get(&handle)
+        .copied();
+
+    let Some(ownership) = ownership else {
+        // Compatibility for an external caller that still passes a literal
+        // HTHUMBNAIL. LeopardWM-created registrations always take the tracked
+        // path below.
+        if let Err(error) = unregister_dwm_handle(handle) {
+            warn!("DwmUnregisterThumbnail({handle}) failed for untracked handle: {error}");
+        }
+        return;
+    };
+    if expected_host_generation != 0
+        && (ownership.host_z != fallback_host_z
+            || ownership.band != fallback_band
+            || ownership.host_generation != expected_host_generation)
+    {
+        warn!("Ignoring stale thumbnail ownership token {handle}");
+        return;
+    }
+    if ownership.retired {
+        // Restart proved this destination HWND was destroyed. Removing the
+        // stale token cannot affect a replacement generation's accounting.
+        Z_ORDER_STATE
+            .lock()
+            .unwrap_or_else(crate::recover_poisoned_mutex)
+            .registrations
+            .remove(&handle);
+        return;
+    }
+
+    // Hide first. If unregister itself fails, the globally retained ownership
+    // receipt still owns a non-visible thumbnail and can be retried later.
     if let Err(error) = update(handle, Rect::new(0, 0, 1, 1), 0, false) {
         warn!("Could not hide thumbnail {handle} before unregister: {error}");
     }
-    // A failed DwmUnregisterThumbnail leaks the DWM handle (the caller
-    // already gave up its owning reference, so we can't retry). Decrement
-    // anyway: the balance tracks handles WE account for, and pinning it
-    // above zero on a transient failure would strand the host topmost for
-    // the rest of the session and make the health metric lie. Clamp at
-    // zero so a double-unregister or failure run can't go negative.
-    if let Err(e) = unsafe { DwmUnregisterThumbnail(handle) } {
+    if let Err(error) = unregister_dwm_handle(ownership.dwm_handle) {
         warn!(
-            "DwmUnregisterThumbnail({}) failed (handle leaked): {}",
-            handle, e
+            "DwmUnregisterThumbnail({}) failed; retaining retry receipt: {}",
+            ownership.dwm_handle, error
         );
+        return;
     }
-    // Serialize the balance update with the z-order side effect.
-    let mut z = Z_ORDER_STATE
-        .lock()
-        .unwrap_or_else(crate::recover_poisoned_mutex);
-    z.balance = (z.balance - 1).max(0);
-    REGISTER_BALANCE.store(z.balance, Ordering::Relaxed);
-    // Last accounted HOST thumbnail just went away: drop the host back to
-    // non-topmost so it stops interfering with the taskbar's auto-hide
-    // z-order. Guard on prev >= 1 so a clamped underflow can't skip it.
-    if host_z {
-        z.host_balance = (z.host_balance - 1).max(0);
-        if band == HostBand::Topmost {
-            let prev = z.topmost_balance;
-            z.topmost_balance = (z.topmost_balance - 1).max(0);
-            if prev >= 1 && z.topmost_balance == 0 {
-                if let Err(error) = host().set_topmost(false) {
-                    warn!("Thumbnail host demotion failed: {error}");
-                }
-            }
+
+    let released = {
+        let mut state = Z_ORDER_STATE
+            .lock()
+            .unwrap_or_else(crate::recover_poisoned_mutex);
+        // A token is unique, but retain this check so a future maintenance
+        // change cannot let an old completion release replacement ownership.
+        if state
+            .registrations
+            .get(&handle)
+            .is_some_and(|current| current.dwm_handle == ownership.dwm_handle)
+        {
+            release_registration_locked(&mut state, handle)
+        } else {
+            None
+        }
+    };
+    let Some((released, demote_host)) = released else {
+        return;
+    };
+    if demote_host && released.host_generation == host().generation() {
+        if let Err(error) = host().set_topmost(false) {
+            // The registration is gone, but the host state is retryable on the
+            // next registration/restart. Do not resurrect a released DWM handle.
+            warn!("Thumbnail host demotion failed: {error}");
         }
     }
 }
@@ -2033,6 +2308,7 @@ impl ThumbnailHost {
         {
             return Ok(());
         }
+        let old_generation = self.generation();
         let old_thread = self
             .thread
             .lock()
@@ -2073,6 +2349,15 @@ impl ThumbnailHost {
 
         self.hwnd_raw.store(0, Ordering::Release);
         self.thread_id.store(0, Ordering::Release);
+        // Advance before retiring old claims. A registration that completed its
+        // DWM call just as the pump died now observes a generation mismatch and
+        // cannot insert an old claim after retirement.
+        let _ = self
+            .generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                Some(value.wrapping_add(1).max(1))
+            });
+        retire_host_generation_claims(old_generation);
         let replacement = Self::new()?;
         let ThumbnailHost {
             hwnd_raw,
@@ -2092,11 +2377,6 @@ impl ThumbnailHost {
         self.hwnd_raw.store(new_raw, Ordering::Release);
         self.thread_id.store(new_thread_id, Ordering::Release);
         self.geometry_current.store(true, Ordering::Release);
-        let _ = self
-            .generation
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
-                Some(value.wrapping_add(1).max(1))
-            });
         *self
             .origin
             .lock()
@@ -2390,7 +2670,8 @@ fn virtual_screen_size() -> (i32, i32) {
 pub mod integration_probe {
     use super::*;
     use windows::core::BOOL;
-    use windows::Win32::Foundation::{LPARAM, POINT, WPARAM};
+    use windows::Win32::Foundation::{COLORREF, LPARAM, POINT, WPARAM};
+    use windows::Win32::Graphics::Gdi::{GetPixel, GetDC, ReleaseDC};
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
         MOUSEINPUT,
@@ -2558,6 +2839,227 @@ pub mod integration_probe {
             expected_source_size: source_size,
             destination_screen_rect: destination,
         })
+    }
+
+    /// Verify that an API publication receipt corresponds to sampled pixels for
+    /// a deliberately solid-colored, same-process source. This is intentionally
+    /// probe-only: arbitrary application content, occlusion, color management,
+    /// and protected surfaces make a production pixel assertion dishonest.
+    pub fn controlled_colored_source_pixel_proof(
+        source_window_id: WindowId,
+        destination: Rect,
+        expected: COLORREF,
+    ) -> Result<bool, Win32Error> {
+        invalidate_persistent_preview_surface();
+        clear_persistent_previews()?;
+        let result = (|| {
+            if !prepare_persistent_preview(source_window_id) {
+                return Ok(false);
+            }
+            let request = probe_request(source_window_id, destination)?;
+            let live = commit_persistent_previews(&[request], true, preview_lifecycle_epoch())?;
+            if live != 1 || unsafe { windows::Win32::Graphics::Dwm::DwmFlush() }.is_err() {
+                return Ok(false);
+            }
+            let screen_dc = unsafe { GetDC(None) };
+            if screen_dc.0.is_null() {
+                return Err(Win32Error::SetPositionFailed(
+                    "controlled preview pixel proof could not acquire screen DC".into(),
+                ));
+            }
+            let center_x = destination.x + destination.width / 2;
+            let center_y = destination.y + destination.height / 2;
+            let samples = [
+                unsafe { GetPixel(screen_dc, center_x, center_y) },
+                unsafe { GetPixel(screen_dc, center_x - 2, center_y) },
+                unsafe { GetPixel(screen_dc, center_x + 2, center_y) },
+                unsafe { GetPixel(screen_dc, center_x, center_y - 2) },
+                unsafe { GetPixel(screen_dc, center_x, center_y + 2) },
+            ];
+            unsafe {
+                ReleaseDC(None, screen_dc);
+            }
+            let channel_distance = |actual: COLORREF, wanted: COLORREF| {
+                let channels = |color: COLORREF| {
+                    (
+                        (color.0 & 0xff) as i32,
+                        ((color.0 >> 8) & 0xff) as i32,
+                        ((color.0 >> 16) & 0xff) as i32,
+                    )
+                };
+                let (ar, ag, ab) = channels(actual);
+                let (wr, wg, wb) = channels(wanted);
+                (ar - wr).abs().max((ag - wg).abs()).max((ab - wb).abs())
+            };
+            // The invisible 1/255 input target and desktop color management can
+            // perturb one channel slightly. Requiring a majority of a tiny
+            // center cross avoids claiming a proof from one stale edge pixel.
+            Ok(samples
+                .into_iter()
+                .filter(|sample| channel_distance(*sample, expected) <= 20)
+                .count()
+                >= 3)
+        })();
+        let clear = clear_persistent_previews();
+        match (result, clear) {
+            (Ok(proven), Ok(())) => Ok(proven),
+            (Err(error), _) => Err(error),
+            (_, Err(error)) => Err(error),
+        }
+    }
+
+    /// Exhaust the immediate retry burst, prove the desired request remains
+    /// owned while hidden, then release the fault and require autonomous
+    /// publication without another layout call.
+    pub fn retry_exhaustion_keeps_desired_and_recovers(
+        source_window_id: WindowId,
+        destination: Rect,
+    ) -> Result<bool, Win32Error> {
+        invalidate_persistent_preview_surface();
+        clear_persistent_previews()?;
+        PREVIEW_RETRY_PENDING.store(false, Ordering::Release);
+        if !prepare_persistent_preview(source_window_id) {
+            return Ok(false);
+        }
+        let request = probe_request(source_window_id, destination)?;
+        struct PublishFailureReset;
+        impl Drop for PublishFailureReset {
+            fn drop(&mut self) {
+                FORCE_PREVIEW_PUBLISH_FAILURES.store(0, Ordering::Release);
+            }
+        }
+        let _failure_reset = PublishFailureReset;
+        FORCE_PREVIEW_PUBLISH_FAILURES.store(u32::MAX, Ordering::Release);
+        let initial_live = commit_persistent_previews(&[request], true, preview_lifecycle_epoch())?;
+        std::thread::sleep(Duration::from_millis(450));
+        let retained_desire = {
+            let state = lock_persistent_previews();
+            state.desired.as_slice() == &[request]
+                && state
+                    .previews
+                    .get(&source_window_id)
+                    .is_some()
+                && !state.host_anchored
+        };
+        FORCE_PREVIEW_PUBLISH_FAILURES.store(0, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let mut recovered = false;
+        while Instant::now() < deadline {
+            recovered = {
+                let state = lock_persistent_previews();
+                state.host_anchored
+                    && state
+                        .previews
+                        .get(&source_window_id)
+                        .is_some_and(|preview| preview.published.is_some())
+            };
+            if recovered {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        clear_persistent_previews()?;
+        Ok(initial_live == 0 && retained_desire && recovered)
+    }
+
+    /// Force a real HWND through two failed cloak commits. Both calls must
+    /// return an error and leave no logical cloak/cache success; the verified
+    /// sentinel fallback keeps the source physically safe between attempts.
+    pub fn placement_cloak_failure_is_not_cached(source_window_id: WindowId) -> bool {
+        use leopardwm_core_layout::{Visibility, WindowPlacement};
+
+        let placement = WindowPlacement {
+            window_id: source_window_id,
+            rect: Rect::new(-400, 20, 640, 480),
+            visibility: Visibility::OffScreenLeft,
+            column_index: 0,
+        };
+        let config = crate::PlatformConfig::default();
+        let mut cache = crate::placement::PlacementCache::new();
+        crate::placement::integration_probe_fail_next_cloak();
+        let first = crate::placement::apply_placements(
+            &[placement.clone()],
+            &config,
+            Some(&mut cache),
+            false,
+        );
+        let first_safe = first.is_err()
+            && !crate::placement::is_placement_cloaked(source_window_id)
+            && crate::visibility::has_move_offscreen_ownership(source_window_id);
+        crate::placement::integration_probe_fail_next_cloak();
+        let second = crate::placement::apply_placements(
+            &[placement],
+            &config,
+            Some(&mut cache),
+            false,
+        );
+        let second_safe = second.is_err()
+            && !crate::placement::is_placement_cloaked(source_window_id)
+            && crate::visibility::has_move_offscreen_ownership(source_window_id);
+        let _ = crate::visibility::restore_window_moved_offscreen(source_window_id);
+        first_safe && second_safe
+    }
+
+    fn host_claims() -> (i64, i64, i64) {
+        let state = Z_ORDER_STATE
+            .lock()
+            .unwrap_or_else(crate::recover_poisoned_mutex);
+        (state.balance, state.host_balance, state.topmost_balance)
+    }
+
+    fn force_host_restart_for_probe() -> Result<(), Win32Error> {
+        let old_host = host().hwnd();
+        let thread_id = host().thread_id.load(Ordering::Acquire);
+        unsafe {
+            PostThreadMessageW(thread_id, WM_QUIT, WPARAM(0), LPARAM(0)).map_err(|error| {
+                Win32Error::SetPositionFailed(format!("probe host quit failed: {error}"))
+            })?;
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while unsafe { IsWindow(Some(old_host)) }.as_bool() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        host().restart()
+    }
+
+    /// Hold an old topmost registration across restart, then drop stale and new
+    /// owners in both orders. Old-generation drops must never alter the new
+    /// host's claims or prevent its promotion.
+    pub fn host_restart_claims_are_generation_safe(source_window_id: WindowId) -> Result<bool, Win32Error> {
+        invalidate_persistent_preview_surface();
+        clear_persistent_previews()?;
+        let baseline = host_claims();
+        let old_first = register(source_window_id)?;
+        force_host_restart_for_probe()?;
+        let new_first = register(source_window_id)?;
+        let promoted = host_claims()
+            == (baseline.0 + 1, baseline.1 + 1, baseline.2 + 1);
+        drop(old_first);
+        let stale_drop_inert = host_claims()
+            == (baseline.0 + 1, baseline.1 + 1, baseline.2 + 1);
+        drop(new_first);
+        let first_order_restored = host_claims() == baseline;
+
+        let old_second = register(source_window_id)?;
+        force_host_restart_for_probe()?;
+        let new_second = register(source_window_id)?;
+        drop(new_second);
+        let current_drop_restored = host_claims() == baseline;
+        drop(old_second);
+        let stale_after_current_inert = host_claims() == baseline;
+        Ok(promoted && stale_drop_inert && first_order_restored && current_drop_restored && stale_after_current_inert)
+    }
+
+    /// Fail one DWM unregister, retain its accounting receipt, then service the
+    /// retry and require the exact baseline balance/band to return.
+    pub fn unregister_failure_retains_ownership(source_window_id: WindowId) -> Result<bool, Win32Error> {
+        let baseline = host_claims();
+        let handle = register(source_window_id)?;
+        FORCE_NEXT_UNREGISTER_FAILURE.store(true, Ordering::Release);
+        drop(handle);
+        let retained = host_claims() == (baseline.0 + 1, baseline.1 + 1, baseline.2 + 1);
+        service_pending_thumbnail_unregisters();
+        Ok(retained && host_claims() == baseline)
     }
 
     pub fn retry_spawn_failure_recovers(
@@ -3022,6 +3524,7 @@ mod tests {
             balance: 1,
             host_balance: 1,
             topmost_balance: 0,
+            registrations: std::collections::HashMap::new(),
         };
         assert!(host_band_is_compatible(&normal, HostBand::Normal));
         assert!(!host_band_is_compatible(&normal, HostBand::Topmost));
@@ -3030,6 +3533,7 @@ mod tests {
             balance: 1,
             host_balance: 1,
             topmost_balance: 1,
+            registrations: std::collections::HashMap::new(),
         };
         assert!(host_band_is_compatible(&topmost, HostBand::Topmost));
         assert!(!host_band_is_compatible(&topmost, HostBand::Normal));

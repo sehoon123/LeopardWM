@@ -14,6 +14,8 @@ use crate::window_region::{
 use leopardwm_core_layout::{Rect, Visibility, WindowId, WindowPlacement};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "integration-probes")]
+use std::sync::atomic::AtomicBool;
 use std::sync::{Mutex, OnceLock};
 use windows::core::BOOL;
 use windows::Win32::Foundation::{HWND, RECT};
@@ -45,12 +47,27 @@ const DWMWA_TRANSITIONS_FORCEDISABLED: DWMWINDOWATTRIBUTE = DWMWINDOWATTRIBUTE(3
 /// and `GHOST_CLOAKED` — only callers that have already evaluated the
 /// OR-cloak invariant (or recovery paths that want to force-uncloak
 /// regardless) should call this directly.
+#[cfg(feature = "integration-probes")]
+static FORCE_NEXT_CLOAK_FAILURE: AtomicBool = AtomicBool::new(false);
+
+/// Inject one failed cloak write for the owned-HWND integration probe. The
+/// production path still receives the real DWM result, including the usual
+/// `E_ACCESSDENIED` for a foreign source HWND.
+#[cfg(feature = "integration-probes")]
+pub(crate) fn integration_probe_fail_next_cloak() {
+    FORCE_NEXT_CLOAK_FAILURE.store(true, Ordering::Release);
+}
+
 unsafe fn dwm_set_cloak(hwnd: HWND, cloaked: bool) -> bool {
     // NOTE: DWMWA_CLOAK only succeeds on windows owned by the calling
     // process; cloaking another process's window returns E_ACCESSDENIED
     // (0x80070005). Callers that require an actually-hidden source (the DWM
     // thumbnail animation) must check this result instead of treating logical
     // set membership as proof that the external HWND was cloaked.
+    #[cfg(feature = "integration-probes")]
+    if FORCE_NEXT_CLOAK_FAILURE.swap(false, Ordering::AcqRel) {
+        return false;
+    }
     let value = BOOL::from(cloaked);
     DwmSetWindowAttribute(
         hwnd,
@@ -88,6 +105,44 @@ fn apply_cloak_state_locked(wid: WindowId) -> bool {
 fn global_cloaked_contains(wid: WindowId) -> bool {
     let guard = lock_cloaked();
     guard.as_ref().is_some_and(|set| set.contains(&wid))
+}
+
+/// Change normal-placement cloak ownership only if the corresponding DWM
+/// write commits. On failure restore the old logical receipt and re-apply that
+/// receipt best-effort, so a transient access failure can never turn a
+/// foreign/unresponsive HWND into a falsely cached hidden window.
+///
+/// Callers must hold `CLOAK_COMMIT`.
+fn commit_global_cloak_state_locked(wid: WindowId, should_cloak: bool) -> bool {
+    let was_cloaked = global_cloaked_contains(wid);
+    if was_cloaked != should_cloak {
+        let mut guard = lock_cloaked();
+        let cloaked = guard.get_or_insert_with(HashSet::new);
+        if should_cloak {
+            cloaked.insert(wid);
+        } else {
+            cloaked.remove(&wid);
+        }
+    }
+
+    if apply_cloak_state_locked(wid) {
+        return true;
+    }
+
+    // Reconstruct the exact old logical state before retrying its physical OR.
+    // This leaves a failed uncloak retryable and a failed cloak absent from the
+    // placement ledger.
+    if was_cloaked != should_cloak {
+        let mut guard = lock_cloaked();
+        let cloaked = guard.get_or_insert_with(HashSet::new);
+        if was_cloaked {
+            cloaked.insert(wid);
+        } else {
+            cloaked.remove(&wid);
+        }
+    }
+    let _ = apply_cloak_state_locked(wid);
+    false
 }
 
 // ---------------------------------------------------------------------
@@ -206,17 +261,21 @@ fn lock_cloaked() -> std::sync::MutexGuard<'static, Option<HashSet<WindowId>>> {
 /// scratchpad window that has been removed from its workspace) — nothing
 /// in the placement path will reposition or uncloak it, so a direct cloak
 /// is safe and stays put until the owner uncloaks it.
-pub fn dwm_cloak_window(window_id: WindowId) {
+pub fn dwm_cloak_window(window_id: WindowId) -> bool {
     let _commit = lock_cloak_commit();
-    {
-        let mut guard = lock_direct_cloaked();
-        guard.get_or_insert_with(HashSet::new).insert(window_id);
+    let Ok(hwnd) = window_id_to_hwnd(window_id) else {
+        return false;
+    };
+    if !unsafe { IsWindow(Some(hwnd)).as_bool() } || !unsafe { dwm_set_cloak(hwnd, true) } {
+        // Do not create a recovery receipt for a cloak DWM rejected. Scratchpad
+        // callers park first, so the verified sentinel remains the safety
+        // mechanism for foreign HWNDs rather than a false logical cloak.
+        return false;
     }
-    if let Ok(hwnd) = window_id_to_hwnd(window_id) {
-        unsafe {
-            let _ = dwm_set_cloak(hwnd, true);
-        }
-    }
+    lock_direct_cloaked()
+        .get_or_insert_with(HashSet::new)
+        .insert(window_id);
+    true
 }
 
 /// Force-uncloak a window by its WindowId regardless of either tracking
@@ -227,26 +286,49 @@ pub fn dwm_cloak_window(window_id: WindowId) {
 /// visible" regardless of why the window was originally cloaked.
 pub fn dwm_uncloak_window(window_id: WindowId) {
     let _commit = lock_cloak_commit();
+    let was_global = global_cloaked_contains(window_id);
+    let was_ghost = ghost_cloaked_contains(window_id);
+    let was_direct = lock_direct_cloaked()
+        .as_ref()
+        .is_some_and(|set| set.contains(&window_id));
+
     {
         let mut guard = lock_cloaked();
-        if let Some(ref mut set) = *guard {
+        if let Some(set) = guard.as_mut() {
             set.remove(&window_id);
         }
     }
-    {
-        let mut guard = lock_ghost_cloaked();
-        if let Some(ref mut set) = *guard {
-            set.remove(&window_id);
-        }
-    }
+    unmark_ghost_cloaked_locked(window_id);
     {
         let mut guard = lock_direct_cloaked();
-        if let Some(ref mut set) = *guard {
+        if let Some(set) = guard.as_mut() {
             set.remove(&window_id);
         }
     }
-    if let Ok(hwnd) = window_id_to_hwnd(window_id) {
-        unsafe { dwm_set_cloak(hwnd, false) };
+
+    let uncloaked = window_id_to_hwnd(window_id)
+        .ok()
+        .is_some_and(|hwnd| unsafe { IsWindow(Some(hwnd)).as_bool() && dwm_set_cloak(hwnd, false) });
+    if uncloaked {
+        return;
+    }
+
+    // A failed force-uncloak must remain recoverable. Restore every receipt
+    // exactly as it was instead of claiming shutdown/rollback succeeded.
+    if was_global {
+        lock_cloaked()
+            .get_or_insert_with(HashSet::new)
+            .insert(window_id);
+    }
+    if was_ghost {
+        lock_ghost_cloaked()
+            .get_or_insert_with(HashSet::new)
+            .insert(window_id);
+    }
+    if was_direct {
+        lock_direct_cloaked()
+            .get_or_insert_with(HashSet::new)
+            .insert(window_id);
     }
 }
 
@@ -256,36 +338,36 @@ pub fn dwm_uncloak_all() {
     invalidate_preview_surface_and_clear_best_effort("global uncloak");
     restore_all_window_regions();
     let _commit = lock_cloak_commit();
-    let global_ids: Vec<WindowId> = {
-        let mut guard = lock_cloaked();
-        match guard.as_mut() {
-            Some(set) => set.drain().collect(),
-            None => Vec::new(),
+    let mut ids = HashSet::new();
+    if let Some(set) = lock_cloaked().as_ref() {
+        ids.extend(set.iter().copied());
+    }
+    if let Some(set) = lock_ghost_cloaked().as_ref() {
+        ids.extend(set.iter().copied());
+    }
+    if let Some(set) = lock_direct_cloaked().as_ref() {
+        ids.extend(set.iter().copied());
+    }
+
+    for window_id in ids {
+        let uncloaked = window_id_to_hwnd(window_id)
+            .ok()
+            .is_some_and(|hwnd| unsafe {
+                IsWindow(Some(hwnd)).as_bool() && dwm_set_cloak(hwnd, false)
+            });
+        if !uncloaked {
+            // Keep all receipts for a later recovery pass. Draining them before
+            // DWM confirms the write used to make a transient failure permanent.
+            continue;
         }
-    };
-    let ghost_ids: Vec<WindowId> = {
-        let mut guard = lock_ghost_cloaked();
-        match guard.as_mut() {
-            Some(set) => set.drain().collect(),
-            None => Vec::new(),
+        if let Some(set) = lock_cloaked().as_mut() {
+            set.remove(&window_id);
         }
-    };
-    let direct_ids: Vec<WindowId> = {
-        let mut guard = lock_direct_cloaked();
-        match guard.as_mut() {
-            Some(set) => set.drain().collect(),
-            None => Vec::new(),
+        if let Some(set) = lock_ghost_cloaked().as_mut() {
+            set.remove(&window_id);
         }
-    };
-    // Use a set union so we don't issue redundant DWM calls for windows
-    // present in more than one set. dwm_set_cloak is idempotent.
-    let mut seen: HashSet<WindowId> =
-        HashSet::with_capacity(global_ids.len() + ghost_ids.len() + direct_ids.len());
-    for wid in global_ids.into_iter().chain(ghost_ids).chain(direct_ids) {
-        if seen.insert(wid) {
-            if let Ok(hwnd) = window_id_to_hwnd(wid) {
-                unsafe { dwm_set_cloak(hwnd, false) };
-            }
+        if let Some(set) = lock_direct_cloaked().as_mut() {
+            set.remove(&window_id);
         }
     }
 }
@@ -306,15 +388,14 @@ pub fn is_placement_cloaked(window_id: WindowId) -> bool {
 /// from the previous call are not left permanently invisible.
 fn uncloak_all_tracked() {
     let _commit = lock_cloak_commit();
-    let ids: Vec<WindowId> = {
-        let mut guard = lock_cloaked();
-        match guard.as_mut() {
-            Some(set) => set.drain().collect(),
-            None => return,
-        }
-    };
+    let ids: Vec<WindowId> = lock_cloaked()
+        .as_ref()
+        .map(|set| set.iter().copied().collect())
+        .unwrap_or_default();
     for wid in ids {
-        let _ = apply_cloak_state_locked(wid);
+        // Keep a failed uncloak receipt instead of draining it before DWM has
+        // accepted the visibility transition.
+        let _ = commit_global_cloak_state_locked(wid, false);
     }
 }
 
@@ -472,13 +553,19 @@ fn latch_return_repair(window_id: WindowId) {
         .insert(window_id);
 }
 
-/// Take the latched repairs, leaving the set empty.
-fn take_return_repairs() -> HashSet<WindowId> {
-    std::mem::take(
-        &mut *pending_return_repair()
-            .lock()
-            .unwrap_or_else(crate::recover_poisoned_mutex),
-    )
+/// Claim only repair receipts owned by this exact landing. A disjoint batch
+/// must leave another HWND's renderer-repair obligation intact.
+fn take_return_repairs_for(window_ids: &HashSet<WindowId>) -> HashSet<WindowId> {
+    let mut pending = pending_return_repair()
+        .lock()
+        .unwrap_or_else(crate::recover_poisoned_mutex);
+    let claimed: HashSet<WindowId> = pending
+        .iter()
+        .filter(|window_id| window_ids.contains(window_id))
+        .copied()
+        .collect();
+    pending.retain(|window_id| !claimed.contains(window_id));
+    claimed
 }
 
 /// Forget a latched repair for a window that will not be placed again.
@@ -632,8 +719,10 @@ pub fn apply_placements_with_regions(
     verify_preview_source_landings(&entries, &mut failed_window_ids);
     // A returning window stays cloaked until its visible landing succeeded; the
     // old ordering uncloaked first and could flash a stale offscreen/intermediate
-    // position when SetWindowPos later failed.
-    uncloak_becoming_visible(&entries, &failed_window_ids);
+    // position when SetWindowPos later failed. A failed uncloak retains its
+    // receipt and rejects this landing rather than claiming it became visible.
+    let visible_uncloak_failures = uncloak_becoming_visible(&entries, &failed_window_ids);
+    failed_window_ids.extend(visible_uncloak_failures);
 
     let flush_needed = preview_commit_needs_flush(
         animation_frame,
@@ -655,7 +744,7 @@ pub fn apply_placements_with_regions(
         .copied()
         .filter(|request| !failed_window_ids.contains(&request.window_id))
         .collect();
-    uncloak_preview_sources(&committed_preview_requests);
+    failed_window_ids.extend(uncloak_preview_sources(&committed_preview_requests));
     for clip in region_clips {
         if !failed_window_ids.contains(&clip.window_id)
             && !restore_window_region(clip.window_id, true)
@@ -711,19 +800,30 @@ pub fn apply_placements_with_regions(
         (Vec::new(), Vec::new(), Vec::new())
     }; // end: skip landing verification during async frames
 
-    // Update cache: remove stale entries (windows no longer in placements),
-    // update positioned entries, and keep skipped-unchanged entries intact.
+    // Cloak off-screen windows AFTER positioning. DWM cloaking keeps the
+    // composition surface alive (preventing content shift on return) while
+    // hiding the window from view (preventing peeking through outer gaps).
+    // A rejected foreign-HWND cloak falls back to a verified sentinel park and
+    // is still reported as a failed placement; never cache API acceptance as a
+    // hidden-surface receipt.
+    sync_cloak_state(
+        &entries,
+        placements,
+        &mut failed_window_ids,
+        &committed_preview_requests,
+    );
+
+    // Update cache only after every visibility side effect committed. In
+    // particular, a foreign HWND whose cloak was denied must retry rather than
+    // making a later animation frame skip a false hidden state.
     if let Some(cache) = cache {
         let current_ids: std::collections::HashSet<u64> =
             placements.iter().map(|p| p.window_id).collect();
-        // Remove windows that are no longer in the layout
         cache.positions.retain(|id, _| current_ids.contains(id));
         cache.insets.retain(|id, _| current_ids.contains(id));
         cache
             .compositor_sensitive
             .retain(|id, _| current_ids.contains(id));
-        // Record the effective entry. A region failure may have synchronously
-        // switched this HWND to its safe fallback geometry.
         for entry in &entries {
             if !failed_window_ids.contains(&entry.window_id) {
                 cache
@@ -732,21 +832,6 @@ pub fn apply_placements_with_regions(
             }
         }
     }
-
-    // Cloak off-screen windows AFTER positioning. DWM cloaking keeps the
-    // composition surface alive (preventing content shift on return) while
-    // hiding the window from view (preventing peeking through outer gaps).
-    // Events from cloaking are filtered by is_placement_cloaked() in event_hooks.
-    //
-    // Routed through `apply_cloak_state` so a window that's also in
-    // `GHOST_CLOAKED` stays cloaked even if we remove it from
-    // `GLOBAL_CLOAKED` during pruning.
-    sync_cloak_state(
-        &entries,
-        placements,
-        &failed_window_ids,
-        &committed_preview_requests,
-    );
 
     // DirectComposition swap-chain repair.
     //
@@ -764,13 +849,22 @@ pub fn apply_placements_with_regions(
     // mode only serialises *animation* frames — it does nothing for a single
     // multi-thousand-pixel jump back into the viewport.
     if !animation_frame {
-        let returned_from_park = take_return_repairs();
+        // Claim only receipts this exact landing can actually process. Entries
+        // rejected earlier in the batch retain their receipt for a later retry.
+        let repairable_ids: HashSet<WindowId> = entries
+            .iter()
+            .filter(|entry| {
+                entry.visibility == Visibility::Visible
+                    && entry.w > 1
+                    && !failed_window_ids.contains(&entry.window_id)
+            })
+            .map(|entry| entry.window_id)
+            .collect();
+        let returned_from_park = take_return_repairs_for(&repairable_ids);
         let nudge_targets: Vec<NudgeTarget> = entries
             .iter()
             .filter(|e| {
-                e.visibility == Visibility::Visible
-                    && e.w > 1
-                    && !failed_window_ids.contains(&e.window_id)
+                repairable_ids.contains(&e.window_id)
                     && (nudge_sticky_compositors || returned_from_park.contains(&e.window_id))
             })
             .map(|e| NudgeTarget {
@@ -1220,25 +1314,19 @@ fn build_defer_entries(
 
 /// Install a bridge before uncloaking or moving. Unsupported application-owned
 /// regions use the existing safe whole-window fallback before presentation.
-fn uncloak_preview_sources(requests: &[PersistentPreviewRequest]) {
+fn uncloak_preview_sources(requests: &[PersistentPreviewRequest]) -> HashSet<WindowId> {
     if requests.is_empty() {
-        return;
+        return HashSet::new();
     }
     let _commit = lock_cloak_commit();
-    let mut changed = Vec::new();
-    {
-        let mut cloaked = lock_cloaked();
-        if let Some(ref mut set) = *cloaked {
-            for request in requests {
-                if set.remove(&request.window_id) {
-                    changed.push(request.window_id);
-                }
-            }
-        }
-    }
-    for window_id in changed {
-        let _ = apply_cloak_state_locked(window_id);
-    }
+    requests
+        .iter()
+        .filter_map(|request| {
+            global_cloaked_contains(request.window_id)
+                .then(|| request.window_id)
+                .filter(|window_id| !commit_global_cloak_state_locked(*window_id, false))
+        })
+        .collect()
 }
 
 fn should_cloak_entry(
@@ -1253,27 +1341,22 @@ fn should_cloak_entry(
 }
 
 /// Uncloak entries becoming visible and drop them from the tracking set.
-fn uncloak_becoming_visible(entries: &[DeferEntry], failed_window_ids: &HashSet<WindowId>) {
+fn uncloak_becoming_visible(
+    entries: &[DeferEntry],
+    failed_window_ids: &HashSet<WindowId>,
+) -> HashSet<WindowId> {
     let _commit = lock_cloak_commit();
-    let to_consider: Vec<WindowId> = {
-        let mut cloaked = lock_cloaked();
-        if let Some(ref mut set) = *cloaked {
-            entries
-                .iter()
-                .filter(|e| {
-                    e.visibility == Visibility::Visible
-                        && !failed_window_ids.contains(&e.window_id)
-                        && set.remove(&e.window_id)
-                })
-                .map(|e| e.window_id)
-                .collect()
-        } else {
-            Vec::new()
-        }
-    };
-    for wid in to_consider {
-        let _ = apply_cloak_state_locked(wid);
-    }
+    entries
+        .iter()
+        .filter(|entry| {
+            entry.visibility == Visibility::Visible
+                && !failed_window_ids.contains(&entry.window_id)
+                && global_cloaked_contains(entry.window_id)
+        })
+        .filter_map(|entry| {
+            (!commit_global_cloak_state_locked(entry.window_id, false)).then_some(entry.window_id)
+        })
+        .collect()
 }
 
 /// Position all entries in one DeferWindowPos batch; returns (applied, failed ids).
@@ -1738,70 +1821,79 @@ fn detect_size_violations(
 }
 
 /// Cloak newly off-screen entries and prune cloaks for windows no longer in the layout.
+///
+/// A DWM cloak rejection is not a logical state transition. We instead attempt
+/// a monitor-clearing sentinel park, retain its durable marker, and report the
+/// original placement as failed so an animation cache cannot bless the failed
+/// DWM write. The sole exception is an explicit zero-size global-sentinel
+/// placement: that intent already has a verified physical hiding mechanism,
+/// so it may commit without a cloak receipt.
 fn sync_cloak_state(
     entries: &[DeferEntry],
     placements: &[WindowPlacement],
-    failed_window_ids: &HashSet<u64>,
+    failed_window_ids: &mut HashSet<u64>,
     preview_requests: &[PersistentPreviewRequest],
 ) {
     let preview_ids: HashSet<WindowId> = preview_requests
         .iter()
         .map(|request| request.window_id)
         .collect();
+    let current_ids: HashSet<WindowId> = placements
+        .iter()
+        .map(|placement| placement.window_id)
+        .collect();
     let _commit = lock_cloak_commit();
-    let mut changed: Vec<WindowId> = Vec::new();
-    {
-        let mut guard = lock_cloaked();
-        let cloaked = guard.get_or_insert_with(HashSet::new);
-        for entry in entries {
-            if failed_window_ids.contains(&entry.window_id) {
-                // A preview source whose park failed must remain protected. DWM
-                // cloak is best-effort for foreign HWNDs, but retaining logical
-                // ownership prevents a later path from eagerly uncloaking it.
-                if entry.preview_source && cloaked.insert(entry.window_id) {
-                    changed.push(entry.window_id);
-                }
-                continue;
-            }
-            let placement_exists = placements
-                .iter()
-                .any(|placement| placement.window_id == entry.window_id);
-            let should_cloak = should_cloak_entry(
-                entry,
-                placement_exists,
-                failed_window_ids.contains(&entry.window_id),
-            );
-            if should_cloak {
-                if cloaked.insert(entry.window_id) {
-                    changed.push(entry.window_id);
-                }
-            } else if cloaked.remove(&entry.window_id) {
-                changed.push(entry.window_id);
-            }
+
+    for entry in entries {
+        if failed_window_ids.contains(&entry.window_id) {
+            // Do not replace a prior failed receipt with an unverified logical
+            // cloak. A future exact pass can retry from the original evidence.
+            continue;
         }
-        for window_id in &preview_ids {
-            if cloaked.remove(window_id) {
-                changed.push(*window_id);
+
+        let placement_exists = current_ids.contains(&entry.window_id);
+        let should_cloak = should_cloak_entry(entry, placement_exists, false);
+        if should_cloak {
+            if !commit_global_cloak_state_locked(entry.window_id, true) {
+                let parked = crate::visibility::move_window_offscreen(entry.window_id).is_ok();
+                let explicit_global_sentinel =
+                    entry.layout_rect.width == 0 && entry.layout_rect.height == 0;
+                if !parked || !explicit_global_sentinel {
+                    failed_window_ids.insert(entry.window_id);
+                }
             }
-        }
-        let current_ids: HashSet<u64> = placements
-            .iter()
-            .map(|placement| placement.window_id)
-            .collect();
-        let stale: Vec<WindowId> = cloaked
-            .iter()
-            .filter(|window_id| !current_ids.contains(window_id))
-            .copied()
-            .collect();
-        for window_id in stale {
-            cloaked.remove(&window_id);
-            changed.push(window_id);
+        } else if global_cloaked_contains(entry.window_id)
+            && !commit_global_cloak_state_locked(entry.window_id, false)
+        {
+            failed_window_ids.insert(entry.window_id);
         }
     }
-    changed.sort_unstable();
-    changed.dedup();
-    for window_id in changed {
-        let _ = apply_cloak_state_locked(window_id);
+
+    // Preview sources have a separately verified park and DWM publication
+    // transaction. Their global placement cloak must be removed only if DWM
+    // confirms the corresponding uncloak.
+    for window_id in preview_ids {
+        if global_cloaked_contains(window_id)
+            && !commit_global_cloak_state_locked(window_id, false)
+        {
+            failed_window_ids.insert(window_id);
+        }
+    }
+
+    let stale: Vec<WindowId> = lock_cloaked()
+        .as_ref()
+        .map(|cloaked| {
+            cloaked
+                .iter()
+                .filter(|window_id| !current_ids.contains(window_id))
+                .copied()
+                .collect()
+        })
+        .unwrap_or_default();
+    for window_id in stale {
+        // Failed cleanup remains owned for a later recovery pass rather than
+        // silently dropping the only uncloak receipt.
+        let _ = commit_global_cloak_state_locked(window_id, false);
     }
 }
 
@@ -2247,25 +2339,17 @@ mod tests {
     }
 
     #[test]
-    fn test_direct_cloak_is_tracked_for_recovery() {
-        // A directly-cloaked window (e.g. a stashed scratchpad) must be
-        // tracked in DIRECT_CLOAKED so shutdown/panic recovery can restore
-        // it; otherwise it would be permanently invisible. Uses a unique
-        // wid so it won't collide with parallel tests touching the set.
+    fn test_failed_direct_cloak_does_not_create_a_false_recovery_receipt() {
+        // A direct cloak records ownership only after DWM accepts it. An
+        // invalid/foreign HWND must rely on its verified sentinel park rather
+        // than appearing logically cloaked when no physical write occurred.
         let wid: WindowId = 0x7FFF_FF01;
-        dwm_cloak_window(wid);
-        assert!(
-            lock_direct_cloaked()
-                .as_ref()
-                .is_some_and(|s| s.contains(&wid)),
-            "dwm_cloak_window must record the wid for recovery"
-        );
-        dwm_uncloak_window(wid);
+        assert!(!dwm_cloak_window(wid));
         assert!(
             !lock_direct_cloaked()
                 .as_ref()
                 .is_some_and(|s| s.contains(&wid)),
-            "dwm_uncloak_window must clear the recovery record"
+            "failed direct cloak must not record false ownership"
         );
     }
 
@@ -2497,8 +2581,9 @@ mod visible_landing_policy_tests {
 
 #[cfg(test)]
 mod compositor_return_repair_tests {
-    use super::returns_from_offscreen_park;
+    use super::{latch_return_repair, returns_from_offscreen_park, take_return_repairs_for};
     use leopardwm_core_layout::{Rect, Visibility};
+    use std::collections::HashSet;
 
     fn parked() -> Option<(Rect, Visibility)> {
         Some((
@@ -2589,6 +2674,19 @@ mod compositor_return_repair_tests {
                 previous
             ));
         }
+    }
+
+    #[test]
+    fn disjoint_exact_landing_keeps_another_window_repair_receipt() {
+        let returning = 0x7fff_ff10;
+        let unrelated = 0x7fff_ff11;
+        latch_return_repair(returning);
+
+        let unrelated_ids = HashSet::from([unrelated]);
+        assert!(take_return_repairs_for(&unrelated_ids).is_empty());
+
+        let returning_ids = HashSet::from([returning]);
+        assert_eq!(take_return_repairs_for(&returning_ids), returning_ids);
     }
 }
 
