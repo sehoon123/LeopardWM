@@ -83,6 +83,31 @@ static BORDER_STATE: Mutex<BorderState> = Mutex::new(BorderState {
     cached_corner_radius: -1.0,
 });
 
+/// Publish a render as cacheable only after its layered-window update reached
+/// the compositor. Keeping this decision separate makes failure behavior
+/// testable without allocating GDI objects.
+#[allow(clippy::too_many_arguments)]
+fn commit_border_render_cache(
+    state: &mut BorderState,
+    w: i32,
+    h: i32,
+    width: u32,
+    position: BorderPosition,
+    color_bgr: u32,
+    corner_radius: f32,
+    rendered: bool,
+) {
+    if !rendered {
+        return;
+    }
+    state.cached_w = w;
+    state.cached_h = h;
+    state.cached_width = width;
+    state.cached_position = position;
+    state.cached_color = color_bgr;
+    state.cached_corner_radius = corner_radius;
+}
+
 /// Manages a transparent overlay window that draws a colored border frame
 /// around the focused window with anti-aliased rounded corners.
 pub struct BorderFrame {
@@ -131,7 +156,14 @@ impl BorderFrame {
                     Ok(h) => {
                         let _ = tx.send(Ok((h.0 as isize, thread_id)));
                         let mut msg = MSG::default();
-                        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                        loop {
+                            let result = GetMessageW(&mut msg, None, 0, 0);
+                            if !crate::should_dispatch_message(result.0) {
+                                if result.0 < 0 {
+                                    tracing::warn!("Border frame message retrieval failed");
+                                }
+                                break;
+                            }
                             if msg.message == WM_QUIT_BORDER_THREAD {
                                 break;
                             }
@@ -362,17 +394,16 @@ impl BorderFrame {
         h: i32,
         width: u32,
         position: BorderPosition,
-    ) {
+    ) -> bool {
+        if w <= 0 || h <= 0 {
+            return false;
+        }
         let bw = width as f32;
 
+        // Snapshot the desired appearance, but do not publish it as cached
+        // until the layered update has physically succeeded.
         let (color_bgr, base_radius) = {
-            let mut state = BORDER_STATE.lock().unwrap();
-            state.cached_w = w;
-            state.cached_h = h;
-            state.cached_width = width;
-            state.cached_position = position;
-            state.cached_color = state.color_bgr;
-            state.cached_corner_radius = state.corner_radius;
+            let state = BORDER_STATE.lock().unwrap();
             (state.color_bgr, state.corner_radius)
         };
 
@@ -419,8 +450,12 @@ impl BorderFrame {
             let mut bits: *mut c_void = std::ptr::null_mut();
             let hbitmap = CreateDIBSection(None, &bmi, DIB_RGB_COLORS, &mut bits, None, 0);
             let Ok(hbitmap) = hbitmap else {
-                return;
+                return false;
             };
+            if bits.is_null() {
+                let _ = DeleteObject(hbitmap.into());
+                return false;
+            }
 
             let pixels = std::slice::from_raw_parts_mut(bits as *mut u32, (w * h) as usize);
 
@@ -472,7 +507,16 @@ impl BorderFrame {
             }
 
             let hdc_screen = GetDC(None);
+            if hdc_screen.0.is_null() {
+                let _ = DeleteObject(hbitmap.into());
+                return false;
+            }
             let hdc_mem = CreateCompatibleDC(Some(hdc_screen));
+            if hdc_mem.0.is_null() {
+                ReleaseDC(None, hdc_screen);
+                let _ = DeleteObject(hbitmap.into());
+                return false;
+            }
             let old = SelectObject(hdc_mem, hbitmap.into());
 
             let pt_dst = POINT { x, y };
@@ -485,7 +529,7 @@ impl BorderFrame {
                 AlphaFormat: AC_SRC_ALPHA as u8,
             };
 
-            let _ = UpdateLayeredWindow(
+            let updated = UpdateLayeredWindow(
                 self.hwnd,
                 Some(hdc_screen),
                 Some(&pt_dst),
@@ -495,14 +539,28 @@ impl BorderFrame {
                 windows::Win32::Foundation::COLORREF(0),
                 Some(&blend),
                 ULW_ALPHA,
-            );
+            )
+            .is_ok();
 
             SelectObject(hdc_mem, old);
             let _ = DeleteDC(hdc_mem);
             ReleaseDC(None, hdc_screen);
             let _ = DeleteObject(hbitmap.into());
 
-            let _ = ShowWindow(self.hwnd, SW_SHOWNA);
+            if updated {
+                commit_border_render_cache(
+                    &mut BORDER_STATE.lock().unwrap(),
+                    w,
+                    h,
+                    width,
+                    position,
+                    color_bgr,
+                    base_radius,
+                    true,
+                );
+                let _ = ShowWindow(self.hwnd, SW_SHOWNA);
+            }
+            updated
         }
     }
 }
@@ -531,4 +589,56 @@ unsafe extern "system" fn border_frame_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state() -> BorderState {
+        BorderState {
+            color_bgr: 0x00112233,
+            corner_radius: 8.0,
+            cached_w: 10,
+            cached_h: 20,
+            cached_width: 2,
+            cached_position: BorderPosition::Outside,
+            cached_color: 0x00445566,
+            cached_corner_radius: 4.0,
+        }
+    }
+
+    #[test]
+    fn failed_render_does_not_publish_cache() {
+        let mut state = state();
+        commit_border_render_cache(
+            &mut state,
+            100,
+            200,
+            3,
+            BorderPosition::Inside,
+            0x00778899,
+            12.0,
+            false,
+        );
+        assert_eq!(state.cached_w, 10);
+        assert_eq!(state.cached_h, 20);
+        assert_eq!(state.cached_color, 0x00445566);
+
+        commit_border_render_cache(
+            &mut state,
+            100,
+            200,
+            3,
+            BorderPosition::Inside,
+            0x00778899,
+            12.0,
+            true,
+        );
+        assert_eq!(state.cached_w, 100);
+        assert_eq!(state.cached_h, 200);
+        assert_eq!(state.cached_position, BorderPosition::Inside);
+        assert_eq!(state.cached_color, 0x00778899);
+        assert_eq!(state.cached_corner_radius, 12.0);
+    }
 }

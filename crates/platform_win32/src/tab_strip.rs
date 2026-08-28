@@ -482,7 +482,14 @@ impl TabStripOverlay {
                             create_tooltip_popup(h);
                             let _ = tx.send(Ok((strip_hwnd_isize, thread_id)));
                             let mut msg = MSG::default();
-                            while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                            loop {
+                                let result = GetMessageW(&mut msg, None, 0, 0);
+                                if !crate::should_dispatch_message(result.0) {
+                                    if result.0 < 0 {
+                                        tracing::warn!("Tab strip message retrieval failed");
+                                    }
+                                    break;
+                                }
                                 if msg.message == WM_QUIT_TAB_STRIP_THREAD {
                                     break;
                                 }

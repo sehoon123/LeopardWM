@@ -157,6 +157,33 @@ struct PopupContext {
     check_tooltip_visible: bool,
 }
 
+impl Drop for PopupContext {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.bg_brush.is_invalid() {
+                let _ = DeleteObject(self.bg_brush.into());
+            }
+            if !self.hover_brush.is_invalid() {
+                let _ = DeleteObject(self.hover_brush.into());
+            }
+            if !self.check_bitmap.is_invalid() {
+                let _ = DeleteObject(self.check_bitmap.into());
+            }
+            if !self.edit_font.is_invalid() {
+                let _ = DeleteObject(self.edit_font.into());
+            }
+            if self.check_tooltip_hwnd != 0 {
+                let _ = DestroyWindow(HWND(self.check_tooltip_hwnd as *mut c_void));
+            }
+            if let Some(icon) = self.icon.filter(|icon| *icon != 0) {
+                let _ = windows::Win32::UI::WindowsAndMessaging::DestroyIcon(
+                    windows::Win32::UI::WindowsAndMessaging::HICON(icon as *mut c_void),
+                );
+            }
+        }
+    }
+}
+
 /// Show the inline rename popup over the given screen-coord tab rect.
 ///
 /// `bg_color` and `text_color` are 0xBBGGRR (the strip's color format)
@@ -337,33 +364,28 @@ pub fn show_rename_inline_popup(
         let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
 
         let mut msg = MSG::default();
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+        loop {
+            let result = GetMessageW(&mut msg, None, 0, 0);
+            if !crate::should_dispatch_message(result.0) {
+                if result.0 < 0 {
+                    tracing::warn!("Inline rename popup message retrieval failed");
+                }
+                break;
+            }
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
 
-        // Reclaim ownership; clean up the brushes we allocated up front.
-        let ctx_owned: Box<PopupContext> = Box::from_raw(ctx_ptr);
-        let _ = DeleteObject(ctx_owned.bg_brush.into());
-        let _ = DeleteObject(ctx_owned.hover_brush.into());
-        if !ctx_owned.check_bitmap.is_invalid() {
-            let _ = DeleteObject(ctx_owned.check_bitmap.into());
+        // A retrieval failure can leave the popup alive. Destroy it before
+        // reclaiming its GWLP_USERDATA context so its WndProc can never
+        // observe a dangling pointer.
+        if windows::Win32::UI::WindowsAndMessaging::IsWindow(Some(hwnd)).as_bool() {
+            let _ = DestroyWindow(hwnd);
         }
-        if !ctx_owned.edit_font.is_invalid() {
-            let _ = DeleteObject(ctx_owned.edit_font.into());
-        }
-        if ctx_owned.check_tooltip_hwnd != 0 {
-            let _ = DestroyWindow(HWND(ctx_owned.check_tooltip_hwnd as *mut c_void));
-        }
-        // Release our owned HICON copy.
-        if let Some(h) = ctx_owned.icon {
-            if h != 0 {
-                let _ = windows::Win32::UI::WindowsAndMessaging::DestroyIcon(
-                    windows::Win32::UI::WindowsAndMessaging::HICON(h as *mut c_void),
-                );
-            }
-        }
-        Ok(ctx_owned.result)
+        let mut ctx_owned: Box<PopupContext> = Box::from_raw(ctx_ptr);
+        let result = ctx_owned.result.take();
+        drop(ctx_owned);
+        Ok(result)
     }
 }
 

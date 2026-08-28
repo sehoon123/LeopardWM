@@ -897,7 +897,16 @@ unsafe fn update_mask_window(hwnd: HWND, rect: Rect, caps: &[CornerCap]) {
         return;
     };
     let hdc_screen = GetDC(None);
+    if hdc_screen.0.is_null() {
+        let _ = DeleteObject(hbitmap.into());
+        return;
+    }
     let mem_dc = CreateCompatibleDC(Some(hdc_screen));
+    if mem_dc.0.is_null() {
+        ReleaseDC(None, hdc_screen);
+        let _ = DeleteObject(hbitmap.into());
+        return;
+    }
     let old_bmp = SelectObject(mem_dc, hbitmap.into());
     {
         // CreateDIBSection zero-initializes: everything not painted
@@ -1108,7 +1117,14 @@ impl OverviewOverlay {
                             }
                             let _ = tx.send(Ok((h.0 as isize, thread_id)));
                             let mut msg = MSG::default();
-                            while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                            loop {
+                                let result = GetMessageW(&mut msg, None, 0, 0);
+                                if !crate::should_dispatch_message(result.0) {
+                                    if result.0 < 0 {
+                                        tracing::warn!("Overview message retrieval failed");
+                                    }
+                                    break;
+                                }
                                 if msg.message == WM_QUIT_OVERVIEW_THREAD {
                                     break;
                                 }
@@ -1755,21 +1771,31 @@ fn on_anim_tick(hwnd: HWND) {
         let step = chrome_step_for_k(k);
         if s.chrome_last_step != Some(step) {
             if let Some(dc) = s.chrome_steps.get(step).map(|cs| cs.mem_dc) {
-                s.chrome_last_step = Some(step);
                 unsafe {
                     let hdc = GetDC(Some(hwnd));
-                    let _ = BitBlt(
-                        hdc,
-                        0,
-                        0,
-                        s.window_rect.width,
-                        s.window_rect.height,
-                        Some(HDC(dc as *mut c_void)),
-                        0,
-                        0,
-                        SRCCOPY,
-                    );
-                    ReleaseDC(Some(hwnd), hdc);
+                    let copied = !hdc.0.is_null()
+                        && dc != 0
+                        && BitBlt(
+                            hdc,
+                            0,
+                            0,
+                            s.window_rect.width,
+                            s.window_rect.height,
+                            Some(HDC(dc as *mut c_void)),
+                            0,
+                            0,
+                            SRCCOPY,
+                        )
+                        .as_bool();
+                    if !hdc.0.is_null() {
+                        ReleaseDC(Some(hwnd), hdc);
+                    }
+                    if record_frame_blit(&mut s, copied) {
+                        s.chrome_last_step = Some(step);
+                    } else {
+                        tracing::warn!("Overview animation frame blit failed; scheduling full render");
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
                 }
             }
         }
@@ -2224,12 +2250,28 @@ struct FrameInput<'a> {
 /// it). Callers finish with [`finish_alpha`] and release with
 /// [`release_frame_dib`].
 unsafe fn render_frame_straight(w: i32, h: i32, input: &FrameInput) -> Option<(FrameDib, Vec<u8>)> {
+    if w <= 0 || h <= 0 {
+        return None;
+    }
     let bmi = top_down_bmi(w, h);
     let mut bits: *mut c_void = std::ptr::null_mut();
     let hbitmap = CreateDIBSection(None, &bmi, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+    if bits.is_null() {
+        let _ = DeleteObject(hbitmap.into());
+        return None;
+    }
 
     let hdc_screen = GetDC(None);
+    if hdc_screen.0.is_null() {
+        let _ = DeleteObject(hbitmap.into());
+        return None;
+    }
     let mem_dc = CreateCompatibleDC(Some(hdc_screen));
+    if mem_dc.0.is_null() {
+        ReleaseDC(None, hdc_screen);
+        let _ = DeleteObject(hbitmap.into());
+        return None;
+    }
     let old_bmp = SelectObject(mem_dc, hbitmap.into());
 
     // 1. Backdrop clear (GDI), flushed before the direct-bit shape pass.
@@ -2538,10 +2580,21 @@ fn build_chrome_steps(w: i32, h: i32) {
 /// Create one blank step DIB selected into its own memory DC; the raw
 /// bits pointer for the copy + fade fill rides in `ChromeStep::bits`.
 unsafe fn create_step_dib(w: i32, h: i32) -> Option<ChromeStep> {
+    if w <= 0 || h <= 0 {
+        return None;
+    }
     let bmi = top_down_bmi(w, h);
     let mut bits: *mut c_void = std::ptr::null_mut();
     let hbitmap = CreateDIBSection(None, &bmi, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+    if bits.is_null() {
+        let _ = DeleteObject(hbitmap.into());
+        return None;
+    }
     let mem_dc = CreateCompatibleDC(None);
+    if mem_dc.0.is_null() {
+        let _ = DeleteObject(hbitmap.into());
+        return None;
+    }
     let old_bmp = SelectObject(mem_dc, hbitmap.into());
     Some(ChromeStep {
         mem_dc: mem_dc.0 as isize,
@@ -2553,10 +2606,16 @@ unsafe fn create_step_dib(w: i32, h: i32) -> Option<ChromeStep> {
 
 /// Free one fade step's GDI objects.
 unsafe fn free_chrome_step(st: ChromeStep) {
-    let dc = HDC(st.mem_dc as *mut c_void);
-    SelectObject(dc, HGDIOBJ(st.old_bmp as *mut c_void));
-    let _ = DeleteDC(dc);
-    let _ = DeleteObject(HGDIOBJ(st.hbitmap as *mut c_void));
+    if st.mem_dc != 0 {
+        let dc = HDC(st.mem_dc as *mut c_void);
+        if st.old_bmp != 0 {
+            SelectObject(dc, HGDIOBJ(st.old_bmp as *mut c_void));
+        }
+        let _ = DeleteDC(dc);
+    }
+    if st.hbitmap != 0 {
+        let _ = DeleteObject(HGDIOBJ(st.hbitmap as *mut c_void));
+    }
 }
 
 /// Free every pre-rendered fade step, the retained full-strength frame
@@ -2655,6 +2714,16 @@ fn rebuild_faded_chrome_steps() {
     s.chrome_steps = steps;
 }
 
+/// Record a frame blit result. A failed cached/staged blit must not count as
+/// a successful paint: request the full render path so the next branch can
+/// rebuild rather than repeatedly publishing a stale frame.
+fn record_frame_blit(state: &mut OverviewState, succeeded: bool) -> bool {
+    if !succeeded {
+        state.needs_full_render = true;
+    }
+    succeeded
+}
+
 /// WM_PAINT for the accent (blur) modes: double-buffer the frame in the
 /// DIB and `BitBlt` it to the window DC — SRCCOPY carries the alpha
 /// bytes, so DWM composites the chrome over the blurred backdrop.
@@ -2676,19 +2745,26 @@ unsafe fn paint_frame(hwnd: HWND) {
             _ => None,
         };
         if let Some((step, dc)) = step_dc {
-            let _ = BitBlt(
-                hdc,
-                0,
-                0,
-                s.window_rect.width,
-                s.window_rect.height,
-                Some(HDC(dc as *mut c_void)),
-                0,
-                0,
-                SRCCOPY,
-            );
-            s.chrome_last_step = Some(step);
-            true
+            let copied = dc != 0
+                && BitBlt(
+                    hdc,
+                    0,
+                    0,
+                    s.window_rect.width,
+                    s.window_rect.height,
+                    Some(HDC(dc as *mut c_void)),
+                    0,
+                    0,
+                    SRCCOPY,
+                )
+                .as_bool();
+            if record_frame_blit(&mut s, copied) {
+                s.chrome_last_step = Some(step);
+                true
+            } else {
+                tracing::warn!("Overview staged frame blit failed; rebuilding frame");
+                false
+            }
         } else {
             false
         }
@@ -2701,7 +2777,7 @@ unsafe fn paint_frame(hwnd: HWND) {
     // content — a stray WM_PAINT (occlusion, z churn) re-blits it
     // instead of re-running the SDF render.
     let reblitted = {
-        let s = state();
+        let mut s = state();
         match &s.hover_cache {
             Some(c)
                 if s.visible
@@ -2709,18 +2785,23 @@ unsafe fn paint_frame(hwnd: HWND) {
                     && c.w == s.window_rect.width
                     && c.h == s.window_rect.height =>
             {
-                let _ = BitBlt(
-                    hdc,
-                    0,
-                    0,
-                    c.w,
-                    c.h,
-                    Some(HDC(c.work_dc as *mut c_void)),
-                    0,
-                    0,
-                    SRCCOPY,
-                );
-                true
+                let copied = c.work_dc != 0
+                    && BitBlt(
+                        hdc,
+                        0,
+                        0,
+                        c.w,
+                        c.h,
+                        Some(HDC(c.work_dc as *mut c_void)),
+                        0,
+                        0,
+                        SRCCOPY,
+                    )
+                    .as_bool();
+                if !record_frame_blit(&mut s, copied) {
+                    tracing::warn!("Overview cached frame blit failed; rebuilding frame");
+                }
+                copied
             }
             _ => false,
         }
@@ -2985,23 +3066,30 @@ fn hover_repaint(hwnd: HWND, old: Option<(usize, usize)>, new: Option<(usize, us
     // Blit under the lock: a concurrent drop_hover_cache (which also
     // takes the lock) can never delete the DIB mid-blit.
     if !dirty.is_empty() {
-        unsafe {
+        let copied = unsafe {
             let hdc = GetDC(Some(hwnd));
-            for r in &dirty {
-                let _ = BitBlt(
-                    hdc,
-                    r.x,
-                    r.y,
-                    r.width,
-                    r.height,
-                    Some(HDC(cache.work_dc as *mut c_void)),
-                    r.x,
-                    r.y,
-                    SRCCOPY,
-                );
+            let copied = !hdc.0.is_null()
+                && cache.work_dc != 0
+                && dirty.iter().all(|r| {
+                    BitBlt(
+                        hdc,
+                        r.x,
+                        r.y,
+                        r.width,
+                        r.height,
+                        Some(HDC(cache.work_dc as *mut c_void)),
+                        r.x,
+                        r.y,
+                        SRCCOPY,
+                    )
+                    .as_bool()
+                });
+            if !hdc.0.is_null() {
+                ReleaseDC(Some(hwnd), hdc);
             }
-            ReleaseDC(Some(hwnd), hdc);
-        }
+            copied
+        };
+        return record_frame_blit(s, copied);
     }
     true
 }
@@ -3880,6 +3968,18 @@ mod tests {
             mask_hwnd: 0,
             mask_pushed: (Rect::new(0, 0, 0, 0), Vec::new()),
         }
+    }
+
+    #[test]
+    fn failed_frame_blit_requests_a_full_render_fallback() {
+        let mut state = overlay_state(glide_model(150));
+        state.needs_full_render = false;
+        assert!(!record_frame_blit(&mut state, false));
+        assert!(state.needs_full_render);
+
+        state.needs_full_render = false;
+        assert!(record_frame_blit(&mut state, true));
+        assert!(!state.needs_full_render);
     }
 
     fn fake_step() -> ChromeStep {

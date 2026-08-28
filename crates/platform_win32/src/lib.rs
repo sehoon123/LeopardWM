@@ -132,6 +132,13 @@ pub(crate) fn window_id_to_hwnd(id: WindowId) -> Result<HWND, Win32Error> {
     Ok(HWND(id as *mut c_void))
 }
 
+/// `GetMessageW` returns a positive value for a dispatchable message, zero
+/// for `WM_QUIT`, and -1 on retrieval failure. `BOOL::as_bool()` is not
+/// suitable for this API because it treats -1 as true.
+pub(crate) fn should_dispatch_message(get_message_result: i32) -> bool {
+    get_message_result > 0
+}
+
 pub(crate) fn combine_operation_failures(context: &str, failures: Vec<String>) -> Win32Error {
     debug_assert!(!failures.is_empty());
     Win32Error::SetPositionFailed(format!(
@@ -157,3 +164,15 @@ pub(crate) fn is_benign_side_effect_error(error: &Win32Error) -> bool {
 // Re-export pub(crate) items needed by sibling modules (mouse_hook, etc.)
 pub(crate) use enumeration::normalize_to_root_window;
 pub(crate) use enumeration::should_emit_window_event;
+
+#[cfg(test)]
+mod tests {
+    use super::should_dispatch_message;
+
+    #[test]
+    fn get_message_error_is_not_dispatchable() {
+        assert!(should_dispatch_message(1));
+        assert!(!should_dispatch_message(0));
+        assert!(!should_dispatch_message(-1));
+    }
+}

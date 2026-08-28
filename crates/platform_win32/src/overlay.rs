@@ -29,8 +29,9 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetMessageW, PostMessageW,
-    RegisterClassW, SetWindowPos, ShowWindow, UnregisterClassW, HWND_TOPMOST, MSG, SWP_NOACTIVATE,
-    SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNA, WM_PAINT, WM_USER, WNDCLASSW, WS_EX_LAYERED,
+    PostThreadMessageW, RegisterClassW, SetWindowPos, ShowWindow, UnregisterClassW, HWND_TOPMOST,
+    MSG, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNA, WM_CLOSE, WM_PAINT, WM_USER,
+    WNDCLASSW, WS_EX_LAYERED,
     WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
 };
 
@@ -88,6 +89,9 @@ struct OverlayState {
 /// and the window is destroyed.
 pub struct OverlayWindow {
     hwnd: HWND,
+    /// Stored so teardown remains possible if the HWND was destroyed before
+    /// Drop can post its private shutdown message.
+    thread_id: u32,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -118,10 +122,11 @@ impl OverlayWindow {
             ));
         }
 
-        let (init_tx, init_rx) = mpsc::channel::<Result<isize, Win32Error>>();
+        let (init_tx, init_rx) = mpsc::channel::<Result<(isize, u32), Win32Error>>();
 
         let thread = std::thread::spawn(move || {
             unsafe {
+                let thread_id = windows::Win32::System::Threading::GetCurrentThreadId();
                 let class_name: Vec<u16> = "LeopardWMOverlayClass\0".encode_utf16().collect();
                 let wc = WNDCLASSW {
                     lpfnWndProc: Some(overlay_window_proc),
@@ -182,12 +187,15 @@ impl OverlayWindow {
                 );
 
                 let hwnd_raw = hwnd.0 as isize;
-                let _ = init_tx.send(Ok(hwnd_raw));
+                let _ = init_tx.send(Ok((hwnd_raw, thread_id)));
 
                 let mut msg = MSG::default();
                 loop {
                     let result = GetMessageW(&mut msg, None, 0, 0);
-                    if !result.as_bool() {
+                    if !crate::should_dispatch_message(result.0) {
+                        if result.0 < 0 {
+                            tracing::warn!("Overlay message retrieval failed");
+                        }
                         break;
                     }
                     if msg.message == WM_QUIT_OVERLAY {
@@ -201,8 +209,8 @@ impl OverlayWindow {
             }
         });
 
-        let hwnd_raw = match init_rx.recv() {
-            Ok(Ok(raw)) => raw,
+        let (hwnd_raw, thread_id) = match init_rx.recv() {
+            Ok(Ok(handles)) => handles,
             Ok(Err(e)) => {
                 OVERLAY_ACTIVE.store(false, Ordering::SeqCst);
                 return Err(e);
@@ -221,6 +229,7 @@ impl OverlayWindow {
 
         Ok(Self {
             hwnd,
+            thread_id,
             thread: Some(thread),
         })
     }
@@ -355,8 +364,13 @@ impl OverlayWindow {
 
 impl Drop for OverlayWindow {
     fn drop(&mut self) {
-        unsafe {
-            let _ = PostMessageW(Some(self.hwnd), WM_QUIT_OVERLAY, WPARAM(0), LPARAM(0));
+        let posted_via_window = unsafe {
+            PostMessageW(Some(self.hwnd), WM_QUIT_OVERLAY, WPARAM(0), LPARAM(0)).is_ok()
+        };
+        if !posted_via_window {
+            let _ = unsafe {
+                PostThreadMessageW(self.thread_id, WM_QUIT_OVERLAY, WPARAM(0), LPARAM(0))
+            };
         }
 
         if let Some(thread) = self.thread.take() {
@@ -395,6 +409,16 @@ fn overlay_window_proc_inner(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARA
     let _ = wparam;
     let _ = lparam;
     match msg {
+        // This overlay owns its message pump for its full lifetime. Treat an
+        // external close request as hide, rather than destroying the HWND and
+        // leaving Drop with no window route to stop the pump.
+        WM_CLOSE => {
+            if let Ok(mut state) = OVERLAY_STATE.lock() {
+                state.rect = None;
+            }
+            let _ = unsafe { ShowWindow(hwnd, SW_HIDE) };
+            LRESULT(0)
+        }
         WM_PAINT => {
             let mut ps = PAINTSTRUCT::default();
             let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
