@@ -2494,6 +2494,7 @@ fn test_floating_cross_monitor_drop_records_target_dpi_logical_size() {
 #[test]
 fn test_reconcile_handle_change_rekeys_monitor_owned_state() {
     let mut state = AppState::new_with_config(test_config(), two_monitors());
+    state.paused = false;
     state.workspaces.get_mut(&2).unwrap()[0]
         .add_floating(200, Rect::new(2000, 100, 600, 400))
         .unwrap();
@@ -5161,6 +5162,7 @@ fn test_pull_window_to_workspace() {
     // The Edit Config pull moves a tiled window from another workspace onto the
     // active one and focuses it (#57).
     let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.paused = false;
     let mon = state.focused_monitor;
     for h in [100u64, 200] {
         state
@@ -5200,6 +5202,7 @@ fn test_pull_window_to_workspace() {
 fn test_move_to_workspace_relative_wraps_around() {
     // Prev from the first workspace wraps to the last (index 8 = workspace 9).
     let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.paused = false;
     let mon = state.focused_monitor;
     state
         .injected_window_info
@@ -5217,6 +5220,7 @@ fn test_move_to_workspace_relative_wraps_around() {
 
     // Next from the last workspace wraps back to the first.
     let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.paused = false;
     let mon = state.focused_monitor;
     state.handle_command(IpcCommand::SwitchWorkspace { index: 9 });
     state
@@ -5233,6 +5237,7 @@ fn test_move_to_workspace_relative_wraps_around() {
 #[test]
 fn test_edge_wrap_focus_switches_workspace_only_when_enabled() {
     let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.paused = false;
     let mon = state.focused_monitor;
     state
         .injected_window_info
@@ -5261,6 +5266,7 @@ fn test_edge_wrap_focus_switches_workspace_only_when_enabled() {
 #[test]
 fn test_edge_wrap_move_crosses_window_to_adjacent_workspace() {
     let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.paused = false;
     state.config.behavior.workspace_edge_wrap = true;
     let mon = state.focused_monitor;
     state
@@ -5291,6 +5297,7 @@ fn test_move_to_workspace_preserves_column_width() {
     // A window resized away from the default keeps its column width when moved
     // to another workspace and back, instead of snapping to the default (#50).
     let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.paused = false;
     let mon = state.focused_monitor;
     for h in [100u64, 200] {
         state
@@ -5343,6 +5350,7 @@ fn test_move_to_workspace_restores_original_column() {
     // anchored by a surviving column-mate — something a default right-of-focus
     // insert could never produce (#50).
     let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.paused = false;
     let mon = state.focused_monitor;
     // Build ws1 columns [100],[200],[300], then stack 150 into column 0.
     for h in [100u64, 200, 300] {
@@ -5400,6 +5408,7 @@ fn test_pull_clears_move_origin() {
     // An Edit Config pull establishes a fresh placement, so it must void any
     // prior move-back origin (else a later move could restore a stale column).
     let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.paused = false;
     let mon = state.focused_monitor;
     for h in [100u64, 200] {
         state
@@ -5424,6 +5433,7 @@ fn test_try_edit_config_pull_matches_editor_by_title() {
     // The pull identifies the editor by its title (which shows the config
     // filename); other cross-workspace focus events are ignored (#57).
     let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.paused = false;
     let mon = state.focused_monitor;
     state
         .injected_window_info
@@ -6927,6 +6937,10 @@ fn switch_with_focused_sticky() -> AppState {
     state.previous_focused_hwnd = Some(100);
     // Force the slide transition so the landing-pass path is armed.
     state.reduce_motion = false;
+    state.paused = false;
+    state.injected_apply_placements_behavior = Some(TestApplyPlacementsBehavior::SleepAndSucceed(
+        std::time::Duration::ZERO,
+    ));
 
     let resp = state.handle_command(IpcCommand::SwitchWorkspace { index: 2 });
     assert!(matches!(resp, IpcResponse::Ok));
@@ -7009,6 +7023,10 @@ fn test_sticky_window_not_focused_does_not_steal_focus_on_switch() {
         .insert_window(200, Some(800))
         .unwrap();
     state.reduce_motion = false;
+    state.paused = false;
+    state.injected_apply_placements_behavior = Some(TestApplyPlacementsBehavior::SleepAndSucceed(
+        std::time::Duration::ZERO,
+    ));
 
     let resp = state.handle_command(IpcCommand::SwitchWorkspace { index: 2 });
     assert!(matches!(resp, IpcResponse::Ok));
@@ -7045,6 +7063,10 @@ fn test_tiled_sticky_focused_keeps_focus_across_switch() {
         .unwrap();
     state.previous_focused_hwnd = Some(100); // user is on the sticky window
     state.reduce_motion = false;
+    state.paused = false;
+    state.injected_apply_placements_behavior = Some(TestApplyPlacementsBehavior::SleepAndSucceed(
+        std::time::Duration::ZERO,
+    ));
 
     let resp = state.handle_command(IpcCommand::SwitchWorkspace { index: 2 });
     assert!(matches!(resp, IpcResponse::Ok));
