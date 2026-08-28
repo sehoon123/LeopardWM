@@ -7247,6 +7247,77 @@ fn test_restore_structure_prunes_dead_windows() {
 }
 
 #[test]
+fn test_restore_structure_rejects_invalid_deserialized_focus_indices() {
+    let mut state = structure_restore_state();
+    let snapshot = crate::state::StateSnapshot {
+        saved_at: "0".to_string(),
+        workspaces: vec![crate::state::WorkspaceSnapshot {
+            monitor_device_name: "DISPLAY2".to_string(),
+            workspace_index: 0,
+            workspace: saved_two_column_workspace(),
+        }],
+        focused_monitor_name: "DISPLAY1".to_string(),
+        active_workspace: std::collections::HashMap::new(),
+        tab_title_overrides: std::collections::HashMap::new(),
+    };
+    let mut encoded = serde_json::to_value(snapshot).unwrap();
+    encoded["workspaces"][0]["workspace"]["focused_column"] = serde_json::json!(99);
+    let malformed = serde_json::from_value(encoded).unwrap();
+
+    let restored = state.restore_workspace_structure_with(&malformed, |_| true);
+
+    let display2_id = state
+        .monitors
+        .iter()
+        .find(|(_, monitor)| monitor.device_name == "DISPLAY2")
+        .map(|(&id, _)| id)
+        .unwrap();
+    assert!(!restored.contains(&(display2_id, 0)));
+    assert!(state.workspaces[&display2_id][0].is_empty());
+}
+
+#[test]
+fn test_restore_structure_drops_duplicate_hwnd_from_later_workspace() {
+    let mut state = structure_restore_state();
+    let mut first = Workspace::default();
+    first.insert_window(100, Some(640)).unwrap();
+    let mut second = Workspace::default();
+    second.insert_window(100, Some(480)).unwrap();
+    second.insert_window(200, Some(480)).unwrap();
+    let snapshot = crate::state::StateSnapshot {
+        saved_at: "0".to_string(),
+        workspaces: vec![
+            crate::state::WorkspaceSnapshot {
+                monitor_device_name: "DISPLAY2".to_string(),
+                workspace_index: 0,
+                workspace: first,
+            },
+            crate::state::WorkspaceSnapshot {
+                monitor_device_name: "DISPLAY2".to_string(),
+                workspace_index: 1,
+                workspace: second,
+            },
+        ],
+        focused_monitor_name: "DISPLAY1".to_string(),
+        active_workspace: std::collections::HashMap::new(),
+        tab_title_overrides: std::collections::HashMap::new(),
+    };
+
+    state.restore_workspace_structure_with(&snapshot, |_| true);
+
+    let display2_id = state
+        .monitors
+        .iter()
+        .find(|(_, monitor)| monitor.device_name == "DISPLAY2")
+        .map(|(&id, _)| id)
+        .unwrap();
+    let restored = &state.workspaces[&display2_id];
+    assert!(restored[0].contains_window(100));
+    assert!(!restored[1].contains_window(100));
+    assert!(restored[1].contains_window(200));
+}
+
+#[test]
 fn test_restore_structure_rejects_out_of_range_workspace_index() {
     let mut state = structure_restore_state();
     let mut valid = leopardwm_core_layout::Workspace::default();

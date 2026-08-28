@@ -11,7 +11,7 @@ mod win32;
 pub use win32::push_failed_binds;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
+use std::sync::{mpsc, Mutex, OnceLock};
 
 use tracing::{info, warn};
 
@@ -33,6 +33,43 @@ pub enum SettingsEvent {
 
 /// Singleton guard — only one settings window at a time.
 static SETTINGS_OPEN: AtomicBool = AtomicBool::new(false);
+
+/// Timed-out settings threads remain owned here rather than being detached.
+/// Their `SettingsOpenGuard` stays live until their COM/WebView teardown
+/// genuinely finishes, so a replacement window cannot reuse global state.
+static PENDING_SETTINGS_THREADS: OnceLock<Mutex<Vec<std::thread::JoinHandle<()>>>> =
+    OnceLock::new();
+
+fn pending_settings_threads() -> &'static Mutex<Vec<std::thread::JoinHandle<()>>> {
+    PENDING_SETTINGS_THREADS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Join any retained settings threads that have completed. Daemon shutdown
+/// should call this once after dropping its active settings handle so retained
+/// COM/WebView ownership is recovered before process teardown when possible.
+pub(crate) fn reap_finished_settings_threads() {
+    let mut pending = pending_settings_threads()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut still_running = Vec::with_capacity(pending.len());
+    for thread in pending.drain(..) {
+        if thread.is_finished() {
+            if thread.join().is_err() {
+                warn!("Retained settings window thread panicked during shutdown");
+            }
+        } else {
+            still_running.push(thread);
+        }
+    }
+    *pending = still_running;
+}
+
+fn retain_settings_thread(thread: std::thread::JoinHandle<()>) {
+    let mut pending = pending_settings_threads()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    pending.push(thread);
+}
 
 /// Resets the singleton flag even if the settings thread unwinds unexpectedly.
 struct SettingsOpenGuard;
@@ -60,6 +97,7 @@ impl SettingsWindowHandle {
         high_contrast: bool,
         failed_binds: Vec<String>,
     ) -> Option<Self> {
+        reap_finished_settings_threads();
         if SETTINGS_OPEN
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
@@ -121,9 +159,43 @@ impl Drop for SettingsWindowHandle {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         if thread.is_finished() {
-            let _ = thread.join();
+            if thread.join().is_err() {
+                warn!("Settings window thread panicked during shutdown");
+            }
         } else {
-            warn!("Settings window thread did not exit within shutdown budget");
+            // Do not drop the JoinHandle: doing so detaches a thread that still
+            // owns WebView2, COM, the HWND, and the singleton guard. Retaining
+            // it also fences reopening until the original owner has exited.
+            warn!("Settings window thread exceeded shutdown budget; retaining join ownership");
+            retain_settings_thread(thread);
         }
+        reap_finished_settings_threads();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unfinished_settings_thread_is_retained_until_it_can_be_joined() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            release_rx.recv().unwrap();
+        });
+
+        assert!(!thread.is_finished());
+        retain_settings_thread(thread);
+        assert_eq!(pending_settings_threads().lock().unwrap().len(), 1);
+
+        release_tx.send(()).unwrap();
+        for _ in 0..100 {
+            reap_finished_settings_threads();
+            if pending_settings_threads().lock().unwrap().is_empty() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        panic!("retained settings thread was not joined after completion");
     }
 }

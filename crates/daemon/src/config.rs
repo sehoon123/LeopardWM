@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 
 /// Executables whose windows should never be tiled (system dialogs, security prompts, etc.).
 /// These are appended as built-in Ignore rules after user-defined rules.
@@ -197,6 +198,20 @@ pub struct LayoutConfig {
     max_column_width: Option<i32>,
 }
 
+/// Presets are fractional shares of the usable layout dimension.
+const MIN_PRESET_FRACTION: f64 = 0.0;
+const MAX_PRESET_FRACTION: f64 = 1.0;
+/// Rule column widths have a documented practical lower bound.
+const MIN_RULE_COLUMN_FRACTION: f64 = 0.05;
+
+fn valid_preset_fraction(value: f64) -> bool {
+    value.is_finite() && value > MIN_PRESET_FRACTION && value <= MAX_PRESET_FRACTION
+}
+
+fn valid_rule_column_fraction(value: f64) -> bool {
+    value.is_finite() && (MIN_RULE_COLUMN_FRACTION..=MAX_PRESET_FRACTION).contains(&value)
+}
+
 fn default_width_presets() -> Vec<f64> {
     vec![0.333, 0.5, 0.667]
 }
@@ -260,8 +275,14 @@ impl LayoutConfig {
         let idx = self.default_width_preset.saturating_sub(1);
         self.width_presets
             .get(idx)
-            .or_else(|| self.width_presets.first())
             .copied()
+            .filter(|value| valid_preset_fraction(*value))
+            .or_else(|| {
+                self.width_presets
+                    .iter()
+                    .copied()
+                    .find(|value| valid_preset_fraction(*value))
+            })
             .unwrap_or(0.5)
     }
 
@@ -1009,6 +1030,86 @@ pub struct ConfigWarning {
     pub message: String,
 }
 
+/// Result of comparing a settings-window snapshot with the current config
+/// immediately before writing it.
+#[derive(Debug, Clone)]
+pub(crate) enum ConditionalConfigSave {
+    Saved { revision: String },
+    Conflict { current: Config, revision: String },
+}
+
+static CONFIG_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn config_write_lock() -> &'static Mutex<()> {
+    CONFIG_WRITE_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// Canonical JSON is used as an exact revision token. Sorting object keys is
+/// necessary because flattened hotkey bindings live in a `HashMap` whose
+/// iteration order is not stable between independently loaded configs.
+fn write_canonical_json(value: &serde_json::Value, output: &mut String) {
+    match value {
+        serde_json::Value::Null => output.push_str("null"),
+        serde_json::Value::Bool(value) => output.push_str(if *value { "true" } else { "false" }),
+        serde_json::Value::Number(value) => output.push_str(&value.to_string()),
+        serde_json::Value::String(value) => {
+            output.push_str(&serde_json::to_string(value).expect("serializing a JSON string"));
+        }
+        serde_json::Value::Array(values) => {
+            output.push('[');
+            for (index, value) in values.iter().enumerate() {
+                if index != 0 {
+                    output.push(',');
+                }
+                write_canonical_json(value, output);
+            }
+            output.push(']');
+        }
+        serde_json::Value::Object(values) => {
+            output.push('{');
+            let mut keys: Vec<_> = values.keys().collect();
+            keys.sort_unstable();
+            for (index, key) in keys.into_iter().enumerate() {
+                if index != 0 {
+                    output.push(',');
+                }
+                output.push_str(&serde_json::to_string(key).expect("serializing a JSON key"));
+                output.push(':');
+                let value = values
+                    .get(key.as_str())
+                    .expect("canonical JSON key must exist");
+                write_canonical_json(value, output);
+            }
+            output.push('}');
+        }
+    }
+}
+
+fn validate_preset_values(
+    values: &mut Vec<f64>,
+    field: &str,
+    defaults: fn() -> Vec<f64>,
+    warnings: &mut Vec<ConfigWarning>,
+) {
+    let original_len = values.len();
+    values.retain(|value| valid_preset_fraction(*value));
+    if values.len() != original_len {
+        warnings.push(ConfigWarning {
+            field: field.to_string(),
+            message: format!(
+                "Removed preset values outside the finite range ({MIN_PRESET_FRACTION}, {MAX_PRESET_FRACTION}]"
+            ),
+        });
+    }
+    if values.is_empty() {
+        warnings.push(ConfigWarning {
+            field: field.to_string(),
+            message: format!("No valid {field}, using defaults"),
+        });
+        *values = defaults();
+    }
+}
+
 /// A window rule with pre-compiled regex patterns for efficient matching.
 #[derive(Debug, Clone)]
 pub struct CompiledWindowRule {
@@ -1128,6 +1229,42 @@ impl Config {
         Ok(Self::default())
     }
 
+    /// Return a deterministic, exact identity for the serialized configuration
+    /// fields. This is a process-local optimistic-concurrency token, not a
+    /// security primitive.
+    pub(crate) fn revision(&self) -> Result<String> {
+        let value = serde_json::to_value(self).context("Failed to serialize config revision")?;
+        let mut revision = String::new();
+        write_canonical_json(&value, &mut revision);
+        Ok(revision)
+    }
+
+    /// Save only when the current on-disk configuration still matches the
+    /// settings window's initial revision. The shared lock makes the check and
+    /// replacement atomic with respect to all in-process `Config::save` calls.
+    pub(crate) fn save_if_current_revision(
+        &self,
+        expected_revision: &str,
+    ) -> Result<ConditionalConfigSave> {
+        let _write_guard = config_write_lock().lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("Config write lock was poisoned; recovering ownership");
+            poisoned.into_inner()
+        });
+        let current = Self::load()?;
+        let current_revision = current.revision()?;
+        if current_revision != expected_revision {
+            return Ok(ConditionalConfigSave::Conflict {
+                current,
+                revision: current_revision,
+            });
+        }
+
+        self.save_to_primary_path()?;
+        Ok(ConditionalConfigSave::Saved {
+            revision: self.revision()?,
+        })
+    }
+
     /// Validate configuration values, clamping out-of-range fields and returning warnings.
     pub fn validate(&mut self) -> Vec<ConfigWarning> {
         let mut warnings = Vec::new();
@@ -1225,14 +1362,14 @@ impl Config {
             }
         }
 
-        // width_presets must not be empty
-        if self.layout.width_presets.is_empty() {
-            warnings.push(ConfigWarning {
-                field: "layout.width_presets".to_string(),
-                message: "Empty width_presets, using defaults".to_string(),
-            });
-            self.layout.width_presets = default_width_presets();
-        }
+        // Presets flow into layout sizing and must remain finite fractional
+        // shares even when config is edited outside the Settings UI.
+        validate_preset_values(
+            &mut self.layout.width_presets,
+            "layout.width_presets",
+            default_width_presets,
+            &mut warnings,
+        );
 
         // default_width_preset must be a valid 1-based index into width_presets
         let preset_count = self.layout.width_presets.len();
@@ -1248,13 +1385,42 @@ impl Config {
             self.layout.default_width_preset = 1;
         }
 
-        // height_presets must not be empty
-        if self.layout.height_presets.is_empty() {
-            warnings.push(ConfigWarning {
-                field: "layout.height_presets".to_string(),
-                message: "Empty height_presets, using defaults".to_string(),
-            });
-            self.layout.height_presets = default_height_presets();
+        validate_preset_values(
+            &mut self.layout.height_presets,
+            "layout.height_presets",
+            default_height_presets,
+            &mut warnings,
+        );
+
+        // Fixed floating-rule dimensions are DPI-scaled before becoming Win32
+        // rectangles, so reject nonpositive values at the configuration edge.
+        for (index, rule) in self.window_rules.iter_mut().enumerate() {
+            if rule.width.is_some_and(|width| width < 1) {
+                warnings.push(ConfigWarning {
+                    field: format!("window_rules[{index}].width"),
+                    message: "Floating rule width must be positive; ignoring it".to_string(),
+                });
+                rule.width = None;
+            }
+            if rule.height.is_some_and(|height| height < 1) {
+                warnings.push(ConfigWarning {
+                    field: format!("window_rules[{index}].height"),
+                    message: "Floating rule height must be positive; ignoring it".to_string(),
+                });
+                rule.height = None;
+            }
+            if rule
+                .column_width
+                .is_some_and(|fraction| !valid_rule_column_fraction(fraction))
+            {
+                warnings.push(ConfigWarning {
+                    field: format!("window_rules[{index}].column_width"),
+                    message: format!(
+                        "Column width must be finite and in {MIN_RULE_COLUMN_FRACTION}..={MAX_PRESET_FRACTION}; ignoring it"
+                    ),
+                });
+                rule.column_width = None;
+            }
         }
 
         // focus_follows_mouse_delay_ms must be >= 50 when enabled
@@ -1437,11 +1603,33 @@ impl Config {
                 None => None,
             };
             let column_width = match rule.column_width {
-                Some(f) if (0.05..=1.0).contains(&f) => Some(f),
+                Some(f) if valid_rule_column_fraction(f) => Some(f),
                 Some(f) => {
                     tracing::warn!(
-                        "Window rule column_width = {} is out of range (0.05-1.0); ignoring",
+                        "Window rule column_width = {} is not finite or out of range (0.05-1.0); ignoring",
                         f
+                    );
+                    None
+                }
+                None => None,
+            };
+            let width = match rule.width {
+                Some(width) if width > 0 => Some(width),
+                Some(width) => {
+                    tracing::warn!(
+                        "Window rule width = {} must be positive; ignoring",
+                        width
+                    );
+                    None
+                }
+                None => None,
+            };
+            let height = match rule.height {
+                Some(height) if height > 0 => Some(height),
+                Some(height) => {
+                    tracing::warn!(
+                        "Window rule height = {} must be positive; ignoring",
+                        height
                     );
                     None
                 }
@@ -1463,8 +1651,8 @@ impl Config {
                 title_regex,
                 match_executable: rule.match_executable.clone(),
                 action: rule.action,
-                width: rule.width,
-                height: rule.height,
+                width,
+                height,
                 corner_style: rule.corner_style,
                 open_on_workspace,
                 open_maximized: rule.open_maximized,
@@ -1511,6 +1699,12 @@ impl Config {
 
         Self::merge_default_hotkeys(&mut config.hotkeys);
 
+        // Every ingress (startup, reload, and settings conflict checks) must
+        // enter the same validated runtime domain.
+        for warning in config.validate() {
+            tracing::warn!("Config validation: {}: {}", warning.field, warning.message);
+        }
+
         Ok(config)
     }
 
@@ -1520,9 +1714,16 @@ impl Config {
     /// the user intentionally cleared (those go in `hotkeys.disabled`).
     fn merge_default_hotkeys(hotkeys: &mut HotkeyConfig) {
         let user_commands: HashSet<String> = hotkeys.bindings.values().cloned().collect();
+        let occupied_keys: HashSet<String> = hotkeys.bindings.keys().cloned().collect();
         let disabled: HashSet<&String> = hotkeys.disabled.iter().collect();
         for (key, cmd) in HotkeyConfig::default().bindings {
-            if !user_commands.contains(&cmd) && !disabled.contains(&cmd) {
+            // A default may be added only when neither its command nor its
+            // chord has been customized. Checking the key prevents a migration
+            // from replacing a user's unrelated command with the new default.
+            if !user_commands.contains(&cmd)
+                && !occupied_keys.contains(&key)
+                && !disabled.contains(&cmd)
+            {
                 hotkeys.bindings.insert(key, cmd);
             }
         }
@@ -1533,6 +1734,14 @@ impl Config {
     /// Serializes the config to TOML and writes to `config_paths()[0]`.
     /// Creates parent directories if they don't exist.
     pub fn save(&self) -> Result<()> {
+        let _write_guard = config_write_lock().lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("Config write lock was poisoned; recovering ownership");
+            poisoned.into_inner()
+        });
+        self.save_to_primary_path()
+    }
+
+    fn save_to_primary_path(&self) -> Result<()> {
         // Unit tests exercise command handlers that persist config; never
         // let them overwrite the developer's real config file.
         if cfg!(test) {
@@ -1675,6 +1884,24 @@ mod tests {
         let parsed: Config = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed.layout.gap, config.layout.gap);
         assert_eq!(parsed.layout.centering_mode, config.layout.centering_mode);
+    }
+
+    #[test]
+    fn test_config_revision_is_stable_for_binding_order_and_changes_with_content() {
+        let mut first = Config::default();
+        first.hotkeys.bindings = HashMap::from([
+            ("Ctrl+Alt+A".to_string(), "focus_left".to_string()),
+            ("Ctrl+Alt+B".to_string(), "focus_right".to_string()),
+        ]);
+        let mut second = first.clone();
+        second.hotkeys.bindings = HashMap::from([
+            ("Ctrl+Alt+B".to_string(), "focus_right".to_string()),
+            ("Ctrl+Alt+A".to_string(), "focus_left".to_string()),
+        ]);
+
+        assert_eq!(first.revision().unwrap(), second.revision().unwrap());
+        second.layout.gap += 1;
+        assert_ne!(first.revision().unwrap(), second.revision().unwrap());
     }
 
     #[test]
@@ -1856,7 +2083,6 @@ mod tests {
     fn test_hotkey_merge_adds_missing_defaults() {
         // Simulate a user config with only one hotkey — load_from_path
         // would merge defaults for unbound commands.
-        let defaults = HotkeyConfig::default();
         let mut user = HotkeyConfig {
             scroll_modifier: default_scroll_modifier(),
             disabled: Vec::new(),
@@ -1866,13 +2092,8 @@ mod tests {
         user.bindings
             .insert("Ctrl+Alt+X".to_string(), "focus_left".to_string());
 
-        // Merge: commands not bound by user get default binding
-        let user_commands: HashSet<String> = user.bindings.values().cloned().collect();
-        for (key, cmd) in defaults.bindings.iter() {
-            if !user_commands.contains(cmd) {
-                user.bindings.insert(key.clone(), cmd.clone());
-            }
-        }
+        // Merge: commands not bound by user get default bindings.
+        Config::merge_default_hotkeys(&mut user);
 
         // User's custom binding preserved (default focus_left key not added)
         assert_eq!(
@@ -1890,6 +2111,26 @@ mod tests {
             user.bindings.get("Ctrl+Alt+Shift+J"),
             Some(&"move_window_down".to_string())
         );
+    }
+
+    #[test]
+    fn test_merge_does_not_replace_a_user_command_on_a_default_key() {
+        let mut hk = HotkeyConfig {
+            scroll_modifier: default_scroll_modifier(),
+            disabled: Vec::new(),
+            bindings: HashMap::from([(
+                "Ctrl+Alt+H".to_string(),
+                "custom_user_command".to_string(),
+            )]),
+        };
+
+        Config::merge_default_hotkeys(&mut hk);
+
+        assert_eq!(
+            hk.bindings.get("Ctrl+Alt+H"),
+            Some(&"custom_user_command".to_string())
+        );
+        assert!(!hk.bindings.values().any(|command| command == "focus_left"));
     }
 
     #[test]
@@ -2460,6 +2701,51 @@ mod tests {
     // =========================================================================
     // Config Validation Tests
     // =========================================================================
+
+    #[test]
+    fn test_validate_presets_and_rule_dimensions_are_finite_and_in_range() {
+        let mut config = Config::default();
+        config.layout.width_presets = vec![0.5, 0.0, -0.1, 1.1, f64::NAN, f64::INFINITY];
+        config.layout.height_presets = vec![f64::NEG_INFINITY, 0.25, 2.0];
+        config.window_rules = vec![WindowRule {
+            match_class: Some("Example".to_string()),
+            width: Some(0),
+            height: Some(-10),
+            column_width: Some(f64::NAN),
+            ..Default::default()
+        }];
+
+        let warnings = config.validate();
+
+        assert_eq!(config.layout.width_presets, vec![0.5]);
+        assert_eq!(config.layout.height_presets, vec![0.25]);
+        assert_eq!(config.window_rules[0].width, None);
+        assert_eq!(config.window_rules[0].height, None);
+        assert_eq!(config.window_rules[0].column_width, None);
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.field == "layout.width_presets"));
+        assert!(warnings
+            .iter()
+            .any(|warning| warning.field == "window_rules[0].width"));
+    }
+
+    #[test]
+    fn test_compile_rules_defensively_drops_nonpositive_float_dimensions() {
+        let config = Config {
+            window_rules: vec![WindowRule {
+                match_class: Some("Example".to_string()),
+                width: Some(0),
+                height: Some(-1),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let compiled = config.compile_window_rules();
+        assert_eq!(compiled[0].width, None);
+        assert_eq!(compiled[0].height, None);
+    }
 
     #[test]
     fn test_validate_negative_gap_clamped() {
@@ -3056,6 +3342,46 @@ mod tests {
             result.is_err(),
             "String where integer expected should fail to parse"
         );
+    }
+
+    #[test]
+    fn test_load_from_path_validates_reload_values() {
+        let path = std::env::temp_dir().join(format!(
+            "leopardwm-config-reload-validation-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(
+            &path,
+            r#"
+[layout]
+gap = -5
+default_floating_width = 0
+width_presets = [0.5, 0.0, 2.0]
+
+[animation]
+layout_duration_ms = 999999
+
+[[window_rules]]
+match_class = "Example"
+width = -100
+height = 0
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load_from_path(&path).unwrap();
+        assert_eq!(config.layout.gap, 0);
+        assert_eq!(config.layout.default_floating_width, default_floating_width());
+        assert_eq!(config.layout.width_presets, vec![0.5]);
+        assert_eq!(config.animation.layout_duration_ms, MAX_ANIMATION_DURATION_MS);
+        assert_eq!(config.window_rules[0].width, None);
+        assert_eq!(config.window_rules[0].height, None);
+
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

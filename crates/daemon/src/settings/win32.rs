@@ -29,7 +29,7 @@ use raw_window_handle::{
 };
 use wry::WebContext;
 
-use crate::config::Config;
+use crate::config::{ConditionalConfigSave, Config};
 
 use super::html::SETTINGS_HTML;
 use super::SettingsEvent;
@@ -58,6 +58,9 @@ const WM_SETTINGS_PUSH_BINDS: u32 = WM_APP + 1;
 /// Sent to the settings thread so all window activation work stays on the
 /// owning GUI thread.
 const WM_SETTINGS_ACTIVATE: u32 = WM_APP + 2;
+/// Custom message: deliver a save acknowledgement or optimistic-concurrency
+/// conflict to the WebView on its owning thread.
+const WM_SETTINGS_SAVE_RESULT: u32 = WM_APP + 3;
 
 /// Thread id of the open settings window's message loop, or `None` when closed.
 /// We target the thread queue (not the HWND) so a destroyed or recycled window
@@ -65,6 +68,8 @@ const WM_SETTINGS_ACTIVATE: u32 = WM_APP + 2;
 static SETTINGS_THREAD: Mutex<Option<u32>> = Mutex::new(None);
 /// Latest rejected-bind list as a JSON array, staged for the next push.
 static PENDING_FAILED_BINDS: Mutex<Option<String>> = Mutex::new(None);
+/// Latest save result staged by the WebView IPC callback for the message loop.
+static PENDING_SAVE_RESULT: Mutex<Option<String>> = Mutex::new(None);
 /// Rendered static settings resources are shared across opens.
 static SETTINGS_HTML_RENDERED: OnceLock<String> = OnceLock::new();
 static SETTINGS_HOTKEY_CATALOG_JSON: OnceLock<String> = OnceLock::new();
@@ -213,6 +218,7 @@ pub fn run_settings_window(
     high_contrast: bool,
     failed_binds: Vec<String>,
 ) -> Result<()> {
+    let config_revision = config.revision()?;
     unsafe {
         let hinstance = GetModuleHandleW(None)?;
         let dark = is_dark_mode();
@@ -321,6 +327,10 @@ pub fn run_settings_window(
                     "auto_start".to_string(),
                     serde_json::Value::Bool(auto_start),
                 );
+                map.insert(
+                    "config_revision".to_string(),
+                    serde_json::Value::String(config_revision),
+                );
             }
             serde_json::to_string(&val).unwrap_or_else(|_| "{}".to_string())
         };
@@ -419,6 +429,17 @@ pub fn run_settings_window(
                 }
                 continue;
             }
+            if msg_buf.message == WM_SETTINGS_SAVE_RESULT {
+                let json = PENDING_SAVE_RESULT.lock().ok().and_then(|mut p| p.take());
+                if let Some(json) = json {
+                    let js = format!(
+                        "if (typeof handleSaveResult === 'function') handleSaveResult({});",
+                        json
+                    );
+                    let _ = webview.evaluate_script(&js);
+                }
+                continue;
+            }
             let _ = TranslateMessage(&msg_buf);
             DispatchMessageW(&msg_buf);
         }
@@ -429,6 +450,9 @@ pub fn run_settings_window(
             *guard = None;
         }
         if let Ok(mut pending) = PENDING_FAILED_BINDS.lock() {
+            *pending = None;
+        }
+        if let Ok(mut pending) = PENDING_SAVE_RESULT.lock() {
             *pending = None;
         }
         // Let the daemon resume hotkeys if the window closed mid-recording.
@@ -478,9 +502,21 @@ fn handle_ipc(body: &str, event_tx: &mpsc::Sender<SettingsEvent>, _hwnd: HWND) {
 
     match action {
         "save" => {
-            if let Some(cfg_val) = msg.get("config") {
-                do_save(cfg_val, event_tx);
-            }
+            let result = match (
+                msg.get("config"),
+                msg.get("revision").and_then(|value| value.as_str()),
+            ) {
+                (Some(cfg_val), Some(revision)) => do_save(cfg_val, revision, event_tx),
+                (_, None) => {
+                    warn!("Settings IPC: save missing config revision; rejecting stale snapshot");
+                    SettingsSaveResult::Failed
+                }
+                (None, _) => {
+                    warn!("Settings IPC: save missing config");
+                    SettingsSaveResult::Failed
+                }
+            };
+            push_save_result(&result);
         }
         "set_recording" => {
             let recording = msg
@@ -526,13 +562,59 @@ fn handle_ipc(body: &str, event_tx: &mpsc::Sender<SettingsEvent>, _hwnd: HWND) {
     }
 }
 
-/// Deserialize config JSON, validate, save to disk, and notify daemon.
-fn do_save(cfg_val: &serde_json::Value, event_tx: &mpsc::Sender<SettingsEvent>) -> bool {
+#[derive(Debug)]
+enum SettingsSaveResult {
+    Saved { revision: String },
+    Conflict { current: Config, revision: String },
+    Failed,
+}
+
+/// Stage a result for delivery on the window thread; `WebView` itself never
+/// crosses the IPC callback boundary.
+fn push_save_result(result: &SettingsSaveResult) {
+    let thread_id = match SETTINGS_THREAD.lock() {
+        Ok(guard) => *guard,
+        Err(_) => return,
+    };
+    let Some(thread_id) = thread_id else { return };
+
+    let json = match result {
+        SettingsSaveResult::Saved { revision } => {
+            serde_json::json!({ "status": "saved", "revision": revision }).to_string()
+        }
+        SettingsSaveResult::Conflict { current, revision } => serde_json::json!({
+            "status": "conflict",
+            "revision": revision,
+            "config": current,
+        })
+        .to_string(),
+        SettingsSaveResult::Failed => serde_json::json!({ "status": "failed" }).to_string(),
+    };
+
+    let Ok(mut pending) = PENDING_SAVE_RESULT.lock() else {
+        return;
+    };
+    *pending = Some(json);
+    let posted = unsafe {
+        PostThreadMessageW(thread_id, WM_SETTINGS_SAVE_RESULT, WPARAM(0), LPARAM(0)).is_ok()
+    };
+    if !posted {
+        *pending = None;
+    }
+}
+
+/// Deserialize config JSON, validate, compare its snapshot revision, save to
+/// disk only when current, and notify the daemon after a successful write.
+fn do_save(
+    cfg_val: &serde_json::Value,
+    expected_revision: &str,
+    event_tx: &mpsc::Sender<SettingsEvent>,
+) -> SettingsSaveResult {
     let mut cfg: Config = match serde_json::from_value(cfg_val.clone()) {
         Ok(c) => c,
         Err(e) => {
             warn!("Settings: failed to parse config JSON: {}", e);
-            return false;
+            return SettingsSaveResult::Failed;
         }
     };
 
@@ -541,15 +623,19 @@ fn do_save(cfg_val: &serde_json::Value, event_tx: &mpsc::Sender<SettingsEvent>) 
         warn!("Config validation: {}: {}", w.field, w.message);
     }
 
-    match cfg.save() {
-        Ok(()) => {
+    match cfg.save_if_current_revision(expected_revision) {
+        Ok(ConditionalConfigSave::Saved { revision }) => {
             info!("Settings saved successfully");
             let _ = event_tx.send(SettingsEvent::Saved);
-            true
+            SettingsSaveResult::Saved { revision }
+        }
+        Ok(ConditionalConfigSave::Conflict { current, revision }) => {
+            warn!("Settings save rejected because the config changed outside this window");
+            SettingsSaveResult::Conflict { current, revision }
         }
         Err(e) => {
             warn!("Failed to save settings: {}", e);
-            false
+            SettingsSaveResult::Failed
         }
     }
 }

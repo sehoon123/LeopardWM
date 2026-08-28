@@ -6,48 +6,205 @@ use anyhow::Result;
 use leopardwm_core_layout::Workspace;
 use leopardwm_platform_win32::MonitorId;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use tracing::{debug, info, warn};
 
 /// Persisted workspace indices are user-writable JSON but the public command
 /// surface exposes exactly workspaces 1 through 9 (zero-based 0 through 8).
 const MAX_SAVED_WORKSPACE_INDEX: usize = 8;
 
+/// A serialized state snapshot paired with the generation assigned while the
+/// model lock was held. Writers must retain this value rather than extracting
+/// only its JSON, otherwise a delayed older worker could be mistaken for a
+/// newer snapshot when it reaches the filesystem.
+#[derive(Debug)]
+pub(crate) struct PreparedStateWrite {
+    generation: u64,
+    json: String,
+}
+
+/// Result of a generation-aware state-file write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StateWriteOutcome {
+    Written,
+    SkippedStale,
+}
+
+/// Serializes state-file replacement and rejects a generation after a newer
+/// generation has started its write. The mutex deliberately covers both the
+/// freshness check and durable replacement.
+#[derive(Debug)]
+pub(crate) struct StateFileWriter {
+    path: PathBuf,
+    next_generation: AtomicU64,
+    highest_started_generation: Mutex<u64>,
+}
+
+impl StateFileWriter {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            next_generation: AtomicU64::new(0),
+            highest_started_generation: Mutex::new(0),
+        }
+    }
+
+    fn prepare(&self, json: String) -> PreparedStateWrite {
+        PreparedStateWrite {
+            generation: self.next_generation.fetch_add(1, Ordering::SeqCst) + 1,
+            json,
+        }
+    }
+
+    fn write(&self, prepared: &PreparedStateWrite) -> Result<StateWriteOutcome> {
+        let mut highest_started = self
+            .highest_started_generation
+            .lock()
+            .unwrap_or_else(|poisoned| {
+                warn!("State-file writer lock was poisoned; recovering ownership");
+                poisoned.into_inner()
+            });
+
+        if prepared.generation <= *highest_started {
+            return Ok(StateWriteOutcome::SkippedStale);
+        }
+
+        // Advance before I/O. If a newer write fails, allowing an older worker
+        // to replace the file afterwards would still regress durable state.
+        *highest_started = prepared.generation;
+        crate::atomic_file::write(&self.path, &prepared.json)?;
+        Ok(StateWriteOutcome::Written)
+    }
+}
+
+fn state_file_writer() -> &'static StateFileWriter {
+    static WRITER: OnceLock<StateFileWriter> = OnceLock::new();
+    WRITER.get_or_init(|| StateFileWriter::new(AppState::state_file_path()))
+}
+
+/// Validate the portions of a deserialized core workspace which normally stay
+/// true only when it is mutated through core-layout APIs. Core currently has
+/// no public snapshot validator, so persistence fails closed before invoking
+/// layout operations that assume these invariants.
+fn validate_restored_workspace(workspace: &Workspace) -> std::result::Result<(), &'static str> {
+    if !workspace.scroll_offset().is_finite() {
+        return Err("scroll offset is not finite");
+    }
+    let (outer_left, outer_right, outer_top, outer_bottom) = workspace.outer_gaps();
+    if workspace.gap() < 0
+        || [outer_left, outer_right, outer_top, outer_bottom]
+            .into_iter()
+            .any(|gap| gap < 0)
+    {
+        return Err("gap is negative");
+    }
+    if workspace.default_column_width() < 100 {
+        return Err("default column width is below the core minimum");
+    }
+
+    let columns = workspace.columns();
+    let focused_column = workspace.focused_column_index();
+    let focused_window = workspace.focused_window_index_in_column();
+    if columns.is_empty() {
+        if focused_column != 0 || focused_window != 0 {
+            return Err("empty workspace has nonzero focus indices");
+        }
+    } else {
+        let Some(focused) = columns.get(focused_column) else {
+            return Err("focused column is out of bounds");
+        };
+        if focused_window >= focused.len() {
+            return Err("focused window is out of bounds");
+        }
+    }
+
+    let mut seen = HashSet::new();
+    for (column_index, column) in columns.iter().enumerate() {
+        if column.is_empty() {
+            return Err("workspace contains an empty column");
+        }
+        if column.width() < 100 {
+            return Err("column width is below the core minimum");
+        }
+        if let Some(active_tab) = column.active_tab_idx() {
+            if column.len() < 2 || active_tab >= column.len() {
+                return Err("tabbed column has an invalid active tab");
+            }
+            if column_index == focused_column && active_tab != focused_window {
+                return Err("focused tabbed column has mismatched active tab and focus");
+            }
+        }
+
+        let weights = column.height_weights();
+        if !weights.is_empty() {
+            if weights.len() != column.len()
+                || weights.iter().any(|weight| !weight.is_finite() || *weight < 0.0)
+            {
+                return Err("column has invalid height weights");
+            }
+            let total: f64 = weights.iter().sum();
+            if !total.is_finite() || total <= 0.0 || (total - 1.0).abs() > 1e-6 {
+                return Err("column height weights are not normalized");
+            }
+        }
+
+        for &hwnd in column.windows() {
+            if !seen.insert(hwnd) {
+                return Err("workspace contains a duplicate HWND");
+            }
+        }
+    }
+
+    for floating in workspace.floating_windows() {
+        if floating.rect.width < 1 || floating.rect.height < 1 {
+            return Err("floating window has a nonpositive size");
+        }
+        if !seen.insert(floating.id) {
+            return Err("workspace contains a duplicate HWND");
+        }
+    }
+
+    if let Some(fullscreen) = workspace.fullscreen_window_id() {
+        if !seen.contains(&fullscreen) || workspace.is_minimized(fullscreen) {
+            return Err("fullscreen window is absent or minimized");
+        }
+    }
+
+    Ok(())
+}
+
 impl AppState {
     /// Save current workspace state to disk.
     pub(crate) fn save_state(&self) -> Result<()> {
-        let json = self.build_state_json()?;
-        Self::write_state_file(&json)?;
-        info!("Workspace state saved to {:?}", Self::state_file_path());
-        Ok(())
-    }
-
-    /// Atomically write the state JSON: write a uniquely-named temp file then
-    /// rename it over the target. Rename is atomic on the same volume, so a
-    /// concurrent writer (the debounced background save vs the graceful
-    /// shutdown save) or a crash mid-write can never leave a torn/truncated
-    /// state file — readers always see a complete previous or new version.
-    pub(crate) fn write_state_file(json: &str) -> Result<()> {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
-
-        let path = Self::state_file_path();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+        let prepared = self.build_state_json()?;
+        match Self::write_state_file(&prepared)? {
+            StateWriteOutcome::Written => {
+                info!("Workspace state saved to {:?}", Self::state_file_path());
+            }
+            StateWriteOutcome::SkippedStale => {
+                debug!("Skipped stale synchronous workspace-state save");
+            }
         }
-        // Unique temp name per write so two concurrent writers don't share
-        // (and tear) the same temp file before their renames.
-        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let tmp = path.with_extension(format!("{seq}.tmp"));
-        crate::atomic_file::write(&tmp, json)?;
-        std::fs::rename(&tmp, &path)?;
         Ok(())
     }
 
-    /// Build the persisted-state JSON string (StateSnapshot serialized).
-    /// Does everything `save_state` does except the filesystem write, so
-    /// the debounced background task can build under the lock and write
-    /// outside it.
-    pub(crate) fn build_state_json(&self) -> Result<String> {
+    /// Atomically write a state snapshot only if no newer prepared generation
+    /// has started first. Callers must pass the opaque value returned by
+    /// [`Self::build_state_json`] unchanged; this preserves the generation
+    /// assigned while the model lock was held.
+    pub(crate) fn write_state_file(
+        prepared: &PreparedStateWrite,
+    ) -> Result<StateWriteOutcome> {
+        state_file_writer().write(prepared)
+    }
+
+    /// Serialize the persisted state and assign its write generation while the
+    /// caller holds the `AppState` lock. The existing background-save caller
+    /// can continue to build under the lock and write outside it, but it must
+    /// retain this opaque prepared value rather than extracting only the JSON.
+    pub(crate) fn build_state_json(&self) -> Result<PreparedStateWrite> {
         let mut snapshots: Vec<WorkspaceSnapshot> = Vec::new();
         for (monitor_id, ws_vec) in &self.workspaces {
             let active_idx = self.active_workspace_idx(*monitor_id);
@@ -96,7 +253,7 @@ impl AppState {
         };
 
         let json = serde_json::to_string_pretty(&snapshot)?;
-        Ok(json)
+        Ok(state_file_writer().prepare(json))
     }
 
     /// Cheap deterministic hash of the persisted workspace state. Used to
@@ -268,6 +425,9 @@ impl AppState {
         keep: impl Fn(u64) -> bool,
     ) -> HashSet<(MonitorId, usize)> {
         let mut restored_slots = HashSet::new();
+        // A snapshot is user-writable, so ownership must be unique across every
+        // restored workspace, not merely within each individual workspace.
+        let mut seen_hwnds = HashSet::new();
 
         for ws_snapshot in &snapshot.workspaces {
             let Some(monitor_id) = self
@@ -296,16 +456,35 @@ impl AppState {
                 continue;
             }
             let ws_idx = ws_snapshot.workspace_index;
+            if restored_slots.contains(&(monitor_id, ws_idx)) {
+                warn!(
+                    "Skipping duplicate saved workspace slot {} for monitor '{}'",
+                    ws_idx, ws_snapshot.monitor_device_name
+                );
+                continue;
+            }
+
+            // `Workspace` derives Deserialize for compatibility, but its
+            // mutation APIs assume invariants that arbitrary JSON does not
+            // establish. Reject malformed structures before any layout code
+            // can observe their invalid focus, columns, or weights.
+            if let Err(reason) = validate_restored_workspace(&ws_snapshot.workspace) {
+                warn!(
+                    "Skipping invalid saved workspace {} for monitor '{}': {}",
+                    ws_idx, ws_snapshot.monitor_device_name, reason
+                );
+                continue;
+            }
 
             // Clone the saved workspace and drop windows that should not be
-            // restored (closed while the daemon was down, or now unmanageable).
-            // Mirror reconcile/migration pruning: use the type-preserving remove
-            // APIs (remove_window / remove_floating).
+            // restored (closed while the daemon was down, now unmanageable, or
+            // already claimed by an earlier snapshot). Mirror reconcile/migration
+            // pruning: use the type-preserving remove APIs.
             let mut ws = ws_snapshot.workspace.clone();
             let to_drop: Vec<u64> = ws
                 .all_window_ids()
                 .into_iter()
-                .filter(|&w| !keep(w))
+                .filter(|&w| !keep(w) || seen_hwnds.contains(&w))
                 .collect();
             for wid in to_drop {
                 if ws.is_floating(wid) {
@@ -314,6 +493,16 @@ impl AppState {
                     let _ = ws.remove_window(wid);
                 }
             }
+            // Core removal APIs repair focus/mode state, but validate again to
+            // keep the restore boundary fail-closed if their contract changes.
+            if let Err(reason) = validate_restored_workspace(&ws) {
+                warn!(
+                    "Skipping invalid pruned saved workspace {} for monitor '{}': {}",
+                    ws_idx, ws_snapshot.monitor_device_name, reason
+                );
+                continue;
+            }
+            seen_hwnds.extend(ws.all_window_ids());
 
             // The clone's #[serde(skip)] runtime fields deserialized to
             // defaults; re-apply them exactly like reconcile_monitors does.
@@ -391,6 +580,7 @@ impl AppState {
     /// monitors to avoid overwriting the restored offset.
     pub(crate) fn restore_state(&mut self, snapshot: &StateSnapshot) -> HashSet<MonitorId> {
         let mut restored_monitors = HashSet::new();
+        let mut restored_slots = HashSet::new();
 
         for ws_snapshot in &snapshot.workspaces {
             // Find matching monitor by device name
@@ -411,6 +601,21 @@ impl AppState {
                     continue;
                 }
                 let ws_idx = ws_snapshot.workspace_index;
+                if restored_slots.contains(&(id, ws_idx)) {
+                    warn!(
+                        "Skipping duplicate saved workspace state {} for monitor '{}'",
+                        ws_idx, ws_snapshot.monitor_device_name
+                    );
+                    continue;
+                }
+                if let Err(reason) = validate_restored_workspace(&ws_snapshot.workspace) {
+                    warn!(
+                        "Skipping invalid saved workspace state {} for monitor '{}': {}",
+                        ws_idx, ws_snapshot.monitor_device_name, reason
+                    );
+                    continue;
+                }
+                restored_slots.insert((id, ws_idx));
                 if let Some(ws_vec) = self.workspaces.get_mut(&id) {
                     // Extend the vec with empty workspaces if needed
                     let scale = self
@@ -510,5 +715,34 @@ impl AppState {
         }
 
         restored_monitors
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn state_writer_keeps_newer_prepared_snapshot_when_workers_finish_reordered() {
+        let path = std::env::temp_dir().join(format!(
+            "leopardwm-state-writer-order-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let writer = StateFileWriter::new(path.clone());
+        let older = writer.prepare("older".to_string());
+        let newer = writer.prepare("newer".to_string());
+
+        assert_eq!(writer.write(&newer).unwrap(), StateWriteOutcome::Written);
+        assert_eq!(
+            writer.write(&older).unwrap(),
+            StateWriteOutcome::SkippedStale
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "newer");
+
+        std::fs::remove_file(path).unwrap();
     }
 }

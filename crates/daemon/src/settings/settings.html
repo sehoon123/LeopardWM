@@ -924,6 +924,10 @@ input[type="range"]::-webkit-slider-thumb {
 
   <div class="main">
     <div class="content">
+      <div class="info-bar warning" id="save-conflict-bar" hidden>
+        <svg class="info-bar-icon" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1a7 7 0 100 14A7 7 0 008 1zm-.75 3.5a.75.75 0 011.5 0v4a.75.75 0 01-1.5 0v-4zm.75 7a.75.75 0 110-1.5.75.75 0 010 1.5z"/></svg>
+        <div class="info-bar-content"><span class="info-bar-title" id="save-conflict-title">Settings were not saved.</span><span class="info-bar-message" id="save-conflict-message"></span></div>
+      </div>
       <!-- Layout -->
       <div id="sec-layout" class="section active">
         <h2 class="section-title">Layout</h2>
@@ -1581,6 +1585,7 @@ function inputToHex(v) { return v.replace('#', '').toUpperCase(); }
 /* ── Init ────────────────────────────────────────────────────────────── */
 function init(cfg) {
   window._initConfig = cfg;
+  window._configRevision = cfg.config_revision || '';
   setVal('layout-gap', cfg.layout.gap);
   setVal('layout-outer_gap_left', cfg.layout.outer_gap_left);
   setVal('layout-outer_gap_right', cfg.layout.outer_gap_right);
@@ -2372,10 +2377,41 @@ wrapAllInputs();
 
 /* ── Auto-save ────────────────────────────────────────────────────── */
 var _saveTimer = null;
+function showSaveNotice(title, message, isError) {
+  var bar = document.getElementById('save-conflict-bar');
+  if (!bar) return;
+  bar.classList.toggle('error', !!isError);
+  bar.classList.toggle('warning', !isError);
+  document.getElementById('save-conflict-title').textContent = title;
+  document.getElementById('save-conflict-message').textContent = message;
+  bar.hidden = false;
+}
+function handleSaveResult(result) {
+  if (!result || !result.status) return;
+  var bar = document.getElementById('save-conflict-bar');
+  if (result.status === 'saved') {
+    window._configRevision = result.revision || window._configRevision;
+    if (bar) bar.hidden = true;
+    return;
+  }
+  if (result.status === 'conflict' && result.config) {
+    /* A full snapshot built from an old form must never be retried over the
+       external change. Reinitialize from the current file before allowing the
+       next autosave. Runtime-only UI fields stay from this window. */
+    clearTimeout(_saveTimer);
+    result.config.high_contrast = window._initConfig && window._initConfig.high_contrast;
+    result.config.auto_start = window._initConfig && window._initConfig.auto_start;
+    result.config.config_revision = result.revision || '';
+    init(result.config);
+    showSaveNotice('External settings change kept.', 'Your pending edit was not saved. Review the current settings and make the change again.', false);
+    return;
+  }
+  showSaveNotice('Settings were not saved.', 'The configuration could not be validated or written. Your existing file was left unchanged.', true);
+}
 function autoSave(delay) {
   clearTimeout(_saveTimer);
   _saveTimer = setTimeout(function() {
-    window.ipc.postMessage(JSON.stringify({ action: 'save', config: readConfig() }));
+    window.ipc.postMessage(JSON.stringify({ action: 'save', revision: window._configRevision || '', config: readConfig() }));
   }, delay || 0);
 }
 
