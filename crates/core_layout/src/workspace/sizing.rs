@@ -434,7 +434,7 @@ impl Workspace {
                 frac
             };
 
-            let new_w = preset_width(base, gap, final_frac);
+            let new_w = preset_width(base, gap, final_frac).max(min_width);
             if let Some(column) = self.columns.get_mut(col_idx) {
                 column.set_width(new_w);
             }
@@ -627,7 +627,7 @@ impl Workspace {
             nearest
         };
 
-        Some(preset_width(base, gap, final_frac))
+        Some(preset_width(base, gap, final_frac).max(min_width))
     }
 
     /// Compute the nearest height weight preset for a window, without mutating state.

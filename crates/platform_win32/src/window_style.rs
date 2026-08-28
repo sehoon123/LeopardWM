@@ -258,7 +258,17 @@ fn set_maximizebox_state<A: SnapStyleApi>(
     // partially reported call can still have changed the style, and a removed
     // bit must retain a recovery receipt rather than becoming ownerless.
     let set_result = api.set_style(wanted_style);
-    let observed = api.get_style()?;
+    let observed = match api.get_style() {
+        Ok(observed) => observed,
+        Err(error) => {
+            // The write may already have reached User32. A first removal must
+            // remain recoverable until a later read proves no mutation occurred.
+            if !want_maximizebox {
+                receipts.insert(window_id);
+            }
+            return Err(error);
+        }
+    };
     let observed_maximizebox = observed & WS_MAXIMIZEBOX_STYLE != 0;
     if observed_maximizebox == want_maximizebox && (!want_maximizebox || set_result.is_err()) {
         receipts.insert(window_id);
@@ -472,16 +482,26 @@ pub fn restore_marked_maximizeboxes_best_effort() -> usize {
             continue;
         };
         let token = snap_property_token(hwnd);
+        let Some(identity) = snap_identity(hwnd) else {
+            continue;
+        };
         if token == 0 {
             continue;
         }
         let _commit = SNAP_COMMIT
             .lock()
             .unwrap_or_else(crate::recover_poisoned_mutex);
+        if snap_property_token(hwnd) != token || snap_identity(hwnd).as_ref() != Some(&identity) {
+            continue;
+        }
         let mut receipt_ids = HashSet::from([window_id]);
         let mut api = Win32SnapStyleApi { hwnd };
         match set_maximizebox_state(&mut api, &mut receipt_ids, window_id, true) {
-            Ok(_) if !receipt_ids.contains(&window_id) => {
+            Ok(_)
+                if !receipt_ids.contains(&window_id)
+                    && snap_property_token(hwnd) == token
+                    && snap_identity(hwnd).as_ref() == Some(&identity) =>
+            {
                 clear_snap_property_if_owned(hwnd, token);
                 restored += 1;
             }
@@ -507,6 +527,8 @@ mod tests {
         set_changes_style_on_error: bool,
         frame_error: bool,
         frame_calls: usize,
+        get_fail_after_set: bool,
+        set_called: bool,
     }
 
     impl FakeSnapStyleApi {
@@ -517,16 +539,23 @@ mod tests {
                 set_changes_style_on_error: false,
                 frame_error: false,
                 frame_calls: 0,
+                get_fail_after_set: false,
+                set_called: false,
             }
         }
     }
 
     impl SnapStyleApi for FakeSnapStyleApi {
         fn get_style(&mut self) -> Result<i32, String> {
-            Ok(self.style)
+            if self.get_fail_after_set && self.set_called {
+                Err("injected post-write readback failure".into())
+            } else {
+                Ok(self.style)
+            }
         }
 
         fn set_style(&mut self, style: i32) -> Result<(), String> {
+            self.set_called = true;
             if !self.set_error || self.set_changes_style_on_error {
                 self.style = style;
             }
@@ -572,6 +601,19 @@ mod tests {
         assert!(set_maximizebox_state(&mut api, &mut receipts, wid, false).is_err());
         assert!(receipts.is_empty());
         assert_ne!(api.style & WS_MAXIMIZEBOX_STYLE, 0);
+    }
+
+    #[test]
+    fn post_write_readback_failure_keeps_first_removal_receipt() {
+        let wid = 45;
+        let mut api = FakeSnapStyleApi {
+            get_fail_after_set: true,
+            ..FakeSnapStyleApi::with_maximizebox()
+        };
+        let mut receipts = HashSet::new();
+
+        assert!(set_maximizebox_state(&mut api, &mut receipts, wid, false).is_err());
+        assert!(receipts.contains(&wid));
     }
 
     #[test]

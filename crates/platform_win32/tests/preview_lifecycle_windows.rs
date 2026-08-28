@@ -601,10 +601,12 @@ fn ordered_real_preview_lifecycle_contract() {
         ),
         vec![
             TabLabel {
+                window_id: ownership_source.hwnd as u64,
                 title: "One".into(),
                 icon: None,
             },
             TabLabel {
+                window_id: retry_source.hwnd as u64,
                 title: "Two".into(),
                 icon: None,
             },

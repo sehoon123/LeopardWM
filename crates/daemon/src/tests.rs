@@ -89,11 +89,15 @@ fn test_stale_untab_does_not_mutate_the_current_workspace() {
         .unwrap()
         .block_on(handle_tab_action(
             &state,
-            1,
-            0,
-            0,
-            0,
-            leopardwm_platform_win32::tab_strip::TabAction::Untab,
+            leopardwm_platform_win32::tab_strip::TabActionEvent {
+                monitor: 1,
+                workspace_idx: 0,
+                column_idx: 0,
+                tab_idx: 0,
+                window_id: 100,
+                incarnation_token: 0,
+                action: leopardwm_platform_win32::tab_strip::TabAction::Untab,
+            },
         ));
     let state = state.blocking_lock();
     assert_eq!(
@@ -4356,6 +4360,7 @@ fn test_hotkey_state_registered_count_default() {
         registered_count: 1, // Simulate: only 1 of 2 installed in the hook
         failed_binds: vec!["Win+Left".to_string()],
         recording: false,
+        disabled_by_cli: false,
     };
 
     assert_eq!(hs.mapping.len(), 2, "mapping has 2 parsed hotkeys");
@@ -6781,6 +6786,30 @@ fn test_tiled_sticky_follows_switch_as_end_column() {
         !state.workspaces.get(&mon).unwrap()[0].is_floating(100),
         "still tiled after switching back"
     );
+}
+
+#[test]
+fn sticky_rehome_preserves_minimized_state() {
+    for floating in [false, true] {
+        let mut state = AppState::new_with_config(test_config(), test_monitors());
+        let mon = state.focused_monitor;
+        state
+            .focused_workspace_mut()
+            .unwrap()
+            .insert_window(100, Some(800))
+            .unwrap();
+        if floating {
+            float_focused_window(&mut state, 100);
+        }
+        state.toggle_sticky().unwrap();
+        state.focused_workspace_mut().unwrap().mark_minimized(100);
+        state.ensure_workspace_exists(mon, 1);
+        state.active_workspace.insert(mon, 1);
+
+        state.rehome_sticky_windows();
+
+        assert!(state.workspaces[&mon][1].is_minimized(100));
+    }
 }
 
 #[test]

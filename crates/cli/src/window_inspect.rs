@@ -70,7 +70,9 @@ fn partition_for_display(
 }
 
 fn run_watch(secs: u64, include_titles: bool, show_all: bool) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(secs);
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(secs))
+        .ok_or_else(|| anyhow::anyhow!("watch duration is too large"))?;
     // Full key includes verdicts so a stable hwnd+class re-prints when a verdict
     // flips. Title is intentionally excluded: browser/editor titles thrash.
     let mut seen: HashSet<WatchKey> = HashSet::new();

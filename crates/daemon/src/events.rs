@@ -1,5 +1,4 @@
 use leopardwm_platform_win32::overview::OverviewEvent;
-use leopardwm_platform_win32::tab_strip::TabAction;
 use leopardwm_platform_win32::{
     GestureEvent, HookWindowEvent, HotkeyEvent, WindowEvent, WindowInfo,
 };
@@ -194,13 +193,7 @@ pub(crate) enum DaemonEvent {
     /// originating WM_* arriving in the strip's WndProc and the main loop
     /// draining the channel.) `action` discriminates left-click vs.
     /// close/untab/rename surfaces.
-    TabAction {
-        monitor: isize,
-        workspace_idx: usize,
-        column_idx: usize,
-        tab_idx: usize,
-        action: TabAction,
-    },
+    TabAction(leopardwm_platform_win32::tab_strip::TabActionEvent),
     /// A pointer gesture on a monitor-edge preview. A preview is a DWM
     /// thumbnail, so the pointer lands on its overlay rather than on the
     /// previewed window; the overlay reports which window it was showing and

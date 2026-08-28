@@ -402,6 +402,30 @@ fn worker_loop(
                 // Wait for next vsync via DwmFlush
                 dwm_flush_or_fallback();
 
+                // A frame can cross session-end/pause after its initial epoch
+                // check while blocked inside Win32/DWM. Make recovery the final
+                // writer before publishing any result for that stale request.
+                if apply_worker_cancelled.load(Ordering::SeqCst)
+                    || current_apply_epoch.load(Ordering::SeqCst) != request.apply_epoch
+                {
+                    let mut window_ids: Vec<_> = request
+                        .placements
+                        .iter()
+                        .map(|placement| placement.window_id)
+                        .collect();
+                    window_ids.extend(request.ghost_updates.iter().map(|ghost| ghost.window_id));
+                    window_ids.sort_unstable();
+                    window_ids.dedup();
+                    leopardwm_platform_win32::thumbnail::invalidate_persistent_preview_surface();
+                    let _ =
+                        leopardwm_platform_win32::thumbnail::clear_persistent_previews_best_effort(
+                        );
+                    crate::layout_apply::run_layout_apply_recovery_pass(
+                        &window_ids,
+                        "superseded-animation-frame",
+                    );
+                }
+
                 let frame_time = frame_start.elapsed();
 
                 let result = FrameResult {

@@ -800,13 +800,30 @@ impl AppState {
         IpcResponse::Ok
     }
 
+    fn managed_focused_window(&self) -> Option<u64> {
+        let workspace = self.focused_workspace()?;
+        self.previous_focused_hwnd
+            .filter(|hwnd| workspace.contains_window(*hwnd))
+            .or_else(|| workspace.focused_window())
+    }
+
     /// Handle `IpcCommand::QueryFocused`.
     fn handle_query_focused(&mut self) -> IpcResponse {
         if let Some(workspace) = self.focused_workspace() {
+            let window_id = self.managed_focused_window();
+            let floating = window_id.is_some_and(|hwnd| workspace.is_floating(hwnd));
             IpcResponse::FocusedWindow {
-                window_id: workspace.focused_window(),
-                column_index: workspace.focused_column_index(),
-                window_index: workspace.focused_window_index_in_column(),
+                window_id,
+                column_index: if floating {
+                    0
+                } else {
+                    workspace.focused_column_index()
+                },
+                window_index: if floating {
+                    0
+                } else {
+                    workspace.focused_window_index_in_column()
+                },
             }
         } else {
             IpcResponse::error("No focused workspace")
@@ -1020,11 +1037,39 @@ impl AppState {
         let monitors: Vec<_> = self.monitors.values().cloned().collect();
         if let Some(target) = select(&monitors, self.focused_monitor) {
             let target_id = target.id;
+            let source_id = self.focused_monitor;
+            let source_idx = self.active_workspace_idx(source_id);
+            let target_idx = self.active_workspace_idx(target_id);
+            let source_before = self
+                .workspaces
+                .get(&source_id)
+                .and_then(|workspaces| workspaces.get(source_idx))
+                .cloned();
+            let target_before = self
+                .workspaces
+                .get(&target_id)
+                .and_then(|workspaces| workspaces.get(target_idx))
+                .cloned();
+            let focused_before = self.focused_monitor;
             match self.move_focused_window_to_monitor_transactional(target_id) {
                 Ok(Some(hwnd)) => {
                     info!("Moved window {} to monitor {}", hwnd, target_id);
                     if let Err(e) = self.apply_layout() {
-                        return IpcResponse::error(format!("Failed to apply layout: {}", e));
+                        if let Some(workspace) = source_before {
+                            self.workspaces.get_mut(&source_id).unwrap()[source_idx] = workspace;
+                        }
+                        if let Some(workspace) = target_before {
+                            self.workspaces.get_mut(&target_id).unwrap()[target_idx] = workspace;
+                        }
+                        self.focused_monitor = focused_before;
+                        self.last_placed_layout_rects.clear();
+                        let rollback = self.apply_layout();
+                        if rollback.is_err() {
+                            self.enter_paused_state("cross-monitor move rollback failure");
+                        }
+                        return IpcResponse::error(format!(
+                            "Failed to apply layout: {e}; rollback={rollback:?}"
+                        ));
                     }
                     self.sync_foreground_window();
                 }
@@ -1061,7 +1106,7 @@ impl AppState {
     fn handle_query_all_windows(&mut self) -> IpcResponse {
         let mut windows = Vec::new();
 
-        let focused_hwnd = self.focused_workspace().and_then(|ws| ws.focused_window());
+        let focused_hwnd = self.managed_focused_window();
 
         let win_info_map: HashMap<u64, (String, String, u32)> = match enumerate_windows() {
             Ok(wins) => wins
@@ -1079,6 +1124,10 @@ impl AppState {
                         let (title, class_name, process_id) = win_info_map
                             .get(&window_id)
                             .cloned()
+                            .or_else(|| {
+                                self.lookup_window_info(window_id)
+                                    .map(|info| (info.title, info.class_name, info.process_id))
+                            })
                             .unwrap_or_else(|| ("Unknown".to_string(), "Unknown".to_string(), 0));
 
                         let executable = get_process_executable(process_id).unwrap_or_default();
@@ -1124,6 +1173,10 @@ impl AppState {
                     let (title, class_name, process_id) = win_info_map
                         .get(&floating.id)
                         .cloned()
+                        .or_else(|| {
+                            self.lookup_window_info(floating.id)
+                                .map(|info| (info.title, info.class_name, info.process_id))
+                        })
                         .unwrap_or_else(|| ("Unknown".to_string(), "Unknown".to_string(), 0));
 
                     let executable = get_process_executable(process_id).unwrap_or_default();
@@ -1494,7 +1547,22 @@ impl AppState {
         }
 
         if let Err(e) = self.apply_layout() {
-            return IpcResponse::error(format!("Failed to apply layout: {}", e));
+            let transition_cleanup = if animating {
+                self.cancel_layout_transition_for_exact_landing()
+                    .map(|_| ())
+            } else {
+                Ok(())
+            };
+            self.active_workspace.insert(monitor, current_idx);
+            self.rehome_sticky_windows();
+            self.last_placed_layout_rects.clear();
+            let rollback = self.apply_layout();
+            if transition_cleanup.is_err() || rollback.is_err() {
+                self.enter_paused_state("workspace switch rollback failure");
+            }
+            return IpcResponse::error(format!(
+                "Failed to apply layout: {e}; transition_cleanup={transition_cleanup:?}; rollback={rollback:?}"
+            ));
         }
         // Hide the now-inactive workspace's windows from the taskbar (cloak).
         // Mid-slide windows are skipped here and cloaked when the transition
@@ -1858,7 +1926,10 @@ impl AppState {
         use leopardwm_platform_win32::autostart;
         let result = if enabled {
             match std::env::current_exe() {
-                Ok(exe) => autostart::enable_autostart(&exe).map(|()| exe),
+                Ok(exe) => {
+                    let target = autostart::preferred_autostart_executable(&exe);
+                    autostart::enable_autostart(&target).map(|()| target)
+                }
                 Err(e) => Err(anyhow::anyhow!("resolve daemon executable: {}", e)),
             }
         } else {
@@ -2007,6 +2078,46 @@ mod transaction_tests {
             IpcResponse::Error { .. }
         ));
         assert_eq!(state.focused_monitor, 1);
+    }
+
+    #[test]
+    fn cross_monitor_apply_failure_restores_source_ownership() {
+        let mut state = state_with_monitors(vec![monitor(1, 0), monitor(2, 1920)]);
+        state.paused = false;
+        state.workspaces.get_mut(&1).unwrap()[0]
+            .insert_window(10, Some(700))
+            .unwrap();
+        state.injected_apply_placements_behavior =
+            Some(TestApplyPlacementsBehavior::SleepAndFail(Duration::ZERO));
+
+        assert!(matches!(
+            state.handle_command(IpcCommand::MoveWindowToMonitorRight),
+            IpcResponse::Error { .. }
+        ));
+        assert_eq!(state.find_window_workspace(10), Some((1, 0)));
+        assert_eq!(state.focused_monitor, 1);
+    }
+
+    #[test]
+    fn reduced_motion_workspace_apply_failure_restores_active_workspace() {
+        let mut state = state_with_monitors(vec![monitor(1, 0)]);
+        state.paused = false;
+        state.reduce_motion = true;
+        state.workspaces.get_mut(&1).unwrap()[0]
+            .insert_window(10, Some(700))
+            .unwrap();
+        state.ensure_workspace_exists(1, 1);
+        state.workspaces.get_mut(&1).unwrap()[1]
+            .insert_window(20, Some(700))
+            .unwrap();
+        state.injected_apply_placements_behavior =
+            Some(TestApplyPlacementsBehavior::SleepAndFail(Duration::ZERO));
+
+        assert!(matches!(
+            state.handle_command(IpcCommand::SwitchWorkspace { index: 2 }),
+            IpcResponse::Error { .. }
+        ));
+        assert_eq!(state.active_workspace_idx(1), 0);
     }
 
     #[test]

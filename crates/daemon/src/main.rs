@@ -339,6 +339,8 @@ struct HotkeyState {
     failed_binds: Vec<String>,
     /// True while hotkey matching is suspended for the Settings recorder.
     recording: bool,
+    /// Process-lifetime CLI safety policy; config reloads may not override it.
+    disabled_by_cli: bool,
 }
 
 /// Build the tray quick-toggle state from config (reads autostart from the registry).
@@ -371,6 +373,20 @@ fn sync_tray_toggles(tray_manager: &Option<tray::TrayManager>, config: &Config) 
 /// Reload hotkeys and sync tray/overlay state after a config change.
 ///
 /// Called from IPC Reload, tray Reload, and settings save handlers.
+fn disabled_hotkey_state() -> HotkeyState {
+    HotkeyState {
+        handle: setup_system_event_handle(),
+        hook: None,
+        forwarder: None,
+        mapping: HashMap::new(),
+        requested_count: 0,
+        registered_count: 0,
+        failed_binds: Vec::new(),
+        recording: false,
+        disabled_by_cli: true,
+    }
+}
+
 async fn reload_config_and_hotkeys(
     state: &Arc<Mutex<AppState>>,
     hotkey_state: &mut HotkeyState,
@@ -383,6 +399,7 @@ async fn reload_config_and_hotkeys(
     // Drop both handles BEFORE setup_hotkeys rebuilds them: assignment drops the
     // old HotkeyState last, so an unhook-then-reinstall must happen here or the
     // keyboard hook's double-install guard would reject the new one.
+    let disabled_by_cli = hotkey_state.disabled_by_cli;
     hotkey_state.handle = None;
     if let Some(mut forwarder) = hotkey_state.forwarder.take() {
         let _ = forwarder.join_with_timeout(Duration::from_millis(500));
@@ -392,7 +409,11 @@ async fn reload_config_and_hotkeys(
         let state = state.lock().await;
         state.config.clone()
     };
-    *hotkey_state = setup_hotkeys(&new_config, event_tx.clone());
+    *hotkey_state = if disabled_by_cli {
+        disabled_hotkey_state()
+    } else {
+        setup_hotkeys(&new_config, event_tx.clone())
+    };
     // Apply a focus-follows-mouse change from the reloaded config (e.g. the
     // Settings toggle) without waiting for a restart.
     sync_mouse_hook(
@@ -549,6 +570,7 @@ fn setup_hotkeys(config: &Config, event_tx: mpsc::Sender<DaemonEvent>) -> Hotkey
             registered_count: 0,
             failed_binds,
             recording: false,
+            disabled_by_cli: false,
         };
     }
 
@@ -589,6 +611,7 @@ fn setup_hotkeys(config: &Config, event_tx: mpsc::Sender<DaemonEvent>) -> Hotkey
         registered_count,
         failed_binds,
         recording: false,
+        disabled_by_cli: false,
     }
 }
 
@@ -1185,16 +1208,28 @@ fn init_workspace_state(state: &mut AppState) {
     // match the current window set.
     for (&monitor_id, ws_vec) in state.workspaces.iter_mut() {
         for (ws_idx, workspace) in ws_vec.iter_mut().enumerate() {
-            // Restored slots keep their exact saved scroll offset.
-            if restored_slots.contains(&(monitor_id, ws_idx)) {
-                continue;
-            }
             if workspace.column_count() > 0 {
                 let width = monitor_widths
                     .get(&monitor_id)
                     .copied()
                     .unwrap_or(FALLBACK_VIEWPORT_WIDTH);
-                workspace.ensure_focused_visible(width);
+                // Preserve an exact saved offset only while it still exposes
+                // the focused live column. Pruning offline members can make an
+                // otherwise valid historical offset render a blank workspace.
+                let restored_focus_visible = restored_slots.contains(&(monitor_id, ws_idx))
+                    && workspace.focused_window().is_some_and(|focused| {
+                        workspace
+                            .compute_placements(Rect::new(0, 0, width, FALLBACK_WORK_AREA_HEIGHT))
+                            .iter()
+                            .any(|placement| {
+                                placement.window_id == focused
+                                    && placement.visibility
+                                        == leopardwm_core_layout::Visibility::Visible
+                            })
+                    });
+                if !restored_focus_visible {
+                    workspace.ensure_focused_visible(width);
+                }
             }
         }
     }
@@ -1259,13 +1294,7 @@ async fn spawn_tab_forwarders(
         "tab-action-forwarder",
         tab_action_rx,
         event_tx.clone(),
-        |action_event| DaemonEvent::TabAction {
-            monitor: action_event.monitor,
-            workspace_idx: action_event.workspace_idx,
-            column_idx: action_event.column_idx,
-            tab_idx: action_event.tab_idx,
-            action: action_event.action,
-        },
+        DaemonEvent::TabAction,
     ) {
         Ok(handle) => {
             // Do not publish a source sender until its complete route exists.
@@ -2725,6 +2754,11 @@ async fn handle_tab_strip_icon_poll(state: &Arc<Mutex<AppState>>) {
         s.tab_strip_icon_cache.clear();
         s.update_tab_strip();
     }
+    if s.overview_open {
+        // Overview model construction probes a bounded icon batch; this
+        // existing low-frequency driver drains later batches while idle.
+        s.refresh_overview_model();
+    }
 }
 
 /// Persist the current workspace state to disk. The JSON snapshot is
@@ -2950,13 +2984,33 @@ fn captured_tab_workspace_is_active(
 /// Handle a tab-strip click action routed to the captured column identity.
 async fn handle_tab_action(
     state: &Arc<Mutex<AppState>>,
-    monitor: isize,
-    workspace_idx: usize,
-    column_idx: usize,
-    tab_idx: usize,
-    action: leopardwm_platform_win32::tab_strip::TabAction,
+    event: leopardwm_platform_win32::tab_strip::TabActionEvent,
 ) {
     use leopardwm_platform_win32::tab_strip::TabAction;
+    let leopardwm_platform_win32::tab_strip::TabActionEvent {
+        monitor,
+        workspace_idx,
+        column_idx,
+        tab_idx,
+        window_id,
+        incarnation_token,
+        action,
+    } = event;
+    let current_target = {
+        let state = state.lock().await;
+        state
+            .workspaces
+            .get(&monitor)
+            .and_then(|workspaces| workspaces.get(workspace_idx))
+            .and_then(|workspace| workspace.column(column_idx))
+            .and_then(|column| column.get(tab_idx))
+    };
+    let current_token = leopardwm_platform_win32::current_window_event_identity(window_id)
+        .map(|identity| identity.token);
+    if current_target != Some(window_id) || current_token != Some(incarnation_token) {
+        debug!("Ignoring stale tab action for changed HWND/column membership");
+        return;
+    }
     match action {
         TabAction::Activate => {
             // Trust the strip's captured identity over current
@@ -3986,23 +4040,7 @@ async fn run_daemon_event_loop(
                 let _ = state.reap_finished_pending_apply_workers();
             }
             DaemonEvent::Overview(event) => handle_overview_event(&mut ctx, event).await,
-            DaemonEvent::TabAction {
-                monitor,
-                workspace_idx,
-                column_idx,
-                tab_idx,
-                action,
-            } => {
-                handle_tab_action(
-                    ctx.state,
-                    monitor,
-                    workspace_idx,
-                    column_idx,
-                    tab_idx,
-                    action,
-                )
-                .await;
-            }
+            DaemonEvent::TabAction(event) => handle_tab_action(ctx.state, event).await,
             DaemonEvent::PreviewGesture(gesture) => {
                 handle_preview_gesture(&mut ctx, gesture).await;
             }
@@ -4134,6 +4172,10 @@ async fn main() -> Result<()> {
         config.behavior.log_level
     );
 
+    // Recover crash-surviving snap receipts before enumeration can claim and
+    // suppress the same tiled HWNDs under this daemon generation.
+    let _ = leopardwm_platform_win32::restore_marked_maximizeboxes_best_effort();
+
     let monitors = detect_monitors();
 
     // Initialize state with config and monitors
@@ -4173,16 +4215,7 @@ async fn main() -> Result<()> {
     // Register global hotkeys (mutable to support reload)
     let mut hotkey_state = if args.skip_hotkeys() {
         info!("Hotkeys disabled by command-line flag");
-        HotkeyState {
-            handle: setup_system_event_handle(),
-            hook: None,
-            forwarder: None,
-            mapping: HashMap::new(),
-            requested_count: 0,
-            registered_count: 0,
-            failed_binds: Vec::new(),
-            recording: false,
-        }
+        disabled_hotkey_state()
     } else {
         setup_hotkeys(&config, event_tx.clone())
     };
@@ -4290,10 +4323,6 @@ async fn main() -> Result<()> {
 
     // Print startup banner for immediate user feedback
     print_banner(&state, &config_warnings, &hotkey_state, &args).await;
-
-    // Import crash-surviving receipts before this process publishes new style
-    // or taskbar ownership for the same targets.
-    let _ = leopardwm_platform_win32::restore_marked_maximizeboxes_best_effort();
 
     // Taskbar-button controller (ITaskbarList). Held for the whole session;
     // dropping it on shutdown restores every hidden window's taskbar button.

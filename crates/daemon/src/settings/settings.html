@@ -632,7 +632,17 @@ input[type="color"]::-webkit-color-swatch { border: none; border-radius: 2px; }
   cursor: pointer;
   flex-shrink: 0;
 }
-.toggle input { display: none; }
+.toggle input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+.toggle input:focus-visible ~ .track {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
 .toggle .track {
   position: absolute;
   inset: 0;
@@ -1385,6 +1395,15 @@ input[type="range"]::-webkit-slider-thumb {
 </div>
 
 <script>
+/* Keep custom toggles keyboard-operable and named in the accessibility tree. */
+document.querySelectorAll('.toggle input[type="checkbox"]').forEach(function(input) {
+  var field = input.closest('.field');
+  var label = field && field.querySelector('.field-label');
+  if (label && !input.hasAttribute('aria-label')) {
+    input.setAttribute('aria-label', label.textContent.trim());
+  }
+});
+
 /* ── Navigation ─────────────────────────────────────────────────────── */
 document.querySelectorAll('.nav-item[data-section]').forEach(function(link) {
   link.addEventListener('click', function(e) {
@@ -1946,12 +1965,14 @@ function refreshDuplicateWarnings() {
     var v = tr.querySelector('.hk-key').value.trim();
     if (v) { var k = normalizeCombo(v); (byCombo[k] = byCombo[k] || []).push(tr); }
   });
+  var hasDuplicates = false;
   rows.forEach(function(tr) {
     var note = tr.querySelector('.hk-dup-note');
     if (!note) { return; }
     var v = tr.querySelector('.hk-key').value.trim();
     var group = v ? byCombo[normalizeCombo(v)] : null;
     if (group && group.length > 1) {
+      hasDuplicates = true;
       var others = group.filter(function(t) { return t !== tr; })
         .map(function(t) { return cmdShortLabel(t.dataset.cmd); });
       note.textContent = 'Also bound to ' + others.join(', ');
@@ -1959,6 +1980,7 @@ function refreshDuplicateWarnings() {
       note.textContent = '';
     }
   });
+  return hasDuplicates;
 }
 
 function escHtml(s) { var d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
@@ -1972,7 +1994,9 @@ function defaultKeyForCmd(cmd) {
 
 function resetHotkeyRow(tr) {
   var defKey = defaultKeyForCmd(tr.dataset.cmd);
-  if (defKey) { tr.querySelector('.hk-key').value = defKey; refreshDuplicateWarnings(); autoSave(0); }
+  tr.querySelector('.hk-key').value = defKey;
+  refreshDuplicateWarnings();
+  autoSave(0);
 }
 
 /* Show a dismissible warning for binds Windows reserves below the keyboard
@@ -2411,6 +2435,10 @@ function handleSaveResult(result) {
 function autoSave(delay) {
   clearTimeout(_saveTimer);
   _saveTimer = setTimeout(function() {
+    if (refreshDuplicateWarnings()) {
+      showSaveNotice('Settings were not saved.', 'Resolve duplicate hotkey bindings first.', true);
+      return;
+    }
     window.ipc.postMessage(JSON.stringify({ action: 'save', revision: window._configRevision || '', config: readConfig() }));
   }, delay || 0);
 }

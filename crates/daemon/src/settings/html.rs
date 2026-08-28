@@ -182,6 +182,19 @@ mod tests {
     }
 
     #[test]
+    fn toggles_remain_keyboard_accessible_and_named() {
+        assert!(!SETTINGS_HTML.contains(".toggle input { display: none; }"));
+        assert!(SETTINGS_HTML.contains(".toggle input:focus-visible ~ .track"));
+        assert!(SETTINGS_HTML.contains("input.setAttribute('aria-label'"));
+    }
+
+    #[test]
+    fn duplicate_hotkeys_block_lossy_autosave() {
+        assert!(SETTINGS_HTML.contains("if (refreshDuplicateWarnings())"));
+        assert!(SETTINGS_HTML.contains("Resolve duplicate hotkey bindings first."));
+    }
+
+    #[test]
     fn every_section_explains_itself() {
         for section in [
             "sec-layout",

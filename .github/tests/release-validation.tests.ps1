@@ -9,6 +9,10 @@ $validator = Join-Path (Split-Path -Parent $PSScriptRoot) 'validate-release.ps1'
 if (-not (Test-Path -LiteralPath $validator)) {
     throw "Release validator not found: $validator"
 }
+$validatorSource = Get-Content -LiteralPath $validator -Raw
+if ($validatorSource -notmatch '\$actualHash\s+-ine\s+\$records\[\$name\]') {
+    throw 'Release checksum comparison must accept lowercase sha256sum output'
+}
 
 function Invoke-TestGit {
     param(

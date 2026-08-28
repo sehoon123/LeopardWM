@@ -4511,4 +4511,15 @@ mod tests {
             .compute_placements(Rect::new(0, 0, 500, 600))
             .is_empty());
     }
+
+    #[test]
+    fn width_presets_never_undercut_a_known_minimum() {
+        let mut ws = Workspace::with_gaps(0, 0);
+        ws.insert_window(1, Some(400)).unwrap();
+        ws.set_window_min_width(1, 700);
+
+        ws.snap_column_width_to_preset(0, 533, &[0.333, 0.5, 0.667], 800);
+
+        assert!(ws.column(0).unwrap().width() >= 700);
+    }
 }

@@ -615,8 +615,9 @@ pub(crate) fn handle_autostart(action: AutostartAction) -> Result<()> {
     match action {
         AutostartAction::Enable => {
             let daemon_path = ensure_daemon_binary()?;
-            autostart::enable_autostart(&daemon_path)?;
-            println!("Auto-start enabled: \"{}\"", daemon_path.display());
+            let autostart_path = autostart::preferred_autostart_executable(&daemon_path);
+            autostart::enable_autostart(&autostart_path)?;
+            println!("Auto-start enabled: \"{}\"", autostart_path.display());
         }
         AutostartAction::Disable => {
             let was_enabled = autostart::get_autostart().unwrap_or(false);

@@ -154,7 +154,7 @@ fn bounded_timeout_diagnostic(value: String) -> Option<String> {
     Some(bounded)
 }
 
-fn run_layout_apply_recovery_pass(window_ids: &[u64], context: &str) {
+pub(crate) fn run_layout_apply_recovery_pass(window_ids: &[u64], context: &str) {
     #[cfg(not(test))]
     run_visibility_recovery_pass(window_ids, context);
     #[cfg(test)]
@@ -1105,11 +1105,26 @@ impl AppState {
         let bypass_fast_path = self.injected_apply_placements_behavior.is_some();
         #[cfg(not(test))]
         let bypass_fast_path = false;
-        if can_skip_unchanged_layout(
-            placements_unchanged,
-            bypass_fast_path,
-            self.post_animation_landing_pending,
-        ) {
+        let identities_current = all_placements.iter().all(|placement| {
+            self.window_incarnations
+                .get(&placement.window_id)
+                .map(crate::events::WindowIncarnation::to_platform)
+                .as_ref()
+                == leopardwm_platform_win32::current_window_event_identity(placement.window_id)
+                    .as_ref()
+        });
+        if !identities_current {
+            for placement in &all_placements {
+                self.last_placed_layout_rects.remove(&placement.window_id);
+            }
+        }
+        if identities_current
+            && can_skip_unchanged_layout(
+                placements_unchanged,
+                bypass_fast_path,
+                self.post_animation_landing_pending,
+            )
+        {
             // "Unchanged" only describes what this daemon last *requested*.
             // Windows relocates managed windows on its own (display topology
             // changes, session unlock, RDP reconnect, resume from sleep) and that

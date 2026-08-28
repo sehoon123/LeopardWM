@@ -238,6 +238,7 @@ impl AppState {
         }
         placements
             .iter()
+            .rev()
             .find(|p| p.window_id == hwnd)
             .map(|p| p.rect)
     }
@@ -400,6 +401,7 @@ impl AppState {
                     .iter()
                     .filter(|&&w| w != crate::state::DRAG_PLACEHOLDER_HWND)
                     .map(|&w| TabLabel {
+                        window_id: w,
                         title: self
                             .tab_title_overrides
                             .get(&w)

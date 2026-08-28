@@ -5,6 +5,7 @@ use crate::events::SubscribeStartup;
 use anyhow::{Context, Result};
 use leopardwm_ipc::{
     preferred_pipe_name, EventKind, IpcCommand, IpcEvent, IpcResponse, MAX_IPC_MESSAGE_SIZE,
+    PIPE_NAME,
 };
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -40,6 +41,7 @@ pub(crate) const MAX_IPC_SUBSCRIBERS: usize = 32;
 pub(crate) struct IpcServerOwnership {
     pipe_name: String,
     first_server: NamedPipeServer,
+    legacy: Option<(String, NamedPipeServer)>,
     pipe_security_ptr: Option<usize>,
 }
 
@@ -82,6 +84,18 @@ pub(crate) fn acquire_ipc_server_ownership() -> Result<IpcServerOwnership> {
             pipe_name
         )
     })?;
+    let legacy = (pipe_name != PIPE_NAME)
+        .then(|| {
+            create_pipe_server(PIPE_NAME, true, pipe_security_ptr)
+                .map(|server| (PIPE_NAME.to_string(), server))
+                .with_context(|| {
+                    format!(
+                        "Failed to acquire legacy IPC ownership for '{}'; an older daemon may still be running",
+                        PIPE_NAME
+                    )
+                })
+        })
+        .transpose()?;
 
     // `create_with_security_attributes_raw` borrows this descriptor. Later
     // pipe instances need the same descriptor, so retain it for the daemon
@@ -93,6 +107,7 @@ pub(crate) fn acquire_ipc_server_ownership() -> Result<IpcServerOwnership> {
     Ok(IpcServerOwnership {
         pipe_name,
         first_server,
+        legacy,
         pipe_security_ptr,
     })
 }
@@ -114,11 +129,41 @@ pub(crate) async fn run_ipc_server_with_ownership(
     let IpcServerOwnership {
         pipe_name,
         first_server,
+        legacy,
         pipe_security_ptr,
     } = ownership;
-    let mut first_server = Some(first_server);
     let command_limit = Arc::new(Semaphore::new(MAX_IPC_COMMAND_HANDLERS));
     let subscriber_limit = Arc::new(Semaphore::new(MAX_IPC_SUBSCRIBERS));
+    let _legacy_task = legacy.map(|(legacy_name, legacy_server)| {
+        tokio::spawn(run_ipc_accept_loop(
+            event_tx.clone(),
+            legacy_name,
+            legacy_server,
+            pipe_security_ptr,
+            command_limit.clone(),
+            subscriber_limit.clone(),
+        ))
+    });
+    run_ipc_accept_loop(
+        event_tx,
+        pipe_name,
+        first_server,
+        pipe_security_ptr,
+        command_limit,
+        subscriber_limit,
+    )
+    .await;
+}
+
+async fn run_ipc_accept_loop(
+    event_tx: mpsc::Sender<DaemonEvent>,
+    pipe_name: String,
+    first_server: NamedPipeServer,
+    pipe_security_ptr: Option<usize>,
+    command_limit: Arc<Semaphore>,
+    subscriber_limit: Arc<Semaphore>,
+) {
+    let mut first_server = Some(first_server);
 
     loop {
         let permit = match command_limit.clone().acquire_owned().await {

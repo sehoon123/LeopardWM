@@ -49,15 +49,12 @@ fn transition_requires_compositor_safe_snap(
         ),
     >,
     ghosted_wids: &std::collections::HashSet<u64>,
-    compositor_sensitive_wids: &std::collections::HashSet<u64>,
 ) -> bool {
     compositor_safe_mode
         && start_rects.iter().any(|(wid, start)| {
             targets.get(wid).is_some_and(|(target, _)| {
                 !ghosted_wids.contains(wid)
-                    && (start.width != target.width
-                        || start.height != target.height
-                        || compositor_sensitive_wids.contains(wid))
+                    && (start.width != target.width || start.height != target.height)
             })
         })
 }
@@ -181,7 +178,10 @@ impl AppState {
             Ok(false) => false,
             Err(error) => {
                 tracing::warn!("Could not collapse unsafe layout transition: {error}");
-                false
+                self.enter_paused_state("compositor-safe transition fence failure");
+                // Terminal handling: never dispatch another unsafe frame after
+                // the exact-landing ownership fence failed.
+                true
             }
         }
     }
@@ -334,24 +334,19 @@ impl AppState {
         // transitions; position-only movement is already safe on the adaptive
         // synchronous path. Legacy mode keeps its broader experimental ghosting.
         let mut ghosted_wids = std::collections::HashSet::new();
-        if self.config.behavior.swap_chain_ghost_animation
-            && !self.config.behavior.compositor_safe_mode
-        {
-            self.register_ghosts_for_transition(&start_rects, &targets, false, &mut ghosted_wids);
+        if self.config.behavior.swap_chain_ghost_animation {
+            self.register_ghosts_for_transition(
+                &start_rects,
+                &targets,
+                self.config.behavior.compositor_safe_mode,
+                &mut ghosted_wids,
+            );
         }
-        let compositor_sensitive_wids: std::collections::HashSet<_> = targets
-            .keys()
-            .copied()
-            .filter(|window_id| {
-                leopardwm_platform_win32::thumbnail::is_compositor_sensitive_class(*window_id)
-            })
-            .collect();
         let requires_compositor_safe_snap = transition_requires_compositor_safe_snap(
             self.config.behavior.compositor_safe_mode,
             &start_rects,
             &targets,
             &ghosted_wids,
-            &compositor_sensitive_wids,
         );
 
         // Start with one frame (~16ms) already elapsed so the first
@@ -396,13 +391,7 @@ impl AppState {
                 "cannot start workspace transition while prior ghost registrations remain owned"
             ));
         }
-        let requires_compositor_safe_snap = self.config.behavior.compositor_safe_mode
-            && start_rects
-                .keys()
-                .chain(exit_rects.keys())
-                .any(|window_id| {
-                    leopardwm_platform_win32::thumbnail::is_compositor_sensitive_class(*window_id)
-                });
+        let requires_compositor_safe_snap = false;
         let exit_column_indices = exit_rects
             .keys()
             .map(|window_id| {
@@ -851,7 +840,7 @@ mod tests {
     }
 
     #[test]
-    fn transition_policy_snaps_unprotected_resize_and_sensitive_position_changes() {
+    fn transition_policy_snaps_only_unprotected_resizes() {
         let start = HashMap::from([(1, Rect::new(0, 0, 800, 600))]);
         let moved = HashMap::from([(1, (Rect::new(100, 0, 800, 600), 1))]);
         let resized = HashMap::from([(1, (Rect::new(100, 0, 900, 600), 1))]);
@@ -861,27 +850,17 @@ mod tests {
             &start,
             &moved,
             &HashSet::new(),
-            &HashSet::new(),
-        ));
-        assert!(transition_requires_compositor_safe_snap(
-            true,
-            &start,
-            &moved,
-            &HashSet::new(),
-            &HashSet::from([1]),
         ));
         assert!(transition_requires_compositor_safe_snap(
             true,
             &start,
             &resized,
-            &HashSet::new(),
             &HashSet::new(),
         ));
         assert!(!transition_requires_compositor_safe_snap(
             true,
             &start,
             &resized,
-            &HashSet::from([1]),
             &HashSet::from([1]),
         ));
         assert!(!transition_requires_compositor_safe_snap(
@@ -889,7 +868,6 @@ mod tests {
             &start,
             &resized,
             &HashSet::new(),
-            &HashSet::from([1]),
         ));
     }
 
@@ -938,5 +916,39 @@ mod tests {
             .layout_transition
             .as_ref()
             .is_some_and(|transition| transition.exit_rects.contains_key(&41)));
+    }
+
+    #[test]
+    fn failed_compositor_fence_is_terminal_and_pauses() {
+        use crate::config::Config;
+        use crate::state::{AppState, LayoutTransition};
+        use leopardwm_platform_win32::MonitorInfo;
+
+        let mut state = AppState::new_with_config(
+            Config::default(),
+            vec![MonitorInfo {
+                id: 1,
+                rect: Rect::new(0, 0, 1920, 1080),
+                work_area: Rect::new(0, 0, 1920, 1040),
+                is_primary: true,
+                device_name: "DISPLAY1".into(),
+                scale_factor: 1.0,
+            }],
+        );
+        state.layout_transition = Some(LayoutTransition {
+            start_rects: HashMap::from([(41, Rect::new(0, 0, 800, 600))]),
+            exit_rects: HashMap::from([(41, Rect::new(0, -1040, 800, 600))]),
+            exit_column_indices: HashMap::new(),
+            elapsed_ms: 16,
+            duration_ms: 150,
+            easing: leopardwm_core_layout::Easing::default(),
+            requires_compositor_safe_snap: true,
+            ghosted_wids: HashSet::new(),
+            exit_park_failures: 0,
+        });
+        state.injected_scratchpad_park_failure = true;
+
+        assert!(state.settle_animations_for_compositor_safety());
+        assert!(state.paused);
     }
 }

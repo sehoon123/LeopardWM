@@ -377,7 +377,8 @@ pub fn register_system_events() -> Result<SystemEventHandle, Win32Error> {
             "System-event window is still owned by an existing generation".into(),
         ));
     }
-    PENDING_SYSTEM_EVENTS.store(0, Ordering::Release);
+    // Pending bits are process-lifetime obligations. A replacement system-event
+    // window must flush anything the prior generation could not deliver.
     // Create the message window on a separate thread.
     // We send isize (raw pointer value) instead of HWND because HWND is !Send
     let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<(isize, u32), Win32Error>>();

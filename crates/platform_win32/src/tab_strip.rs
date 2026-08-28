@@ -56,6 +56,7 @@ fn snap_to_parity(target: i32, parity_of: i32) -> i32 {
 /// belong to the windows that already outlive the strip's render call.
 #[derive(Debug, Clone)]
 pub struct TabLabel {
+    pub window_id: u64,
     pub title: String,
     pub icon: Option<isize>,
 }
@@ -100,6 +101,9 @@ pub struct TabActionEvent {
     pub column_idx: usize,
     /// 0-based tab index targeted by the action.
     pub tab_idx: usize,
+    /// Exact HWND incarnation rendered at this index.
+    pub window_id: u64,
+    pub incarnation_token: u64,
     pub action: TabAction,
 }
 
@@ -208,6 +212,24 @@ struct TabStripState {
     /// Wall-clock instant the fade-in animation started. `None` means
     /// not animating (tooltip is either fully shown or hidden).
     tooltip_fade_start: Option<std::time::Instant>,
+}
+
+fn captured_tab_action(
+    state: &TabStripState,
+    tab_idx: usize,
+    action: TabAction,
+) -> Option<TabActionEvent> {
+    let window_id = state.tabs.get(tab_idx)?.window_id;
+    let incarnation_token = crate::current_window_event_identity(window_id)?.token;
+    Some(TabActionEvent {
+        monitor: state.target_monitor,
+        workspace_idx: state.target_workspace_idx,
+        column_idx: state.target_column_idx,
+        tab_idx,
+        window_id,
+        incarnation_token,
+        action,
+    })
 }
 
 /// In-flight highlight slide state. Used by the `WM_TIMER`-driven
@@ -2567,15 +2589,9 @@ unsafe fn on_tab_left_click(hwnd: HWND, lparam: LPARAM) -> LRESULT {
                     TabCloseAction::CloseWindow => TabAction::Close,
                     TabCloseAction::Untab => TabAction::Untab,
                 };
-                hit = Some(LClick::Close {
-                    ev: TabActionEvent {
-                        monitor: state.target_monitor,
-                        workspace_idx: state.target_workspace_idx,
-                        column_idx: state.target_column_idx,
-                        tab_idx: idx,
-                        action,
-                    },
-                });
+                if let Some(ev) = captured_tab_action(state, idx, action) {
+                    hit = Some(LClick::Close { ev });
+                }
                 break;
             }
         }
@@ -2586,15 +2602,9 @@ unsafe fn on_tab_left_click(hwnd: HWND, lparam: LPARAM) -> LRESULT {
                     && click_y >= rect.top
                     && click_y < rect.bottom
                 {
-                    hit = Some(LClick::Activate {
-                        ev: TabActionEvent {
-                            monitor: state.target_monitor,
-                            workspace_idx: state.target_workspace_idx,
-                            column_idx: state.target_column_idx,
-                            tab_idx: idx,
-                            action: TabAction::Activate,
-                        },
-                    });
+                    if let Some(ev) = captured_tab_action(state, idx, TabAction::Activate) {
+                        hit = Some(LClick::Activate { ev });
+                    }
                     break;
                 }
             }
@@ -2645,13 +2655,9 @@ unsafe fn on_tab_double_click(hwnd: HWND, lparam: LPARAM) -> LRESULT {
                 && click_y < rect.bottom
             {
                 if let Some(tx) = &state.action_tx {
-                    let _ = tx.send(TabActionEvent {
-                        monitor: state.target_monitor,
-                        workspace_idx: state.target_workspace_idx,
-                        column_idx: state.target_column_idx,
-                        tab_idx: idx,
-                        action: TabAction::Rename,
-                    });
+                    if let Some(event) = captured_tab_action(state, idx, TabAction::Rename) {
+                        let _ = tx.send(event);
+                    }
                 }
                 return LRESULT(0);
             }
@@ -2678,13 +2684,9 @@ unsafe fn on_tab_middle_click(hwnd: HWND, lparam: LPARAM) -> LRESULT {
                         TabCloseAction::CloseWindow => TabAction::Close,
                         TabCloseAction::Untab => TabAction::Untab,
                     };
-                    let _ = tx.send(TabActionEvent {
-                        monitor: state.target_monitor,
-                        workspace_idx: state.target_workspace_idx,
-                        column_idx: state.target_column_idx,
-                        tab_idx: idx,
-                        action,
-                    });
+                    if let Some(event) = captured_tab_action(state, idx, action) {
+                        let _ = tx.send(event);
+                    }
                 }
                 return LRESULT(0);
             }
@@ -2702,7 +2704,7 @@ unsafe fn on_tab_context_menu(hwnd: HWND, lparam: LPARAM) -> LRESULT {
     // Resolve the target tab index + identity under one lock, drop
     // before TrackPopupMenu (which runs a nested modal loop and may
     // re-enter the WndProc for WM_TIMER).
-    let (target_idx, monitor, ws_idx, col_idx) = {
+    let (target_event, monitor, ws_idx, col_idx) = {
         let reg = registry();
         let Some(state) = reg.states.get(&(hwnd.0 as isize)) else {
             return LRESULT(0);
@@ -2715,13 +2717,13 @@ unsafe fn on_tab_context_menu(hwnd: HWND, lparam: LPARAM) -> LRESULT {
             }
         });
         (
-            idx,
+            idx.and_then(|idx| captured_tab_action(state, idx, TabAction::Activate)),
             state.target_monitor,
             state.target_workspace_idx,
             state.target_column_idx,
         )
     };
-    let Some(idx) = target_idx else {
+    let Some(target_event) = target_event else {
         return LRESULT(0);
     };
 
@@ -2800,7 +2802,10 @@ unsafe fn on_tab_context_menu(hwnd: HWND, lparam: LPARAM) -> LRESULT {
     let _ = ClientToScreen(hwnd, &mut screen_pt);
 
     // MSDN-documented workaround: without SetForegroundWindow the
-    // first click outside the menu may not dismiss it.
+    // first click outside the menu may not dismiss it. Restore the prior
+    // foreground owner after the modal loop so this no-activate overlay never
+    // remains the keyboard target.
+    let previous_foreground = GetForegroundWindow();
     let _ = SetForegroundWindow(hwnd);
 
     #[cfg(feature = "integration-probes")]
@@ -2816,6 +2821,12 @@ unsafe fn on_tab_context_menu(hwnd: HWND, lparam: LPARAM) -> LRESULT {
     );
     #[cfg(feature = "integration-probes")]
     CONTEXT_MENU_OPEN.store(false, Ordering::Release);
+    if GetForegroundWindow() == hwnd
+        && !previous_foreground.is_invalid()
+        && IsWindow(Some(previous_foreground)).as_bool()
+    {
+        let _ = SetForegroundWindow(previous_foreground);
+    }
     let _ = DestroyMenu(menu);
     // Bitmaps must outlive `TrackPopupMenu`; safe to delete now.
     for hbmp in [icon_close, icon_untab, icon_rename] {
@@ -2839,8 +2850,8 @@ unsafe fn on_tab_context_menu(hwnd: HWND, lparam: LPARAM) -> LRESULT {
                     monitor,
                     workspace_idx: ws_idx,
                     column_idx: col_idx,
-                    tab_idx: idx,
                     action,
+                    ..target_event
                 });
             }
         }

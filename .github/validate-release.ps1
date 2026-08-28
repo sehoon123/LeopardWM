@@ -286,7 +286,7 @@ function Assert-Checksums {
             throw "checksums.txt is missing $name"
         }
         $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $artifactPath).Hash
-        if ($actualHash -cne $records[$name]) {
+        if ($actualHash -ine $records[$name]) {
             throw "Checksum mismatch for $name"
         }
     }

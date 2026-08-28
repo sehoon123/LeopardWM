@@ -5,7 +5,7 @@
 //! daemon at user sign-in. Removing the value disables auto-start.
 
 use anyhow::{anyhow, Context, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use winreg::enums::*;
 use winreg::RegKey;
 
@@ -25,6 +25,21 @@ pub fn get_autostart() -> Result<bool> {
         Ok(_) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(e).context("Failed to read Registry value"),
+    }
+}
+
+/// Resolve the supervised login target for a daemon executable. Installed
+/// packages place the watchdog beside the daemon; partial development builds
+/// safely fall back to the supplied daemon path.
+pub fn preferred_autostart_executable(daemon_path: &Path) -> PathBuf {
+    let Some(directory) = daemon_path.parent() else {
+        return daemon_path.to_path_buf();
+    };
+    let watchdog = directory.join("leopardwm-watchdog.exe");
+    if daemon_path.is_file() && watchdog.is_file() {
+        watchdog
+    } else {
+        daemon_path.to_path_buf()
     }
 }
 
@@ -63,4 +78,26 @@ pub fn disable_autostart() -> Result<()> {
 pub fn is_in_temp_dir(path: &Path) -> bool {
     let temp = std::env::temp_dir();
     path.starts_with(&temp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn autostart_prefers_sibling_watchdog_and_falls_back() {
+        let root = std::env::temp_dir().join(format!(
+            "leopardwm-autostart-resolver-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let daemon = root.join("leopardwm.exe");
+        let watchdog = root.join("leopardwm-watchdog.exe");
+        std::fs::write(&daemon, b"daemon").unwrap();
+        assert_eq!(preferred_autostart_executable(&daemon), daemon);
+        std::fs::write(&watchdog, b"watchdog").unwrap();
+        assert_eq!(preferred_autostart_executable(&daemon), watchdog);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

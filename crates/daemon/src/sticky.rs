@@ -120,6 +120,11 @@ impl AppState {
             // Branch on the window's mode in ITS OWN (source) workspace, never
             // the now-active one — else a floating sticky could be misread as
             // tiled and wrongly converted.
+            let was_minimized = self
+                .workspaces
+                .get(&mon)
+                .and_then(|v| v.get(ws_idx))
+                .is_some_and(|ws| ws.is_minimized(wid));
             let is_floating = self
                 .workspaces
                 .get(&mon)
@@ -152,7 +157,13 @@ impl AppState {
                     .workspaces
                     .get_mut(&monitor)
                     .and_then(|v| v.get_mut(active))
-                    .map(|ws| ws.append_window_no_focus(wid, width).is_ok())
+                    .map(|ws| {
+                        let added = ws.append_window_no_focus(wid, width).is_ok();
+                        if added && was_minimized {
+                            ws.mark_minimized(wid);
+                        }
+                        added
+                    })
                     .unwrap_or(false);
                 if !appended {
                     // Effectively unreachable (no duplicate possible post-remove);
@@ -167,6 +178,9 @@ impl AppState {
                         .and_then(|v| v.get_mut(ws_idx))
                     {
                         let _ = ws.insert_window(wid, None);
+                        if was_minimized {
+                            ws.mark_minimized(wid);
+                        }
                     }
                 }
                 continue;
@@ -200,6 +214,9 @@ impl AppState {
                     let ok = ws.add_floating(wid, rect).is_ok();
                     if ok {
                         ws.set_floating_pinned(wid, true);
+                        if was_minimized {
+                            ws.mark_minimized(wid);
+                        }
                     }
                     ok
                 })

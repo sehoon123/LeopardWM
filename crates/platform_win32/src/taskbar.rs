@@ -69,9 +69,9 @@ pub fn taskbar_show(wid: WindowId) {
     send_taskbar_command(TaskbarCmd::Show(wid));
 }
 
-/// Drop `wid` from the hidden set without an `AddTab` (the window is gone).
-/// Keeps the set from retaining a stale id whose HWND could be recycled, which
-/// would otherwise make the change-gate skip re-hiding the new window.
+/// Retire `wid` from taskbar ownership. A matching live hidden incarnation is
+/// restored first; dead/recycled incarnations are dropped without touching the
+/// replacement.
 pub fn taskbar_forget(wid: WindowId) {
     send_taskbar_command(TaskbarCmd::Forget(wid));
 }
@@ -404,9 +404,7 @@ fn run_commands<A: TaskbarAdapter>(rx: mpsc::Receiver<TaskbarCmd>, adapter: &mut
         match rx.recv() {
             Ok(TaskbarCmd::Hide(wid)) => hide_tab(adapter, &mut hidden, wid),
             Ok(TaskbarCmd::Show(wid)) => show_tab(adapter, &mut hidden, wid),
-            Ok(TaskbarCmd::Forget(wid)) => {
-                hidden.remove(&wid);
-            }
+            Ok(TaskbarCmd::Forget(wid)) => show_tab(adapter, &mut hidden, wid),
             Ok(TaskbarCmd::Shutdown(ack_tx)) => {
                 let unrestored = restore_hidden_tabs_bounded(adapter, &mut hidden);
                 let _ = ack_tx.send(ShutdownAck { unrestored });
@@ -602,6 +600,23 @@ mod tests {
         show_tab(&mut adapter, &mut hidden, 8);
         assert!(!hidden.contains_key(&8));
         assert_eq!(adapter.calls, vec![("add", 8), ("add", 8)]);
+    }
+
+    #[test]
+    fn forget_restores_a_matching_live_hidden_tab() {
+        let mut adapter = FakeTaskbar::default();
+        let (tx, rx) = mpsc::channel();
+        let (ack_tx, ack_rx) = mpsc::channel();
+        tx.send(TaskbarCmd::Hide(14)).unwrap();
+        tx.send(TaskbarCmd::Forget(14)).unwrap();
+        tx.send(TaskbarCmd::Shutdown(ack_tx)).unwrap();
+        drop(tx);
+
+        run_commands(rx, &mut adapter);
+
+        assert!(ack_rx.recv().unwrap().unrestored.is_empty());
+        assert_eq!(adapter.calls, vec![("delete", 14), ("add", 14)]);
+        assert!(!adapter.markers.contains_key(&14));
     }
 
     #[test]

@@ -538,6 +538,9 @@ struct ChromeStep {
     bits: isize,
 }
 
+static THUMBNAIL_RECONCILE: Mutex<()> = Mutex::new(());
+static MASK_RECONCILE: Mutex<()> = Mutex::new(());
+
 static STATE: LazyLock<Mutex<OverviewState>> = LazyLock::new(|| {
     Mutex::new(OverviewState {
         model: OverviewModel::default(),
@@ -847,8 +850,9 @@ fn corner_caps(
 /// with live thumbnails to round off. Cross-thread-safe
 /// (`UpdateLayeredWindow` + `SetWindowPos`, like the border overlay).
 fn sync_mask() {
+    let _reconcile = MASK_RECONCILE.lock().unwrap_or_else(|p| p.into_inner());
     let (mask, rect, caps) = {
-        let mut s = state();
+        let s = state();
         if s.mask_hwnd == 0 {
             return;
         }
@@ -866,17 +870,23 @@ fn sync_mask() {
         if s.mask_pushed.0 == s.window_rect && s.mask_pushed.1 == caps {
             return;
         }
-        s.mask_pushed = (s.window_rect, caps.clone());
         (s.mask_hwnd, s.window_rect, caps)
     };
     let hwnd = HWND(mask as *mut c_void);
-    if caps.is_empty() {
+    let applied = if caps.is_empty() {
         unsafe {
             let _ = ShowWindow(hwnd, SW_HIDE);
         }
-        return;
+        true
+    } else {
+        unsafe { update_mask_window(hwnd, rect, &caps) }
+    };
+    if applied {
+        let mut s = state();
+        if s.mask_hwnd == mask {
+            s.mask_pushed = (rect, caps);
+        }
     }
-    unsafe { update_mask_window(hwnd, rect, &caps) };
 }
 
 /// Paint the cap layer into a transparent DIB sized to the caps'
@@ -884,34 +894,30 @@ fn sync_mask() {
 /// push it with `UpdateLayeredWindow` at that sub-rect, and show the
 /// window in the topmost band (the ownership chain keeps it above the
 /// overlay). Never activates.
-unsafe fn update_mask_window(hwnd: HWND, rect: Rect, caps: &[CornerCap]) {
+unsafe fn update_mask_window(hwnd: HWND, rect: Rect, caps: &[CornerCap]) -> bool {
     let Some(bounds) = caps_bounds(caps, rect.width, rect.height) else {
-        // Caps entirely clipped out: nothing to show.
         let _ = ShowWindow(hwnd, SW_HIDE);
-        return;
+        return true;
     };
     let (w, h) = (bounds.width, bounds.height);
     let bmi = top_down_bmi(w, h);
     let mut bits: *mut c_void = std::ptr::null_mut();
     let Ok(hbitmap) = CreateDIBSection(None, &bmi, DIB_RGB_COLORS, &mut bits, None, 0) else {
-        return;
+        return false;
     };
     let hdc_screen = GetDC(None);
     if hdc_screen.0.is_null() {
         let _ = DeleteObject(hbitmap.into());
-        return;
+        return false;
     }
     let mem_dc = CreateCompatibleDC(Some(hdc_screen));
     if mem_dc.0.is_null() {
         ReleaseDC(None, hdc_screen);
         let _ = DeleteObject(hbitmap.into());
-        return;
+        return false;
     }
     let old_bmp = SelectObject(mem_dc, hbitmap.into());
     {
-        // CreateDIBSection zero-initializes: everything not painted
-        // below stays fully transparent (premultiplied 0). Caps shift
-        // into the sub-rect's local space before painting.
         let pixels = std::slice::from_raw_parts_mut(bits as *mut u32, (w * h) as usize);
         for cap in caps {
             paint_corner_cap(pixels, w, h, &cap.offset(-bounds.x, -bounds.y));
@@ -929,7 +935,7 @@ unsafe fn update_mask_window(hwnd: HWND, rect: Rect, caps: &[CornerCap]) {
         SourceConstantAlpha: 255,
         AlphaFormat: AC_SRC_ALPHA as u8,
     };
-    let _ = UpdateLayeredWindow(
+    let updated = UpdateLayeredWindow(
         hwnd,
         Some(hdc_screen),
         Some(&pt_dst),
@@ -939,20 +945,24 @@ unsafe fn update_mask_window(hwnd: HWND, rect: Rect, caps: &[CornerCap]) {
         COLORREF(0),
         Some(&blend),
         ULW_ALPHA,
-    );
-    let _ = SetWindowPos(
-        hwnd,
-        Some(HWND_TOPMOST),
-        0,
-        0,
-        0,
-        0,
-        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
-    );
+    )
+    .is_ok();
+    let shown = updated
+        && SetWindowPos(
+            hwnd,
+            Some(HWND_TOPMOST),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        )
+        .is_ok();
     SelectObject(mem_dc, old_bmp);
     let _ = DeleteDC(mem_dc);
     ReleaseDC(None, hdc_screen);
     let _ = DeleteObject(hbitmap.into());
+    shown
 }
 
 /// Rasterize one cap, premultiplied for `ULW_ALPHA`. Alpha = 1 -
@@ -1575,6 +1585,9 @@ fn user_close(hwnd: HWND) {
 /// Unregister every live thumbnail (each `ThumbnailHandle` drop calls
 /// `unregister_raw`). DWM calls happen outside the state lock.
 fn drop_all_thumbnails() {
+    let _reconcile = THUMBNAIL_RECONCILE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let handles = std::mem::take(&mut state().thumbnails);
     drop(handles);
 }
@@ -1660,6 +1673,9 @@ fn card_can_glide(card: &OverviewCard) -> bool {
 /// fade when inactive). The painted chrome fades separately through the
 /// pre-rendered step frames, see [`AnimPhase`].
 fn sync_thumbnails(hwnd: HWND) {
+    let _reconcile = THUMBNAIL_RECONCILE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let (mode, targets) = {
         let s = state();
         let anim = s.anim;

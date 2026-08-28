@@ -2577,6 +2577,7 @@ impl ThumbnailHost {
         // All handles targeting the prior host generation are invalid. Revoke
         // their publication epoch before callers can register on the new host.
         invalidate_persistent_preview_surface();
+        PREVIEW_RELAYOUT_REQUIRED.store(true, Ordering::Release);
         Ok(())
     }
 

@@ -533,7 +533,10 @@ fn handle_ipc(body: &str, event_tx: &mpsc::Sender<SettingsEvent>, _hwnd: HWND) {
             use leopardwm_platform_win32::autostart;
             let result = if enabled {
                 match std::env::current_exe() {
-                    Ok(exe) => autostart::enable_autostart(&exe).map(|()| Some(exe)),
+                    Ok(exe) => {
+                        let target = autostart::preferred_autostart_executable(&exe);
+                        autostart::enable_autostart(&target).map(|()| Some(target))
+                    }
                     Err(e) => Err(anyhow::anyhow!("resolve daemon executable: {}", e)),
                 }
             } else {

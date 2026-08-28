@@ -46,7 +46,7 @@ fn handle_init(output: Option<PathBuf>, force: bool, profile: Option<String>) ->
         ),
         None => generate_default_config(),
     };
-    fs::write(&path, &config_content)
+    atomic_write_config(&path, config_content.as_bytes())
         .with_context(|| format!("Failed to write config file: {}", path.display()))?;
 
     if let Some(name) = &profile {

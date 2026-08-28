@@ -254,7 +254,12 @@ fn capture_callback_window_identity(event: &WindowEvent) -> Option<WindowEventId
                 None
             }
         },
-        WindowEvent::Hidden(window_id) | WindowEvent::Restored(window_id) => {
+        WindowEvent::Hidden(window_id)
+        | WindowEvent::Restored(window_id)
+        | WindowEvent::Focused(window_id)
+        | WindowEvent::Minimized(window_id)
+        | WindowEvent::MoveSizeStart(window_id)
+        | WindowEvent::MoveSizeEnd(window_id) => {
             capture_live_window_identity(*window_id, false, true)
         }
         _ => None,
@@ -269,6 +274,10 @@ fn callback_payload(event: WindowEvent) -> Option<HookWindowEvent> {
             | WindowEvent::Destroyed(_)
             | WindowEvent::Hidden(_)
             | WindowEvent::Restored(_)
+            | WindowEvent::Focused(_)
+            | WindowEvent::Minimized(_)
+            | WindowEvent::MoveSizeStart(_)
+            | WindowEvent::MoveSizeEnd(_)
     ) && identity.is_none()
     {
         EVENT_RESCAN_REQUIRED.store(true, Ordering::Release);
@@ -774,8 +783,17 @@ mod tests {
     #[test]
     fn lifecycle_event_without_identity_becomes_only_a_rescan_obligation() {
         EVENT_RESCAN_REQUIRED.store(false, Ordering::Release);
-        assert!(callback_payload(WindowEvent::Hidden(u64::MAX)).is_none());
-        assert!(EVENT_RESCAN_REQUIRED.load(Ordering::Acquire));
+        for event in [
+            WindowEvent::Hidden(u64::MAX),
+            WindowEvent::Focused(u64::MAX),
+            WindowEvent::Minimized(u64::MAX),
+            WindowEvent::MoveSizeStart(u64::MAX),
+            WindowEvent::MoveSizeEnd(u64::MAX),
+        ] {
+            EVENT_RESCAN_REQUIRED.store(false, Ordering::Release);
+            assert!(callback_payload(event).is_none());
+            assert!(EVENT_RESCAN_REQUIRED.load(Ordering::Acquire));
+        }
     }
 
     #[test]

@@ -329,7 +329,8 @@ pub enum CenteringModeConfig {
     /// Center the focused column in the viewport.
     #[default]
     Center,
-    /// Only scroll if the focused column would be outside the viewport.
+    /// Deterministically anchor a fitting focused column to the nearest
+    /// viewport edge; oversized columns keep their current visible edge.
     JustInView,
     /// Center only when the focused column is wider than the viewport;
     /// otherwise behave like `JustInView`.
