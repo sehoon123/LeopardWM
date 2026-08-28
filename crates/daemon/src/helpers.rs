@@ -686,12 +686,20 @@ impl AppState {
     /// without waiting for another command/event. If resume reapply fails,
     /// paused state is restored to avoid claiming a healthy resumed mode.
     pub(crate) fn toggle_pause(&mut self, source: &str) -> Result<()> {
-        // Pause/resume invalidates any in-flight ghost animation:
-        // - apply_layout no-ops while paused (helpers.rs:1044), so a
-        //   ghosted window would remain cloaked indefinitely.
-        // - send_animation_frame returns Ok(false) when paused, so
-        //   the per-frame thumbnail updates would stop mid-animation.
-        // Aborting now drops handles + uncloaks sources cleanly.
+        // Establish an ordering edge before changing lifecycle state. Without a
+        // barrier, an already-running frame can re-park sources and republish
+        // previews after pause has restored the desktop.
+        if self
+            .animation_worker_control
+            .as_ref()
+            .is_some_and(|worker| !worker.wait_for_barrier(std::time::Duration::from_millis(750)))
+        {
+            return Err(anyhow::anyhow!(
+                "Could not pause: animation worker barrier timed out"
+            ));
+        }
+        self.settle_scroll_animations();
+        self.cancel_layout_transition_for_exact_landing()?;
         self.abort_active_ghost_transition();
         let was_paused = self.paused;
         self.paused = !was_paused;
@@ -709,10 +717,16 @@ impl AppState {
             // pause lasts. Resuming re-applies the layout, which re-installs
             // exactly the clips the current geometry needs.
             leopardwm_platform_win32::restore_all_window_regions();
-            // Same reasoning for preview click targets: while paused nothing
-            // reconciles them, and an overlay that no longer corresponds to a
-            // live preview must not keep absorbing clicks.
-            leopardwm_platform_win32::preview_input::clear_preview_click_targets();
+            // Preview is optional to true tiling cleanup. Revoke/hide it first;
+            // a later handle/input acknowledgement failure is degraded health,
+            // not a reason to report that pause failed after state already
+            // changed or to skip border/tab cleanup.
+            leopardwm_platform_win32::thumbnail::invalidate_persistent_preview_surface();
+            match leopardwm_platform_win32::thumbnail::clear_persistent_previews_best_effort() {
+                Ok(true) => {}
+                Ok(false) => warn!("Pause preview cleanup deferred behind active placement"),
+                Err(error) => warn!("Pause preview cleanup degraded: {error}"),
+            }
             self.hide_border();
             self.hide_tab_strip();
             // Hide any visible drag ghost overlay

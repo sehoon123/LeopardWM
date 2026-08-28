@@ -1029,9 +1029,14 @@ impl AppState {
             }
             self.focused_monitor = target_monitor;
 
-            // Clear any in-progress transition so windows stay at their current positions.
+            // Never discard transition-owned exit HWNDs at an intermediate
+            // position. A dead exit is already safe; a live parking failure keeps
+            // ownership and defers this physical landing.
+            if let Err(error) = self.cancel_layout_transition_for_exact_landing() {
+                warn!("Drag merge transition cancellation failed: {error}");
+                return;
+            }
             self.abort_active_ghost_transition();
-            self.layout_transition = None;
             // Evict the dragged hwnd from last_placed_layout_rects: when the
             // user drops it back in its original column, the layout is
             // unchanged and apply_layout's fast-path would skip repositioning,

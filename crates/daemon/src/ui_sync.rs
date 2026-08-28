@@ -494,8 +494,6 @@ impl AppState {
         });
 
         if let Some(hwnd) = focused_hwnd {
-            self.show_border(hwnd);
-
             // Skip SetForegroundWindow if the target is currently cloaked
             // (off-screen-parked or ghost-animating). Calling
             // SetForegroundWindow on a cloaked HWND is undocumented
@@ -503,23 +501,50 @@ impl AppState {
             // state still updates so Alt+Tab / next-Focused-event correctly
             // resync once the cloak lifts.
             let target_cloaked = leopardwm_platform_win32::is_placement_cloaked(hwnd);
+            #[cfg(test)]
+            let _ = target_cloaked;
 
-            // Set foreground window — track it regardless of OS result since
-            // this is our intended focus. The call can fail if the window
-            // vanished between layout and here, which is a transient condition.
+            // Set foreground window, but record/broadcast it only after Windows
+            // confirms the transfer. Layout intent already lives in Workspace;
+            // `previous_focused_hwnd` represents observed foreground state.
             // Skipped under #[cfg(test)] so placeholder hwnds (100, 200, …)
             // can't collide with a real running HWND and lag the user's mouse
             // via AttachThreadInput.
             #[cfg(not(test))]
-            if !target_cloaked {
-                let _ = leopardwm_platform_win32::set_foreground_window(hwnd);
-            }
+            let foreground_transferred = !target_cloaked
+                && match leopardwm_platform_win32::set_foreground_window(hwnd) {
+                    Ok(true) => true,
+                    Ok(false) => {
+                        debug!("OS refused foreground handoff to {hwnd:#x}");
+                        false
+                    }
+                    Err(error) => {
+                        debug!("Foreground handoff to {hwnd:#x} failed: {error}");
+                        false
+                    }
+                };
             #[cfg(test)]
-            let _ = target_cloaked; // silence unused warning under cfg(test)
-            self.previous_focused_hwnd = Some(hwnd);
+            let foreground_transferred = true;
+
             self.update_tab_strip();
-            let monitor = self.focused_monitor as i64;
-            self.broadcast_focused_window_if_changed(monitor, Some(hwnd));
+            if foreground_transferred {
+                self.show_border(hwnd);
+                self.previous_focused_hwnd = Some(hwnd);
+                let monitor = self.focused_monitor as i64;
+                self.broadcast_focused_window_if_changed(monitor, Some(hwnd));
+                // Raising the target is the event that can put it above the
+                // preview layer. Re-anchor only after confirmed transfer.
+                #[cfg(not(test))]
+                if let Err(error) =
+                    leopardwm_platform_win32::thumbnail::reanchor_persistent_previews()
+                {
+                    debug!("Preview layer re-anchor after focus failed: {error}");
+                }
+            } else {
+                debug!(
+                    "Layout focus intends {hwnd:#x}, but observed OS foreground was not changed"
+                );
+            }
         } else {
             // No focused window on the active workspace — clear stale state
             // so border/focus don't target a window that's no longer here.

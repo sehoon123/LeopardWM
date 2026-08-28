@@ -1121,14 +1121,13 @@ impl AppState {
                     }
                 }
                 self.pending_drag_hint = Some(crate::state::DragHintAction::Hide);
-                // Move exit windows offscreen before clearing the transition
-                if let Some(ref transition) = self.layout_transition {
-                    for wid in transition.exit_rects.keys() {
-                        let _ = leopardwm_platform_win32::move_window_offscreen(*wid);
-                    }
+                if let Err(error) = self.cancel_layout_transition_for_exact_landing() {
+                    warn!(
+                        "Auto workspace switch deferred until transition exits are safe: {error}"
+                    );
+                    return;
                 }
                 self.abort_active_ghost_transition();
-                self.layout_transition = None;
 
                 let slide_height = self
                     .monitors
@@ -1207,8 +1206,22 @@ impl AppState {
                     let duration = self.config.animation.workspace_switch_duration_ms;
                     self.start_workspace_switch_transition(start_rects, exit_rects, duration);
                 } else {
-                    for (wid, _) in &old_placements {
-                        let _ = leopardwm_platform_win32::move_window_offscreen(*wid);
+                    let failures: Vec<_> = old_placements
+                        .iter()
+                        .filter_map(|(wid, _)| {
+                            leopardwm_platform_win32::move_window_offscreen(*wid)
+                                .err()
+                                .map(|error| (*wid, error))
+                        })
+                        .collect();
+                    if !failures.is_empty() {
+                        self.active_workspace.insert(monitor_id, active_idx);
+                        warn!(
+                            "Auto workspace switch rolled back because old windows could not be parked: {:?}",
+                            failures
+                        );
+                        let _ = self.apply_layout();
+                        return;
                     }
                 }
             }
@@ -1240,6 +1253,23 @@ impl AppState {
             let user_initiated = leopardwm_platform_win32::ms_since_last_user_input()
                 .map(|ms| ms <= FOCUS_INPUT_RECENT_MS)
                 .unwrap_or(false);
+
+            // A physical click is a new owner of layout intent. Letting it
+            // mutate focus under an older structural/workspace transition makes
+            // `apply_layout` report Ok without doing anything (it intentionally
+            // defers while a transition exists), after which old frames can
+            // finish over the clicked layout. The transition cancellation API
+            // owns the epoch/barrier/park/clear fence for every caller.
+            if user_initiated && self.layout_transition.is_some() {
+                self.settle_scroll_animations();
+                if let Err(error) = self.cancel_layout_transition_for_exact_landing() {
+                    self.paused = true;
+                    warn!(
+                        "Physical focus to {hwnd} could not park transition exits; tiling paused: {error}"
+                    );
+                    return;
+                }
+            }
             // A non-user-initiated focus event for a window other than the
             // fullscreen one (e.g. a window that just opened behind a fullscreen
             // window and self-activated) must not pull focus off the fullscreen
@@ -1276,6 +1306,15 @@ impl AppState {
                         workspace.ensure_focused_visible_animated(viewport_width);
                     }
                 }
+            }
+            // Physical focus events must use the same compositor policy as
+            // hotkeys and preview clicks. Without this, clicking a partially
+            // visible Firefox/Chromium/Cascadia window emitted a burst of live
+            // SetWindowPos frames even though the command path deliberately
+            // snaps those renderers; their swap-chain surface could remain at an
+            // intermediate offset after the outer HWND reached its target.
+            if user_initiated {
+                self.settle_focused_compositor_scroll();
             }
             // Always apply layout — even if focus_window failed (floating windows),
             // we still need to repaint if we just switched workspaces.
@@ -1556,6 +1595,9 @@ impl AppState {
     /// Handle the start of a user drag or resize.
     fn on_move_size_start(&mut self, hwnd: u64) {
         debug!("User started dragging/resizing window {}", hwnd);
+        // A real OS move loop owns this HWND now. Do not let completion-relative
+        // suppression intended for our last SetWindowPos hide user movement.
+        self.moved_or_resized_suppression.remove(&hwnd);
 
         // Distinguish resize (border drag) from move (title bar drag).
         // Only create drag state for moves — resizes should not trigger

@@ -17,7 +17,15 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 winreg = "0.56"
 
+[features]
+integration-probes = []
+
 [dev-dependencies]
+
+[[test]]
+name = "preview_lifecycle_windows"
+path = "tests/preview_lifecycle_windows.rs"
+required-features = ["integration-probes"]
 
 [lints]
 workspace = true

@@ -45,7 +45,7 @@ impl Drop for SettingsOpenGuard {
 
 /// Handle to the settings window thread.
 pub struct SettingsWindowHandle {
-    _thread: std::thread::JoinHandle<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl SettingsWindowHandle {
@@ -95,6 +95,35 @@ impl SettingsWindowHandle {
             }
         };
 
-        Some(SettingsWindowHandle { _thread: handle })
+        Some(SettingsWindowHandle {
+            thread: Some(handle),
+        })
+    }
+}
+
+impl Drop for SettingsWindowHandle {
+    fn drop(&mut self) {
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        // The HWND/thread queue appears after WebView construction. Allow a
+        // short startup race, then ask the owning message loop to quit so COM
+        // and the parent HWND are torn down on their creation thread.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !thread.is_finished() && std::time::Instant::now() < deadline {
+            if win32::request_close() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let finish_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !thread.is_finished() && std::time::Instant::now() < finish_deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if thread.is_finished() {
+            let _ = thread.join();
+        } else {
+            warn!("Settings window thread did not exit within shutdown budget");
+        }
     }
 }

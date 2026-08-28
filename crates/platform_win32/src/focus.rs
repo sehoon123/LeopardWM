@@ -7,7 +7,8 @@ use windows::Win32::Foundation::RECT;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId, IsIconic,
-    IsWindow, PostMessageW, SetCursorPos, SetForegroundWindow, ShowWindow, SW_RESTORE,
+    IsWindow, PostMessageW, SetCursorPos, SetForegroundWindow, ShowWindow, SwitchToThisWindow,
+    SW_RESTORE,
 };
 
 /// The current OS foreground window as a `WindowId`, if any. This is
@@ -147,6 +148,17 @@ pub fn set_foreground_window(hwnd: WindowId) -> Result<bool, Win32Error> {
                     }
                 }
                 Err(e) => diagnostics.push(format!("BringWindowToTop failed: {}", e)),
+            }
+        }
+
+        // Shell-style fallback for explicit user intent. This is the same API
+        // used by task switchers and succeeds in cases where foreground queue
+        // attachment is denied (higher-integrity or protected UI threads).
+        if !foreground_set {
+            SwitchToThisWindow(hwnd, true);
+            foreground_set = GetForegroundWindow() == hwnd;
+            if !foreground_set {
+                diagnostics.push("SwitchToThisWindow did not transfer foreground".to_string());
             }
         }
 

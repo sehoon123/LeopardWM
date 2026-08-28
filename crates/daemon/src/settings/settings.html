@@ -1174,14 +1174,14 @@ input[type="range"]::-webkit-slider-thumb {
           </div>
         </div>
         <h3 class="section-subtitle">Rendering</h3>
-        <p class="section-desc">How windows are moved on screen. Leave adaptive mode on unless an app misrenders while scrolling.</p>
+        <p class="section-desc">How windows are moved on screen. Leave safe mode on for reliable GPU-backed window placement.</p>
         <div class="card">
           <div class="field">
-            <div class="field-info"><div class="field-label">Adaptive compositor-safe animation</div><div class="field-desc">Keep position-only scrolling smooth while serializing GPU-backed windows per frame. Size-changing transitions use a safe DWM ghost or one exact landing.</div></div>
+            <div class="field-info"><div class="field-label">Compositor-safe animation</div><div class="field-desc">Move ordinary windows smoothly, but land Chromium, Firefox, terminal, and other GPU-backed windows exactly so their content cannot lag behind the frame.</div></div>
             <label class="toggle"><input type="checkbox" id="behavior-compositor_safe_mode"><span class="track"></span><span class="thumb"></span></label>
           </div>
           <div class="field">
-            <div class="field-info"><div class="field-label">DWM thumbnail animation (experimental)</div><div class="field-desc">Use a live DWM ghost for size-changing transitions when Windows can safely hide the source. Otherwise adaptive mode performs an exact landing.</div></div>
+            <div class="field-info"><div class="field-label">Legacy DWM ghost animation (experimental)</div><div class="field-desc">Use live DWM ghosts only when compositor-safe mode is disabled. Safe mode always prefers an exact landing for GPU-backed windows.</div></div>
             <label class="toggle"><input type="checkbox" id="behavior-swap_chain_ghost_animation"><span class="track"></span><span class="thumb"></span></label>
           </div>
           <div class="field">

@@ -125,21 +125,12 @@ impl AppState {
         if let Some(workspace) = self.focused_workspace_mut() {
             f(workspace, viewport_width);
         }
-        let focused_live_animation_is_unsafe = sync_focus
-            && self
-                .focused_workspace()
-                .is_some_and(|workspace| workspace.is_animating())
-            && self.focused_window_uses_sticky_compositor();
-        if focused_live_animation_is_unsafe {
-            // The focused HWND cannot use the thumbnail path, and rapid async
-            // SetWindowPos leaves Chromium/Firefox/Cascadia surfaces behind the
-            // window frame. Snap this navigation directly; the bounded sync
-            // apply worker below retains hung-window protection.
-            if let Some(workspace) = self.focused_workspace_mut() {
-                workspace.stop_animation();
+        let focused_live_animation_is_unsafe =
+            sync_focus && self.settle_focused_compositor_scroll();
+        if !focused_live_animation_is_unsafe {
+            if let Some(snapshot) = snapshot {
+                self.start_layout_transition(snapshot);
             }
-        } else if let Some(snapshot) = snapshot {
-            self.start_layout_transition(snapshot);
         }
         if let Err(e) = self.apply_layout() {
             return IpcResponse::error(format!("Failed to apply layout: {}", e));
@@ -151,6 +142,23 @@ impl AppState {
             self.sync_foreground_window();
         }
         IpcResponse::Ok
+    }
+
+    /// Stop an active focused-workspace scroll when its target renderer cannot
+    /// reliably follow per-frame live-HWND movement. This is shared by command,
+    /// preview and physical `EVENT_SYSTEM_FOREGROUND` focus paths so input origin
+    /// cannot select a different placement algorithm.
+    pub(crate) fn settle_focused_compositor_scroll(&mut self) -> bool {
+        let should_stop = self
+            .focused_workspace()
+            .is_some_and(|workspace| workspace.is_animating())
+            && self.focused_window_uses_sticky_compositor();
+        if should_stop {
+            if let Some(workspace) = self.focused_workspace_mut() {
+                workspace.stop_animation();
+            }
+        }
+        should_stop
     }
 
     /// Whether the focused tiled window uses a compositor that cannot reliably
@@ -261,6 +269,15 @@ impl AppState {
             ));
         }
 
+        let previous_focused_monitor = self.focused_monitor;
+        let previous_floating_focus = self.previous_focused_hwnd;
+        let previous_workspace = self
+            .workspaces
+            .get(&monitor)
+            .and_then(|workspaces| workspaces.get(active_idx))
+            .cloned()
+            .expect("active preview workspace was validated above");
+
         self.focused_monitor = monitor;
         // Pointer-driven focus is explicit intent, so drop any floating-window
         // preference first. `sync_foreground_window` otherwise keeps foregrounding
@@ -281,7 +298,35 @@ impl AppState {
                 },
             );
         if let Some(error) = focus_error {
+            if let Some(workspaces) = self.workspaces.get_mut(&monitor) {
+                workspaces[active_idx] = previous_workspace;
+            }
+            self.focused_monitor = previous_focused_monitor;
+            self.previous_focused_hwnd = previous_floating_focus;
             return IpcResponse::error(format!("Failed to focus column: {error}"));
+        }
+        if let IpcResponse::Error { message } = &response {
+            // The focus/scroll mutation happened before the physical apply. Roll
+            // it back so an unrelated later event cannot suddenly apply a click
+            // that appeared to fail now.
+            if let Some(workspaces) = self.workspaces.get_mut(&monitor) {
+                workspaces[active_idx] = previous_workspace;
+            }
+            self.focused_monitor = previous_focused_monitor;
+            self.previous_focused_hwnd = previous_floating_focus;
+            self.settle_scroll_animations();
+            self.last_placed_layout_rects.clear();
+            if self.paused {
+                return IpcResponse::error(format!(
+                    "{message}; logical focus rolled back but physical rollback is pending paused recovery"
+                ));
+            }
+            if let Err(rollback_error) = self.apply_layout() {
+                return IpcResponse::error(format!(
+                    "{message}; focus rollback also failed: {rollback_error}"
+                ));
+            }
+            return response;
         }
 
         // Focus and z-order are independent in Windows. A floating window sits
@@ -296,6 +341,13 @@ impl AppState {
         {
             if let Err(error) = leopardwm_platform_win32::raise_window(hwnd) {
                 debug!("Could not raise clicked window {hwnd:#x}: {error}");
+            }
+            if leopardwm_platform_win32::get_foreground_window() == Some(hwnd) {
+                if let Err(error) =
+                    leopardwm_platform_win32::thumbnail::reanchor_persistent_previews()
+                {
+                    debug!("Could not re-anchor preview layer after focus: {error}");
+                }
             }
         }
 
@@ -1113,15 +1165,12 @@ impl AppState {
             }
         }
         self.pending_drag_hint = Some(crate::state::DragHintAction::Hide);
-        // Move exit windows offscreen before clearing the transition,
-        // so they don't get stranded at intermediate positions.
-        if let Some(ref transition) = self.layout_transition {
-            for wid in transition.exit_rects.keys() {
-                let _ = leopardwm_platform_win32::move_window_offscreen(*wid);
-            }
+        if let Err(error) = self.cancel_layout_transition_for_exact_landing() {
+            return IpcResponse::error(format!(
+                "Cannot switch workspace until the current transition exits are safe: {error}"
+            ));
         }
         self.abort_active_ghost_transition();
-        self.layout_transition = None;
 
         let slide_height = self
             .monitors
@@ -1209,8 +1258,17 @@ impl AppState {
             let duration = self.config.animation.workspace_switch_duration_ms;
             self.start_workspace_switch_transition(start_rects, exit_rects, duration);
         } else {
-            for (wid, _) in &old_placements {
-                let _ = move_window_offscreen(*wid);
+            let failures: Vec<_> = old_placements
+                .iter()
+                .filter_map(|(wid, _)| move_window_offscreen(*wid).err().map(|error| (*wid, error)))
+                .collect();
+            if !failures.is_empty() {
+                self.active_workspace.insert(monitor, current_idx);
+                self.rehome_sticky_windows();
+                let rollback = self.apply_layout().err();
+                return IpcResponse::error(format!(
+                    "Workspace switch rolled back because old windows could not be parked: {failures:?}; rollback={rollback:?}"
+                ));
             }
         }
 

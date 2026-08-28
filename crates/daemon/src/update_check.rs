@@ -21,11 +21,14 @@ pub const RELEASES_PAGE_URL: &str = "https://github.com/jcardama/LeopardWM/relea
 ///
 /// `on_update_found` runs on the worker thread when a newer release tag is
 /// observed. `cancel` lets shutdown abort sleeps early.
-pub fn spawn_update_checker<F>(cancel: Arc<AtomicBool>, on_update_found: F)
+pub fn spawn_update_checker<F>(
+    cancel: Arc<AtomicBool>,
+    on_update_found: F,
+) -> Option<std::thread::JoinHandle<()>>
 where
     F: Fn(String) + Send + 'static,
 {
-    std::thread::Builder::new()
+    match std::thread::Builder::new()
         .name("leopardwm-update-check".to_string())
         .spawn(move || {
             interruptible_sleep(STARTUP_DELAY, &cancel);
@@ -33,9 +36,13 @@ where
                 run_check_once(&on_update_found);
                 interruptible_sleep(POLL_INTERVAL, &cancel);
             }
-        })
-        .map(|_| ())
-        .unwrap_or_else(|e| warn!("Failed to spawn update checker: {}", e));
+        }) {
+        Ok(handle) => Some(handle),
+        Err(error) => {
+            warn!("Failed to spawn update checker: {error}");
+            None
+        }
+    }
 }
 
 fn run_check_once(on_update_found: &impl Fn(String)) {

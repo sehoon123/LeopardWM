@@ -484,16 +484,15 @@ pub struct BehaviorConfig {
     #[serde(default)]
     pub tab_close_action: TabCloseAction,
 
-    /// Use adaptive compositor-safe animation. Position-only movement remains
-    /// smooth; sensitive renderers are serialized per frame, and unprotected
-    /// size-changing transitions use one exact landing. Enabled by default.
+    /// Use compositor-safe animation. Any live movement of a known swap-chain
+    /// renderer and any unprotected size change collapses to one exact landing;
+    /// ordinary position-only windows may remain smooth. Enabled by default.
     #[serde(default = "default_true")]
     pub compositor_safe_mode: bool,
 
-    /// Use DWM thumbnails only when Windows permits the live source HWND to
-    /// be physically cloaked. External application windows commonly reject
-    /// cloaking, so this path is used only when the source can be hidden
-    /// reliably; otherwise adaptive safe mode chooses an exact landing.
+    /// Experimental DWM ghost transitions for legacy animation mode. Safe mode
+    /// prefers exact landings for compositor-sensitive windows; monitor-edge
+    /// previews continue to use settled DWM thumbnails independently.
     #[serde(default = "default_true")]
     pub swap_chain_ghost_animation: bool,
 

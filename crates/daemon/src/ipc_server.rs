@@ -382,25 +382,86 @@ where
     }
 }
 
-/// Spawn a named forwarding thread that receives events from a std::sync::mpsc channel
-/// and forwards them to a tokio mpsc sender. Returns the JoinHandle for graceful shutdown.
-pub(crate) fn spawn_forwarding_thread<T: Send + 'static>(
+/// A forwarding thread plus an explicit stop edge. Source owners live in UI and
+/// hook objects that intentionally outlive the event loop, so sender drop alone
+/// is not a valid shutdown protocol.
+pub(crate) struct ForwardingThreadHandle {
+    name: String,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ForwardingThreadHandle {
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(crate) fn request_stop(&self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    pub(crate) fn join_with_timeout(&mut self, timeout: Duration) -> bool {
+        self.request_stop();
+        join_with_timeout(&mut self.thread, timeout)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn join(mut self) -> std::thread::Result<()> {
+        self.thread
+            .take()
+            .expect("forwarding thread handle must exist")
+            .join()
+    }
+}
+
+/// Spawn a named forwarding thread that receives events from a sync channel
+/// and forwards them to a Tokio channel. A short timed receive lets an explicit
+/// shutdown request terminate the thread even while a source sender remains
+/// owned by a long-lived hook/overlay.
+pub(crate) fn spawn_forwarding_thread<T: Send + 'static, U: Send + 'static>(
     name: &str,
     receiver: std::sync::mpsc::Receiver<T>,
-    sender: mpsc::Sender<DaemonEvent>,
-    map_fn: impl Fn(T) -> DaemonEvent + Send + 'static,
-) -> Result<std::thread::JoinHandle<()>> {
+    sender: mpsc::Sender<U>,
+    map_fn: impl Fn(T) -> U + Send + 'static,
+) -> Result<ForwardingThreadHandle> {
     let thread_name = name.to_string();
-    std::thread::Builder::new()
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let thread_stop = stop.clone();
+    let thread = std::thread::Builder::new()
         .name(thread_name.clone())
-        .spawn(move || {
-            while let Ok(event) = receiver.recv() {
-                if sender.blocking_send(map_fn(event)).is_err() {
-                    break; // Channel closed, daemon shutting down
+        .spawn(move || 'forward: loop {
+            if thread_stop.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
+            match receiver.recv_timeout(Duration::from_millis(50)) {
+                Ok(event) => {
+                    let mut mapped = map_fn(event);
+                    loop {
+                        if thread_stop.load(std::sync::atomic::Ordering::Acquire) {
+                            break 'forward;
+                        }
+                        match sender.try_send(mapped) {
+                            Ok(()) => break,
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(value)) => {
+                                mapped = value;
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                break 'forward;
+                            }
+                        }
+                    }
                 }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
         })
-        .map_err(|e| anyhow::anyhow!("Failed to spawn {} thread: {}", thread_name, e))
+        .map_err(|e| anyhow::anyhow!("Failed to spawn {} thread: {}", thread_name, e))?;
+    Ok(ForwardingThreadHandle {
+        name: thread_name,
+        stop,
+        thread: Some(thread),
+    })
 }
 
 /// Join a thread with a timeout. Returns true if the thread joined within the deadline,

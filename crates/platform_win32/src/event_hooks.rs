@@ -333,6 +333,11 @@ fn win_event_callback_inner(
     };
 
     let window_id = hwnd.0 as WindowId;
+    if event == EVENT_OBJECT_DESTROY {
+        // Synchronous incarnation fence: preview input has a separate priority
+        // lane and can otherwise overtake this queued destroy event.
+        crate::thumbnail::invalidate_persistent_preview_source(window_id);
+    }
 
     // Suppress LOCATIONCHANGE and SHOW events for windows currently cloaked
     // by our placement system. DWM cloaking fires EVENT_OBJECT_LOCATIONCHANGE
@@ -341,7 +346,8 @@ fn win_event_callback_inner(
     // HIDE is NOT suppressed: cloaking doesn't fire HIDE, and real hide
     // events (minimize, close-to-tray) must reach the daemon.
     if matches!(event, EVENT_OBJECT_SHOW | EVENT_OBJECT_LOCATIONCHANGE)
-        && crate::is_placement_cloaked(window_id)
+        && (crate::is_placement_cloaked(window_id)
+            || crate::thumbnail::has_persistent_preview(window_id))
     {
         return;
     }

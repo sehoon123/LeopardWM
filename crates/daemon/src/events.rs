@@ -60,8 +60,9 @@ pub(crate) enum DaemonEvent {
     HideSnapHint,
     /// Apply focus-follows-mouse focus after delay.
     FocusFollowsMouse { window_id: u64 },
-    /// Debounced display change — fires after WM_DISPLAYCHANGE settles.
-    DisplayChangeSettled,
+    /// Debounced display change — fires after WM_DISPLAYCHANGE settles. Stale
+    /// timers are ignored by generation.
+    DisplayChangeSettled { generation: u64 },
     /// Power state changed (AC/battery or power saver toggled).
     PowerStateChanged { on_battery_or_saver: bool },
     /// Update checker observed a newer release tag (e.g. `v0.1.11`).
@@ -87,10 +88,7 @@ pub(crate) enum DaemonEvent {
     /// what the pointer did. A click focuses that column, which also scrolls it
     /// into view; a drag focuses it and then hands the pointer to the window so
     /// Windows' own move loop takes over.
-    PreviewGesture {
-        window_id: u64,
-        gesture: leopardwm_platform_win32::PreviewGesture,
-    },
+    PreviewGesture(leopardwm_platform_win32::PreviewClickEvent),
     /// Low-frequency tick that triggers a tab-strip refresh so background
     /// icon changes (notification badges, app icon swaps that don't
     /// accompany a title change) propagate without user interaction.

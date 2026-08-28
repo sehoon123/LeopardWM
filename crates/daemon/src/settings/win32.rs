@@ -101,6 +101,17 @@ pub fn push_failed_binds(failed_binds: &[String]) {
 /// Activation is posted to the owning message loop rather than manipulating
 /// the HWND from the daemon thread. Returns false only when the window is not
 /// ready yet, has already closed, or its thread queue rejected the message.
+pub fn request_close() -> bool {
+    let thread_id = match SETTINGS_THREAD.lock() {
+        Ok(guard) => *guard,
+        Err(_) => return false,
+    };
+    let Some(thread_id) = thread_id else {
+        return false;
+    };
+    unsafe { PostThreadMessageW(thread_id, WM_QUIT, WPARAM(0), LPARAM(0)).is_ok() }
+}
+
 pub fn focus_existing_window() -> bool {
     let thread_id = match SETTINGS_THREAD.lock() {
         Ok(guard) => *guard,

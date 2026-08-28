@@ -5,6 +5,17 @@ use crate::state::*;
 use std::collections::HashMap;
 use tracing::{debug, info};
 
+fn ghost_frame_barrier_timeout() -> std::time::Duration {
+    #[cfg(test)]
+    {
+        std::time::Duration::from_millis(50)
+    }
+    #[cfg(not(test))]
+    {
+        std::time::Duration::from_millis(1500)
+    }
+}
+
 pub(crate) fn reduce_motion_enabled(
     animations_enabled: bool,
     on_battery_or_saver: bool,
@@ -38,12 +49,15 @@ fn transition_requires_compositor_safe_snap(
         ),
     >,
     ghosted_wids: &std::collections::HashSet<u64>,
+    compositor_sensitive_wids: &std::collections::HashSet<u64>,
 ) -> bool {
     compositor_safe_mode
         && start_rects.iter().any(|(wid, start)| {
             targets.get(wid).is_some_and(|(target, _)| {
                 !ghosted_wids.contains(wid)
-                    && (start.width != target.width || start.height != target.height)
+                    && (start.width != target.width
+                        || start.height != target.height
+                        || compositor_sensitive_wids.contains(wid))
             })
         })
 }
@@ -56,6 +70,62 @@ impl AppState {
                 .workspaces
                 .values()
                 .any(|ws_vec| ws_vec.iter().any(|w| w.is_animating()))
+    }
+
+    /// Cancel the structural/workspace transition without stranding its exiting
+    /// HWNDs, and force the next apply through the exact-landing path.
+    ///
+    /// Every caller that clears `layout_transition` must use this operation. The
+    /// transition is the only owner of `exit_rects`; dropping it directly leaves
+    /// old-workspace windows at their last interpolated positions, and the normal
+    /// active-workspace apply has no way to discover or park them.
+    pub(crate) fn cancel_layout_transition_for_exact_landing(&mut self) -> anyhow::Result<bool> {
+        let Some(transition) = self.layout_transition.as_ref() else {
+            return Ok(false);
+        };
+
+        // This method is the sole transition-ownership release operation, so the
+        // ordering edge belongs here rather than at selected callers. A frame
+        // that passed its worker-side epoch check can otherwise move an exit
+        // back on-screen after we park it and drop its only ownership record.
+        self.apply_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let worker = self.animation_worker_control.clone();
+        if worker
+            .as_ref()
+            .is_some_and(|worker| !worker.wait_for_barrier(std::time::Duration::from_millis(750)))
+        {
+            return Err(anyhow::anyhow!(
+                "animation worker barrier timed out before transition ownership release"
+            ));
+        }
+
+        let exit_windows: Vec<u64> = transition.exit_rects.keys().copied().collect();
+
+        let mut failures = Vec::new();
+        for window_id in exit_windows {
+            if let Err(error) = leopardwm_platform_win32::move_window_offscreen(window_id) {
+                // A destroyed HWND has no pixels to strand and is therefore
+                // already a safe terminal state.
+                if leopardwm_platform_win32::is_valid_window(window_id) {
+                    failures.push(format!("{window_id:#x}: {error}"));
+                }
+            }
+        }
+        if !failures.is_empty() {
+            return Err(anyhow::anyhow!(
+                "could not park transition exit window(s): {}",
+                failures.join(", ")
+            ));
+        }
+        self.abort_active_ghost_transition();
+        self.layout_transition = None;
+        self.post_animation_landing_pending = true;
+        self.last_placed_layout_rects.clear();
+        if let Some(worker) = worker {
+            worker.clear_cache();
+        }
+        Ok(true)
     }
 
     /// Collapse an unsafe size-changing transition to its final state.
@@ -76,36 +146,25 @@ impl AppState {
             return false;
         }
 
-        let exit_windows: Vec<u64> = self
-            .layout_transition
-            .as_ref()
-            .map(|transition| transition.exit_rects.keys().copied().collect())
-            .unwrap_or_default();
-
         for workspaces in self.workspaces.values_mut() {
             for workspace in workspaces {
                 workspace.stop_animation();
             }
         }
 
-        // Release any thumbnail/crossfade state before touching source HWNDs.
-        self.abort_active_ghost_transition();
-
-        // Structural/workspace transitions own their exiting HWNDs until the
-        // animation completes. Since safe mode skips the frames, park them now
-        // so clearing the transition cannot leave an old workspace on screen.
-        for window_id in exit_windows {
-            let _ = leopardwm_platform_win32::move_window_offscreen(window_id);
+        // Park transition-owned exit windows, release ghosts, and force the
+        // exact synchronous landing even when desired rectangles match cache.
+        match self.cancel_layout_transition_for_exact_landing() {
+            Ok(true) => {
+                debug!("Collapsed unsafe size-changing transition into an exact landing");
+                true
+            }
+            Ok(false) => false,
+            Err(error) => {
+                tracing::warn!("Could not collapse unsafe layout transition: {error}");
+                false
+            }
         }
-        self.layout_transition = None;
-
-        // Force the exact synchronous landing even when the desired rectangles
-        // match the cache. The landing performs edge verification and a guarded
-        // compositor refresh for known swap-chain renderers.
-        self.post_animation_landing_pending = true;
-        self.last_placed_layout_rects.clear();
-        debug!("Collapsed unsafe size-changing transition into an exact landing");
-        true
     }
 
     /// Tick all active animations by the given delta time.
@@ -148,17 +207,43 @@ impl AppState {
             if transition.tick(delta_ms) {
                 still_animating = true;
             } else {
-                // Transition complete — move exiting windows offscreen.
-                for wid in transition.exit_rects.keys() {
-                    let _ = leopardwm_platform_win32::move_window_offscreen(*wid);
+                // Transition ownership ends only after every live exit is parked.
+                let failures: Vec<_> = transition
+                    .exit_rects
+                    .keys()
+                    .filter_map(|window_id| {
+                        leopardwm_platform_win32::move_window_offscreen(*window_id)
+                            .err()
+                            .filter(|_| leopardwm_platform_win32::is_valid_window(*window_id))
+                            .map(|error| (*window_id, error))
+                    })
+                    .collect();
+                if failures.is_empty() {
+                    self.layout_transition = None;
+                    self.sync_taskbar_buttons();
+                } else {
+                    transition.exit_park_failures = transition.exit_park_failures.saturating_add(1);
+                    tracing::warn!(
+                        "Transition exit parking attempt {}/3 failed: {:?}",
+                        transition.exit_park_failures,
+                        failures
+                            .iter()
+                            .map(|(window_id, _)| format!("{window_id:#x}"))
+                            .collect::<Vec<_>>()
+                    );
+                    if transition.exit_park_failures >= 3 {
+                        // Retain ownership for an explicit resume/recovery, but
+                        // stop the frame-cadence retry loop.
+                        self.paused = true;
+                        still_animating = false;
+                    } else {
+                        still_animating = true;
+                    }
                 }
-                self.layout_transition = None;
-                // The slide is done; cloak any settled off-workspace windows
-                // that were skipped while animating so their taskbar buttons go.
-                self.sync_taskbar_buttons();
-                // Signal one more frame so entering windows land at their
-                // exact final positions (previous frame had t < 1.0).
-                still_animating = true;
+                if self.layout_transition.is_none() {
+                    // Exact landing follows successful ownership release.
+                    still_animating = true;
+                }
             }
         }
         still_animating
@@ -207,6 +292,11 @@ impl AppState {
         // by a new transition starting. Drops handles via Drop, uncloaks
         // sources, and tells the worker to abort the fade.
         self.abort_active_ghost_transition();
+        if !self.ghost_handles.is_empty() {
+            // The abort fence timed out and paused tiling. Never overlap a new
+            // registration with frame-owned registrations for the same source.
+            return;
+        }
 
         let targets = self.collect_transition_targets();
 
@@ -214,19 +304,24 @@ impl AppState {
         // transitions; position-only movement is already safe on the adaptive
         // synchronous path. Legacy mode keeps its broader experimental ghosting.
         let mut ghosted_wids = std::collections::HashSet::new();
-        if self.config.behavior.swap_chain_ghost_animation {
-            self.register_ghosts_for_transition(
-                &start_rects,
-                &targets,
-                self.config.behavior.compositor_safe_mode,
-                &mut ghosted_wids,
-            );
+        if self.config.behavior.swap_chain_ghost_animation
+            && !self.config.behavior.compositor_safe_mode
+        {
+            self.register_ghosts_for_transition(&start_rects, &targets, false, &mut ghosted_wids);
         }
+        let compositor_sensitive_wids: std::collections::HashSet<_> = targets
+            .keys()
+            .copied()
+            .filter(|window_id| {
+                leopardwm_platform_win32::thumbnail::is_compositor_sensitive_class(*window_id)
+            })
+            .collect();
         let requires_compositor_safe_snap = transition_requires_compositor_safe_snap(
             self.config.behavior.compositor_safe_mode,
             &start_rects,
             &targets,
             &ghosted_wids,
+            &compositor_sensitive_wids,
         );
 
         // Start with one frame (~16ms) already elapsed so the first
@@ -234,11 +329,13 @@ impl AppState {
         self.layout_transition = Some(LayoutTransition {
             start_rects,
             exit_rects: HashMap::new(),
+            exit_column_indices: HashMap::new(),
             elapsed_ms: 16,
             duration_ms,
             easing: self.config.animation.easing,
             requires_compositor_safe_snap,
             ghosted_wids,
+            exit_park_failures: 0,
         });
     }
 
@@ -260,14 +357,37 @@ impl AppState {
             return;
         }
         self.abort_active_ghost_transition();
+        if !self.ghost_handles.is_empty() {
+            return;
+        }
+        let requires_compositor_safe_snap = self.config.behavior.compositor_safe_mode
+            && start_rects
+                .keys()
+                .chain(exit_rects.keys())
+                .any(|window_id| {
+                    leopardwm_platform_win32::thumbnail::is_compositor_sensitive_class(*window_id)
+                });
+        let exit_column_indices = exit_rects
+            .keys()
+            .map(|window_id| {
+                let is_floating = self.workspaces.values().any(|workspaces| {
+                    workspaces.iter().any(|workspace| {
+                        workspace.contains_window(*window_id) && workspace.is_floating(*window_id)
+                    })
+                });
+                (*window_id, if is_floating { usize::MAX } else { 0 })
+            })
+            .collect();
         self.layout_transition = Some(LayoutTransition {
             start_rects,
             exit_rects,
+            exit_column_indices,
             elapsed_ms: 16,
             duration_ms,
             easing: self.config.animation.easing,
-            requires_compositor_safe_snap: false,
+            requires_compositor_safe_snap,
             ghosted_wids: std::collections::HashSet::new(),
+            exit_park_failures: 0,
         });
     }
 
@@ -277,8 +397,25 @@ impl AppState {
     /// Routed through by every code path that mutates or clears
     /// `layout_transition`. No-op when no ghost state is alive.
     pub(crate) fn abort_active_ghost_transition(&mut self) {
-        // Each GhostEntry::Drop calls thumbnail::unregister_raw, so dropping
-        // the handles is enough — no manual cleanup needed.
+        if !self.ghost_handles.is_empty() {
+            // A queued frame owns Arc clones of these registrations. Invalidate
+            // its desired epoch and drain the worker before clearing daemon
+            // ownership, uncloaking sources, or permitting same-source
+            // re-registration. Arc prevents UAF; this fence prevents overlap.
+            self.apply_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self
+                .animation_worker_control
+                .as_ref()
+                .is_some_and(|worker| !worker.wait_for_barrier(ghost_frame_barrier_timeout()))
+            {
+                self.paused = true;
+                tracing::warn!(
+                    "Ghost frame barrier timed out; retaining registrations and pausing tiling"
+                );
+                return;
+            }
+        }
         let wids: Vec<u64> = self.ghost_handles.keys().copied().collect();
         self.ghost_handles.clear();
 
@@ -496,7 +633,11 @@ impl AppState {
                         start.height + ((target.height - start.height) as f64 * t).round() as i32,
                     ),
                     visibility: leopardwm_core_layout::Visibility::Visible,
-                    column_index: 0,
+                    column_index: transition
+                        .exit_column_indices
+                        .get(wid)
+                        .copied()
+                        .unwrap_or(0),
                 });
             }
         }
@@ -513,6 +654,7 @@ impl AppState {
         placements: Vec<leopardwm_core_layout::WindowPlacement>,
         transition: Option<&LayoutTransition>,
         ghost_handles: &std::collections::HashMap<u64, crate::state::GhostEntry>,
+        region_clips: &[leopardwm_platform_win32::WindowRegionClip],
     ) -> (
         Vec<leopardwm_core_layout::WindowPlacement>,
         Vec<animation_worker::GhostFrame>,
@@ -531,12 +673,65 @@ impl AppState {
                 .unwrap_or(false);
             if is_ghost {
                 if let Some(entry) = ghost_handles.get(&p.window_id) {
+                    let clipped = region_clips
+                        .iter()
+                        .find(|clip| clip.window_id == p.window_id)
+                        .and_then(|clip| {
+                            let left = p.rect.x.max(clip.clip_bounds.x);
+                            let top = p.rect.y.max(clip.clip_bounds.y);
+                            let right = p.rect.right().min(clip.clip_bounds.right());
+                            let bottom = p.rect.bottom().min(clip.clip_bounds.bottom());
+                            (right > left && bottom > top).then(|| {
+                                let destination = leopardwm_core_layout::Rect::new(
+                                    left,
+                                    top,
+                                    right - left,
+                                    bottom - top,
+                                );
+                                let source = leopardwm_core_layout::Rect::new(
+                                    left - p.rect.x,
+                                    top - p.rect.y,
+                                    right - left,
+                                    bottom - top,
+                                );
+                                (source, destination)
+                            })
+                        });
+                    let (source_crop, destination) = if let Some((source, destination)) = clipped {
+                        (
+                            Some((source, (p.rect.width.max(1), p.rect.height.max(1)))),
+                            destination,
+                        )
+                    } else if region_clips
+                        .iter()
+                        .any(|clip| clip.window_id == p.window_id)
+                    {
+                        // The planned clip contains no pixels for this frame.
+                        // Keep the handle hidden rather than drawing a full ghost.
+                        ghosts.push(animation_worker::GhostFrame {
+                            window_id: p.window_id,
+                            registration: entry.shared_registration(),
+                            source_crop: None,
+                            dest_client_rect:
+                                leopardwm_platform_win32::thumbnail::screen_to_host_client(
+                                    p.rect,
+                                    host_origin,
+                                ),
+                            opacity: 0,
+                            visible: false,
+                        });
+                        continue;
+                    } else {
+                        (None, p.rect)
+                    };
                     let dest = leopardwm_platform_win32::thumbnail::screen_to_host_client(
-                        p.rect,
+                        destination,
                         host_origin,
                     );
                     ghosts.push(animation_worker::GhostFrame {
-                        handle_isize: entry.handle(),
+                        window_id: p.window_id,
+                        registration: entry.shared_registration(),
+                        source_crop,
                         dest_client_rect: dest,
                         opacity: 255,
                         visible: true,
@@ -595,7 +790,7 @@ mod tests {
     }
 
     #[test]
-    fn transition_policy_snaps_only_unprotected_size_changes() {
+    fn transition_policy_snaps_unprotected_resize_and_sensitive_position_changes() {
         let start = HashMap::from([(1, Rect::new(0, 0, 800, 600))]);
         let moved = HashMap::from([(1, (Rect::new(100, 0, 800, 600), 1))]);
         let resized = HashMap::from([(1, (Rect::new(100, 0, 900, 600), 1))]);
@@ -605,11 +800,20 @@ mod tests {
             &start,
             &moved,
             &HashSet::new(),
+            &HashSet::new(),
+        ));
+        assert!(transition_requires_compositor_safe_snap(
+            true,
+            &start,
+            &moved,
+            &HashSet::new(),
+            &HashSet::from([1]),
         ));
         assert!(transition_requires_compositor_safe_snap(
             true,
             &start,
             &resized,
+            &HashSet::new(),
             &HashSet::new(),
         ));
         assert!(!transition_requires_compositor_safe_snap(
@@ -617,12 +821,14 @@ mod tests {
             &start,
             &resized,
             &HashSet::from([1]),
+            &HashSet::from([1]),
         ));
         assert!(!transition_requires_compositor_safe_snap(
             false,
             &start,
             &resized,
             &HashSet::new(),
+            &HashSet::from([1]),
         ));
     }
 

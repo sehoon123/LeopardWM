@@ -143,9 +143,11 @@ async fn setup_daemon_runtime(
 ) -> (
     mpsc::Sender<DaemonEvent>,
     mpsc::Receiver<DaemonEvent>,
+    mpsc::UnboundedReceiver<DaemonEvent>,
     animation_worker::AnimationWorkerHandle,
 ) {
     let (event_tx, event_rx) = mpsc::channel::<DaemonEvent>(100);
+    let (animation_event_tx, animation_event_rx) = mpsc::unbounded_channel::<DaemonEvent>();
     let (apply_worker_cancelled, apply_epoch) = {
         let state = state.lock().await;
         (
@@ -154,8 +156,9 @@ async fn setup_daemon_runtime(
         )
     };
     let animation_worker = animation_worker::AnimationWorkerHandle::spawn(
-        event_tx.clone(),
+        animation_event_tx,
         apply_worker_cancelled.clone(),
+        apply_epoch.clone(),
     )
     .expect("Failed to spawn animation worker");
     let animation_worker_control = animation_worker.control();
@@ -183,7 +186,7 @@ async fn setup_daemon_runtime(
             e
         );
     }
-    (event_tx, event_rx, animation_worker)
+    (event_tx, event_rx, animation_event_rx, animation_worker)
 }
 
 /// Listen for console-close / Ctrl+C / break. On receipt, latch apply
@@ -310,6 +313,8 @@ struct HotkeyState {
     /// there are no binds, the hook failed to install, or matching is
     /// suspended for the Settings recorder.
     hook: Option<KeyboardHookHandle>,
+    /// Explicitly-cancellable sync-to-Tokio route paired with `hook`.
+    forwarder: Option<ForwardingThreadHandle>,
     /// Mapping of hotkey IDs to commands.
     mapping: HashMap<HotkeyId, IpcCommand>,
     /// Number of hotkeys parsed from config and handed to the hook.
@@ -361,11 +366,15 @@ async fn reload_config_and_hotkeys(
     tray_manager: &Option<tray::TrayManager>,
     snap_hint_overlay: &Option<OverlayWindow>,
     mouse_hook_handle: &mut Option<MouseHookHandle>,
+    forwarding_threads: &mut Vec<ForwardingThreadHandle>,
 ) {
     // Drop both handles BEFORE setup_hotkeys rebuilds them: assignment drops the
     // old HotkeyState last, so an unhook-then-reinstall must happen here or the
     // keyboard hook's double-install guard would reject the new one.
     hotkey_state.handle = None;
+    if let Some(mut forwarder) = hotkey_state.forwarder.take() {
+        let _ = forwarder.join_with_timeout(Duration::from_millis(500));
+    }
     hotkey_state.hook = None;
     let new_config = {
         let state = state.lock().await;
@@ -378,6 +387,7 @@ async fn reload_config_and_hotkeys(
         new_config.behavior.focus_follows_mouse,
         mouse_hook_handle,
         event_tx,
+        forwarding_threads,
     );
     // Refresh the rejected-hotkey warning in an open settings window so it
     // reflects the new registration instead of the snapshot taken at open.
@@ -419,22 +429,16 @@ fn protected_binds(bind_labels: &[BindInfo]) -> Vec<String> {
 fn install_hotkey_hook(
     binds: Vec<HotkeyBind>,
     event_tx: mpsc::Sender<DaemonEvent>,
-) -> Option<KeyboardHookHandle> {
+) -> Option<(KeyboardHookHandle, ForwardingThreadHandle)> {
     match install_keyboard_hook(binds) {
         Ok((handle, rx)) => {
-            if let Err(e) = std::thread::Builder::new()
-                .name("hotkey-fwd".to_string())
-                .spawn(move || {
-                    while let Ok(event) = rx.recv() {
-                        if event_tx.blocking_send(DaemonEvent::Hotkey(event)).is_err() {
-                            break;
-                        }
-                    }
-                })
-            {
-                warn!("Failed to spawn hotkey-fwd thread: {}", e);
+            match spawn_forwarding_thread("hotkey-fwd", rx, event_tx, DaemonEvent::Hotkey) {
+                Ok(forwarder) => Some((handle, forwarder)),
+                Err(error) => {
+                    warn!("Failed to spawn hotkey-fwd thread: {error}");
+                    None
+                }
             }
-            Some(handle)
         }
         Err(e) => {
             warn!("Failed to install keyboard hook: {}", e);
@@ -514,6 +518,7 @@ fn setup_hotkeys(config: &Config, event_tx: mpsc::Sender<DaemonEvent>) -> Hotkey
         return HotkeyState {
             handle,
             hook: None,
+            forwarder: None,
             mapping,
             requested_count: 0,
             registered_count: 0,
@@ -530,9 +535,13 @@ fn setup_hotkeys(config: &Config, event_tx: mpsc::Sender<DaemonEvent>) -> Hotkey
         );
     }
 
-    let hook = install_hotkey_hook(binds, event_tx);
-    let registered_count = if hook.is_some() { requested_count } else { 0 };
-    if hook.is_some() {
+    let installed = install_hotkey_hook(binds, event_tx);
+    let registered_count = if installed.is_some() {
+        requested_count
+    } else {
+        0
+    };
+    if installed.is_some() {
         info!(
             "Matching {} global hotkeys via the keyboard hook",
             requested_count
@@ -541,9 +550,13 @@ fn setup_hotkeys(config: &Config, event_tx: mpsc::Sender<DaemonEvent>) -> Hotkey
         warn!("Keyboard hook unavailable; global shortcuts are disabled.");
     }
 
+    let (hook, forwarder) = installed
+        .map(|(hook, forwarder)| (Some(hook), Some(forwarder)))
+        .unwrap_or((None, None));
     HotkeyState {
         handle,
         hook,
+        forwarder,
         mapping,
         requested_count,
         registered_count,
@@ -643,13 +656,7 @@ async fn run_shutdown_cleanup(state: &Arc<Mutex<AppState>>, mode: ShutdownMode) 
 async fn stop_animation_worker_and_run_recovery(
     animation_worker: animation_worker::AnimationWorkerHandle,
     state: &Arc<Mutex<AppState>>,
-    event_rx: mpsc::Receiver<DaemonEvent>,
 ) {
-    // Alive-but-undrained event_rx lets a full channel wedge the worker on
-    // blocking_send, so it never observes Shutdown and Drop's join hangs.
-    // Closing first makes those sends fail promptly.
-    drop(event_rx);
-
     let mut thread = animation_worker.into_shutdown_join_handle();
     if !join_with_timeout(&mut thread, SHUTDOWN_FINAL_JOIN_TIMEOUT) {
         warn!(
@@ -719,12 +726,70 @@ struct EventLoopCtx<'a> {
     settings_sync_tx: &'a std::sync::mpsc::Sender<settings::SettingsEvent>,
     settings_handle: &'a mut Option<settings::SettingsWindowHandle>,
     animation_worker: &'a animation_worker::AnimationWorkerHandle,
-    animation_active: &'a mut bool,
+    animation_in_flight_epoch: &'a mut Option<u64>,
     last_frame_instant: &'a mut Option<std::time::Instant>,
     snap_hint_timer_handle: &'a mut Option<tokio::task::JoinHandle<()>>,
     focus_follows_mouse_timer: &'a mut Option<tokio::task::JoinHandle<()>>,
     display_change_timer: &'a mut Option<tokio::task::JoinHandle<()>>,
     mouse_hook_handle: &'a mut Option<MouseHookHandle>,
+    forwarding_threads: &'a mut Vec<ForwardingThreadHandle>,
+}
+
+/// Collapse every logical animation owner and make one exact synchronous
+/// landing. Any failure is terminal for active tiling: continuing to report an
+/// animation as complete after a failed platform apply leaves logical focus and
+/// real HWND geometry permanently divergent.
+fn land_animation_exactly(state: &mut AppState, context: &str) -> bool {
+    state.settle_scroll_animations();
+    if let Err(error) = state.cancel_layout_transition_for_exact_landing() {
+        state.paused = true;
+        error!("{context}: could not park transition exits; tiling paused: {error}");
+        return false;
+    }
+    state.post_animation_landing_pending = true;
+    match state.apply_layout() {
+        Ok(()) => {
+            state.sync_taskbar_buttons();
+            state.sync_foreground_window();
+            true
+        }
+        Err(error) => {
+            state.paused = true;
+            error!("{context}: exact landing failed; tiling paused: {error}");
+            false
+        }
+    }
+}
+
+/// Start the sole in-flight animation frame, or collapse safely when the worker
+/// cannot accept it. Callers must hold the daemon state lock.
+fn start_animation_frame_if_needed(
+    state: &mut AppState,
+    worker: &animation_worker::AnimationWorkerHandle,
+    animation_in_flight_epoch: &mut Option<u64>,
+    last_frame_instant: &mut Option<std::time::Instant>,
+    context: &str,
+) {
+    if !state.is_animating() || animation_in_flight_epoch.is_some() {
+        return;
+    }
+    state.tick_animations(0);
+    match state.send_animation_frame(worker) {
+        Ok(Some(frame_epoch)) => {
+            *animation_in_flight_epoch = Some(frame_epoch);
+            *last_frame_instant = Some(std::time::Instant::now());
+        }
+        Ok(None) => {
+            *animation_in_flight_epoch = None;
+            *last_frame_instant = None;
+        }
+        Err(error) => {
+            warn!("{context}: animation frame dispatch failed: {error}");
+            *animation_in_flight_epoch = None;
+            *last_frame_instant = None;
+            land_animation_exactly(state, context);
+        }
+    }
 }
 
 async fn sync_pending_layout_apply_timeout_ui(
@@ -970,6 +1035,16 @@ fn init_workspace_state(state: &mut AppState) {
             error!("Failed to enumerate windows: {}", e);
         }
     }
+    // A persisted HWND can die between the prior clean shutdown snapshot and
+    // this startup. Leaving that numeric ID in a column contributes phantom
+    // width/scroll even though the platform skips its placement, making clicks
+    // center the wrong real column until some later focus event prunes it.
+    let before_prune = state.all_managed_window_ids().len();
+    state.prune_stale_windows();
+    let pruned = before_prune.saturating_sub(state.all_managed_window_ids().len());
+    if pruned > 0 {
+        info!("Pruned {pruned} stale persisted window(s) before initial layout");
+    }
 
     // Log workspace state for all monitors
     let total_windows: usize = state
@@ -1072,8 +1147,12 @@ fn init_workspace_state(state: &mut AppState) {
 async fn spawn_tab_forwarders(
     state: &Arc<Mutex<AppState>>,
     event_tx: &mpsc::Sender<DaemonEvent>,
-    thread_handles: &mut Vec<std::thread::JoinHandle<()>>,
-) {
+    thread_handles: &mut Vec<ForwardingThreadHandle>,
+) -> mpsc::Receiver<leopardwm_platform_win32::PreviewClickEvent> {
+    // Preview gestures have a bounded priority lane. A bound prevents synthetic
+    // input from allocating without limit; the main loop also enforces a burst
+    // budget so Destroyed/DisplayChange/Pause/Shutdown cannot starve.
+    let (preview_event_tx, preview_event_rx) = mpsc::channel(64);
     // Tab strip overlay action channel. The overlay's WndProc posts a
     // `TabActionEvent` on WM_LBUTTONDOWN / WM_MBUTTONUP / WM_RBUTTONUP /
     // close-X; the forwarder thread below dispatches a `DaemonEvent::TabAction`
@@ -1084,57 +1163,45 @@ async fn spawn_tab_forwarders(
         let mut state_guard = state.lock().await;
         state_guard.install_tab_strip(tab_action_tx);
     }
-    {
-        let event_tx_for_actions = event_tx.clone();
-        match std::thread::Builder::new()
-            .name("tab-action-forwarder".into())
-            .spawn(move || {
-                while let Ok(action_event) = tab_action_rx.recv() {
-                    if event_tx_for_actions
-                        .blocking_send(DaemonEvent::TabAction {
-                            monitor: action_event.monitor,
-                            workspace_idx: action_event.workspace_idx,
-                            column_idx: action_event.column_idx,
-                            tab_idx: action_event.tab_idx,
-                            action: action_event.action,
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            }) {
-            Ok(handle) => thread_handles.push(handle),
-            Err(e) => warn!("Failed to spawn tab-action forwarder thread: {}", e),
-        }
+    match spawn_forwarding_thread(
+        "tab-action-forwarder",
+        tab_action_rx,
+        event_tx.clone(),
+        |action_event| DaemonEvent::TabAction {
+            monitor: action_event.monitor,
+            workspace_idx: action_event.workspace_idx,
+            column_idx: action_event.column_idx,
+            tab_idx: action_event.tab_idx,
+            action: action_event.action,
+        },
+    ) {
+        Ok(handle) => thread_handles.push(handle),
+        Err(e) => warn!("Failed to spawn tab-action forwarder thread: {}", e),
     }
 
-    // Monitor-edge preview click channel. Each preview overlay posts the
-    // identity of the window it is showing on WM_LBUTTONDOWN; this forwarder
-    // turns it into a `DaemonEvent::PreviewClick` so the focus change happens
-    // under the main event loop's serial lock.
+    // Monitor-edge preview gesture channel. Install the sender only after its
+    // forwarder exists; the previous ordering left live overlays connected to a
+    // receiver that had already been dropped when thread creation failed.
     let (preview_click_tx, preview_click_rx) =
         std::sync::mpsc::channel::<leopardwm_platform_win32::PreviewClickEvent>();
-    leopardwm_platform_win32::preview_input::set_click_sender(preview_click_tx);
-    {
-        let event_tx_for_preview = event_tx.clone();
-        match std::thread::Builder::new()
-            .name("preview-click-forwarder".into())
-            .spawn(move || {
-                while let Ok(gesture) = preview_click_rx.recv() {
-                    if event_tx_for_preview
-                        .blocking_send(DaemonEvent::PreviewGesture {
-                            window_id: gesture.window_id,
-                            gesture: gesture.gesture,
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            }) {
-            Ok(handle) => thread_handles.push(handle),
-            Err(e) => warn!("Failed to spawn preview-click forwarder thread: {}", e),
+    match spawn_forwarding_thread(
+        "preview-click-forwarder",
+        preview_click_rx,
+        preview_event_tx,
+        |gesture| gesture,
+    ) {
+        Ok(handle) => {
+            leopardwm_platform_win32::preview_input::set_click_sender(preview_click_tx);
+            thread_handles.push(handle);
+        }
+        Err(error) => {
+            warn!("Failed to spawn preview-click forwarder thread: {error}");
+            leopardwm_platform_win32::preview_input::clear_click_sender();
+            if let Err(clear_error) =
+                leopardwm_platform_win32::thumbnail::clear_persistent_previews()
+            {
+                warn!("Preview clear after forwarder failure also failed: {clear_error}");
+            }
         }
     }
 
@@ -1150,31 +1217,23 @@ async fn spawn_tab_forwarders(
         let mut state_guard = state.lock().await;
         state_guard.rename_result_tx = Some(rename_result_tx);
     }
-    {
-        let event_tx_for_rename = event_tx.clone();
-        match std::thread::Builder::new()
-            .name("tab-rename-forwarder".into())
-            .spawn(move || {
-                while let Ok(result) = rename_result_rx.recv() {
-                    if event_tx_for_rename
-                        .blocking_send(DaemonEvent::TabRenameSubmitted {
-                            monitor: result.monitor,
-                            workspace_idx: result.workspace_idx,
-                            column_idx: result.column_idx,
-                            tab_idx: result.tab_idx,
-                            target_hwnd: result.target_hwnd,
-                            new_title: result.new_title,
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            }) {
-            Ok(handle) => thread_handles.push(handle),
-            Err(e) => warn!("Failed to spawn tab-rename forwarder thread: {}", e),
-        }
+    match spawn_forwarding_thread(
+        "tab-rename-forwarder",
+        rename_result_rx,
+        event_tx.clone(),
+        |result| DaemonEvent::TabRenameSubmitted {
+            monitor: result.monitor,
+            workspace_idx: result.workspace_idx,
+            column_idx: result.column_idx,
+            tab_idx: result.tab_idx,
+            target_hwnd: result.target_hwnd,
+            new_title: result.new_title,
+        },
+    ) {
+        Ok(handle) => thread_handles.push(handle),
+        Err(e) => warn!("Failed to spawn tab-rename forwarder thread: {}", e),
     }
+    preview_event_rx
 }
 
 /// Wire the overview overlay's event channel and forwarder thread.
@@ -1183,7 +1242,7 @@ async fn spawn_tab_forwarders(
 async fn spawn_overview_forwarder(
     state: &Arc<Mutex<AppState>>,
     event_tx: &mpsc::Sender<DaemonEvent>,
-    thread_handles: &mut Vec<std::thread::JoinHandle<()>>,
+    thread_handles: &mut Vec<ForwardingThreadHandle>,
 ) {
     let (overview_tx, overview_rx) =
         std::sync::mpsc::channel::<leopardwm_platform_win32::overview::OverviewEvent>();
@@ -1206,7 +1265,7 @@ async fn spawn_overview_forwarder(
 fn setup_window_hooks(
     config: &Config,
     event_tx: &mpsc::Sender<DaemonEvent>,
-    thread_handles: &mut Vec<std::thread::JoinHandle<()>>,
+    thread_handles: &mut Vec<ForwardingThreadHandle>,
 ) -> Option<leopardwm_platform_win32::EventHookHandle> {
     let hook_handle = if config.behavior.track_focus_changes {
         match install_event_hooks() {
@@ -1287,12 +1346,11 @@ fn setup_window_hooks(
 
 /// Install the focus-follows-mouse hook and spawn its event-forwarding thread.
 /// Returns the handle; dropping it uninstalls the hook, after which the
-/// forwarding thread exits as its channel closes. `thread_handles`, when
-/// supplied (startup), tracks that thread for a clean shutdown join; live
-/// toggles pass `None` and let it exit on channel close.
+/// forwarding thread exits as its channel closes. Every generation remains
+/// tracked so live off/on toggles cannot detach a forwarding thread.
 fn install_ffm_hook(
     event_tx: &mpsc::Sender<DaemonEvent>,
-    thread_handles: Option<&mut Vec<std::thread::JoinHandle<()>>>,
+    thread_handles: &mut Vec<ForwardingThreadHandle>,
 ) -> Option<MouseHookHandle> {
     let (mouse_tx, mouse_rx) = std::sync::mpsc::channel::<WindowEvent>();
     match install_mouse_hook(mouse_tx) {
@@ -1304,11 +1362,7 @@ fn install_ffm_hook(
                 event_tx.clone(),
                 DaemonEvent::WindowEvent,
             ) {
-                Ok(fwd) => {
-                    if let Some(handles) = thread_handles {
-                        handles.push(fwd);
-                    }
-                }
+                Ok(fwd) => thread_handles.push(fwd),
                 Err(e) => warn!("{}", e),
             }
             Some(handle)
@@ -1327,10 +1381,10 @@ fn install_ffm_hook(
 fn setup_mouse_hook(
     config: &Config,
     event_tx: &mpsc::Sender<DaemonEvent>,
-    thread_handles: &mut Vec<std::thread::JoinHandle<()>>,
+    thread_handles: &mut Vec<ForwardingThreadHandle>,
 ) -> Option<MouseHookHandle> {
     if config.behavior.focus_follows_mouse {
-        install_ffm_hook(event_tx, Some(thread_handles))
+        install_ffm_hook(event_tx, thread_handles)
     } else {
         info!("Focus-follows-mouse disabled by config (focus_follows_mouse = false)");
         None
@@ -1344,9 +1398,10 @@ fn sync_mouse_hook(
     enabled: bool,
     handle: &mut Option<MouseHookHandle>,
     event_tx: &mpsc::Sender<DaemonEvent>,
+    forwarding_threads: &mut Vec<ForwardingThreadHandle>,
 ) {
     match (enabled, handle.is_some()) {
-        (true, false) => *handle = install_ffm_hook(event_tx, None),
+        (true, false) => *handle = install_ffm_hook(event_tx, forwarding_threads),
         (false, true) => {
             *handle = None;
             info!("Focus-follows-mouse disabled");
@@ -1359,7 +1414,7 @@ fn sync_mouse_hook(
 fn setup_gestures(
     config: &Config,
     event_tx: &mpsc::Sender<DaemonEvent>,
-    thread_handles: &mut Vec<std::thread::JoinHandle<()>>,
+    thread_handles: &mut Vec<ForwardingThreadHandle>,
 ) -> Option<leopardwm_platform_win32::GestureHandle> {
     if config.gestures.enabled {
         // Set scroll modifier before registering the hook
@@ -1400,7 +1455,7 @@ fn setup_gestures(
 fn setup_tray(
     config: &Config,
     event_tx: &mpsc::Sender<DaemonEvent>,
-    thread_handles: &mut Vec<std::thread::JoinHandle<()>>,
+    thread_handles: &mut Vec<ForwardingThreadHandle>,
 ) -> Option<tray::TrayManager> {
     let (tray_sync_tx, tray_sync_rx) = std::sync::mpsc::channel();
 
@@ -1606,6 +1661,7 @@ async fn handle_ipc_command(
             ctx.tray_manager,
             ctx.snap_hint_overlay,
             ctx.mouse_hook_handle,
+            ctx.forwarding_threads,
         )
         .await;
         info!("Hotkeys reloaded after config reload");
@@ -1658,13 +1714,15 @@ async fn handle_ipc_command(
     }
 
     // Start animation if needed
-    if should_animate && !*ctx.animation_active {
+    if should_animate {
         let mut state = ctx.state.lock().await;
-        state.tick_animations(0);
-        if let Ok(true) = state.send_animation_frame(ctx.animation_worker) {
-            *ctx.animation_active = true;
-            *ctx.last_frame_instant = Some(std::time::Instant::now());
-        }
+        start_animation_frame_if_needed(
+            &mut state,
+            ctx.animation_worker,
+            ctx.animation_in_flight_epoch,
+            ctx.last_frame_instant,
+            "IPC command",
+        );
     }
 
     false
@@ -1683,25 +1741,74 @@ async fn process_window_event(ctx: &mut EventLoopCtx<'_>, win_event: WindowEvent
         win_event,
         WindowEvent::DisplayChange | WindowEvent::WorkAreaChanged
     ) {
-        // Immediately clear inset cache and refresh high contrast state
-        // (cheap operations that should happen right away).
-        leopardwm_platform_win32::clear_inset_cache();
-        // Preview click targets are screen-positioned, so they are stale the
-        // moment the topology starts changing. Windows moves the strip before
-        // the debounce settles; dropping them now keeps an invisible overlay
-        // from absorbing clicks at an old rectangle in the meantime.
-        leopardwm_platform_win32::preview_input::clear_preview_click_targets();
-        {
+        // Revoke preview producers and hide the host without waiting for a
+        // possibly wedged platform transaction. Old frame/retry epochs cannot
+        // expose the pre-change coordinates again.
+        leopardwm_platform_win32::thumbnail::host().mark_virtual_screen_geometry_stale();
+        leopardwm_platform_win32::thumbnail::invalidate_persistent_preview_surface();
+        // Invalidate frame intent before waiting: queued frames reject this epoch;
+        // an already-running one is drained by the barrier, after which the clear
+        // below is the final writer of both preview pixels and input.
+        let generation = {
             let mut state = ctx.state.lock().await;
+            state
+                .apply_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            state.settle_scroll_animations();
+            // Transition exit ownership is retained until the worker barrier
+            // below succeeds; parking before that edge lets an old frame move an
+            // exit back on-screen after ownership is dropped.
+            state.applying_layout = false;
             state.refresh_high_contrast();
             state.display_change_pending = true;
+            state.display_change_generation =
+                state.display_change_generation.wrapping_add(1).max(1);
+            state.display_change_retry_count = 0;
             // A real topology/DPI change needs the full reconcile; a
             // work-area-only change (taskbar) does not. Sticky-true if a
             // DisplayChange occurs anywhere in the debounce window.
             if matches!(win_event, WindowEvent::DisplayChange) {
                 state.display_change_needs_full = true;
             }
+            state.display_change_generation
+        };
+        *ctx.animation_in_flight_epoch = None;
+        *ctx.last_frame_instant = None;
+        let barrier_ok = ctx
+            .animation_worker
+            .wait_for_barrier(std::time::Duration::from_millis(1500));
+        if !barrier_ok {
+            warn!(
+                "Display-change animation barrier timed out; preview cleanup will retry at settle"
+            );
         }
+        leopardwm_platform_win32::clear_inset_cache();
+        ctx.animation_worker.clear_cache();
+        let transition_safe = if barrier_ok {
+            let mut state = ctx.state.lock().await;
+            match state.cancel_layout_transition_for_exact_landing() {
+                Ok(_) => true,
+                Err(error) => {
+                    warn!("Display change retained transition ownership: {error}");
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        if transition_safe {
+            match leopardwm_platform_win32::thumbnail::clear_persistent_previews_best_effort() {
+                Ok(true) => {}
+                Ok(false) => {
+                    warn!("Display invalidation preview clear deferred behind active placement")
+                }
+                Err(error) => {
+                    warn!("Display invalidation preview clear will retry at settle: {error}")
+                }
+            }
+        }
+        // On timeout, the transaction-independent invalidation above already
+        // hid/disarmed the surface; settle retains ownership and retries cleanup.
         // A work-area change coalesces fast; a topology/DPI change needs to
         // settle. Take the longer of the two if both are in flight.
         let debounce_ms = if matches!(win_event, WindowEvent::WorkAreaChanged) {
@@ -1716,7 +1823,9 @@ async fn process_window_event(ctx: &mut EventLoopCtx<'_>, win_event: WindowEvent
         let dc_tx = ctx.event_tx.clone();
         *ctx.display_change_timer = Some(tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(debounce_ms)).await;
-            let _ = dc_tx.send(DaemonEvent::DisplayChangeSettled).await;
+            let _ = dc_tx
+                .send(DaemonEvent::DisplayChangeSettled { generation })
+                .await;
         }));
         return;
     }
@@ -1765,13 +1874,13 @@ async fn process_window_event(ctx: &mut EventLoopCtx<'_>, win_event: WindowEvent
             }
 
             // Start animation worker if the event triggered a transition.
-            if state.is_animating() && !*ctx.animation_active {
-                state.tick_animations(0);
-                if let Ok(true) = state.send_animation_frame(ctx.animation_worker) {
-                    *ctx.animation_active = true;
-                    *ctx.last_frame_instant = Some(std::time::Instant::now());
-                }
-            }
+            start_animation_frame_if_needed(
+                &mut state,
+                ctx.animation_worker,
+                ctx.animation_in_flight_epoch,
+                ctx.last_frame_instant,
+                "window event",
+            );
 
             // Process drag hint overlay requests from event handler.
             // Drag ghost always shows regardless of snap_hints.enabled.
@@ -1833,13 +1942,13 @@ async fn process_window_event(ctx: &mut EventLoopCtx<'_>, win_event: WindowEvent
             }
 
             // Start animation if needed (e.g. animated snap-back)
-            if state.is_animating() && !*ctx.animation_active {
-                state.tick_animations(0);
-                if let Ok(true) = state.send_animation_frame(ctx.animation_worker) {
-                    *ctx.animation_active = true;
-                    *ctx.last_frame_instant = Some(std::time::Instant::now());
-                }
-            }
+            start_animation_frame_if_needed(
+                &mut state,
+                ctx.animation_worker,
+                ctx.animation_in_flight_epoch,
+                ctx.last_frame_instant,
+                "move/resize event",
+            );
         }
     }
 }
@@ -1912,13 +2021,15 @@ async fn handle_hotkey_event(
     }
 
     // Start animation if needed
-    if should_animate && !*ctx.animation_active {
+    if should_animate {
         let mut state = ctx.state.lock().await;
-        state.tick_animations(0);
-        if let Ok(true) = state.send_animation_frame(ctx.animation_worker) {
-            *ctx.animation_active = true;
-            *ctx.last_frame_instant = Some(std::time::Instant::now());
-        }
+        start_animation_frame_if_needed(
+            &mut state,
+            ctx.animation_worker,
+            ctx.animation_in_flight_epoch,
+            ctx.last_frame_instant,
+            "hotkey command",
+        );
     }
 
     false
@@ -1965,13 +2076,13 @@ async fn handle_gesture_event(ctx: &mut EventLoopCtx<'_>, gesture_event: Gesture
             if let IpcResponse::Error { message } = response {
                 warn!("Gesture command failed: {}", message);
             }
-            if state.is_animating() && !*ctx.animation_active {
-                state.tick_animations(0);
-                if let Ok(true) = state.send_animation_frame(ctx.animation_worker) {
-                    *ctx.animation_active = true;
-                    *ctx.last_frame_instant = Some(std::time::Instant::now());
-                }
-            }
+            start_animation_frame_if_needed(
+                &mut state,
+                ctx.animation_worker,
+                ctx.animation_in_flight_epoch,
+                ctx.last_frame_instant,
+                "gesture command",
+            );
         }
     } else {
         warn!("Unknown command for gesture: {}", cmd_str);
@@ -2033,6 +2144,7 @@ async fn handle_tray_event(ctx: &mut EventLoopCtx<'_>, tray_event: tray::TrayEve
                     ctx.tray_manager,
                     ctx.snap_hint_overlay,
                     ctx.mouse_hook_handle,
+                    ctx.forwarding_threads,
                 )
                 .await;
                 info!("Hotkeys reloaded after tray config reload");
@@ -2075,13 +2187,15 @@ async fn handle_tray_event(ctx: &mut EventLoopCtx<'_>, tray_event: tray::TrayEve
                 st.refresh_high_contrast();
                 (st.config.clone(), st.high_contrast)
             };
-            *ctx.settings_handle = settings::SettingsWindowHandle::open(
+            if let Some(handle) = settings::SettingsWindowHandle::open(
                 config_snapshot,
                 ctx.settings_sync_tx.clone(),
                 None,
                 hc,
                 ctx.hotkey_state.failed_binds.clone(),
-            );
+            ) {
+                *ctx.settings_handle = Some(handle);
+            }
         }
         tray::TrayEvent::OpenAbout => {
             info!("Tray: About requested");
@@ -2090,13 +2204,15 @@ async fn handle_tray_event(ctx: &mut EventLoopCtx<'_>, tray_event: tray::TrayEve
                 st.refresh_high_contrast();
                 (st.config.clone(), st.high_contrast)
             };
-            *ctx.settings_handle = settings::SettingsWindowHandle::open(
+            if let Some(handle) = settings::SettingsWindowHandle::open(
                 config_snapshot,
                 ctx.settings_sync_tx.clone(),
                 Some("about"),
                 hc,
                 ctx.hotkey_state.failed_binds.clone(),
-            );
+            ) {
+                *ctx.settings_handle = Some(handle);
+            }
         }
         tray::TrayEvent::EditConfig => {
             info!("Tray: Edit config requested");
@@ -2193,7 +2309,12 @@ async fn handle_tray_event(ctx: &mut EventLoopCtx<'_>, tray_event: tray::TrayEve
             };
             // Install or drop the hook now so the toggle takes effect without a
             // restart; clear any pending focus when turning it off.
-            sync_mouse_hook(enabled, ctx.mouse_hook_handle, ctx.event_tx);
+            sync_mouse_hook(
+                enabled,
+                ctx.mouse_hook_handle,
+                ctx.event_tx,
+                ctx.forwarding_threads,
+            );
             if !enabled {
                 if let Some(handle) = ctx.focus_follows_mouse_timer.take() {
                     handle.abort();
@@ -2386,9 +2507,15 @@ async fn spawn_debounced_save(state: &Arc<Mutex<AppState>>, event_tx: &mpsc::Sen
 /// scrolls it into view, and the OS foreground follows.
 async fn handle_preview_gesture(
     ctx: &mut EventLoopCtx<'_>,
-    window_id: u64,
-    gesture: leopardwm_platform_win32::PreviewGesture,
+    event: leopardwm_platform_win32::PreviewClickEvent,
 ) {
+    let leopardwm_platform_win32::PreviewClickEvent {
+        window_id,
+        source_process_id,
+        publication_generation,
+        preview_rect,
+        gesture,
+    } = event;
     let mut state = ctx.state.lock().await;
     // The overview owns the screen while it is open and its model is not rebuilt
     // from here, so a click queued before it opened must not move focus behind it.
@@ -2401,20 +2528,42 @@ async fn handle_preview_gesture(
         );
         return;
     }
-    // A live layout transition turns `apply_layout` into a no-op, so focusing
-    // the column would move the OS foreground to a window still parked clear of
-    // every monitor: nothing visibly happens and the keyboard goes nowhere.
-    // Land the transition first, exactly as the drag hand-off does. A plain
-    // scroll animation is left alone: it is re-targeted by the focus change.
-    if state.layout_transition.is_some() {
-        state.settle_scroll_animations();
-        state.abort_active_ghost_transition();
-        state.layout_transition = None;
-        ctx.animation_worker.clear_cache();
-        *ctx.animation_active = false;
+    let current_publication = leopardwm_platform_win32::thumbnail::current_persistent_preview_rect(
+        window_id,
+        source_process_id,
+        publication_generation,
+    );
+    let Some(current_preview_rect) = current_publication else {
+        debug!(
+            "Preview generation {publication_generation} for {window_id:#x} ignored: publication ownership changed"
+        );
+        return;
+    };
+    // Validate before mutating transition state. A queued release may refer to a
+    // preview from the workspace that just left; cancelling the new transition
+    // for that stale event would strand its exit windows mid-slide.
+    let Some(preferred_monitor) = state
+        .monitors
+        .iter()
+        .find(|(_, monitor)| monitor.rect.intersects(&preview_rect))
+        .map(|(monitor_id, _)| *monitor_id)
+    else {
+        debug!("Preview {window_id:#x} ignored: captured rectangle owns no live monitor");
+        return;
+    };
+    let current_owner = state
+        .monitors
+        .iter()
+        .find(|(_, monitor)| monitor.rect.intersects(&current_preview_rect))
+        .map(|(monitor_id, _)| *monitor_id);
+    if current_owner != Some(preferred_monitor) {
+        debug!(
+            "Preview {window_id:#x} ignored: publication moved from monitor {preferred_monitor} to {current_owner:?}"
+        );
+        return;
     }
     let Some((monitor_id, column_idx, window_in_column)) =
-        crate::state::preview_click_focus_target(&state, window_id)
+        crate::state::preview_click_focus_target(&state, window_id, Some(preferred_monitor))
     else {
         debug!(
             "Preview click for window {:#x} ignored: not in an active workspace",
@@ -2423,6 +2572,24 @@ async fn handle_preview_gesture(
         return;
     };
 
+    // A live layout transition turns `apply_layout` into a no-op, so focusing
+    // the column would move the OS foreground to a window still parked clear of
+    // every monitor. Park transition-owned exit HWNDs and force an exact landing
+    // rather than merely dropping the transition object.
+    if state.layout_transition.is_some() {
+        state.settle_scroll_animations();
+        if let Err(error) = state.cancel_layout_transition_for_exact_landing() {
+            state.paused = true;
+            *ctx.animation_in_flight_epoch = None;
+            *ctx.last_frame_instant = None;
+            warn!("Preview gesture could not supersede transition; tiling paused: {error}");
+            return;
+        }
+        ctx.animation_worker.clear_cache();
+        *ctx.animation_in_flight_epoch = None;
+        *ctx.last_frame_instant = None;
+    }
+
     // Same routing as a focus hotkey: the column scrolls in with its animation
     // and the OS foreground follows, so a click cannot leave the strip in a
     // half-applied state.
@@ -2430,6 +2597,9 @@ async fn handle_preview_gesture(
         state.focus_column_in_active_workspace(monitor_id, column_idx, window_in_column)
     {
         warn!("Preview click focus failed: {}", message);
+        // In particular, never hand a drag to a source whose focus/apply rolled
+        // back: it may still be parked at the preview sentinel.
+        return;
     }
 
     // A drag continues in the window itself. Settle the scroll first so the
@@ -2462,13 +2632,13 @@ async fn handle_preview_gesture(
     // driving it the strip would sit at the interpolated offset of frame zero.
     // Checked even after a failed apply, exactly like the gesture path: the
     // animation may already exist by the time the failure happened.
-    if state.is_animating() && !*ctx.animation_active {
-        state.tick_animations(0);
-        if let Ok(true) = state.send_animation_frame(ctx.animation_worker) {
-            *ctx.animation_active = true;
-            *ctx.last_frame_instant = Some(std::time::Instant::now());
-        }
-    }
+    start_animation_frame_if_needed(
+        &mut state,
+        ctx.animation_worker,
+        ctx.animation_in_flight_epoch,
+        ctx.last_frame_instant,
+        "preview gesture",
+    );
 }
 
 /// Handle a tab-strip click action routed to the captured column identity.
@@ -2730,13 +2900,13 @@ async fn handle_overview_event(
     }
     // A workspace switch above may have started a slide transition.
     let mut state = ctx.state.lock().await;
-    if state.is_animating() && !*ctx.animation_active {
-        state.tick_animations(0);
-        if let Ok(true) = state.send_animation_frame(ctx.animation_worker) {
-            *ctx.animation_active = true;
-            *ctx.last_frame_instant = Some(std::time::Instant::now());
-        }
-    }
+    start_animation_frame_if_needed(
+        &mut state,
+        ctx.animation_worker,
+        ctx.animation_in_flight_epoch,
+        ctx.last_frame_instant,
+        "overview action",
+    );
 }
 
 /// Apply a rename-dialog result as a tab title override.
@@ -2804,6 +2974,7 @@ async fn handle_settings_event(
                     ctx.tray_manager,
                     ctx.snap_hint_overlay,
                     ctx.mouse_hook_handle,
+                    ctx.forwarding_threads,
                 )
                 .await;
                 info!("Hotkeys reloaded after settings save");
@@ -2831,10 +3002,39 @@ async fn handle_settings_event(
                     ctx.tray_manager,
                     ctx.snap_hint_overlay,
                     ctx.mouse_hook_handle,
+                    ctx.forwarding_threads,
                 )
                 .await;
             }
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnimationResultOwnership {
+    Current,
+    StaleOwned,
+    Unowned,
+}
+
+/// Consume a result only when it owns the tracked in-flight epoch. Desired-state
+/// freshness and in-flight ownership are separate: a stale E result must never
+/// clear a replacement N token.
+fn reconcile_animation_result_epoch(
+    current_epoch: u64,
+    result_epoch: u64,
+    animation_in_flight_epoch: &mut Option<u64>,
+    last_frame_instant: &mut Option<std::time::Instant>,
+) -> AnimationResultOwnership {
+    if *animation_in_flight_epoch != Some(result_epoch) {
+        return AnimationResultOwnership::Unowned;
+    }
+    *animation_in_flight_epoch = None;
+    if current_epoch == result_epoch {
+        AnimationResultOwnership::Current
+    } else {
+        *last_frame_instant = None;
+        AnimationResultOwnership::StaleOwned
     }
 }
 
@@ -2843,6 +3043,53 @@ async fn handle_animation_frame_applied(
     ctx: &mut EventLoopCtx<'_>,
     frame_result: animation_worker::FrameResult,
 ) {
+    let current_epoch = {
+        let state = ctx.state.lock().await;
+        state.apply_epoch.load(std::sync::atomic::Ordering::SeqCst)
+    };
+    match reconcile_animation_result_epoch(
+        current_epoch,
+        frame_result.apply_epoch,
+        ctx.animation_in_flight_epoch,
+        ctx.last_frame_instant,
+    ) {
+        AnimationResultOwnership::Current => {}
+        AnimationResultOwnership::Unowned => {
+            debug!(
+                "Ignoring animation result epoch {}: tracked in-flight epoch is {:?}",
+                frame_result.apply_epoch, ctx.animation_in_flight_epoch
+            );
+            return;
+        }
+        AnimationResultOwnership::StaleOwned => {
+            debug!(
+                "Discarding stale owned animation result epoch {} (current {}); token released",
+                frame_result.apply_epoch, current_epoch
+            );
+            let mut state = ctx.state.lock().await;
+            state.applying_layout = false;
+            start_animation_frame_if_needed(
+                &mut state,
+                ctx.animation_worker,
+                ctx.animation_in_flight_epoch,
+                ctx.last_frame_instant,
+                "stale-frame recovery",
+            );
+            return;
+        }
+    }
+    if !frame_result.ghost_update_failures.is_empty() {
+        let mut state = ctx.state.lock().await;
+        warn!(
+            "Ghost update failed for {:?}; collapsing to exact landing",
+            frame_result.ghost_update_failures
+        );
+        land_animation_exactly(&mut state, "ghost failure recovery");
+        state.applying_layout = false;
+        *ctx.animation_in_flight_epoch = None;
+        *ctx.last_frame_instant = None;
+        return;
+    }
     {
         let mut state = ctx.state.lock().await;
         state.applying_layout = false;
@@ -2959,8 +3206,13 @@ async fn handle_animation_frame_applied(
             }
         }
     }
-    if let Err(ref e) = frame_result.apply_result {
-        warn!("Animation frame failed: {}", e);
+    if let Err(ref error) = frame_result.apply_result {
+        warn!("Animation frame failed; abandoning interpolation: {error}");
+        *ctx.animation_in_flight_epoch = None;
+        *ctx.last_frame_instant = None;
+        let mut state = ctx.state.lock().await;
+        land_animation_exactly(&mut state, "animation frame failure");
+        return;
     }
     // Measure real elapsed time (cap at 100ms to prevent jump from stalls)
     let delta_ms = ctx
@@ -2969,11 +3221,24 @@ async fn handle_animation_frame_applied(
         .unwrap_or(16);
     *ctx.last_frame_instant = Some(std::time::Instant::now());
 
-    let still_animating = {
+    let (still_animating, dispatch_failed) = {
         let mut state = ctx.state.lock().await;
         let running = state.tick_animations(delta_ms);
+        let mut dispatch_failed = false;
         let frame_sent = if running || state.is_animating() {
-            matches!(state.send_animation_frame(ctx.animation_worker), Ok(true))
+            match state.send_animation_frame(ctx.animation_worker) {
+                Ok(Some(frame_epoch)) => {
+                    *ctx.animation_in_flight_epoch = Some(frame_epoch);
+                    true
+                }
+                Ok(None) => false,
+                Err(error) => {
+                    warn!("Animation frame dispatch failed; landing exactly: {error}");
+                    dispatch_failed = true;
+                    land_animation_exactly(&mut state, "animation continuation dispatch");
+                    false
+                }
+            }
         } else {
             false
         };
@@ -2987,17 +3252,22 @@ async fn handle_animation_frame_applied(
                 }
             }
         }
-        frame_sent
+        (frame_sent, dispatch_failed)
     };
+    if dispatch_failed {
+        *ctx.animation_in_flight_epoch = None;
+        *ctx.last_frame_instant = None;
+        return;
+    }
     if !still_animating {
-        *ctx.animation_active = false;
+        *ctx.animation_in_flight_epoch = None;
         *ctx.last_frame_instant = None;
         // Final landing pass: apply exact resting positions.
         // The last animation frame was at an interpolated offset
         // slightly before the target; this pass uses the exact
         // scroll_offset (set to target by tick_animation) and
         // bypasses the worker cache to reposition every window.
-        {
+        let final_landing_ok = {
             let mut state = ctx.state.lock().await;
 
             // HWND-recycling guard for ghosted wids: if the
@@ -3039,11 +3309,12 @@ async fn handle_animation_frame_applied(
             // visible 1 px wobble on every Chromium / Firefox
             // window every time the layout is re-applied.
             state.post_animation_landing_pending = true;
-            let landing_ok = state.apply_layout().is_ok();
-            if !landing_ok {
-                warn!(
-                    "Final landing layout failed; dropping any active ghosts \
-                     without crossfade"
+            let landing_result = state.apply_layout();
+            let landing_ok = landing_result.is_ok();
+            if let Err(error) = landing_result {
+                state.paused = true;
+                error!(
+                    "Final animation landing failed; tiling paused and active ghosts will be dropped: {error}"
                 );
             }
 
@@ -3064,7 +3335,7 @@ async fn handle_animation_frame_applied(
                     if let Some(entry) = state.ghost_handles.remove(wid) {
                         let dest = entry.final_dest_client_rect;
                         entries.push(animation_worker::CrossfadeEntry {
-                            handle_isize: entry.take_isize(),
+                            registration: entry.into_shared_registration(),
                             dest_client_rect: dest,
                         });
                         sources.insert(*wid);
@@ -3114,8 +3385,13 @@ async fn handle_animation_frame_applied(
                     state.refocus_sticky_window(wid);
                 }
             }
+            landing_ok
+        };
+        if final_landing_ok {
+            debug!("All animations complete");
+        } else {
+            error!("Animation stopped without a verified final landing");
         }
-        debug!("All animations complete");
     }
 }
 
@@ -3133,18 +3409,90 @@ async fn handle_focus_follows_mouse(ctx: &mut EventLoopCtx<'_>, window_id: u64) 
             return;
         }
         let applied = state.apply_focus_follows_mouse(window_id);
-        if applied && state.is_animating() && !*ctx.animation_active {
-            state.tick_animations(0);
-            if let Ok(true) = state.send_animation_frame(ctx.animation_worker) {
-                *ctx.animation_active = true;
-                *ctx.last_frame_instant = Some(std::time::Instant::now());
-            }
+        if applied {
+            start_animation_frame_if_needed(
+                &mut state,
+                ctx.animation_worker,
+                ctx.animation_in_flight_epoch,
+                ctx.last_frame_instant,
+                "focus follows mouse",
+            );
         }
     }
 }
 
+async fn reschedule_display_settle(
+    ctx: &EventLoopCtx<'_>,
+    generation: u64,
+    delay_ms: u64,
+    reason: &str,
+) {
+    let mut state = ctx.state.lock().await;
+    if !state.display_change_pending || state.display_change_generation != generation {
+        return;
+    }
+    state.display_change_retry_count = state.display_change_retry_count.saturating_add(1);
+    if state.display_change_retry_count >= 5 {
+        state.paused = true;
+        state.display_change_pending = false;
+        error!(
+            "Display recovery generation {generation} exhausted after 5 attempts ({reason}); tiling paused"
+        );
+        return;
+    }
+    let attempt = state.display_change_retry_count;
+    drop(state);
+    warn!("Display recovery generation {generation} attempt {attempt}/5 delayed: {reason}");
+    let tx = ctx.event_tx.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        let _ = tx
+            .send(DaemonEvent::DisplayChangeSettled { generation })
+            .await;
+    });
+}
+
 /// Process a debounced display change with the settled monitor state.
-async fn handle_display_change_settled(ctx: &mut EventLoopCtx<'_>) {
+async fn handle_display_change_settled(ctx: &mut EventLoopCtx<'_>, generation: u64) {
+    {
+        let state = ctx.state.lock().await;
+        if !state.display_change_pending || state.display_change_generation != generation {
+            debug!(
+                "Ignoring stale display settle generation {} (current {})",
+                generation, state.display_change_generation
+            );
+            return;
+        }
+    }
+    if !ctx
+        .animation_worker
+        .wait_for_barrier(std::time::Duration::from_millis(1500))
+    {
+        reschedule_display_settle(ctx, generation, 100, "animation barrier timeout").await;
+        return;
+    }
+    // The barrier is now the final ordering edge for the old geometry. Park
+    // transition-owned exits only after it, so no old frame can move them back.
+    let exit_park_error = {
+        let mut state = ctx.state.lock().await;
+        state
+            .cancel_layout_transition_for_exact_landing()
+            .err()
+            .map(|error| error.to_string())
+    };
+    if let Some(error) = exit_park_error {
+        reschedule_display_settle(ctx, generation, 100, &error).await;
+        return;
+    }
+    match leopardwm_platform_win32::thumbnail::clear_persistent_previews_best_effort() {
+        Ok(true) => {}
+        Ok(false) => warn!(
+            "Display recovery generation {generation}: preview cleanup deferred behind active placement"
+        ),
+        Err(error) => warn!(
+            "Display recovery generation {generation}: optional preview cleanup degraded: {error}"
+        ),
+    }
     // Debounced display change — process the final monitor state after
     // WM_DISPLAYCHANGE messages have stopped (theme/DPI transitions settled).
     // Clear inset cache again — MovedOrResized events during the transition
@@ -3161,7 +3509,11 @@ async fn handle_display_change_settled(ctx: &mut EventLoopCtx<'_>) {
     // leaves the virtual screen unchanged. Safe no-op when host construction
     // failed earlier (returns Ok with hwnd_raw == 0).
     if needs_full {
-        leopardwm_platform_win32::thumbnail::host().resize_to_virtual_screen();
+        if let Err(error) = leopardwm_platform_win32::thumbnail::host().resize_to_virtual_screen() {
+            // The host is optional. Invalidation already hid/disarmed previews;
+            // monitor reconciliation and true HWND tiling must still proceed.
+            warn!("Display recovery continuing without preview host resize: {error}");
+        }
     }
     let mut state = ctx.state.lock().await;
     // Cancel any in-flight ghost animation — its rects were
@@ -3170,6 +3522,7 @@ async fn handle_display_change_settled(ctx: &mut EventLoopCtx<'_>) {
     // The overview's geometry is stale too — hide instead of rebuilding.
     state.hide_overview();
     state.display_change_pending = false;
+    state.display_change_retry_count = 0;
     // Clear stale min-width and min-height constraints ONLY for a real
     // topology/DPI change: they were computed with old border metrics and
     // cause cumulative column shrinking there. For a work-area-only change
@@ -3187,11 +3540,211 @@ async fn handle_display_change_settled(ctx: &mut EventLoopCtx<'_>) {
     state.handle_window_event(WindowEvent::DisplayChange);
     state.refresh_reduce_motion();
 
-    if state.is_animating() && !*ctx.animation_active {
-        state.tick_animations(0);
-        if let Ok(true) = state.send_animation_frame(ctx.animation_worker) {
-            *ctx.animation_active = true;
-            *ctx.last_frame_instant = Some(std::time::Instant::now());
+    start_animation_frame_if_needed(
+        &mut state,
+        ctx.animation_worker,
+        ctx.animation_in_flight_epoch,
+        ctx.last_frame_instant,
+        "display settle",
+    );
+}
+
+async fn receive_next_daemon_event(
+    preview_event_rx: &mut mpsc::Receiver<leopardwm_platform_win32::PreviewClickEvent>,
+    animation_event_rx: &mut mpsc::UnboundedReceiver<DaemonEvent>,
+    event_rx: &mut mpsc::Receiver<DaemonEvent>,
+    preview_burst: &mut usize,
+) -> Option<DaemonEvent> {
+    if *preview_burst >= 8 {
+        // A frame result releases the sole in-flight token, so consume at most
+        // one first; the next burst necessarily services the normal lifecycle
+        // lane. This prevents either lane from starving under continuous
+        // preview input plus a full normal queue.
+        if let Ok(event) = animation_event_rx.try_recv() {
+            *preview_burst = 0;
+            return Some(event);
+        }
+        match event_rx.try_recv() {
+            Ok(event) => {
+                *preview_burst = 0;
+                return Some(event);
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return None,
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+        }
+    }
+    tokio::select! {
+        biased;
+        Some(gesture) = preview_event_rx.recv() => {
+            *preview_burst += 1;
+            Some(DaemonEvent::PreviewGesture(gesture))
+        },
+        Some(event) = animation_event_rx.recv() => {
+            *preview_burst = 0;
+            Some(event)
+        },
+        event = event_rx.recv() => {
+            *preview_burst = 0;
+            event
+        },
+    }
+}
+
+async fn run_daemon_event_loop(
+    mut ctx: EventLoopCtx<'_>,
+    mut preview_event_rx: mpsc::Receiver<leopardwm_platform_win32::PreviewClickEvent>,
+    mut animation_event_rx: mpsc::UnboundedReceiver<DaemonEvent>,
+    mut event_rx: mpsc::Receiver<DaemonEvent>,
+) -> (
+    mpsc::Receiver<leopardwm_platform_win32::PreviewClickEvent>,
+    mpsc::UnboundedReceiver<DaemonEvent>,
+    mpsc::Receiver<DaemonEvent>,
+) {
+    let mut preview_burst = 0usize;
+    loop {
+        let Some(event) = receive_next_daemon_event(
+            &mut preview_event_rx,
+            &mut animation_event_rx,
+            &mut event_rx,
+            &mut preview_burst,
+        )
+        .await
+        else {
+            break;
+        };
+
+        match event {
+            DaemonEvent::IpcSubscribe { events, responder } => {
+                handle_ipc_subscribe(ctx.state, events, responder).await;
+            }
+            DaemonEvent::IpcCommand { cmd, responder } => {
+                if handle_ipc_command(&mut ctx, cmd, responder).await {
+                    break;
+                }
+            }
+            DaemonEvent::WindowEvent(event) => process_window_event(&mut ctx, event).await,
+            DaemonEvent::Hotkey(event) => {
+                if handle_hotkey_event(&mut ctx, event).await {
+                    break;
+                }
+            }
+            DaemonEvent::Gesture(event) => {
+                if handle_gesture_event(&mut ctx, event).await {
+                    break;
+                }
+            }
+            DaemonEvent::Tray(event) => handle_tray_event(&mut ctx, event).await,
+            DaemonEvent::UpdateAvailable(tag) => {
+                if let Some(manager) = ctx.tray_manager {
+                    manager.set_available_update(Some(tag));
+                }
+            }
+            DaemonEvent::TabStripIconPoll => handle_tab_strip_icon_poll(ctx.state).await,
+            DaemonEvent::PersistStateNow => handle_persist_state_now(ctx.state).await,
+            DaemonEvent::Overview(event) => handle_overview_event(&mut ctx, event).await,
+            DaemonEvent::TabAction {
+                monitor,
+                workspace_idx,
+                column_idx,
+                tab_idx,
+                action,
+            } => {
+                handle_tab_action(
+                    ctx.state,
+                    monitor,
+                    workspace_idx,
+                    column_idx,
+                    tab_idx,
+                    action,
+                )
+                .await;
+            }
+            DaemonEvent::PreviewGesture(gesture) => {
+                handle_preview_gesture(&mut ctx, gesture).await;
+            }
+            DaemonEvent::TabRenameSubmitted {
+                monitor,
+                workspace_idx,
+                column_idx,
+                tab_idx,
+                target_hwnd,
+                new_title,
+            } => {
+                handle_tab_rename_submitted(
+                    ctx.state,
+                    monitor,
+                    workspace_idx,
+                    column_idx,
+                    tab_idx,
+                    target_hwnd,
+                    new_title,
+                )
+                .await;
+            }
+            DaemonEvent::Settings(event) => handle_settings_event(&mut ctx, event).await,
+            DaemonEvent::AnimationFrameApplied(result) => {
+                handle_animation_frame_applied(&mut ctx, result).await;
+            }
+            DaemonEvent::CrossfadeComplete { epoch } => {
+                let mut state = ctx.state.lock().await;
+                if state.active_crossfade.as_ref().map(|fade| fade.epoch) == Some(epoch) {
+                    state.active_crossfade = None;
+                }
+                state.crossfade_sources.remove(&epoch);
+            }
+            DaemonEvent::HideSnapHint => {
+                if let Some(overlay) = ctx.snap_hint_overlay {
+                    overlay.hide();
+                    debug!("Snap hint hidden");
+                }
+            }
+            DaemonEvent::FocusFollowsMouse { window_id } => {
+                handle_focus_follows_mouse(&mut ctx, window_id).await;
+            }
+            DaemonEvent::PowerStateChanged {
+                on_battery_or_saver,
+            } => {
+                let mut state = ctx.state.lock().await;
+                state.on_battery_or_saver = on_battery_or_saver;
+                state.refresh_reduce_motion();
+            }
+            DaemonEvent::DisplayChangeSettled { generation } => {
+                handle_display_change_settled(&mut ctx, generation).await;
+            }
+            DaemonEvent::Shutdown => {
+                info!("Shutdown signal received");
+                run_shutdown_cleanup(ctx.state, ShutdownMode::Graceful).await;
+                break;
+            }
+        }
+
+        sync_pending_layout_apply_timeout_ui(ctx.state, ctx.tray_manager, &*ctx.hotkey_state).await;
+        leopardwm_platform_win32::thumbnail::service_pending_preview_retry();
+    }
+    (preview_event_rx, animation_event_rx, event_rx)
+}
+
+fn join_forwarding_threads(thread_handles: Vec<ForwardingThreadHandle>) {
+    info!("Waiting for forwarding threads to exit...");
+    let shutdown_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut pending = Vec::new();
+    for mut handle in thread_handles {
+        let remaining = shutdown_deadline.saturating_duration_since(std::time::Instant::now());
+        let per_thread = remaining.min(Duration::from_secs(3));
+        if !handle.join_with_timeout(per_thread) {
+            warn!(
+                "Forwarding thread '{}' did not exit within shared deadline; retrying",
+                handle.name()
+            );
+            pending.push(handle);
+        }
+    }
+    for mut handle in pending {
+        if !handle.join_with_timeout(Duration::from_millis(500)) {
+            warn!(
+                "Forwarding thread '{}' did not exit after final retry",
+                handle.name()
+            );
         }
     }
 }
@@ -3254,12 +3807,13 @@ async fn main() -> Result<()> {
     }
 
     // Create the event channel/animation worker before the system-event window.
-    let (event_tx, mut event_rx, animation_worker) = setup_daemon_runtime(&state).await;
+    let (event_tx, event_rx, animation_event_rx, animation_worker) =
+        setup_daemon_runtime(&state).await;
 
     // Collect forwarding thread handles for graceful shutdown
-    let mut thread_handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
+    let mut thread_handles: Vec<ForwardingThreadHandle> = Vec::new();
 
-    spawn_tab_forwarders(&state, &event_tx, &mut thread_handles).await;
+    let preview_event_rx = spawn_tab_forwarders(&state, &event_tx, &mut thread_handles).await;
     spawn_overview_forwarder(&state, &event_tx, &mut thread_handles).await;
 
     // Debounced workspace-state persistence (see `spawn_debounced_save`).
@@ -3274,6 +3828,7 @@ async fn main() -> Result<()> {
         HotkeyState {
             handle: setup_system_event_handle(),
             hook: None,
+            forwarder: None,
             mapping: HashMap::new(),
             requested_count: 0,
             registered_count: 0,
@@ -3322,10 +3877,11 @@ async fn main() -> Result<()> {
 
     // Update checker — daily GitHub Releases poll, opt-out via behavior.check_for_updates.
     let update_check_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut update_check_thread = None;
     if config.behavior.check_for_updates {
         let tx = event_tx.clone();
         let cancel = update_check_cancel.clone();
-        update_check::spawn_update_checker(cancel, move |tag| {
+        update_check_thread = update_check::spawn_update_checker(cancel, move |tag| {
             // Best-effort send — if the receiver is gone we're already shutting down.
             let _ = tx.blocking_send(DaemonEvent::UpdateAvailable(tag));
         });
@@ -3396,7 +3952,7 @@ async fn main() -> Result<()> {
 
     info!("Ready. Use leopardwm-cli to send commands.");
 
-    let mut animation_active = false;
+    let mut animation_in_flight_epoch = None;
     let mut last_frame_instant: Option<std::time::Instant> = None;
 
     // Snap hint timer handle - cancels pending hide operation when new hint is shown
@@ -3411,7 +3967,7 @@ async fn main() -> Result<()> {
     // transient work area.
     let mut display_change_timer: Option<tokio::task::JoinHandle<()>> = None;
 
-    let mut ctx = EventLoopCtx {
+    let ctx = EventLoopCtx {
         state: &state,
         event_tx: &event_tx,
         hotkey_state: &mut hotkey_state,
@@ -3420,142 +3976,49 @@ async fn main() -> Result<()> {
         settings_sync_tx: &settings_sync_tx,
         settings_handle: &mut _settings_handle,
         animation_worker: &animation_worker,
-        animation_active: &mut animation_active,
+        animation_in_flight_epoch: &mut animation_in_flight_epoch,
         last_frame_instant: &mut last_frame_instant,
         snap_hint_timer_handle: &mut snap_hint_timer_handle,
         focus_follows_mouse_timer: &mut focus_follows_mouse_timer,
         display_change_timer: &mut display_change_timer,
         mouse_hook_handle: &mut mouse_hook_handle,
+        forwarding_threads: &mut thread_handles,
     };
 
-    // Main event loop
-    loop {
-        let event = match event_rx.recv().await {
-            Some(e) => e,
-            None => break,
-        };
-
-        match event {
-            DaemonEvent::IpcSubscribe { events, responder } => {
-                handle_ipc_subscribe(&state, events, responder).await;
-            }
-            DaemonEvent::IpcCommand { cmd, responder } => {
-                if handle_ipc_command(&mut ctx, cmd, responder).await {
-                    break;
-                }
-            }
-            DaemonEvent::WindowEvent(win_event) => {
-                process_window_event(&mut ctx, win_event).await;
-            }
-            DaemonEvent::Hotkey(hotkey_event) => {
-                if handle_hotkey_event(&mut ctx, hotkey_event).await {
-                    break;
-                }
-            }
-            DaemonEvent::Gesture(gesture_event) => {
-                if handle_gesture_event(&mut ctx, gesture_event).await {
-                    break;
-                }
-            }
-            DaemonEvent::Tray(tray_event) => {
-                handle_tray_event(&mut ctx, tray_event).await;
-            }
-            DaemonEvent::UpdateAvailable(tag) => {
-                if let Some(ref mgr) = tray_manager {
-                    mgr.set_available_update(Some(tag));
-                }
-            }
-            DaemonEvent::TabStripIconPoll => {
-                handle_tab_strip_icon_poll(&state).await;
-            }
-            DaemonEvent::PersistStateNow => {
-                handle_persist_state_now(&state).await;
-            }
-            DaemonEvent::Overview(overview_event) => {
-                handle_overview_event(&mut ctx, overview_event).await;
-            }
-            DaemonEvent::TabAction {
-                monitor,
-                workspace_idx,
-                column_idx,
-                tab_idx,
-                action,
-            } => {
-                handle_tab_action(&state, monitor, workspace_idx, column_idx, tab_idx, action)
-                    .await;
-            }
-            DaemonEvent::PreviewGesture { window_id, gesture } => {
-                handle_preview_gesture(&mut ctx, window_id, gesture).await;
-            }
-            DaemonEvent::TabRenameSubmitted {
-                monitor,
-                workspace_idx,
-                column_idx,
-                tab_idx,
-                target_hwnd,
-                new_title,
-            } => {
-                handle_tab_rename_submitted(
-                    &state,
-                    monitor,
-                    workspace_idx,
-                    column_idx,
-                    tab_idx,
-                    target_hwnd,
-                    new_title,
-                )
-                .await;
-            }
-            DaemonEvent::Settings(settings_event) => {
-                handle_settings_event(&mut ctx, settings_event).await;
-            }
-            DaemonEvent::AnimationFrameApplied(frame_result) => {
-                handle_animation_frame_applied(&mut ctx, frame_result).await;
-            }
-            DaemonEvent::CrossfadeComplete { epoch } => {
-                let mut state = state.lock().await;
-                let active = state.active_crossfade.as_ref().map(|s| s.epoch);
-                if active == Some(epoch) {
-                    state.active_crossfade = None;
-                }
-                // Always release this epoch's re-registration barrier.
-                // Per-epoch tracking means an aborted fade's stale
-                // CrossfadeComplete only clears its own entry, not a
-                // newer in-flight fade's.
-                state.crossfade_sources.remove(&epoch);
-            }
-            DaemonEvent::HideSnapHint => {
-                if let Some(ref overlay) = snap_hint_overlay {
-                    overlay.hide();
-                    debug!("Snap hint hidden");
-                }
-            }
-            DaemonEvent::FocusFollowsMouse { window_id } => {
-                handle_focus_follows_mouse(&mut ctx, window_id).await;
-            }
-            DaemonEvent::PowerStateChanged {
-                on_battery_or_saver,
-            } => {
-                let mut state = state.lock().await;
-                state.on_battery_or_saver = on_battery_or_saver;
-                state.refresh_reduce_motion();
-            }
-            DaemonEvent::DisplayChangeSettled => {
-                handle_display_change_settled(&mut ctx).await;
-            }
-            DaemonEvent::Shutdown => {
-                info!("Shutdown signal received");
-                run_shutdown_cleanup(&state, ShutdownMode::Graceful).await;
-                break;
-            }
-        }
-
-        sync_pending_layout_apply_timeout_ui(ctx.state, ctx.tray_manager, &*ctx.hotkey_state).await;
+    // Moving the context into the loop function releases every mutable borrow
+    // before shutdown tears down hooks, UI sources, and forwarding threads.
+    let (preview_event_rx, animation_event_rx, event_rx) =
+        run_daemon_event_loop(ctx, preview_event_rx, animation_event_rx, event_rx).await;
+    if let Some(forwarder) = hotkey_state.forwarder.take() {
+        thread_handles.push(forwarder);
     }
+    hotkey_state.hook = None;
+    drop(mouse_hook_handle.take());
+    drop(_gesture_handle);
+    drop(_hook_handle);
+    drop(_settings_handle.take());
+    drop(settings_sync_tx);
+    drop(tray_manager);
+
+    // Stop every sync-channel forwarder explicitly. Their source senders are
+    // owned by hooks/overlays that intentionally remain alive through recovery,
+    // so waiting for sender drop here deadlocks shutdown. Closing both Tokio
+    // receivers also releases a forwarder already blocked in `blocking_send`.
+    for handle in &thread_handles {
+        handle.request_stop();
+    }
+    drop(preview_event_rx);
+    drop(animation_event_rx);
+    // Close the normal destination before joining any producer that could be
+    // blocked in `blocking_send` after the main loop stopped draining it.
+    drop(event_rx);
 
     // Stop the update-checker worker so it doesn't hold up shutdown.
     update_check_cancel.store(true, std::sync::atomic::Ordering::SeqCst);
-    stop_animation_worker_and_run_recovery(animation_worker, &state, event_rx).await;
+    if !join_with_timeout(&mut update_check_thread, SHUTDOWN_FINAL_JOIN_TIMEOUT) {
+        warn!("Update checker did not exit within shutdown budget");
+    }
+    stop_animation_worker_and_run_recovery(animation_worker, &state).await;
 
     // Clean up timers if running
     if let Some(handle) = snap_hint_timer_handle {
@@ -3568,17 +4031,7 @@ async fn main() -> Result<()> {
         handle.abort();
     }
 
-    // Join forwarding threads with timeout for graceful shutdown
-    info!("Waiting for forwarding threads to exit...");
-    let shutdown_deadline = std::time::Instant::now() + Duration::from_secs(5);
-    for handle in thread_handles {
-        let remaining = shutdown_deadline.saturating_duration_since(std::time::Instant::now());
-        let per_thread = remaining.min(Duration::from_secs(3));
-        let mut handle = Some(handle);
-        if !join_with_timeout(&mut handle, per_thread) {
-            warn!("A forwarding thread did not exit within timeout, continuing shutdown");
-        }
-    }
+    join_forwarding_threads(thread_handles);
 
     info!("LeopardWM daemon shutting down.");
     Ok(())

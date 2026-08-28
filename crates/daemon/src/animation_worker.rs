@@ -11,14 +11,21 @@
 
 use leopardwm_core_layout::{Rect, WindowPlacement};
 use leopardwm_platform_win32::{PlacementCache, PlatformConfig};
-use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::debug;
 
+#[cfg(test)]
+static FRAME_PLATFORM_APPLY_COUNT: AtomicUsize = AtomicUsize::new(0);
+
 /// Data sent to the worker for each animation frame.
 pub struct FrameRequest {
+    /// Shared desired-state epoch captured when this frame was planned.
+    pub apply_epoch: u64,
     /// Placements driven via per-frame `SetWindowPos` on the live HWND.
     /// Excludes any windows being driven via DWM thumbnail (those are in
     /// `ghost_updates`).
@@ -32,10 +39,15 @@ pub struct FrameRequest {
     pub platform_config: PlatformConfig,
 }
 
-/// Per-frame thumbnail update payload. `handle_isize` is a raw
-/// `HTHUMBNAIL` value (sender owns the registration; worker only updates).
+/// Per-frame thumbnail update payload. Shared registration ownership keeps the
+/// HTHUMBNAIL alive until this queued worker command is consumed or dropped.
 pub struct GhostFrame {
-    pub handle_isize: isize,
+    pub window_id: u64,
+    pub registration: Arc<crate::state::GhostRegistration>,
+    /// Optional crop expressed in the interpolated placement's coordinate
+    /// system, plus that expected full source size. Used when the ghost reaches
+    /// a neighbouring monitor and must obey the same owner-edge clip.
+    pub source_crop: Option<(Rect, (i32, i32))>,
     /// Destination rect in client coordinates of the thumbnail host.
     pub dest_client_rect: Rect,
     pub opacity: u8,
@@ -44,6 +56,7 @@ pub struct GhostFrame {
 
 /// Result sent back from the worker after applying a frame.
 pub struct FrameResult {
+    pub apply_epoch: u64,
     /// Whether the placements were applied successfully.
     pub apply_result: Result<(), String>,
     /// How long the frame took (apply + vsync wait).
@@ -53,6 +66,7 @@ pub struct FrameResult {
     pub width_violations: Vec<leopardwm_platform_win32::WidthViolation>,
     /// Height violations detected (windows enforcing a minimum height).
     pub height_violations: Vec<leopardwm_platform_win32::HeightViolation>,
+    pub ghost_update_failures: Vec<u64>,
 }
 
 /// Commands the main thread can send to the worker.
@@ -84,20 +98,10 @@ enum WorkerCommand {
     Shutdown,
 }
 
-/// Worker-owned thumbnail handle during a crossfade. Drop unregisters,
-/// so panic-unwind and normal end-of-fade both unregister cleanly.
+/// Worker-owned shared thumbnail registration during a crossfade.
 pub struct CrossfadeEntry {
-    pub handle_isize: isize,
+    pub registration: Arc<crate::state::GhostRegistration>,
     pub dest_client_rect: Rect,
-}
-
-impl Drop for CrossfadeEntry {
-    fn drop(&mut self) {
-        if self.handle_isize != 0 {
-            leopardwm_platform_win32::thumbnail::unregister_raw(self.handle_isize);
-            self.handle_isize = 0;
-        }
-    }
 }
 
 /// Handle to the persistent animation worker thread.
@@ -128,9 +132,10 @@ impl AnimationWorkerControl {
 
     /// Wait until commands already queued on the worker have completed.
     ///
-    /// Returns `true` when the barrier was acknowledged or the worker had
-    /// already exited, and `false` when the bounded wait expired.
-    pub fn wait_for_session_end_barrier(&self, timeout: Duration) -> bool {
+    /// This is the ordering edge between animation frames and any newer exact
+    /// placement/cleanup. `ClearCache` alone is just another queued command and
+    /// does not stop an older frame from landing after newer state.
+    pub fn wait_for_barrier(&self, timeout: Duration) -> bool {
         let (ack_tx, ack_rx) = std_mpsc::channel();
         if self
             .command_tx
@@ -140,6 +145,16 @@ impl AnimationWorkerControl {
             return true;
         }
         ack_rx.recv_timeout(timeout).is_ok()
+    }
+
+    pub fn wait_for_session_end_barrier(&self, timeout: Duration) -> bool {
+        self.wait_for_barrier(timeout)
+    }
+
+    /// Invalidate worker-local placement state after an exact landing takes
+    /// ownership away from an interrupted animation.
+    pub fn clear_cache(&self) {
+        let _ = self.command_tx.send(WorkerCommand::ClearCache);
     }
 }
 
@@ -151,15 +166,16 @@ impl AnimationWorkerHandle {
     /// `apply_worker_cancelled` gates Frame application so a frame already in
     /// the channel cannot re-park windows after console-signal restore.
     pub fn spawn(
-        event_tx: tokio::sync::mpsc::Sender<super::DaemonEvent>,
+        event_tx: tokio::sync::mpsc::UnboundedSender<super::DaemonEvent>,
         apply_worker_cancelled: Arc<AtomicBool>,
+        apply_epoch: Arc<AtomicU64>,
     ) -> Result<Self, std::io::Error> {
         let (command_tx, command_rx) = std_mpsc::channel::<WorkerCommand>();
 
         let thread = std::thread::Builder::new()
             .name("leopardwm-animation-worker".to_string())
             .spawn(move || {
-                worker_loop(command_rx, event_tx, apply_worker_cancelled);
+                worker_loop(command_rx, event_tx, apply_worker_cancelled, apply_epoch);
             })?;
 
         Ok(Self {
@@ -183,6 +199,19 @@ impl AnimationWorkerHandle {
         AnimationWorkerControl {
             command_tx: self.command_tx.clone(),
         }
+    }
+
+    /// Wait until all frame/crossfade work already queued has completed.
+    pub fn wait_for_barrier(&self, timeout: Duration) -> bool {
+        let (ack_tx, ack_rx) = std_mpsc::channel();
+        if self
+            .command_tx
+            .send(WorkerCommand::SessionEndBarrier(ack_tx))
+            .is_err()
+        {
+            return true;
+        }
+        ack_rx.recv_timeout(timeout).is_ok()
     }
 
     /// Invalidate the worker's placement cache. Call after theme/display changes
@@ -209,6 +238,11 @@ impl AnimationWorkerHandle {
             .map_err(|_| "Animation worker thread has exited".to_string())
     }
 
+    #[cfg(test)]
+    pub fn send_test_block(&self, release: std_mpsc::Receiver<()>) {
+        let _ = self.command_tx.send(WorkerCommand::TestBlock(release));
+    }
+
     /// Send Shutdown and release the thread for a caller-owned join.
     /// After this returns, `Drop` will not join (thread already taken).
     pub fn into_shutdown_join_handle(mut self) -> Option<std::thread::JoinHandle<()>> {
@@ -233,8 +267,9 @@ impl Drop for AnimationWorkerHandle {
 /// For each frame: apply placements → DwmFlush → send result back.
 fn worker_loop(
     command_rx: std_mpsc::Receiver<WorkerCommand>,
-    event_tx: tokio::sync::mpsc::Sender<super::DaemonEvent>,
+    event_tx: tokio::sync::mpsc::UnboundedSender<super::DaemonEvent>,
     apply_worker_cancelled: Arc<AtomicBool>,
+    current_apply_epoch: Arc<AtomicU64>,
 ) {
     debug!("Animation worker thread started");
     let mut placement_cache = PlacementCache::new();
@@ -292,19 +327,21 @@ fn worker_loop(
             WorkerCommand::Frame(request) => {
                 let frame_start = Instant::now();
 
-                // Skip apply after shutdown/revert latch so a queued frame
-                // cannot re-park windows after the console-signal restore.
-                // Plain cancelled flag is enough: apply_epoch also bumps on
-                // every normal apply and would falsely drop live frames.
-                if apply_worker_cancelled.load(Ordering::SeqCst) {
+                // Reject a queued frame whose desired-state epoch was superseded
+                // by an exact apply, pause, display invalidation or cleanup.
+                if apply_worker_cancelled.load(Ordering::SeqCst)
+                    || current_apply_epoch.load(Ordering::SeqCst) != request.apply_epoch
+                {
                     let result = FrameResult {
+                        apply_epoch: request.apply_epoch,
                         apply_result: Ok(()),
                         frame_time: frame_start.elapsed(),
                         width_violations: Vec::new(),
                         height_violations: Vec::new(),
+                        ghost_update_failures: Vec::new(),
                     };
                     if event_tx
-                        .blocking_send(super::DaemonEvent::AnimationFrameApplied(result))
+                        .send(super::DaemonEvent::AnimationFrameApplied(result))
                         .is_err()
                     {
                         debug!("Animation worker: event channel closed, exiting");
@@ -314,6 +351,8 @@ fn worker_loop(
                 }
 
                 // Apply window placements, skipping unchanged windows via cache.
+                #[cfg(test)]
+                FRAME_PLATFORM_APPLY_COUNT.fetch_add(1, Ordering::SeqCst);
                 // Adaptive mode keeps ordinary HWNDs asynchronous, serializes
                 // compositor-sensitive HWNDs, and omits already-hung sensitive
                 // targets until the bounded exact landing pass.
@@ -332,14 +371,28 @@ fn worker_loop(
                 // Apply per-frame thumbnail updates for ghost-animated windows.
                 // Failures are logged but don't fail the frame — a ghost that
                 // misses a single frame is better than a stalled animation.
-                for g in &request.ghost_updates {
-                    if let Err(e) = leopardwm_platform_win32::thumbnail::update(
-                        g.handle_isize,
-                        g.dest_client_rect,
-                        g.opacity,
-                        g.visible,
-                    ) {
-                        debug!("thumbnail::update failed: {}", e);
+                let mut ghost_update_failures = Vec::new();
+                for ghost in &request.ghost_updates {
+                    let result = if let Some((source, expected_size)) = ghost.source_crop {
+                        leopardwm_platform_win32::thumbnail::update_cropped_scaled(
+                            ghost.registration.handle(),
+                            source,
+                            expected_size,
+                            ghost.dest_client_rect,
+                            ghost.opacity,
+                            ghost.visible,
+                        )
+                    } else {
+                        leopardwm_platform_win32::thumbnail::update(
+                            ghost.registration.handle(),
+                            ghost.dest_client_rect,
+                            ghost.opacity,
+                            ghost.visible,
+                        )
+                    };
+                    if let Err(error) = result {
+                        ghost_update_failures.push(ghost.window_id);
+                        debug!("thumbnail ghost update failed: {error}");
                     }
                 }
 
@@ -349,15 +402,19 @@ fn worker_loop(
                 let frame_time = frame_start.elapsed();
 
                 let result = FrameResult {
+                    apply_epoch: request.apply_epoch,
                     apply_result,
                     frame_time,
                     width_violations,
                     height_violations,
+                    ghost_update_failures,
                 };
 
-                // Send result back to main event loop
+                // A dedicated unbounded result lane keeps publication
+                // nonblocking. Single-flight frame ownership bounds this lane,
+                // and worker barriers can never sit behind a full daemon queue.
                 if event_tx
-                    .blocking_send(super::DaemonEvent::AnimationFrameApplied(result))
+                    .send(super::DaemonEvent::AnimationFrameApplied(result))
                     .is_err()
                 {
                     debug!("Animation worker: event channel closed, exiting");
@@ -385,7 +442,7 @@ fn worker_loop(
 /// same-source-re-registration barrier.
 fn run_crossfade(
     command_rx: &std_mpsc::Receiver<WorkerCommand>,
-    event_tx: &tokio::sync::mpsc::Sender<super::DaemonEvent>,
+    event_tx: &tokio::sync::mpsc::UnboundedSender<super::DaemonEvent>,
     epoch: u64,
     entries: Vec<CrossfadeEntry>,
     frames: u32,
@@ -425,7 +482,7 @@ fn run_crossfade(
         let opacity = ((1.0 - t.powi(3)) * 255.0).round().clamp(0.0, 255.0) as u8;
         for entry in &entries {
             if let Err(e) = leopardwm_platform_win32::thumbnail::update(
-                entry.handle_isize,
+                entry.registration.handle(),
                 entry.dest_client_rect,
                 opacity,
                 opacity > 0,
@@ -436,14 +493,13 @@ fn run_crossfade(
         dwm_flush_or_fallback();
     }
 
-    // Drop entries here — each CrossfadeEntry::Drop calls unregister_raw,
-    // regardless of normal completion or early abort.
+    // Drop the worker's shared registrations on normal completion or abort.
     drop(entries);
 
     if aborted {
         debug!("Animation worker: crossfade epoch {} aborted", epoch);
     }
-    let _ = event_tx.blocking_send(super::DaemonEvent::CrossfadeComplete { epoch });
+    let _ = event_tx.send(super::DaemonEvent::CrossfadeComplete { epoch });
 }
 
 /// Call DwmFlush to wait for the next compositor vsync.
@@ -463,11 +519,82 @@ mod tests {
     use super::*;
 
     #[test]
+    fn stale_frame_epoch_performs_no_platform_apply() {
+        FRAME_PLATFORM_APPLY_COUNT.store(0, Ordering::SeqCst);
+        let (command_tx, command_rx) = std_mpsc::channel();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let current_epoch = Arc::new(AtomicU64::new(2));
+        let worker_epoch = current_epoch.clone();
+        let worker_thread = std::thread::spawn(move || {
+            worker_loop(
+                command_rx,
+                event_tx,
+                Arc::new(AtomicBool::new(false)),
+                worker_epoch,
+            );
+        });
+        command_tx
+            .send(WorkerCommand::Frame(FrameRequest {
+                apply_epoch: 1,
+                placements: Vec::new(),
+                region_clips: Vec::new(),
+                ghost_updates: Vec::new(),
+                platform_config: PlatformConfig::default(),
+            }))
+            .unwrap();
+        match event_rx.blocking_recv() {
+            Some(crate::events::DaemonEvent::AnimationFrameApplied(result)) => {
+                assert_eq!(result.apply_epoch, 1);
+                assert!(result.apply_result.is_ok());
+            }
+            _ => panic!("stale frame did not return an acknowledgement"),
+        }
+        assert_eq!(FRAME_PLATFORM_APPLY_COUNT.load(Ordering::SeqCst), 0);
+        command_tx.send(WorkerCommand::Shutdown).unwrap();
+        worker_thread.join().unwrap();
+    }
+
+    #[test]
+    fn unconsumed_frame_result_never_blocks_worker_barrier() {
+        let (command_tx, command_rx) = std_mpsc::channel();
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let worker_thread = std::thread::spawn(move || {
+            worker_loop(
+                command_rx,
+                event_tx,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicU64::new(2)),
+            );
+        });
+        command_tx
+            .send(WorkerCommand::Frame(FrameRequest {
+                apply_epoch: 1,
+                placements: Vec::new(),
+                region_clips: Vec::new(),
+                ghost_updates: Vec::new(),
+                platform_config: PlatformConfig::default(),
+            }))
+            .unwrap();
+        let control = AnimationWorkerControl {
+            command_tx: command_tx.clone(),
+        };
+
+        assert!(control.wait_for_session_end_barrier(Duration::from_millis(500)));
+        command_tx.send(WorkerCommand::Shutdown).unwrap();
+        worker_thread.join().unwrap();
+    }
+
+    #[test]
     fn session_end_barrier_waits_for_prior_worker_command() {
         let (command_tx, command_rx) = std_mpsc::channel();
-        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(1);
+        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
         let worker_thread = std::thread::spawn(move || {
-            worker_loop(command_rx, event_tx, Arc::new(AtomicBool::new(false)));
+            worker_loop(
+                command_rx,
+                event_tx,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicU64::new(0)),
+            );
         });
         let control = AnimationWorkerControl {
             command_tx: command_tx.clone(),

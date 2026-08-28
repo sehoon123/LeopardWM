@@ -19,6 +19,8 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
+#[cfg(feature = "integration-probes")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, LazyLock, Mutex, MutexGuard};
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
@@ -259,6 +261,8 @@ const TOOLTIP_FADE_INTERVAL_MS: u32 = 16;
 /// "Do not post the WM_QUIT message using PostMessage"), so we use a
 /// custom message and break the loop explicitly when it lands.
 const WM_QUIT_TAB_STRIP_THREAD: u32 = WM_USER + 4;
+#[cfg(feature = "integration-probes")]
+static CONTEXT_MENU_OPEN: AtomicBool = AtomicBool::new(false);
 /// Synchronously hides a strip on its owning UI thread. Serializing the hide
 /// with timer and input callbacks prevents an in-flight repaint from showing
 /// the layered window again after the daemon requested it hidden.
@@ -388,6 +392,16 @@ pub struct TabStripOverlay {
 }
 
 impl TabStripOverlay {
+    #[cfg(feature = "integration-probes")]
+    pub fn hwnd_for_integration_probe(&self) -> isize {
+        self.hwnd.0 as isize
+    }
+
+    #[cfg(feature = "integration-probes")]
+    pub fn context_menu_open_for_integration_probe() -> bool {
+        CONTEXT_MENU_OPEN.load(Ordering::Acquire)
+    }
+
     /// Create the tab strip overlay on a background thread.
     /// `action_tx` receives `TabActionEvent` whenever the user invokes a
     /// tab action (click, middle-click, right-click menu, etc.).
@@ -2782,6 +2796,8 @@ unsafe fn on_tab_context_menu(hwnd: HWND, lparam: LPARAM) -> LRESULT {
     // first click outside the menu may not dismiss it.
     let _ = SetForegroundWindow(hwnd);
 
+    #[cfg(feature = "integration-probes")]
+    CONTEXT_MENU_OPEN.store(true, Ordering::Release);
     let cmd = TrackPopupMenu(
         menu,
         TPM_RETURNCMD | TPM_RIGHTBUTTON,
@@ -2791,6 +2807,8 @@ unsafe fn on_tab_context_menu(hwnd: HWND, lparam: LPARAM) -> LRESULT {
         hwnd,
         None,
     );
+    #[cfg(feature = "integration-probes")]
+    CONTEXT_MENU_OPEN.store(false, Ordering::Release);
     let _ = DestroyMenu(menu);
     // Bitmaps must outlive `TrackPopupMenu`; safe to delete now.
     for hbmp in [icon_close, icon_untab, icon_rename] {
@@ -2832,6 +2850,15 @@ unsafe extern "system" fn tab_strip_wnd_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if msg == WM_QUIT_TAB_STRIP_THREAD {
+        // This message can arrive inside TrackPopupMenu's nested modal loop.
+        // End that menu explicitly and post WM_QUIT from the owning UI thread;
+        // otherwise DefWindowProc can consume the custom message and leave the
+        // outer GetMessage loop waiting forever during Drop::join.
+        let _ = EndMenu();
+        PostQuitMessage(0);
+        return LRESULT(0);
+    }
     if msg == WM_HIDE_TAB_STRIP {
         return hide_tab_strip_on_ui_thread(hwnd);
     }

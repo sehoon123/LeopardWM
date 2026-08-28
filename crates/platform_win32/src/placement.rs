@@ -1,9 +1,9 @@
 //! Window placement application via SetWindowPos / DeferWindowPos.
 
 use crate::thumbnail::{
-    clear_persistent_previews, commit_persistent_previews, forget_persistent_preview,
-    has_persistent_preview, lock_persistent_preview_transaction, prepare_persistent_preview,
-    PersistentPreviewRequest,
+    commit_persistent_previews, forget_persistent_preview, has_persistent_preview,
+    has_published_persistent_preview, lock_persistent_preview_transaction,
+    prepare_persistent_preview, PersistentPreviewRequest,
 };
 use crate::types::{AnimationPlacementPolicy, PlatformConfig, Win32Error};
 use crate::window_id_to_hwnd;
@@ -252,7 +252,7 @@ pub fn dwm_uncloak_window(window_id: WindowId) {
 /// Force-uncloak every tracked window from both sets. Called during
 /// shutdown and panic recovery. Bypasses `apply_cloak_state`.
 pub fn dwm_uncloak_all() {
-    clear_persistent_previews();
+    invalidate_preview_surface_and_clear_best_effort("global uncloak");
     restore_all_window_regions();
     let _commit = lock_cloak_commit();
     let global_ids: Vec<WindowId> = {
@@ -517,6 +517,15 @@ pub(crate) fn returns_from_offscreen_park(
         || previous.is_some_and(|(_, visibility)| visibility != Visibility::Visible)
 }
 
+fn invalidate_preview_surface_and_clear_best_effort(context: &str) {
+    crate::thumbnail::invalidate_persistent_preview_surface();
+    match crate::thumbnail::clear_persistent_previews_best_effort() {
+        Ok(true) => {}
+        Ok(false) => tracing::warn!("Preview cleanup deferred during {context}"),
+        Err(error) => tracing::warn!("Preview cleanup degraded during {context}: {error}"),
+    }
+}
+
 /// Apply window placements from the layout engine.
 ///
 /// Visible windows are positioned immediately via SetWindowPos.
@@ -550,7 +559,7 @@ pub fn apply_placements_with_regions(
         if let Some(cache) = cache {
             cache.clear();
         }
-        clear_persistent_previews();
+        invalidate_preview_surface_and_clear_best_effort("empty layout");
         // Empty layout is also a hard region-lifecycle boundary.
         restore_all_window_regions();
         // Uncloak all tracked windows — no placements means all previous
@@ -588,47 +597,79 @@ pub fn apply_placements_with_regions(
     // overlap and the layout gaps disappear.  Zero the insets to keep correct spacing.
     let high_contrast = crate::is_high_contrast_enabled();
 
-    let (entries, preview_requests, new_preview_count, skipped, safe_fallbacks) =
-        build_defer_entries(
-            placements,
-            region_clips,
-            &mut cache,
-            animation_frame,
-            config.animation_placement_policy,
-            high_contrast,
-        );
+    let (
+        entries,
+        preview_requests,
+        new_preview_count,
+        skipped,
+        safe_fallbacks,
+        unsafe_hung_sensitive,
+    ) = build_defer_entries(
+        placements,
+        region_clips,
+        &mut cache,
+        animation_frame,
+        config.animation_placement_policy,
+        high_contrast,
+    );
 
-    uncloak_becoming_visible(&entries);
-    let (applied, failed_window_ids) = position_entries(&entries);
+    if !unsafe_hung_sensitive.is_empty() {
+        return Err(Win32Error::SetPositionFailed(format!(
+            "hung compositor-sensitive window(s) require exact landing: {unsafe_hung_sensitive:?}"
+        )));
+    }
 
-    let committed_preview_requests: Vec<_> = preview_requests
+    let (applied, mut failed_window_ids) = position_entries(&entries);
+    verify_preview_source_landings(&entries, &mut failed_window_ids);
+    // A returning window stays cloaked until its visible landing succeeded; the
+    // old ordering uncloaked first and could flash a stale offscreen/intermediate
+    // position when SetWindowPos later failed.
+    uncloak_becoming_visible(&entries, &failed_window_ids);
+
+    let flush_needed = preview_commit_needs_flush(
+        animation_frame,
+        new_preview_count,
+        preview_requests
+            .iter()
+            .filter(|request| !failed_window_ids.contains(&request.window_id))
+            .count(),
+    );
+    if flush_needed && unsafe { DwmFlush() }.is_err() {
+        failed_window_ids.extend(preview_requests.iter().map(|request| request.window_id));
+    }
+
+    // Keep every visibility protection until the source was both physically
+    // verified at its park rect and compositor-committed there. Only then may
+    // its cloak/owned region be released for DWM thumbnail capture.
+    let mut committed_preview_requests: Vec<_> = preview_requests
         .iter()
         .copied()
         .filter(|request| !failed_window_ids.contains(&request.window_id))
         .collect();
-
-    // The real source is now outside every monitor. Only now may it be
-    // uncloaked and its legacy HRGN removed. A new thumbnail is not published
-    // until DWM has committed that safe source landing.
     uncloak_preview_sources(&committed_preview_requests);
     for clip in region_clips {
-        if !failed_window_ids.contains(&clip.window_id) {
-            let _ = restore_window_region(clip.window_id, true);
+        if !failed_window_ids.contains(&clip.window_id)
+            && !restore_window_region(clip.window_id, true)
+        {
+            failed_window_ids.insert(clip.window_id);
         }
     }
-    if preview_commit_needs_flush(
-        animation_frame,
-        new_preview_count,
-        committed_preview_requests.len(),
-    ) {
-        unsafe {
-            let _ = DwmFlush();
-        }
+    committed_preview_requests.retain(|request| !failed_window_ids.contains(&request.window_id));
+    // Region/cloak release changes the source surface DWM captures. Commit that
+    // release too; otherwise the first thumbnail can sample the protected frame.
+    if !committed_preview_requests.is_empty() && unsafe { DwmFlush() }.is_err() {
+        failed_window_ids.extend(
+            committed_preview_requests
+                .iter()
+                .map(|request| request.window_id),
+        );
+        committed_preview_requests.clear();
     }
     let active_preview_count = commit_persistent_previews(
         &committed_preview_requests,
         !animation_frame || new_preview_count > 0,
-    );
+        config.preview_lifecycle_epoch,
+    )?;
 
     // If the source move failed, retain an older LeopardWM region rather than
     // exposing the full foreign HWND. No new SetWindowRgn state is created by
@@ -724,6 +765,7 @@ pub fn apply_placements_with_regions(
                     && (nudge_sticky_compositors || returned_from_park.contains(&e.window_id))
             })
             .map(|e| NudgeTarget {
+                window_id: e.window_id,
                 hwnd: e.hwnd,
                 x: e.x,
                 y: e.y,
@@ -731,7 +773,10 @@ pub fn apply_placements_with_regions(
                 h: e.h,
             })
             .collect();
-        nudge_sticky_compositor_windows(&nudge_targets);
+        for window_id in nudge_sticky_compositor_windows(&nudge_targets) {
+            latch_return_repair(window_id);
+            failed_window_ids.insert(window_id);
+        }
     }
 
     tracing::debug!(
@@ -742,6 +787,14 @@ pub fn apply_placements_with_regions(
         safe_fallbacks,
         offscreen_count,
     );
+
+    if !failed_window_ids.is_empty() {
+        let mut failed: Vec<_> = failed_window_ids.into_iter().collect();
+        failed.sort_unstable();
+        return Err(Win32Error::SetPositionFailed(format!(
+            "layout did not safely commit window(s): {failed:?}"
+        )));
+    }
 
     Ok(ApplyPlacementsResult {
         width_violations,
@@ -902,12 +955,14 @@ fn build_defer_entries(
     usize,
     u32,
     u32,
+    Vec<WindowId>,
 ) {
     let mut skipped = 0u32;
     let mut safe_fallbacks = 0u32;
     let mut entries: Vec<DeferEntry> = Vec::with_capacity(placements.len());
     let mut preview_requests = Vec::with_capacity(region_clips.len());
     let mut new_preview_count = 0usize;
+    let mut unsafe_hung_sensitive = Vec::new();
 
     for requested in placements {
         let region_clip = region_clips
@@ -947,6 +1002,7 @@ fn build_defer_entries(
         let had_preview = has_persistent_preview(requested.window_id);
         let was_cloaked = is_placement_cloaked(requested.window_id);
         let mut preview_source = false;
+        let mut preview_was_published = false;
         let mut placement = requested.clone();
         let mut preview_request = None;
         if let Some(clip) = region_clip {
@@ -958,6 +1014,7 @@ fn build_defer_entries(
                 preview_request =
                     persistent_preview_request(requested.window_id, target_outer, clip.clip_bounds);
                 let preview_existed = has_persistent_preview(requested.window_id);
+                preview_was_published = has_published_persistent_preview(requested.window_id);
                 if preview_request.is_some() && prepare_persistent_preview(requested.window_id) {
                     preview_source = true;
                     if !preview_existed {
@@ -999,15 +1056,24 @@ fn build_defer_entries(
             AnimationDispatchMode::Synchronous
         };
         if dispatch == AnimationDispatchMode::SkipHungSensitive {
-            skipped += 1;
-            // Skipping means "do not touch this HWND on this frame", not "give up
-            // its preview": the commit below treats an omitted request as an
-            // instruction to unregister, so an app that hangs for a moment would
-            // lose a thumbnail whose source is already parked and stays valid.
-            // Keep the request; it positions nothing by itself.
-            if let Some(request) = preview_request {
-                preview_requests.push(request);
+            // A skipped request may survive only when the worker cache proves
+            // this exact fallback is already applied and DWM has successfully
+            // published it before. A new registration is not a park receipt.
+            // Nor is SWP_ASYNCWINDOWPOS: success only means the request was queued
+            // to the hung owner, and foreign HWND cloaking commonly fails. Force
+            // the frame to fail so the daemon takes its bounded exact-landing
+            // path instead of caching false physical success.
+            let already_safely_parked =
+                preview_was_published && previous == Some((placement.rect, placement.visibility));
+            if already_safely_parked {
+                skipped += 1;
+                if let Some(request) = preview_request {
+                    preview_requests.push(request);
+                }
+                continue;
             }
+            safe_fallbacks += 1;
+            unsafe_hung_sensitive.push(placement.window_id);
             continue;
         }
 
@@ -1090,6 +1156,7 @@ fn build_defer_entries(
         new_preview_count,
         skipped,
         safe_fallbacks,
+        unsafe_hung_sensitive,
     )
 }
 
@@ -1128,14 +1195,23 @@ fn should_cloak_entry(
 }
 
 /// Uncloak entries becoming visible and drop them from the tracking set.
-fn uncloak_becoming_visible(entries: &[DeferEntry]) {
+fn uncloak_becoming_visible(entries: &[DeferEntry], failed_window_ids: &HashSet<WindowId>) {
+    for entry in entries.iter().filter(|entry| {
+        entry.visibility == Visibility::Visible && !failed_window_ids.contains(&entry.window_id)
+    }) {
+        crate::visibility::clear_move_offscreen_marker(entry.window_id);
+    }
     let _commit = lock_cloak_commit();
     let to_consider: Vec<WindowId> = {
         let mut cloaked = lock_cloaked();
         if let Some(ref mut set) = *cloaked {
             entries
                 .iter()
-                .filter(|e| e.visibility == Visibility::Visible && set.remove(&e.window_id))
+                .filter(|e| {
+                    e.visibility == Visibility::Visible
+                        && !failed_window_ids.contains(&e.window_id)
+                        && set.remove(&e.window_id)
+                })
                 .map(|e| e.window_id)
                 .collect()
         } else {
@@ -1246,6 +1322,72 @@ fn position_entries(entries: &[DeferEntry]) -> (u32, HashSet<u64>) {
     }
 
     (applied, failed_window_ids)
+}
+
+/// Confirm that a preview source actually honored the off-monitor park request.
+/// `SetWindowPos` success only means Windows accepted the request; applications
+/// can synchronously constrain or undo it. Publishing before this check exposes
+/// both the real crossing HWND and its thumbnail.
+fn verify_preview_source_landings(
+    entries: &[DeferEntry],
+    failed_window_ids: &mut HashSet<WindowId>,
+) {
+    for entry in entries {
+        if !entry.preview_source || failed_window_ids.contains(&entry.window_id) {
+            continue;
+        }
+        let mut actual = RECT::default();
+        let landed = unsafe { GetWindowRect(entry.hwnd, &mut actual) }.is_ok()
+            && (actual.left - entry.x).abs() <= EDGE_EPSILON_PX
+            && (actual.top - entry.y).abs() <= EDGE_EPSILON_PX
+            && (actual.right - entry.x.saturating_add(entry.w)).abs() <= EDGE_EPSILON_PX
+            && (actual.bottom - entry.y.saturating_add(entry.h)).abs() <= EDGE_EPSILON_PX;
+        if landed {
+            continue;
+        }
+
+        // An application-enforced minimum size can accept top/left while its
+        // right/bottom still reaches a monitor. Preserve the actual size and use
+        // the global sentinel as a final physical fallback; unlike above/left
+        // adjacency this remains clear even when the frame is larger than asked.
+        let emergency_flags = SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE;
+        let emergency_moved = unsafe {
+            SetWindowPos(
+                entry.hwnd,
+                None,
+                crate::MOVE_OFFSCREEN_SENTINEL_COORD,
+                crate::MOVE_OFFSCREEN_SENTINEL_COORD,
+                0,
+                0,
+                emergency_flags,
+            )
+        }
+        .is_ok();
+        let mut emergency = RECT::default();
+        let emergency_rect_available =
+            emergency_moved && unsafe { GetWindowRect(entry.hwnd, &mut emergency) }.is_ok();
+        let emergency_rect = Rect::new(
+            emergency.left,
+            emergency.top,
+            emergency.right.saturating_sub(emergency.left),
+            emergency.bottom.saturating_sub(emergency.top),
+        );
+        // Win32 clamps very large negative coordinates to its signed virtual
+        // coordinate floor (commonly -32768), so equality with the requested
+        // -100000 sentinel is not a valid receipt. The safety property is the
+        // complete actual rectangle clearing every current monitor.
+        let emergency_landed = emergency_rect_available
+            && emergency_rect.width > 0
+            && emergency_rect.height > 0
+            && crate::enumerate_monitors().is_ok_and(|monitors| {
+                monitors
+                    .iter()
+                    .all(|monitor| !emergency_rect.intersects(&monitor.rect))
+            });
+        if !emergency_landed {
+            failed_window_ids.insert(entry.window_id);
+        }
+    }
 }
 
 /// Per-window suspect state for the size-violation two-pass confirmation:
@@ -1528,6 +1670,12 @@ fn sync_cloak_state(
         let cloaked = guard.get_or_insert_with(HashSet::new);
         for entry in entries {
             if failed_window_ids.contains(&entry.window_id) {
+                // A preview source whose park failed must remain protected. DWM
+                // cloak is best-effort for foreign HWNDs, but retaining logical
+                // ownership prevents a later path from eagerly uncloaking it.
+                if entry.preview_source && cloaked.insert(entry.window_id) {
+                    changed.push(entry.window_id);
+                }
                 continue;
             }
             let placement_exists = placements
@@ -1585,6 +1733,7 @@ fn window_class_name(hwnd: HWND) -> String {
 
 /// Position data passed to the nudge helper.
 struct NudgeTarget {
+    window_id: WindowId,
     hwnd: HWND,
     x: i32,
     y: i32,
@@ -1596,8 +1745,9 @@ struct NudgeTarget {
 /// compositor-sensitive window. The final restore also forces non-client
 /// recalculation, then one DwmFlush publishes the repaired surfaces before the
 /// landing is considered complete.
-fn nudge_sticky_compositor_windows(targets: &[NudgeTarget]) {
-    let mut repaired_any = false;
+fn nudge_sticky_compositor_windows(targets: &[NudgeTarget]) -> Vec<WindowId> {
+    let mut repaired = Vec::new();
+    let mut failed = Vec::new();
     for t in targets {
         unsafe {
             if !IsWindow(Some(t.hwnd)).as_bool() {
@@ -1611,6 +1761,7 @@ fn nudge_sticky_compositor_windows(targets: &[NudgeTarget]) {
         let flags = SWP_NOZORDER | SWP_NOACTIVATE;
         unsafe {
             if SetWindowPos(t.hwnd, None, t.x, t.y, t.w - 1, t.h, flags).is_err() {
+                failed.push(t.window_id);
                 continue;
             }
             // Re-validate the HWND between the pair: the first SetWindowPos
@@ -1635,21 +1786,23 @@ fn nudge_sticky_compositor_windows(targets: &[NudgeTarget]) {
                     "Nudge restore SetWindowPos failed for hwnd={:?} class={} — window left at w-1 until next apply: {:?}",
                     t.hwnd, class, e
                 );
+                failed.push(t.window_id);
                 continue;
             }
         }
-        repaired_any = true;
+        repaired.push(t.window_id);
         tracing::debug!(
             "Refreshed compositor-sensitive window (class={}, hwnd={:?})",
             class,
             t.hwnd
         );
     }
-    if repaired_any {
-        unsafe {
-            let _ = DwmFlush();
-        }
+    if !repaired.is_empty() && unsafe { DwmFlush() }.is_err() {
+        failed.extend(repaired);
     }
+    failed.sort_unstable();
+    failed.dedup();
+    failed
 }
 
 type InsetMap = HashMap<WindowId, (i32, i32, i32, i32)>;

@@ -16,6 +16,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU8, Ordering},
     mpsc, Arc, Mutex,
 };
+use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, info};
 use tray_icon::{
@@ -209,10 +210,20 @@ pub struct TrayManager {
     msg_thread_id: u32,
     /// Join handle for the message-loop thread.
     msg_thread: Option<std::thread::JoinHandle<()>>,
+    event_threads_cancelled: Arc<AtomicBool>,
+    menu_event_thread: Option<std::thread::JoinHandle<()>>,
+    icon_event_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 /// Init handshake sent from the message-loop thread back to the caller.
 type InitResult = Result<u32, TrayError>;
+
+fn stop_tray_message_thread(thread_id: u32, thread: std::thread::JoinHandle<()>) {
+    unsafe {
+        win32_msg::PostThreadMessageW(thread_id, win32_msg::WM_QUIT, 0, 0);
+    }
+    let _ = thread.join();
+}
 
 impl TrayManager {
     /// Create a new tray manager with icon and context menu.
@@ -250,41 +261,71 @@ impl TrayManager {
             .recv()
             .map_err(|_| TrayError::Build("Tray thread exited during init".into()))??;
 
-        // Spawn thread to listen for menu events and forward them.
+        // Spawn cancellable listeners for process-global tray event streams.
+        // Polling is intentional: these receivers have no close operation.
+        let event_threads_cancelled = Arc::new(AtomicBool::new(false));
         let menu_sender = event_sender.clone();
-        std::thread::Builder::new()
+        let menu_cancelled = event_threads_cancelled.clone();
+        let menu_event_thread = match std::thread::Builder::new()
             .name("tray-menu-events".into())
             .spawn(move || {
                 let rx = MenuEvent::receiver();
-                while let Ok(event) = rx.recv() {
-                    let Some(tray_event) = map_menu_id_to_event(event.id.0.as_str()) else {
-                        debug!("Unknown menu item clicked: {}", event.id.0);
-                        continue;
-                    };
-                    if menu_sender.send(tray_event).is_err() {
-                        break;
+                while !menu_cancelled.load(Ordering::Acquire) {
+                    match rx.try_recv() {
+                        Ok(event) => {
+                            let Some(tray_event) = map_menu_id_to_event(event.id.0.as_str()) else {
+                                debug!("Unknown menu item clicked: {}", event.id.0);
+                                continue;
+                            };
+                            if menu_sender.send(tray_event).is_err() {
+                                break;
+                            }
+                        }
+                        Err(_) => std::thread::sleep(Duration::from_millis(25)),
                     }
                 }
-            })
-            .ok();
+            }) {
+            Ok(handle) => handle,
+            Err(error) => {
+                stop_tray_message_thread(thread_id, thread);
+                return Err(TrayError::Build(format!(
+                    "Failed to spawn tray menu listener: {error}"
+                )));
+            }
+        };
 
         // Spawn thread for tray-icon clicks: double-click opens Settings
         // (single/right click keep showing the context menu).
         // TrayIconEvent::receiver() is one process-global stream; this must
         // stay the only consumer or readers would compete for events.
-        std::thread::Builder::new()
+        let icon_cancelled = event_threads_cancelled.clone();
+        let icon_event_thread = match std::thread::Builder::new()
             .name("tray-icon-events".into())
             .spawn(move || {
                 let rx = tray_icon::TrayIconEvent::receiver();
-                while let Ok(event) = rx.recv() {
-                    if matches!(event, tray_icon::TrayIconEvent::DoubleClick { .. })
-                        && event_sender.send(TrayEvent::OpenConfig).is_err()
-                    {
-                        break;
+                while !icon_cancelled.load(Ordering::Acquire) {
+                    match rx.try_recv() {
+                        Ok(event) => {
+                            if matches!(event, tray_icon::TrayIconEvent::DoubleClick { .. })
+                                && event_sender.send(TrayEvent::OpenConfig).is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(_) => std::thread::sleep(Duration::from_millis(25)),
                     }
                 }
-            })
-            .ok();
+            }) {
+            Ok(handle) => handle,
+            Err(error) => {
+                event_threads_cancelled.store(true, Ordering::Release);
+                let _ = menu_event_thread.join();
+                stop_tray_message_thread(thread_id, thread);
+                return Err(TrayError::Build(format!(
+                    "Failed to spawn tray icon listener: {error}"
+                )));
+            }
+        };
 
         info!("System tray icon created");
 
@@ -292,6 +333,9 @@ impl TrayManager {
             shared,
             msg_thread_id: thread_id,
             msg_thread: Some(thread),
+            event_threads_cancelled,
+            menu_event_thread: Some(menu_event_thread),
+            icon_event_thread: Some(icon_event_thread),
         })
     }
 
@@ -397,6 +441,13 @@ impl TrayManager {
 
 impl Drop for TrayManager {
     fn drop(&mut self) {
+        self.event_threads_cancelled.store(true, Ordering::Release);
+        if let Some(handle) = self.menu_event_thread.take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.icon_event_thread.take() {
+            let _ = handle.join();
+        }
         // Signal the message loop to exit. WM_QUIT causes GetMessageW to return 0,
         // which breaks the loop and lets TrayIcon drop on its creating thread.
         unsafe {

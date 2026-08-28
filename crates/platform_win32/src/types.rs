@@ -96,6 +96,9 @@ pub enum AnimationPlacementPolicy {
 #[derive(Debug, Clone, Default)]
 pub struct PlatformConfig {
     pub animation_placement_policy: AnimationPlacementPolicy,
+    /// Preview lifecycle captured when this placement intent was planned. Zero
+    /// lets standalone callers bind to the current epoch at entry.
+    pub preview_lifecycle_epoch: u64,
 }
 
 #[cfg(test)]
@@ -109,6 +112,7 @@ mod tests {
             config.animation_placement_policy,
             AnimationPlacementPolicy::AdaptiveCompositorSafe
         );
+        assert_eq!(config.preview_lifecycle_epoch, 0);
     }
 
     #[test]

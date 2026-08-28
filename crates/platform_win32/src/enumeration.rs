@@ -9,6 +9,8 @@ use crate::event_hooks::{
 use crate::types::{MonitorId, MonitorInfo, Win32Error, WindowInfo};
 use leopardwm_core_layout::{Rect, WindowId};
 use std::ffi::c_void;
+#[cfg(feature = "integration-probes")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use windows::core::BOOL;
 use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, RECT, TRUE};
 use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
@@ -165,6 +167,25 @@ pub fn enumerate_windows() -> Result<Vec<WindowInfo>, Win32Error> {
     Ok(windows)
 }
 
+/// Raw visible top-level windows that may own pixels over an edge preview.
+/// Unlike `enumerate_windows`, this intentionally retains owned dialogs, tool
+/// windows, no-activate palettes, empty-title windows, and higher-integrity UI.
+pub fn enumerate_visible_top_level_occluders() -> Result<Vec<WindowInfo>, Win32Error> {
+    let mut context = OccluderEnumerationContext::default();
+    let result = unsafe {
+        EnumWindows(
+            Some(enum_occluder_windows_callback),
+            LPARAM((&mut context as *mut OccluderEnumerationContext) as isize),
+        )
+    };
+    if result.is_err() || context.incomplete {
+        return Err(Win32Error::EnumerationFailed(
+            "raw top-level occluder enumeration was incomplete".into(),
+        ));
+    }
+    Ok(context.windows)
+}
+
 /// Get the primary monitor's information.
 ///
 /// Returns the work area (excluding taskbar) which is suitable for window positioning.
@@ -264,30 +285,40 @@ pub fn monitor_below(monitors: &[MonitorInfo], current_id: MonitorId) -> Option<
         })
 }
 
+#[cfg(feature = "integration-probes")]
+static FORCE_ONE_MONITOR_INFO_FAILURE: AtomicBool = AtomicBool::new(false);
+
+#[cfg(feature = "integration-probes")]
+pub fn integration_probe_incomplete_monitor_snapshot_fails_closed() -> bool {
+    FORCE_ONE_MONITOR_INFO_FAILURE.store(true, Ordering::Release);
+    let rejected = enumerate_monitors().is_err();
+    FORCE_ONE_MONITOR_INFO_FAILURE.store(false, Ordering::Release);
+    rejected
+}
+
 /// Enumerate all connected monitors.
 ///
 /// Returns information about each display including work area (usable space
 /// excluding taskbar and docked windows).
 pub fn enumerate_monitors() -> Result<Vec<MonitorInfo>, Win32Error> {
-    let mut monitors: Vec<MonitorInfo> = Vec::new();
+    let mut context = MonitorEnumerationContext::default();
 
     unsafe {
-        let monitors_ptr = &mut monitors as *mut Vec<MonitorInfo>;
-
         let result = EnumDisplayMonitors(
             None, // HDC - None to enumerate all monitors
             None, // lprcClip - None to not clip
             Some(enum_monitors_callback),
-            LPARAM(monitors_ptr as isize),
+            LPARAM((&mut context as *mut MonitorEnumerationContext) as isize),
         );
 
-        if !result.as_bool() {
+        if !result.as_bool() || context.incomplete {
             return Err(Win32Error::MonitorEnumerationFailed(
-                "EnumDisplayMonitors failed".to_string(),
+                "EnumDisplayMonitors returned an incomplete snapshot".to_string(),
             ));
         }
     }
 
+    let monitors = context.monitors;
     if monitors.is_empty() {
         return Err(Win32Error::MonitorEnumerationFailed(
             "No monitors found".to_string(),
@@ -298,6 +329,12 @@ pub fn enumerate_monitors() -> Result<Vec<MonitorInfo>, Win32Error> {
     Ok(monitors)
 }
 
+#[derive(Default)]
+struct MonitorEnumerationContext {
+    monitors: Vec<MonitorInfo>,
+    incomplete: bool,
+}
+
 /// Callback for EnumDisplayMonitors that collects monitor info.
 unsafe extern "system" fn enum_monitors_callback(
     hmonitor: HMONITOR,
@@ -305,7 +342,12 @@ unsafe extern "system" fn enum_monitors_callback(
     _lprc_clip: *mut RECT,
     lparam: LPARAM,
 ) -> BOOL {
-    let monitors = &mut *(lparam.0 as *mut Vec<MonitorInfo>);
+    let context = &mut *(lparam.0 as *mut MonitorEnumerationContext);
+    #[cfg(feature = "integration-probes")]
+    if FORCE_ONE_MONITOR_INFO_FAILURE.swap(false, Ordering::AcqRel) {
+        context.incomplete = true;
+        return TRUE;
+    }
 
     // Initialize MONITORINFOEXW with correct size
     let mut info = MONITORINFOEXW::default();
@@ -339,7 +381,7 @@ unsafe extern "system" fn enum_monitors_callback(
             }
         };
 
-        monitors.push(MonitorInfo {
+        context.monitors.push(MonitorInfo {
             id: hmonitor.0 as MonitorId,
             rect: Rect::new(
                 mon_rect.left,
@@ -361,9 +403,88 @@ unsafe extern "system" fn enum_monitors_callback(
 
         TRUE
     } else {
-        // Continue enumeration even if one monitor fails
+        context.incomplete = true;
         TRUE
     }
+}
+
+#[derive(Default)]
+struct OccluderEnumerationContext {
+    windows: Vec<WindowInfo>,
+    incomplete: bool,
+}
+
+fn is_owned_leopardwm_surface(class_name: &str, process_id: u32) -> bool {
+    process_id == std::process::id()
+        && matches!(
+            class_name,
+            "LeopardWMSettings"
+                | "LeopardWMBorderFrame"
+                | "LeopardWMInlineRename"
+                | "LeopardWMRenameTooltip"
+                | "LeopardWMSysEventClass"
+                | "LeopardWMOverlayClass"
+                | "LeopardWMOverviewMask"
+                | "LeopardWMOverview"
+                | "LeopardWMPreviewClickTarget"
+                | "LeopardWMTabStrip"
+                | "LeopardWMTabTooltip"
+                | "LeopardWMThumbnailHost"
+        )
+}
+
+unsafe extern "system" fn enum_occluder_windows_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() || is_window_cloaked(hwnd) {
+        return TRUE;
+    }
+    let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
+    if style & WS_VISIBLE.0 == 0 {
+        return TRUE;
+    }
+    let mut class_buf = [0u16; 256];
+    let class_len = GetClassNameW(hwnd, &mut class_buf);
+    let class_name = if class_len > 0 {
+        String::from_utf16_lossy(&class_buf[..class_len as usize])
+    } else {
+        String::new()
+    };
+    let mut process_id = 0u32;
+    GetWindowThreadProcessId(hwnd, Some(&mut process_id));
+    // Wallpaper/desktop hosts cover the virtual screen but do not own pixels
+    // above application windows. Ignore our own exact classes only when the
+    // HWND belongs to this process; foreign processes can register any prefix.
+    if is_owned_leopardwm_surface(&class_name, process_id)
+        || matches!(
+            class_name.as_str(),
+            "Progman" | "WorkerW" | "SHELLDLL_DefView"
+        )
+    {
+        return TRUE;
+    }
+    let context = &mut *(lparam.0 as *mut OccluderEnumerationContext);
+    let mut win_rect = RECT::default();
+    if GetWindowRect(hwnd, &mut win_rect).is_err() {
+        context.incomplete = true;
+        return TRUE;
+    }
+    let rect = Rect::new(
+        win_rect.left,
+        win_rect.top,
+        win_rect.right - win_rect.left,
+        win_rect.bottom - win_rect.top,
+    );
+    if rect.width <= 0 || rect.height <= 0 {
+        return TRUE;
+    }
+    context.windows.push(WindowInfo {
+        hwnd: hwnd.0 as WindowId,
+        title: String::new(),
+        class_name,
+        process_id,
+        rect,
+        visible: true,
+    });
+    TRUE
 }
 
 /// Callback for EnumWindows that filters and collects window info.
@@ -774,36 +895,49 @@ mod tests {
     #[test]
     #[ignore = "Requires display hardware - run with: cargo test -- --ignored"]
     fn test_enumerate_monitors() {
-        let result = enumerate_monitors();
-        if let Ok(monitors) = result {
-            assert!(!monitors.is_empty(), "At least one monitor should exist");
-            for monitor in &monitors {
-                assert!(monitor.rect.width > 0, "Monitor width should be positive");
-                assert!(monitor.rect.height > 0, "Monitor height should be positive");
-                assert!(
-                    monitor.work_area.width > 0,
-                    "Work area width should be positive"
-                );
-                assert!(
-                    monitor.work_area.height > 0,
-                    "Work area height should be positive"
-                );
-            }
+        let monitors = enumerate_monitors().expect("monitor enumeration must succeed");
+        assert!(!monitors.is_empty(), "At least one monitor should exist");
+        for monitor in &monitors {
+            assert!(monitor.rect.width > 0, "Monitor width should be positive");
+            assert!(monitor.rect.height > 0, "Monitor height should be positive");
+            assert!(
+                monitor.work_area.width > 0,
+                "Work area width should be positive"
+            );
+            assert!(
+                monitor.work_area.height > 0,
+                "Work area height should be positive"
+            );
         }
     }
 
     #[test]
     #[ignore = "Requires display hardware - run with: cargo test -- --ignored"]
     fn test_get_primary_monitor() {
-        let result = get_primary_monitor();
-        if let Ok(primary) = result {
-            assert!(
-                primary.is_primary,
-                "Primary monitor should be marked as primary"
-            );
-            assert!(primary.rect.width > 0);
-            assert!(primary.work_area.width > 0);
-        }
+        let primary = get_primary_monitor().expect("primary monitor lookup must succeed");
+        assert!(
+            primary.is_primary,
+            "Primary monitor should be marked as primary"
+        );
+        assert!(primary.rect.width > 0);
+        assert!(primary.work_area.width > 0);
+    }
+
+    #[test]
+    fn only_exact_same_process_leopardwm_classes_are_owned() {
+        let own_pid = std::process::id();
+        assert!(is_owned_leopardwm_surface(
+            "LeopardWMThumbnailHost",
+            own_pid
+        ));
+        assert!(!is_owned_leopardwm_surface(
+            "LeopardWMThumbnailHost",
+            own_pid.wrapping_add(1)
+        ));
+        assert!(!is_owned_leopardwm_surface(
+            "LeopardWMEvilForeignOverlay",
+            own_pid
+        ));
     }
 
     #[test]

@@ -50,10 +50,13 @@ pub use mouse_hook::*;
 
 // Re-export public API from submodules
 pub use elevation::{manage_block, window_manage_block, ManageBlock};
+#[cfg(feature = "integration-probes")]
+pub use enumeration::integration_probe_incomplete_monitor_snapshot_fails_closed;
 pub use enumeration::{
-    enumerate_monitors, enumerate_windows, find_monitor_by_id, find_monitor_for_rect,
-    get_primary_monitor, get_process_executable, get_window_info, is_excluded_tool_window_hwnd,
-    monitor_above, monitor_below, monitor_to_left, monitor_to_right, monitors_by_position,
+    enumerate_monitors, enumerate_visible_top_level_occluders, enumerate_windows,
+    find_monitor_by_id, find_monitor_for_rect, get_primary_monitor, get_process_executable,
+    get_window_info, is_excluded_tool_window_hwnd, monitor_above, monitor_below, monitor_to_left,
+    monitor_to_right, monitors_by_position,
 };
 pub use event_hooks::{install_event_hooks, EventHookHandle, WindowEvent};
 pub use focus::{

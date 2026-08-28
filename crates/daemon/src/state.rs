@@ -211,6 +211,9 @@ pub(crate) struct LayoutTransition {
     /// These windows are included in animation frames alongside entering windows.
     /// When the transition completes, they are moved offscreen.
     pub(crate) exit_rects: HashMap<u64, Rect>,
+    /// Preserve whether an exit was tiled or floating. `usize::MAX` is the
+    /// floating sentinel used by WindowPlacement; other values are tiled.
+    pub(crate) exit_column_indices: HashMap<u64, usize>,
     /// Elapsed time in milliseconds.
     pub(crate) elapsed_ms: u64,
     /// Total duration in milliseconds.
@@ -228,39 +231,43 @@ pub(crate) struct LayoutTransition {
     /// post-landing crossfade. `partition_for_animation` uses this set to
     /// split frame placements into live + ghost streams.
     pub(crate) ghosted_wids: HashSet<u64>,
+    /// Consecutive completed-frame attempts that could not park a live exit.
+    pub(crate) exit_park_failures: u32,
 }
 
-/// Owns a registered DWM thumbnail handle for a single window across a
-/// ghost-animated layout transition. Dropping the entry unregisters the
-/// thumbnail via the platform-layer `unregister_raw` helper, so removal
-/// from `AppState.ghost_handles` (or `AppState::drop`-like cleanup) is
-/// always leak-free.
-///
-/// At landing, the handle is transferred to the animation worker via
-/// `take_isize` for the crossfade phase. After that point the entry is
-/// gone from `ghost_handles` and worker-owned `CrossfadeEntry` values
-/// own the registration until fade-complete.
-pub(crate) struct GhostEntry {
-    /// Raw `HTHUMBNAIL` value. `0` after `take_isize` consumes it, so
-    /// Drop becomes a no-op.
+/// Shared ownership of one DWM ghost registration. Frame requests clone this
+/// object, so clearing AppState cannot unregister a handle while the animation
+/// worker still has a queued update for it.
+pub(crate) struct GhostRegistration {
     handle_isize: isize,
-    /// Class name captured at registration. Used as an HWND-recycling
-    /// guard at landing — if `GetClassNameW(hwnd)` no longer matches,
-    /// the source has died and we drop the entry without uncloaking
-    /// (we don't know what HWND we'd be uncloaking).
-    pub(crate) class_at_register: String,
-    /// Final on-screen rect (host-client coordinates) where the
-    /// thumbnail will rest during the post-landing crossfade.
-    #[allow(dead_code)] // Consumed in the crossfade phase.
-    pub(crate) final_dest_client_rect: Rect,
 }
 
-impl Drop for GhostEntry {
+impl GhostRegistration {
+    pub(crate) fn handle(&self) -> isize {
+        self.handle_isize
+    }
+}
+
+impl Drop for GhostRegistration {
     fn drop(&mut self) {
         if self.handle_isize != 0 {
             leopardwm_platform_win32::thumbnail::unregister_raw(self.handle_isize);
         }
     }
+}
+
+/// Owns a shared DWM registration plus source-incarnation metadata across a
+/// ghost-animated layout transition.
+pub(crate) struct GhostEntry {
+    registration: std::sync::Arc<GhostRegistration>,
+    /// Class name captured at registration. Used as an HWND-recycling
+    /// guard at landing — if `GetClassNameW(hwnd)` no longer matches,
+    /// the source has died and we drop the entry without uncloaking.
+    pub(crate) class_at_register: String,
+    /// Final on-screen rect (host-client coordinates) where the
+    /// thumbnail will rest during the post-landing crossfade.
+    #[allow(dead_code)]
+    pub(crate) final_dest_client_rect: Rect,
 }
 
 impl GhostEntry {
@@ -270,28 +277,19 @@ impl GhostEntry {
         final_dest_client_rect: Rect,
     ) -> Self {
         Self {
-            handle_isize,
+            registration: std::sync::Arc::new(GhostRegistration { handle_isize }),
             class_at_register,
             final_dest_client_rect,
         }
     }
 
-    /// Raw handle for cross-thread updates from the animation worker.
-    /// Read-only access — does not transfer ownership.
-    pub(crate) fn handle(&self) -> isize {
-        self.handle_isize
+    pub(crate) fn shared_registration(&self) -> std::sync::Arc<GhostRegistration> {
+        self.registration.clone()
     }
 
-    /// Consume this entry without firing Drop, returning the raw handle.
-    /// Caller takes responsibility for eventual unregistration. Used at
-    /// landing to transfer ownership into `WorkerCommand::Crossfade`
-    /// entries owned by the worker thread.
-    #[allow(dead_code)] // Consumed in the crossfade phase.
-    pub(crate) fn take_isize(mut self) -> isize {
-        let raw = self.handle_isize;
-        self.handle_isize = 0;
-        std::mem::forget(self);
-        raw
+    #[allow(dead_code)]
+    pub(crate) fn into_shared_registration(self) -> std::sync::Arc<GhostRegistration> {
+        self.registration.clone()
     }
 }
 
@@ -433,6 +431,10 @@ pub(crate) struct AppState {
     /// Suppress MovedOrResized snap-backs while a display change is being debounced.
     /// Set on WM_DISPLAYCHANGE, cleared after the debounced handler runs.
     pub(crate) display_change_pending: bool,
+    /// Monotonic debounce token. A settled timer may only reconcile the raw
+    /// display generation that created it.
+    pub(crate) display_change_generation: u64,
+    pub(crate) display_change_retry_count: u32,
     /// Whether the pending debounced change needs the full topology/DPI
     /// reconcile (clearing stale min-size constraints, resizing the thumbnail
     /// host) vs a lightweight work-area-only refit. A real display change sets
@@ -786,6 +788,8 @@ impl AppState {
             applying_layout: false,
             reapplying_after_violation: false,
             display_change_pending: false,
+            display_change_generation: 0,
+            display_change_retry_count: 0,
             display_change_needs_full: false,
             drag_state: None,
             resize_hwnd: None,
@@ -1205,12 +1209,19 @@ pub(crate) fn merged_cleanup_window_ids(
 pub(crate) fn preview_click_focus_target(
     state: &AppState,
     window_id: u64,
+    preferred_monitor: Option<MonitorId>,
 ) -> Option<(MonitorId, usize, usize)> {
     let mut monitor_ids: Vec<MonitorId> = state.workspaces.keys().copied().collect();
     monitor_ids.sort_unstable();
-    // Prefer the focused monitor: with mirrored or duplicated ids, the click the
-    // user made is the one on the output they were already working on.
-    monitor_ids.sort_by_key(|id| *id != state.focused_monitor);
+    // Physical preview geometry is authoritative when available. Focused monitor
+    // is only the compatibility fallback for callers/tests without a captured
+    // preview rectangle.
+    monitor_ids.sort_by_key(|id| {
+        (
+            preferred_monitor.is_none_or(|preferred| preferred != *id),
+            *id != state.focused_monitor,
+        )
+    });
     for monitor_id in monitor_ids {
         let active_idx = state.active_workspace_idx(monitor_id);
         let Some(workspace) = state

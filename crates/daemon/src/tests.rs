@@ -79,6 +79,39 @@ fn test_monitor_reconcile_invalidates_the_desired_rect_fast_path() {
 }
 
 #[test]
+fn test_animation_result_only_consumes_its_own_epoch_token() {
+    let mut tracked = Some(11);
+    let mut last = Some(std::time::Instant::now());
+    assert_eq!(
+        reconcile_animation_result_epoch(12, 11, &mut tracked, &mut last),
+        AnimationResultOwnership::StaleOwned
+    );
+    assert_eq!(tracked, None);
+    assert!(last.is_none());
+
+    tracked = Some(12);
+    last = Some(std::time::Instant::now());
+    assert_eq!(
+        reconcile_animation_result_epoch(12, 12, &mut tracked, &mut last),
+        AnimationResultOwnership::Current
+    );
+    assert_eq!(tracked, None);
+    assert!(last.is_some());
+
+    // A queued E result arriving after replacement N was dispatched must not
+    // clear N or alter its frame clock.
+    tracked = Some(13);
+    let replacement_clock = std::time::Instant::now();
+    last = Some(replacement_clock);
+    assert_eq!(
+        reconcile_animation_result_epoch(13, 11, &mut tracked, &mut last),
+        AnimationResultOwnership::Unowned
+    );
+    assert_eq!(tracked, Some(13));
+    assert_eq!(last, Some(replacement_clock));
+}
+
+#[test]
 fn test_preview_click_resolves_to_the_previewed_column() {
     let mut state = AppState::new_with_config(test_config(), two_monitors());
     state.paused = true;
@@ -94,20 +127,26 @@ fn test_preview_click_resolves_to_the_previewed_column() {
 
     // Monitor 1's active workspace owns 100: resolved as (monitor, column, window).
     assert_eq!(
-        crate::state::preview_click_focus_target(&state, 100),
+        crate::state::preview_click_focus_target(&state, 100, None),
         Some((1, 0, 0))
     );
     // 301 lives in an *inactive* workspace, so it can never be behind a preview.
     // Resolving it would switch workspaces without parking the visible ones,
     // which is exactly how a click used to scramble the layout.
-    assert_eq!(crate::state::preview_click_focus_target(&state, 301), None);
+    assert_eq!(
+        crate::state::preview_click_focus_target(&state, 301, None),
+        None
+    );
     // A preview whose source is gone must not move focus anywhere.
-    assert_eq!(crate::state::preview_click_focus_target(&state, 999), None);
+    assert_eq!(
+        crate::state::preview_click_focus_target(&state, 999, None),
+        None
+    );
 
     // Activating that workspace makes its stacked window addressable.
     state.active_workspace.insert(2, 1);
     assert_eq!(
-        crate::state::preview_click_focus_target(&state, 301),
+        crate::state::preview_click_focus_target(&state, 301, None),
         Some((2, 1, 1))
     );
 }
@@ -127,13 +166,19 @@ fn test_preview_click_prefers_the_focused_monitor_for_a_duplicate_id() {
 
     state.focused_monitor = 2;
     assert_eq!(
-        crate::state::preview_click_focus_target(&state, 100),
+        crate::state::preview_click_focus_target(&state, 100, None),
         Some((2, 0, 0))
     );
     state.focused_monitor = 1;
     assert_eq!(
-        crate::state::preview_click_focus_target(&state, 100),
+        crate::state::preview_click_focus_target(&state, 100, None),
         Some((1, 0, 0))
+    );
+    // Captured preview geometry beats current focus when a duplicated sticky id
+    // is physically shown on the other monitor.
+    assert_eq!(
+        crate::state::preview_click_focus_target(&state, 100, Some(2)),
+        Some((2, 0, 0))
     );
 }
 
@@ -397,11 +442,13 @@ fn test_compositor_safe_mode_snaps_unprotected_size_transition() {
     state.layout_transition = Some(LayoutTransition {
         start_rects: HashMap::from([(100, Rect::new(0, 0, 800, 600))]),
         exit_rects: HashMap::new(),
+        exit_column_indices: HashMap::new(),
         elapsed_ms: 16,
         duration_ms: 150,
         easing: leopardwm_core_layout::Easing::default(),
         requires_compositor_safe_snap: true,
         ghosted_wids: HashSet::new(),
+        exit_park_failures: 0,
     });
     state
         .last_placed_layout_rects
@@ -516,15 +563,17 @@ fn test_partition_for_animation_routes_ghosted_wids_to_ghost_stream() {
     let transition = LayoutTransition {
         start_rects: HashMap::new(),
         exit_rects: HashMap::new(),
+        exit_column_indices: HashMap::new(),
         elapsed_ms: 0,
         duration_ms: 150,
         easing: leopardwm_core_layout::Easing::default(),
         requires_compositor_safe_snap: false,
         ghosted_wids,
+        exit_park_failures: 0,
     };
 
-    // GhostEntry with handle_isize=0 has a no-op Drop, so it's safe to
-    // construct in tests without touching the DWM thumbnail API.
+    // A shared registration with handle 0 has a no-op Drop, so it is safe in
+    // tests without touching the DWM thumbnail API.
     let mut ghost_handles: HashMap<u64, GhostEntry> = HashMap::new();
     ghost_handles.insert(
         100,
@@ -557,7 +606,7 @@ fn test_partition_for_animation_routes_ghosted_wids_to_ghost_stream() {
     ];
 
     let (live, ghosts) =
-        AppState::partition_for_animation(placements, Some(&transition), &ghost_handles);
+        AppState::partition_for_animation(placements, Some(&transition), &ghost_handles, &[]);
 
     // 100 and 200 are ghosted; 300 stays live.
     assert_eq!(live.len(), 1, "non-ghosted placement should stay live");
@@ -567,9 +616,44 @@ fn test_partition_for_animation_routes_ghosted_wids_to_ghost_stream() {
         2,
         "two ghosted placements should produce ghost frames"
     );
-    // Worker only ever calls thumbnail::update with handle != 0; the test
-    // never does, so handle_isize == 0 here is fine.
-    assert!(ghosts.iter().all(|g| g.handle_isize == 0));
+    assert!(ghosts.iter().all(|ghost| ghost.registration.handle() == 0));
+    ghost_handles.clear();
+    assert!(
+        ghosts
+            .iter()
+            .all(|ghost| std::sync::Arc::strong_count(&ghost.registration) == 1),
+        "queued frames retain the registration after AppState aborts its ghost entries"
+    );
+}
+
+#[test]
+fn test_ghost_abort_retains_registrations_when_worker_fence_times_out() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.ghost_handles.insert(
+        100,
+        GhostEntry::new(0, "Test".into(), Rect::new(0, 0, 100, 100)),
+    );
+    let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let worker = animation_worker::AnimationWorkerHandle::spawn(
+        event_tx,
+        state.apply_worker_cancelled.clone(),
+        state.apply_epoch.clone(),
+    )
+    .unwrap();
+    state.animation_worker_control = Some(worker.control());
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    worker.send_test_block(release_rx);
+
+    state.abort_active_ghost_transition();
+    assert!(state.paused);
+    assert!(state.ghost_handles.contains_key(&100));
+
+    release_tx.send(()).unwrap();
+    assert!(worker.wait_for_barrier(Duration::from_secs(1)));
+    state.paused = false;
+    state.abort_active_ghost_transition();
+    assert!(state.ghost_handles.is_empty());
+    drop(worker);
 }
 
 #[test]
@@ -584,7 +668,7 @@ fn test_partition_for_animation_no_transition_keeps_everything_live() {
         column_index: 0,
     }];
 
-    let (live, ghosts) = AppState::partition_for_animation(placements, None, &HashMap::new());
+    let (live, ghosts) = AppState::partition_for_animation(placements, None, &HashMap::new(), &[]);
     assert_eq!(live.len(), 1);
     assert_eq!(ghosts.len(), 0);
 }
@@ -600,11 +684,13 @@ fn test_aborting_safe_ghost_transition_rearms_exact_landing() {
     state.layout_transition = Some(LayoutTransition {
         start_rects: HashMap::from([(42, Rect::new(0, 0, 800, 600))]),
         exit_rects: HashMap::new(),
+        exit_column_indices: HashMap::new(),
         elapsed_ms: 16,
         duration_ms: 150,
         easing: leopardwm_core_layout::Easing::default(),
         requires_compositor_safe_snap: false,
         ghosted_wids: HashSet::from([42]),
+        exit_park_failures: 0,
     });
     state.ghost_handles.insert(
         42,
@@ -697,11 +783,13 @@ fn test_partition_for_animation_missing_handle_drops_placement() {
     let transition = LayoutTransition {
         start_rects: HashMap::new(),
         exit_rects: HashMap::new(),
+        exit_column_indices: HashMap::new(),
         elapsed_ms: 0,
         duration_ms: 150,
         easing: leopardwm_core_layout::Easing::default(),
         requires_compositor_safe_snap: false,
         ghosted_wids,
+        exit_park_failures: 0,
     };
 
     let placements = vec![WindowPlacement {
@@ -712,7 +800,7 @@ fn test_partition_for_animation_missing_handle_drops_placement() {
     }];
 
     let (live, ghosts) =
-        AppState::partition_for_animation(placements, Some(&transition), &HashMap::new());
+        AppState::partition_for_animation(placements, Some(&transition), &HashMap::new(), &[]);
     assert_eq!(
         live.len(),
         0,
@@ -990,6 +1078,38 @@ fn test_state_snapshot_v0_1_14_backward_compat() {
 }
 
 #[test]
+fn test_preview_burst_services_animation_then_normal_lanes() {
+    let (_preview_tx, mut preview_rx) = mpsc::channel(1);
+    let (animation_tx, mut animation_rx) = mpsc::unbounded_channel();
+    let (event_tx, mut event_rx) = mpsc::channel(1);
+    animation_tx.send(DaemonEvent::HideSnapHint).unwrap();
+    event_tx.try_send(DaemonEvent::PersistStateNow).unwrap();
+    let mut burst = 8;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+
+    let first = runtime.block_on(receive_next_daemon_event(
+        &mut preview_rx,
+        &mut animation_rx,
+        &mut event_rx,
+        &mut burst,
+    ));
+    assert!(matches!(first, Some(DaemonEvent::HideSnapHint)));
+    assert_eq!(burst, 0);
+
+    burst = 8;
+    let second = runtime.block_on(receive_next_daemon_event(
+        &mut preview_rx,
+        &mut animation_rx,
+        &mut event_rx,
+        &mut burst,
+    ));
+    assert!(matches!(second, Some(DaemonEvent::PersistStateNow)));
+    assert_eq!(burst, 0);
+}
+
+#[test]
 fn test_spawn_forwarding_thread_forwards_events() {
     let (tx, rx) = std::sync::mpsc::channel::<u32>();
     let (async_tx, mut async_rx) = mpsc::channel::<DaemonEvent>(10);
@@ -1021,6 +1141,35 @@ fn test_spawn_forwarding_thread_stops_on_channel_close() {
     drop(tx); // Close sender immediately
               // Thread should exit when recv() returns Err
     handle.join().expect("Thread should exit cleanly");
+}
+
+#[test]
+fn test_forwarding_thread_explicit_stop_works_while_source_sender_is_alive() {
+    let (_source_tx, source_rx) = std::sync::mpsc::channel::<u32>();
+    let (async_tx, _async_rx) = mpsc::channel::<DaemonEvent>(1);
+    let mut handle = spawn_forwarding_thread("test-explicit-stop", source_rx, async_tx, |_| {
+        DaemonEvent::HideSnapHint
+    })
+    .unwrap();
+
+    assert!(handle.join_with_timeout(Duration::from_millis(500)));
+}
+
+#[test]
+fn test_forwarding_thread_stop_interrupts_full_destination_wait() {
+    let (source_tx, source_rx) = std::sync::mpsc::channel::<u32>();
+    let (async_tx, async_rx) = mpsc::channel::<DaemonEvent>(1);
+    async_tx.blocking_send(DaemonEvent::HideSnapHint).unwrap();
+    let mut handle = spawn_forwarding_thread("test-full-destination", source_rx, async_tx, |_| {
+        DaemonEvent::HideSnapHint
+    })
+    .unwrap();
+    source_tx.send(1).unwrap();
+    std::thread::sleep(Duration::from_millis(20));
+
+    handle.request_stop();
+    assert!(handle.join_with_timeout(Duration::from_millis(500)));
+    drop(async_rx);
 }
 
 #[ignore] // Depends on no daemon running; fails when daemon is active
@@ -3829,6 +3978,7 @@ fn test_hotkey_state_registered_count_default() {
     let hs = HotkeyState {
         handle: None,
         hook: None,
+        forwarder: None,
         mapping,
         requested_count: 2,
         registered_count: 1, // Simulate: only 1 of 2 installed in the hook
@@ -4257,17 +4407,21 @@ fn test_send_animation_frame_skips_after_apply_worker_cancelled() {
         .insert_window(100, Some(800))
         .unwrap();
 
-    let (event_tx, _event_rx) = tokio::sync::mpsc::channel(4);
+    let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
     let worker = animation_worker::AnimationWorkerHandle::spawn(
         event_tx,
         state.apply_worker_cancelled.clone(),
+        state.apply_epoch.clone(),
     )
     .expect("spawn animation worker");
 
     let sent = state
         .send_animation_frame(&worker)
         .expect("active send_animation_frame should not error");
-    assert!(sent, "active send_animation_frame should dispatch a frame");
+    assert!(
+        sent.is_some(),
+        "active send_animation_frame should dispatch a frame"
+    );
 
     state.begin_shutdown_or_revert();
     assert!(
@@ -4279,7 +4433,7 @@ fn test_send_animation_frame_skips_after_apply_worker_cancelled() {
         .send_animation_frame(&worker)
         .expect("cancelled send_animation_frame should not error");
     assert!(
-        !sent,
+        sent.is_none(),
         "cancelled send_animation_frame must not dispatch a frame that could re-park windows"
     );
     drop(worker);
@@ -4346,6 +4500,43 @@ fn test_apply_layout_timeout_late_worker_triggers_recovery_pass() {
         state.late_worker_recovery_count.load(Ordering::SeqCst),
         1,
         "cancelled late worker should trigger one final recovery pass"
+    );
+}
+
+#[test]
+fn test_slow_successful_apply_refreshes_moved_or_resized_suppression() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.paused = false;
+    state
+        .focused_workspace_mut()
+        .unwrap()
+        .insert_window(100, Some(800))
+        .unwrap();
+    state.injected_apply_placements_behavior = Some(TestApplyPlacementsBehavior::SleepAndSucceed(
+        MOVED_OR_RESIZED_SUPPRESSION_WINDOW + Duration::from_millis(50),
+    ));
+
+    state.apply_layout().expect("injected slow apply succeeds");
+    assert!(
+        state.should_suppress_moved_or_resized(100),
+        "suppression must start when physical landing completes"
+    );
+}
+
+#[test]
+fn test_move_size_start_releases_placement_event_suppression() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.paused = false;
+    state
+        .focused_workspace_mut()
+        .unwrap()
+        .insert_window(100, Some(800))
+        .unwrap();
+    state.arm_moved_or_resized_suppression([100]);
+    state.handle_window_event(WindowEvent::MoveSizeStart(100));
+    assert!(
+        !state.moved_or_resized_suppression.contains_key(&100),
+        "the OS move loop must immediately own subsequent location events"
     );
 }
 
@@ -4434,6 +4625,27 @@ fn test_sticky_compositor_focus_is_detected_for_safe_navigation() {
         make_test_window_info_with_class(100, "TestWindowClass"),
     );
     assert!(!state.focused_window_uses_sticky_compositor());
+}
+
+#[test]
+fn test_sticky_compositor_scroll_policy_is_shared_by_pointer_focus() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    let viewport_width = state.focused_viewport().width;
+    {
+        let workspace = state.focused_workspace_mut().unwrap();
+        workspace.insert_window(100, Some(1200)).unwrap();
+        workspace.insert_window(200, Some(1200)).unwrap();
+        workspace.focus_window(200).unwrap();
+        workspace.ensure_focused_visible_animated(viewport_width);
+        assert!(workspace.is_animating());
+    }
+    state.injected_window_info.insert(
+        200,
+        make_test_window_info_with_class(200, "MozillaWindowClass"),
+    );
+
+    assert!(state.settle_focused_compositor_scroll());
+    assert!(!state.focused_workspace().unwrap().is_animating());
 }
 
 #[test]

@@ -2,6 +2,67 @@
 
 All notable changes to LeopardWM will be documented in this file.
 
+## 0.2.6-sehoon.24-rc1
+
+### Fixes
+
+- **Monitor-edge previews now fail closed through their complete lifetime.** A
+  preview is armed only after its DWM pixels, host generation, input targets and
+  relative z-order are acknowledged for the same lifecycle epoch. Display
+  changes, host or input-pump restarts, stale retry producers and destroyed HWND
+  incarnations revoke that publication synchronously, so an old image cannot
+  leave a live click target behind. Retry workers are restartable after channel,
+  spawn or injected publication failures, and optional preview recovery can no
+  longer pause otherwise valid tiling.
+- **Preview pixels and input keep the same owner in the normal z-order band.** All
+  targets are raised first, the shared DWM host is inserted once behind the
+  bottommost target, and the complete chain is verified before hit testing is
+  enabled. Visible dialogs, tool windows, higher-integrity windows and foreign
+  windows whose classes merely resemble LeopardWM remain real occluders; any
+  incomplete monitor or window enumeration rejects the entire safety snapshot.
+  Floats and unmanaged pixel owners therefore stay above previews without making
+  the preview target disagree with the pixels underneath it.
+- **Off-monitor parking is verified against physical monitor geometry.** Windows
+  clamps very negative User32 coordinates to `-32768`, so success is no longer
+  inferred from equality with the requested sentinel. Every actual window edge
+  must clear every enumerated monitor; constrained windows retry an emergency
+  sentinel, while a total failure remains hidden, unpublished and unregistered.
+  `MoveOffScreen` records a per-HWND ownership marker only after verified
+  clearance and restores the original rectangle on rollback, cleanup or crash
+  recovery instead of mistaking an application's own negative coordinates for a
+  LeopardWM park.
+- **Animation cancellation can no longer race queued compositor work.** In-flight
+  ownership is tied to an exact epoch, worker results use a dedicated unbounded
+  lane, and transition/display fences drain queued work before parking or
+  releasing ownership. Queued ghost and crossfade frames retain shared DWM
+  registrations until their last consumer exits; replacing a ghost transition
+  also invalidates and drains the old frame before uncloaking or re-registering
+  the same source. Hung compositor-sensitive frames collapse through a verified
+  exact landing rather than treating asynchronous Win32 acceptance as success.
+- **Every long-lived Windows pump now has an explicit, bounded shutdown path.**
+  Hook forwarders use cancellable sends, every focus-follows-mouse generation is
+  retained and joined, tray/settings/update threads are stopped by their owning
+  thread, and dead preview pumps/classes are joined and unregistered before
+  replacement. A tab-strip context menu handles the custom quit message inside
+  its nested modal loop, preventing shutdown from hanging while a menu is open;
+  reopening Settings or About also preserves the existing live window.
+- **Placement and transition bookkeeping now follows physical completion.** Slow
+  placements refresh move/resize suppression only after verified landing, real
+  user move-start events release suppression immediately, failed foreground
+  transfer does not overwrite observed focus, and every pause, display,
+  workspace, drag and reanchor path uses the same epoch/barrier/park/release
+  ordering.
+
+### Improvements
+
+- **Real Win32/DWM lifecycle probes cover recovery before release.** The
+  feature-gated suite exercises host and input-pump death, multiple target
+  ordering, incomplete monitor snapshots, real DWM publication and
+  `WindowFromPoint`, routed `SendInput`, stale-epoch rejection, offscreen
+  restoration, retry-worker spawn failure, `WM_CLOSE`, registration balance and
+  modal-menu shutdown. CI compiles and lints these probes in addition to the
+  hermetic workspace suite.
+
 ## 0.2.6-sehoon.23
 
 ### Fixes

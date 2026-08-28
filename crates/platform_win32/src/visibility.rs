@@ -1,5 +1,6 @@
 //! Off-screen sentinel parking, restore/uncloak recovery, and window positioning.
 
+use crate::enumerate_monitors;
 use crate::enumeration::{collect_all_top_level_window_ids, get_primary_monitor};
 use crate::placement::apply_placements;
 use crate::types::{PlatformConfig, Win32Error};
@@ -8,19 +9,49 @@ use crate::MOVE_OFFSCREEN_SENTINEL_COORD;
 use crate::{combine_operation_failures, is_benign_side_effect_error, window_id_to_hwnd};
 use leopardwm_core_layout::{Rect, Visibility, WindowId, WindowPlacement};
 use std::ffi::c_void;
-use windows::Win32::Foundation::{HWND, RECT};
+use windows::core::w;
+use windows::Win32::Foundation::{HANDLE, HWND, RECT};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowRect, IsIconic, IsWindow, SetWindowPos, ShowWindow, HWND_TOP, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_RESTORE,
+    GetPropW, GetWindowRect, IsIconic, IsWindow, RemovePropW, SetPropW, SetWindowPos, ShowWindow,
+    HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_RESTORE,
 };
 
 // ============================================================================
 // Offscreen sentinel helpers
 // ============================================================================
 
-/// Check whether coordinates indicate MoveOffScreen sentinel placement.
+const MOVE_OFFSCREEN_OWNER_MAGIC: usize = 0x4c57_4d4f; // "LWMO"
+                                                       // User32 clamps -100000 to the signed virtual-coordinate floor on current
+                                                       // Windows builds. Keep legacy crash recovery able to recognize that landing.
+const EFFECTIVE_SENTINEL_THRESHOLD: i32 = -32_768;
+
+fn has_move_offscreen_marker(hwnd: HWND) -> bool {
+    unsafe { GetPropW(hwnd, w!("LeopardWM.MoveOffscreen.v1")) }.0 as usize
+        == MOVE_OFFSCREEN_OWNER_MAGIC
+}
+
+fn set_move_offscreen_marker(hwnd: HWND) -> bool {
+    unsafe {
+        SetPropW(
+            hwnd,
+            w!("LeopardWM.MoveOffscreen.v1"),
+            Some(HANDLE(MOVE_OFFSCREEN_OWNER_MAGIC as *mut c_void)),
+        )
+    }
+    .is_ok()
+}
+
+pub(crate) fn clear_move_offscreen_marker(window_id: WindowId) {
+    if let Ok(hwnd) = window_id_to_hwnd(window_id) {
+        unsafe {
+            let _ = RemovePropW(hwnd, w!("LeopardWM.MoveOffscreen.v1"));
+        }
+    }
+}
+
+/// Check whether coordinates indicate a requested or User32-clamped sentinel.
 pub fn is_move_offscreen_sentinel_position(x: i32, y: i32) -> bool {
-    x <= MOVE_OFFSCREEN_SENTINEL_COORD && y <= MOVE_OFFSCREEN_SENTINEL_COORD
+    x <= EFFECTIVE_SENTINEL_THRESHOLD && y <= EFFECTIVE_SENTINEL_THRESHOLD
 }
 
 /// Check whether a rectangle indicates MoveOffScreen sentinel placement.
@@ -32,8 +63,14 @@ pub fn is_move_offscreen_sentinel_rect(rect: &Rect) -> bool {
 /// Used by workspace switching to hide inactive workspace windows.
 pub fn move_window_offscreen(window_id: WindowId) -> Result<(), Win32Error> {
     let hwnd = window_id_to_hwnd(window_id)?;
+    let mut original = RECT::default();
+    unsafe { GetWindowRect(hwnd, &mut original) }.map_err(|error| {
+        Win32Error::SetPositionFailed(format!(
+            "Could not capture window {window_id} before offscreen move: {error}"
+        ))
+    })?;
     unsafe {
-        if let Err(e) = SetWindowPos(
+        SetWindowPos(
             hwnd,
             None,
             MOVE_OFFSCREEN_SENTINEL_COORD,
@@ -41,16 +78,53 @@ pub fn move_window_offscreen(window_id: WindowId) -> Result<(), Win32Error> {
             0,
             0,
             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-        ) {
-            return Err(Win32Error::SetPositionFailed(format!(
-                "Failed to move window {} offscreen: {}",
-                window_id, e
-            )));
-        }
+        )
+    }
+    .map_err(|error| {
+        Win32Error::SetPositionFailed(format!(
+            "Failed to move window {window_id} offscreen: {error}"
+        ))
+    })?;
+
+    let mut actual = RECT::default();
+    unsafe { GetWindowRect(hwnd, &mut actual) }.map_err(|error| {
+        Win32Error::SetPositionFailed(format!(
+            "Could not verify window {window_id} offscreen: {error}"
+        ))
+    })?;
+    let actual = Rect::new(
+        actual.left,
+        actual.top,
+        actual.right.saturating_sub(actual.left),
+        actual.bottom.saturating_sub(actual.top),
+    );
+    let clears_every_monitor = actual.width > 0
+        && actual.height > 0
+        && enumerate_monitors().is_ok_and(|monitors| {
+            monitors
+                .iter()
+                .all(|monitor| !actual.intersects(&monitor.rect))
+        });
+    if !clears_every_monitor || !set_move_offscreen_marker(hwnd) {
+        // Without both physical proof and a crash-surviving ownership marker,
+        // retaining transition ownership is safer than claiming the park.
+        let _ = unsafe {
+            SetWindowPos(
+                hwnd,
+                None,
+                original.left,
+                original.top,
+                original.right.saturating_sub(original.left).max(1),
+                original.bottom.saturating_sub(original.top).max(1),
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+        };
+        return Err(Win32Error::SetPositionFailed(format!(
+            "window {window_id} did not accept a verifiable offscreen park"
+        )));
     }
     // Release a monitor-overflow clip only after the window has reached the
-    // sentinel. Clearing it first would expose the clipped overflow at the old
-    // boundary-crossing position, and a failed move keeps the window protected.
+    // sentinel and carries a recovery marker.
     let _ = crate::window_region::restore_window_region(window_id, false);
     Ok(())
 }
@@ -86,6 +160,7 @@ pub fn position_window(window_id: WindowId, rect: Rect) -> Result<(), Win32Error
             Win32Error::SetPositionFailed(format!("Failed to position window {}: {}", window_id, e))
         })?;
     }
+    clear_move_offscreen_marker(window_id);
     Ok(())
 }
 
@@ -158,7 +233,7 @@ fn restore_window_if_offscreen_to_work_area(
             current_rect.bottom - current_rect.top,
         );
 
-        if !is_move_offscreen_sentinel_rect(&current_rect) {
+        if !has_move_offscreen_marker(hwnd) && !is_move_offscreen_sentinel_rect(&current_rect) {
             return Ok(false);
         }
 
@@ -181,6 +256,7 @@ fn restore_window_if_offscreen_to_work_area(
                 window_id, e
             )));
         }
+        let _ = RemovePropW(hwnd, w!("LeopardWM.MoveOffscreen.v1"));
     }
 
     Ok(true)
@@ -466,17 +542,18 @@ mod tests {
             MOVE_OFFSCREEN_SENTINEL_COORD,
             MOVE_OFFSCREEN_SENTINEL_COORD
         ));
+        assert!(is_move_offscreen_sentinel_position(-32_768, -32_768));
         assert!(is_move_offscreen_sentinel_position(
-            MOVE_OFFSCREEN_SENTINEL_COORD - 1,
-            MOVE_OFFSCREEN_SENTINEL_COORD - 500
+            EFFECTIVE_SENTINEL_THRESHOLD,
+            EFFECTIVE_SENTINEL_THRESHOLD
         ));
         assert!(!is_move_offscreen_sentinel_position(
-            MOVE_OFFSCREEN_SENTINEL_COORD + 1,
-            MOVE_OFFSCREEN_SENTINEL_COORD
+            EFFECTIVE_SENTINEL_THRESHOLD + 1,
+            EFFECTIVE_SENTINEL_THRESHOLD
         ));
         assert!(!is_move_offscreen_sentinel_position(
-            MOVE_OFFSCREEN_SENTINEL_COORD,
-            MOVE_OFFSCREEN_SENTINEL_COORD + 1
+            EFFECTIVE_SENTINEL_THRESHOLD,
+            EFFECTIVE_SENTINEL_THRESHOLD + 1
         ));
     }
 

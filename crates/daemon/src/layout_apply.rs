@@ -104,6 +104,24 @@ fn intersection(
     (width > 0 && height > 0).then(|| leopardwm_core_layout::Rect::new(x, y, width, height))
 }
 
+/// Whether positive pixels shared by `rect` and `neighbor` lie outside its
+/// owner. Mirrored/overlapping outputs can intersect a wholly owner-contained
+/// window; that is not monitor overflow.
+fn overlaps_neighbor_outside_owner(
+    rect: leopardwm_core_layout::Rect,
+    neighbor: leopardwm_core_layout::Rect,
+    owner: leopardwm_core_layout::Rect,
+) -> bool {
+    let Some(overlap) = intersection(rect, neighbor) else {
+        return false;
+    };
+    let overlap_area = i64::from(overlap.width) * i64::from(overlap.height);
+    let owner_area = intersection(overlap, owner)
+        .map(|inside| i64::from(inside.width) * i64::from(inside.height))
+        .unwrap_or(0);
+    overlap_area > owner_area
+}
+
 /// Whether `rect` reaches more than `tolerance` past any edge of `bounds`.
 fn escapes_bounds(
     rect: leopardwm_core_layout::Rect,
@@ -185,10 +203,9 @@ pub(crate) fn park_offscreen_avoiding_neighbors(
     };
     let owner_rect = owner.rect;
     let intersects_neighbor = |rect: leopardwm_core_layout::Rect| {
-        monitors
-            .iter()
-            .filter(|(id, _)| **id != owner_id)
-            .any(|(_, monitor)| rect.intersects(&monitor.rect))
+        monitors.iter().any(|(id, monitor)| {
+            *id != owner_id && overlaps_neighbor_outside_owner(rect, monitor.rect, owner_rect)
+        })
     };
 
     for placement in placements {
@@ -228,79 +245,122 @@ pub(crate) fn park_offscreen_avoiding_neighbors(
     }
 }
 
-/// A strip narrower than this is not worth previewing: there is nothing
-/// recognisable to see and nothing comfortable to click.
+/// A preview rectangle smaller than this in either axis is not recognisable or
+/// comfortable to click.
 const MIN_PREVIEW_STRIP_PX: i32 = 24;
+const MIN_PREVIEW_HEIGHT_PX: i32 = 24;
 
-/// The pixels on `owner` this placement may still be shown in, or `None` when a
-/// floating window leaves nothing usable.
+/// The largest on-owner preview rectangle not owned by a floating window.
 ///
-/// Floating windows sit above the tiled band by design, so a preview drawn under
-/// one is either invisible or, worse, drawn over it by the thumbnail host. The
-/// float owns those pixels — but only the pixels it actually covers: a float
-/// overlapping one end of the strip used to suppress the whole preview, which
-/// made a column vanish for no reason the user could see. The strip is a
-/// vertical band at a monitor edge, so subtracting the floats' horizontal spans
-/// and keeping the widest remaining run preserves the visible part with one
-/// rectangle. Sides the floats did not cut keep the monitor's own bounds, so
-/// with no float in the way the result is exactly the owner rectangle.
-/// Pure so the policy is testable without Win32.
+/// Both axes matter: the old one-dimensional subtraction rejected an entire
+/// full-height run when a small dialog touched only its middle, making a large
+/// preview vanish even though useful pixels remained above and below it. The
+/// candidate boundaries are exactly the strip and occluder edges; therefore an
+/// optimum axis-aligned rectangle always has boundaries in this finite set.
 fn preview_clip_bounds(
     placement_rect: leopardwm_core_layout::Rect,
     owner_rect: leopardwm_core_layout::Rect,
     floating_rects: &[leopardwm_core_layout::Rect],
 ) -> Option<leopardwm_core_layout::Rect> {
     let strip = intersection(placement_rect, owner_rect)?;
-    // Cut points are the strip edges plus every covering float's edges, so the
-    // runs between them are each either fully covered or fully clear.
-    let mut cuts = vec![strip.x, strip.x + strip.width];
-    for floating in floating_rects {
-        if !floating.intersects(&strip) {
-            continue;
+    let occluders: Vec<_> = floating_rects
+        .iter()
+        .copied()
+        .filter(|floating| floating.intersects(&strip))
+        .collect();
+    if occluders.is_empty() {
+        // Preserve every positive unobstructed peek, even 1px. The minimum is
+        // only a policy for remnants left after float subtraction; applying it
+        // here made previews disappear at ordinary near-boundary offsets.
+        return Some(owner_rect);
+    }
+
+    let mut xs = vec![strip.x, strip.right()];
+    let mut ys = vec![strip.y, strip.bottom()];
+    for floating in &occluders {
+        for x in [floating.x.max(strip.x), floating.right().min(strip.right())] {
+            if x > strip.x && x < strip.right() {
+                xs.push(x);
+            }
         }
-        for edge in [floating.x, floating.x + floating.width] {
-            if edge > strip.x && edge < strip.x + strip.width {
-                cuts.push(edge);
+        for y in [
+            floating.y.max(strip.y),
+            floating.bottom().min(strip.bottom()),
+        ] {
+            if y > strip.y && y < strip.bottom() {
+                ys.push(y);
             }
         }
     }
-    cuts.sort_unstable();
-    cuts.dedup();
+    xs.sort_unstable();
+    xs.dedup();
+    ys.sort_unstable();
+    ys.dedup();
 
-    let mut widest: Option<(i32, i32)> = None;
-    for pair in cuts.windows(2) {
-        let (left, right) = (pair[0], pair[1]);
-        if right - left < MIN_PREVIEW_STRIP_PX {
-            continue;
-        }
-        let run =
-            leopardwm_core_layout::Rect::new(left, strip.y, right - left, strip.height.max(1));
-        if floating_rects
-            .iter()
-            .any(|floating| floating.intersects(&run))
-        {
-            continue;
-        }
-        if widest.is_none_or(|(best_left, best_right)| right - left > best_right - best_left) {
-            widest = Some((left, right));
+    let mut best: Option<leopardwm_core_layout::Rect> = None;
+    for left_idx in 0..xs.len().saturating_sub(1) {
+        for right_idx in left_idx + 1..xs.len() {
+            let width = xs[right_idx] - xs[left_idx];
+            if width < MIN_PREVIEW_STRIP_PX {
+                continue;
+            }
+            for top_idx in 0..ys.len().saturating_sub(1) {
+                for bottom_idx in top_idx + 1..ys.len() {
+                    let height = ys[bottom_idx] - ys[top_idx];
+                    if height < MIN_PREVIEW_HEIGHT_PX {
+                        continue;
+                    }
+                    let candidate =
+                        leopardwm_core_layout::Rect::new(xs[left_idx], ys[top_idx], width, height);
+                    if occluders
+                        .iter()
+                        .any(|floating| floating.intersects(&candidate))
+                    {
+                        continue;
+                    }
+                    let area = i64::from(width) * i64::from(height);
+                    let best_area = best
+                        .map(|rect| i64::from(rect.width) * i64::from(rect.height))
+                        .unwrap_or(-1);
+                    if area > best_area
+                        || (area == best_area && best.is_some_and(|rect| width > rect.width))
+                    {
+                        best = Some(candidate);
+                    }
+                }
+            }
         }
     }
 
-    let (left, right) = widest?;
-    // Only the float cut is honoured; an untouched side keeps the monitor bound,
-    // so an unobstructed strip yields the owner rectangle unchanged and the
-    // window's invisible border band is clipped exactly as before.
-    let clip_left = if left == strip.x { owner_rect.x } else { left };
-    let clip_right = if right == strip.x + strip.width {
-        owner_rect.x + owner_rect.width
+    let clear = best?;
+    // Sides not cut by an occluder retain the monitor bound. The window's outer
+    // frame is intersected again downstream, so this preserves ordinary border
+    // handling without widening visible pixels beyond the source.
+    let left = if clear.x == strip.x {
+        owner_rect.x
     } else {
-        right
+        clear.x
+    };
+    let top = if clear.y == strip.y {
+        owner_rect.y
+    } else {
+        clear.y
+    };
+    let right = if clear.right() == strip.right() {
+        owner_rect.right()
+    } else {
+        clear.right()
+    };
+    let bottom = if clear.bottom() == strip.bottom() {
+        owner_rect.bottom()
+    } else {
+        clear.bottom()
     };
     Some(leopardwm_core_layout::Rect::new(
-        clip_left,
-        owner_rect.y,
-        clip_right - clip_left,
-        owner_rect.height,
+        left,
+        top,
+        right - left,
+        bottom - top,
     ))
 }
 
@@ -318,8 +378,92 @@ pub(crate) fn visible_floating_rects(
             placement.column_index == usize::MAX
                 && placement.visibility == leopardwm_core_layout::Visibility::Visible
         })
-        .map(|placement| placement.rect)
+        .map(|placement| {
+            // Floating geometry is OS-owned during a live drag/resize. Stored
+            // workspace rects lag because LOCATIONCHANGE is intentionally
+            // suppressed in those paths; use authoritative chrome geometry for
+            // the occlusion snapshot and retain stored geometry only as fallback.
+            #[cfg(not(test))]
+            {
+                leopardwm_platform_win32::get_window_chrome_rect(placement.window_id)
+                    .unwrap_or(placement.rect)
+            }
+            #[cfg(test)]
+            {
+                placement.rect
+            }
+        })
         .collect()
+}
+
+/// Return unmanaged owners above the bottommost visible tiled HWND. Using the
+/// topmost tiled HWND misses dialogs sandwiched between tiled windows.
+pub(crate) fn occluder_rects_above_tiled_anchor(
+    windows_top_to_bottom: &[leopardwm_platform_win32::WindowInfo],
+    managed_window_ids: &std::collections::HashSet<u64>,
+    visible_tiled_window_ids: &std::collections::HashSet<u64>,
+) -> Option<Vec<leopardwm_core_layout::Rect>> {
+    let tiled_anchor = windows_top_to_bottom
+        .iter()
+        .rposition(|window| visible_tiled_window_ids.contains(&window.hwnd))?;
+    Some(
+        windows_top_to_bottom[..tiled_anchor]
+            .iter()
+            .filter(|window| !managed_window_ids.contains(&window.hwnd))
+            .map(|window| window.rect)
+            .collect(),
+    )
+}
+
+/// Visible top-level windows LeopardWM does not own (including
+/// higher-integrity windows) also own any edge pixels they cover. Excluding only
+/// managed floats let `HWND_TOP` previews paint over or steal input from them.
+fn visible_unmanaged_occlusion_rects(
+    managed_window_ids: &std::collections::HashSet<u64>,
+    visible_tiled_window_ids: &std::collections::HashSet<u64>,
+) -> Option<Vec<leopardwm_core_layout::Rect>> {
+    #[cfg(test)]
+    {
+        let _ = (managed_window_ids, visible_tiled_window_ids);
+        Some(Vec::new())
+    }
+    #[cfg(not(test))]
+    {
+        leopardwm_platform_win32::enumerate_visible_top_level_occluders()
+            .ok()
+            .and_then(|windows| {
+                occluder_rects_above_tiled_anchor(
+                    &windows,
+                    managed_window_ids,
+                    visible_tiled_window_ids,
+                )
+            })
+    }
+}
+
+/// Moving DWM preview pixels and a separately-pumped input HWND on every frame
+/// cannot be atomic. During animation, park non-ghost edge sources at their
+/// safe fallback and publish no persistent preview; the exact landing publishes
+/// one settled pixel/input surface. Ghost clips remain because their source and
+/// destination are owned by the animation worker and are not interactive.
+fn suppress_persistent_previews_during_animation(
+    placements: &mut [leopardwm_core_layout::WindowPlacement],
+    clips: &mut Vec<leopardwm_platform_win32::WindowRegionClip>,
+    ghosted: Option<&std::collections::HashSet<u64>>,
+) {
+    clips.retain(|clip| {
+        if ghosted.is_some_and(|ids| ids.contains(&clip.window_id)) {
+            return true;
+        }
+        if let Some(placement) = placements
+            .iter_mut()
+            .find(|placement| placement.window_id == clip.window_id)
+        {
+            placement.rect = clip.fallback_rect;
+            placement.visibility = clip.fallback_visibility;
+        }
+        false
+    });
 }
 
 fn upsert_region_clip(
@@ -386,10 +530,9 @@ fn prepare_monitor_overflow(
     };
     let owner_rect = owner.rect;
     let intersects_neighbor = |rect: leopardwm_core_layout::Rect| {
-        monitors
-            .iter()
-            .filter(|(id, _)| **id != owner_id)
-            .any(|(_, monitor)| rect.intersects(&monitor.rect))
+        monitors.iter().any(|(id, monitor)| {
+            *id != owner_id && overlaps_neighbor_outside_owner(rect, monitor.rect, owner_rect)
+        })
     };
     for placement in placements.iter_mut() {
         if placement.column_index == usize::MAX {
@@ -570,22 +713,36 @@ impl AppState {
         std::mem::take(&mut self.pending_apply_workers)
     }
 
+    /// Connected monitors in deterministic placement-ownership order. A physical
+    /// HWND can accidentally appear in two active workspace models; focused
+    /// monitor wins, then numeric monitor id, so one batch never positions the
+    /// same HWND twice or overwrites its clip nondeterministically.
+    fn ordered_active_monitor_ids(&self) -> Vec<leopardwm_platform_win32::MonitorId> {
+        let mut ids: Vec<_> = self
+            .workspaces
+            .keys()
+            .copied()
+            .filter(|monitor_id| self.monitors.contains_key(monitor_id))
+            .collect();
+        ids.sort_by_key(|monitor_id| (*monitor_id != self.focused_monitor, *monitor_id));
+        ids
+    }
+
     /// Compute animated placements and send them to the animation worker.
     ///
-    /// Returns `Ok(true)` if a frame was sent. Returns `Ok(false)` when paused,
-    /// empty, or when adaptive safe mode collapsed an unprotected size-changing
-    /// transition into one exact synchronous landing.
+    /// Returns the exact dispatched epoch, or `None` when paused, empty, or
+    /// adaptive safe mode collapsed into one exact synchronous landing.
     pub(crate) fn send_animation_frame(
         &mut self,
         worker: &animation_worker::AnimationWorkerHandle,
-    ) -> Result<bool> {
-        if self.paused {
-            return Ok(false);
+    ) -> Result<Option<u64>> {
+        if self.paused || self.display_change_pending {
+            return Ok(None);
         }
         // Gate after console-signal / shutdown latch so we never compute or
         // dispatch a frame that would re-park windows after restore.
         if self.apply_worker_cancelled.load(Ordering::SeqCst) {
-            return Ok(false);
+            return Ok(None);
         }
 
         // Product-safe default: never emit a burst of asynchronous live-HWND
@@ -604,7 +761,7 @@ impl AppState {
                     self.refocus_sticky_window(window_id);
                 }
             }
-            return Ok(false);
+            return Ok(None);
         }
 
         // Commit deferred min-size clears before the frame reads constraints,
@@ -620,17 +777,29 @@ impl AppState {
         let mut region_clips = Vec::new();
         let monitor_rects: Vec<_> = self.monitors.values().map(|monitor| monitor.rect).collect();
         let mut owner_ranges = Vec::with_capacity(self.monitors.len());
-        for (monitor_id, ws_vec) in &self.workspaces {
-            let idx = self.active_workspace_idx(*monitor_id);
-            if let Some(workspace) = ws_vec.get(idx) {
-                if self.monitors.contains_key(monitor_id) {
-                    let viewport = self.layout_viewport(*monitor_id);
-                    let start = all_placements.len();
-                    all_placements.extend(workspace.compute_placements_animated(viewport));
-                    let focused_column = (*monitor_id == self.focused_monitor)
-                        .then(|| workspace.focused_column_index());
-                    owner_ranges.push((*monitor_id, focused_column, start, all_placements.len()));
+        let mut seen_windows = std::collections::HashSet::new();
+        for monitor_id in self.ordered_active_monitor_ids() {
+            let idx = self.active_workspace_idx(monitor_id);
+            if let Some(workspace) = self
+                .workspaces
+                .get(&monitor_id)
+                .and_then(|workspaces| workspaces.get(idx))
+            {
+                let viewport = self.layout_viewport(monitor_id);
+                let start = all_placements.len();
+                for placement in workspace.compute_placements_animated(viewport) {
+                    if seen_windows.insert(placement.window_id) {
+                        all_placements.push(placement);
+                    } else {
+                        warn!(
+                            "Ignoring duplicate active placement for HWND {:#x} on monitor {}",
+                            placement.window_id, monitor_id
+                        );
+                    }
                 }
+                let focused_column =
+                    (monitor_id == self.focused_monitor).then(|| workspace.focused_column_index());
+                owner_ranges.push((monitor_id, focused_column, start, all_placements.len()));
             }
         }
         let base_placement_len = all_placements.len();
@@ -640,7 +809,7 @@ impl AppState {
                 .as_ref()
                 .is_none_or(|transition| transition.exit_rects.is_empty())
         {
-            return Ok(false);
+            return Ok(None);
         }
 
         // Interpolate first, then enforce monitor isolation against the actual
@@ -651,7 +820,23 @@ impl AppState {
         }
         // One snapshot for every owner: a floating window may span monitors, so
         // a float owned elsewhere can still cover this monitor's edge strip.
-        let floating_rects = visible_floating_rects(&all_placements);
+        let mut floating_rects = visible_floating_rects(&all_placements);
+        let managed_ids: std::collections::HashSet<_> =
+            self.all_managed_window_ids().into_iter().collect();
+        let visible_tiled_ids: std::collections::HashSet<_> = all_placements
+            .iter()
+            .filter(|placement| {
+                placement.column_index != usize::MAX
+                    && placement.visibility == leopardwm_core_layout::Visibility::Visible
+            })
+            .map(|placement| placement.window_id)
+            .collect();
+        match visible_unmanaged_occlusion_rects(&managed_ids, &visible_tiled_ids) {
+            Some(rects) => floating_rects.extend(rects),
+            // Occlusion uncertainty is fail-closed: suppress every edge preview
+            // for this pass rather than steal pixels/input from an unknown owner.
+            None => floating_rects.extend(self.monitors.values().map(|monitor| monitor.rect)),
+        }
         let desktop = OverflowContext {
             monitors: &self.monitors,
             monitor_rects: &monitor_rects,
@@ -678,7 +863,11 @@ impl AppState {
                     std::slice::from_mut(placement),
                     owner_id,
                     None,
-                    self.config.layout.monitor_overflow,
+                    // Exiting workspaces cannot own an interactive preview: by
+                    // the time a release is dispatched their identity is inactive.
+                    // Park tiled exits as soon as they reach another monitor;
+                    // floating exits retain their sentinel and are left alone.
+                    crate::config::MonitorOverflowModeConfig::Hide,
                     &desktop,
                     &mut region_clips,
                 );
@@ -695,6 +884,14 @@ impl AppState {
             }
         }
 
+        suppress_persistent_previews_during_animation(
+            &mut all_placements,
+            &mut region_clips,
+            self.layout_transition
+                .as_ref()
+                .map(|transition| &transition.ghosted_wids),
+        );
+
         self.arm_moved_or_resized_suppression(all_placements.iter().map(|p| p.window_id));
         self.applying_layout = true;
 
@@ -705,15 +902,20 @@ impl AppState {
             all_placements,
             self.layout_transition.as_ref(),
             &self.ghost_handles,
+            &region_clips,
         );
 
         let mut platform_config = self.platform_config.clone();
+        platform_config.preview_lifecycle_epoch =
+            leopardwm_platform_win32::thumbnail::preview_lifecycle_epoch();
         platform_config.animation_placement_policy = if self.config.behavior.compositor_safe_mode {
             leopardwm_platform_win32::AnimationPlacementPolicy::AdaptiveCompositorSafe
         } else {
             leopardwm_platform_win32::AnimationPlacementPolicy::LegacyAsync
         };
+        let frame_epoch = self.apply_epoch.fetch_add(1, Ordering::SeqCst) + 1;
         let request = animation_worker::FrameRequest {
+            apply_epoch: frame_epoch,
             placements: live_placements,
             region_clips,
             ghost_updates,
@@ -737,7 +939,7 @@ impl AppState {
             }
         }
         self.update_tab_strip();
-        Ok(true)
+        Ok(Some(frame_epoch))
     }
 
     fn collect_layout_apply_timeout_candidates(
@@ -800,6 +1002,19 @@ impl AppState {
         if !self.pending_apply_workers.is_empty() {
             return Err(anyhow!(
                 "Layout application skipped: previous timed-out apply worker is still finishing"
+            ));
+        }
+        // Main-loop state is newer than every frame already queued. Drain that
+        // queue before starting a separate exact worker; otherwise an older frame
+        // can acquire the platform transaction after this landing and overwrite
+        // its window, thumbnail and input state.
+        if self
+            .animation_worker_control
+            .as_ref()
+            .is_some_and(|worker| !worker.wait_for_barrier(std::time::Duration::from_millis(750)))
+        {
+            return Err(anyhow!(
+                "Layout application skipped: animation worker barrier timed out"
             ));
         }
         self.applying_layout = true;
@@ -928,6 +1143,12 @@ impl AppState {
                 let _ = worker_handle.join();
                 if result.is_err() {
                     self.moved_or_resized_suppression.clear();
+                } else {
+                    // Start the quiet window at physical completion, not worker
+                    // spawn. A slow synchronous landing can outlive the original
+                    // deadline and leave its own queued LOCATIONCHANGE events
+                    // eligible to trigger a redundant corrective apply.
+                    self.arm_moved_or_resized_suppression(timeout_candidate_ids.iter().copied());
                 }
                 let constraints_changed = if result.is_ok() {
                     self.propagate_size_violations(&width_violations, &height_violations)
@@ -1043,47 +1264,75 @@ impl AppState {
         // owned elsewhere can still cover this monitor's edge strip.
         let mut owner_ranges = Vec::with_capacity(self.monitors.len());
 
-        for (monitor_id, ws_vec) in &self.workspaces {
-            let idx = self.active_workspace_idx(*monitor_id);
-            if let Some(workspace) = ws_vec.get(idx) {
-                if self.monitors.contains_key(monitor_id) {
-                    // Use animated placements to support smooth scrolling
-                    let viewport = self.layout_viewport(*monitor_id);
-                    let placements = workspace.compute_placements_animated(viewport);
-                    let focused_column = (*monitor_id == self.focused_monitor)
-                        .then(|| workspace.focused_column_index());
-                    let start = all_placements.len();
-                    debug!(
-                        "Monitor {}: {} placements for viewport {}x{} (animating: {}, scroll: {:.1}, minimized: {})",
-                        monitor_id,
-                        placements.len(),
-                        viewport.width,
-                        viewport.height,
-                        workspace.is_animating(),
-                        workspace.effective_scroll_offset(),
-                        workspace.minimized_count()
-                    );
-                    for p in &placements {
-                        if p.visibility == leopardwm_core_layout::Visibility::Visible {
-                            debug!(
-                                "  placement hwnd={:#x} col={} rect=({},{} {}x{}) vis={:?}",
-                                p.window_id,
-                                p.column_index,
-                                p.rect.x,
-                                p.rect.y,
-                                p.rect.width,
-                                p.rect.height,
-                                p.visibility,
-                            );
-                        }
+        let mut seen_windows = std::collections::HashSet::new();
+        for monitor_id in self.ordered_active_monitor_ids() {
+            let idx = self.active_workspace_idx(monitor_id);
+            if let Some(workspace) = self
+                .workspaces
+                .get(&monitor_id)
+                .and_then(|workspaces| workspaces.get(idx))
+            {
+                // Use animated placements to support smooth scrolling.
+                let viewport = self.layout_viewport(monitor_id);
+                let mut placements = workspace.compute_placements_animated(viewport);
+                placements.retain(|placement| {
+                    if seen_windows.insert(placement.window_id) {
+                        true
+                    } else {
+                        warn!(
+                            "Ignoring duplicate active placement for HWND {:#x} on monitor {}",
+                            placement.window_id, monitor_id
+                        );
+                        false
                     }
-                    all_placements.extend(placements);
-                    owner_ranges.push((*monitor_id, focused_column, start, all_placements.len()));
+                });
+                let focused_column =
+                    (monitor_id == self.focused_monitor).then(|| workspace.focused_column_index());
+                let start = all_placements.len();
+                debug!(
+                    "Monitor {}: {} placements for viewport {}x{} (animating: {}, scroll: {:.1}, minimized: {})",
+                    monitor_id,
+                    placements.len(),
+                    viewport.width,
+                    viewport.height,
+                    workspace.is_animating(),
+                    workspace.effective_scroll_offset(),
+                    workspace.minimized_count()
+                );
+                for placement in &placements {
+                    if placement.visibility == leopardwm_core_layout::Visibility::Visible {
+                        debug!(
+                            "  placement hwnd={:#x} col={} rect=({},{} {}x{}) vis={:?}",
+                            placement.window_id,
+                            placement.column_index,
+                            placement.rect.x,
+                            placement.rect.y,
+                            placement.rect.width,
+                            placement.rect.height,
+                            placement.visibility,
+                        );
+                    }
                 }
+                all_placements.extend(placements);
+                owner_ranges.push((monitor_id, focused_column, start, all_placements.len()));
             }
         }
 
-        let floating_rects = visible_floating_rects(&all_placements);
+        let mut floating_rects = visible_floating_rects(&all_placements);
+        let managed_ids: std::collections::HashSet<_> =
+            self.all_managed_window_ids().into_iter().collect();
+        let visible_tiled_ids: std::collections::HashSet<_> = all_placements
+            .iter()
+            .filter(|placement| {
+                placement.column_index != usize::MAX
+                    && placement.visibility == leopardwm_core_layout::Visibility::Visible
+            })
+            .map(|placement| placement.window_id)
+            .collect();
+        match visible_unmanaged_occlusion_rects(&managed_ids, &visible_tiled_ids) {
+            Some(rects) => floating_rects.extend(rects),
+            None => floating_rects.extend(self.monitors.values().map(|monitor| monitor.rect)),
+        }
         let desktop = OverflowContext {
             monitors: &self.monitors,
             monitor_rects: &monitor_rects,
@@ -1188,7 +1437,9 @@ impl AppState {
         std::sync::mpsc::Receiver<ApplyWorkerMsg>,
         std::thread::JoinHandle<()>,
     )> {
-        let platform_config = self.platform_config.clone();
+        let mut platform_config = self.platform_config.clone();
+        platform_config.preview_lifecycle_epoch =
+            leopardwm_platform_win32::thumbnail::preview_lifecycle_epoch();
         let apply_worker_cancelled = self.apply_worker_cancelled.clone();
         let apply_epoch_ref = self.apply_epoch.clone();
         let apply_epoch = apply_epoch_ref.fetch_add(1, Ordering::SeqCst) + 1;
