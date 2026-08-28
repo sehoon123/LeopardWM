@@ -30,7 +30,7 @@ use windows::Win32::System::Threading::GetCurrentProcess;
 
 /// AppUserModelID for the watchdog's recovery toasts (distinct from the
 /// daemon's so the two register independently).
-const TOAST_AUMID: &str = "jcardama.LeopardWM.Watchdog";
+const TOAST_AUMID: &str = "sehoon123.LeopardWM.Watchdog";
 const TOAST_APP_NAME: &str = "LeopardWM";
 
 const DAEMON_BIN_NAME: &str = "leopardwm.exe";

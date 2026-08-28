@@ -547,6 +547,9 @@ pub(crate) struct AppState {
     /// intentionally session-only: it fences delayed lifecycle events from a
     /// recycled numeric HWND without persisting process-local identity.
     pub(crate) window_incarnations: HashMap<u64, WindowIncarnation>,
+    /// Window the preview host must be anchored below for the placements last
+    /// prepared. `None` suppresses edge previews for that pass.
+    pub(crate) preview_host_below: Option<u64>,
     /// Last time each tiled window was seen maximized. Lets a window that opens
     /// maximized and momentarily restores itself mid-burst (an app opening
     /// several windows/tabs at once) re-assert maximize instead of being snapped
@@ -901,6 +904,7 @@ impl AppState {
             stashed_monitor_layouts: HashMap::new(),
             window_managed_at: HashMap::new(),
             window_incarnations: HashMap::new(),
+            preview_host_below: None,
             window_last_maximized_at: HashMap::new(),
             snap_disabled_hwnds: HashSet::new(),
             on_battery_or_saver,

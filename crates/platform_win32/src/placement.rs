@@ -917,6 +917,7 @@ pub fn apply_placements_with_regions_fenced(
         &committed_preview_requests,
         !animation_frame || new_preview_count > 0,
         config.preview_lifecycle_epoch,
+        config.preview_host_below,
     )?;
 
     // If the source move failed, retain an older LeopardWM region rather than

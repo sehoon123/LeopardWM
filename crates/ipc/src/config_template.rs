@@ -28,7 +28,7 @@ pub fn render_config(overrides: &TemplateOverrides) -> String {
 
     format!(
         r#"{header}
-# https://github.com/jcardama/LeopardWM
+# https://github.com/sehoon123/LeopardWM
 
 [layout]
 # Gap between columns in pixels

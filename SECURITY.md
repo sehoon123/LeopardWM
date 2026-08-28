@@ -18,7 +18,7 @@ When enabled (the default), the daemon performs a single outbound HTTPS GET to c
 
 | Aspect | Detail |
 |--------|--------|
-| Destination | `https://api.github.com/repos/jcardama/LeopardWM/releases/latest` |
+| Destination | `https://api.github.com/repos/sehoon123/LeopardWM/releases/latest` |
 | Client | `ureq` (HTTPS) |
 | Schedule | Once ~30 seconds after startup, then every 24 hours |
 | Request headers | `User-Agent: LeopardWM/<version>` and `Accept: application/vnd.github+json` |
@@ -42,7 +42,7 @@ Confirmed absent from LeopardWM's own code: telemetry, analytics, remote logging
 | `EnumWindows` / `GetWindowTextW` / `GetClassNameW` | Window enumeration and metadata |
 | Named pipes (async) | Local IPC between CLI and daemon |
 | `ShellExecuteW` | Open the config file, log directory, releases page, and user-selected settings links |
-| Registry (`HKCU\Software\Classes\AppUserModelId\jcardama.LeopardWM` and `...\jcardama.LeopardWM.Watchdog`) | AppUserModelID and display name written at daemon and watchdog startup to enable toast notifications |
+| Registry (`HKCU\Software\Classes\AppUserModelId\sehoon123.LeopardWM` and `...\sehoon123.LeopardWM.Watchdog`) | AppUserModelID and display name written at daemon and watchdog startup to enable toast notifications |
 | Registry (`HKCU\...\Run`) | Per-user auto-start entry when the user enables auto-start |
 
 ## Permission Model
@@ -134,7 +134,7 @@ The global hotkey hook inspects key-down events in memory to match configured sh
 If you discover a security vulnerability in LeopardWM, please report it responsibly:
 
 1. **Do not open a public issue** for security vulnerabilities
-2. Open a [private security advisory](https://github.com/jcardama/LeopardWM/security/advisories/new)
+2. Open a [private security advisory](https://github.com/sehoon123/LeopardWM/security/advisories/new)
 3. Include: description, reproduction steps, and impact assessment
 4. You will receive an acknowledgment within 48 hours
 

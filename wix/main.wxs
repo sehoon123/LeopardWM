@@ -20,7 +20,7 @@
         Id='*'
         Name='LeopardWM'
         UpgradeCode='EE10F2D5-DA80-43EA-B4D4-A0D37C69DE83'
-        Manufacturer='jcardama'
+        Manufacturer='sehoon123'
         Language='1033'
         Codepage='1252'
         Version='$(var.Version)'>
@@ -28,7 +28,7 @@
         <Package Id='*'
             Keywords='Installer'
             Description='LeopardWM scrolling tiling window manager for Windows'
-            Manufacturer='jcardama'
+            Manufacturer='sehoon123'
             InstallerVersion='450'
             Languages='1033'
             Compressed='yes'
@@ -129,8 +129,8 @@
 
         <SetProperty Id='ARPINSTALLLOCATION' Value='[APPLICATIONFOLDER]' After='CostFinalize'/>
 
-        <Property Id='ARPHELPLINK' Value='https://github.com/jcardama/LeopardWM'/>
-        <Property Id='ARPURLINFOABOUT' Value='https://github.com/jcardama/LeopardWM'/>
+        <Property Id='ARPHELPLINK' Value='https://github.com/sehoon123/LeopardWM'/>
+        <Property Id='ARPURLINFOABOUT' Value='https://github.com/sehoon123/LeopardWM'/>
 
         <UI>
             <UIRef Id='WixUI_FeatureTree'/>

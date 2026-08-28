@@ -4,10 +4,10 @@
 
 # LeopardWM
 
-[![CI](https://github.com/jcardama/LeopardWM/actions/workflows/ci.yml/badge.svg)](https://github.com/jcardama/LeopardWM/actions/workflows/ci.yml)
+[![CI](https://github.com/sehoon123/LeopardWM/actions/workflows/ci.yml/badge.svg)](https://github.com/sehoon123/LeopardWM/actions/workflows/ci.yml)
 [![License: GPL-3.0](https://img.shields.io/badge/License-GPL--3.0-blue.svg)](LICENSE)
 ![Platform: Windows 10/11](https://img.shields.io/badge/Platform-Windows%2010%2F11-0078D4)
-[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-ffdd00?logo=buy-me-a-coffee&logoColor=000)](https://buymeacoffee.com/jcardama)
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-ffdd00?logo=buy-me-a-coffee&logoColor=000)](https://github.com/sehoon123/LeopardWM)
 
 A scrollable tiling window manager for Windows.
 
@@ -88,7 +88,7 @@ A few deliberate **non-features**, so you know what you're getting:
 ### Via Winget
 
 ```powershell
-winget install jcardama.LeopardWM
+winget install sehoon123.LeopardWM
 ```
 
 The release workflow does **not** publish Winget manifests. Winget updates are submitted manually, so `winget upgrade` sees a release only after its upstream manifest is accepted.
@@ -105,13 +105,13 @@ It installs `leopardwm`, `leopardwm-cli`, and `lwm` shims. Update the manifest's
 
 ### Via MSI installer
 
-Download `LeopardWM-x.y.z-x86_64.msi` from [GitHub Releases](https://github.com/jcardama/LeopardWM/releases) and run it. Re-running a newer MSI upgrades in place — no manual uninstall needed.
+Download `LeopardWM-x.y.z-x86_64.msi` from [GitHub Releases](https://github.com/sehoon123/LeopardWM/releases) and run it. Re-running a newer MSI upgrades in place — no manual uninstall needed.
 
 ### Via standalone zip
 
 For users who prefer not to install:
 
-1. Download `LeopardWM-x.y.z-x86_64-windows.zip` from [GitHub Releases](https://github.com/jcardama/LeopardWM/releases)
+1. Download `LeopardWM-x.y.z-x86_64-windows.zip` from [GitHub Releases](https://github.com/sehoon123/LeopardWM/releases)
 2. Extract to a permanent location
 3. Run `leopardwm.exe`
 4. (Optional) Enable autostart: `lwm autostart enable`
@@ -123,7 +123,7 @@ Current releases are not code-signed, so Windows SmartScreen may show a warning 
 Prerequisites: [Rust](https://rustup.rs) with the MSVC toolchain (`stable-x86_64-pc-windows-msvc`)
 
 ```bash
-git clone https://github.com/jcardama/LeopardWM.git
+git clone https://github.com/sehoon123/LeopardWM.git
 cd LeopardWM
 cargo build --release
 ```
@@ -402,7 +402,7 @@ The `MozillaDialogClass` → `square` rule ships in the default config as a work
 
 If you find LeopardWM useful, consider supporting development:
 
-[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-ffdd00?logo=buy-me-a-coffee&logoColor=000)](https://buymeacoffee.com/jcardama)
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-ffdd00?logo=buy-me-a-coffee&logoColor=000)](https://github.com/sehoon123/LeopardWM)
 
 ## Contributing
 

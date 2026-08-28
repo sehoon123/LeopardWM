@@ -707,6 +707,12 @@ fn ordered_real_preview_lifecycle_contract() {
         "DWM API publication must produce the controlled source pixels"
     );
 
+    let anchor_source = SourceWindow::new();
+    assert!(
+        integration_probe::host_anchors_below_band_anchor(anchor_source.hwnd as u64),
+        "the preview host must land below its band anchor so windows above the tiled band keep their pixels"
+    );
+
     let cloak_source = SourceWindow::new();
     assert!(
         integration_probe::placement_cloak_failure_is_not_cached(cloak_source.hwnd as u64),

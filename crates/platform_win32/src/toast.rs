@@ -39,7 +39,7 @@ static AUMID: OnceLock<String> = OnceLock::new();
 
 /// Register the AppUserModelID and start the toast worker. Call once, early in
 /// `main()`, before any toast. `aumid` is the per-app identity (distinct per
-/// process, e.g. `jcardama.LeopardWM`); `app_name` is its Notification Center
+/// process, e.g. `sehoon123.LeopardWM`); `app_name` is its Notification Center
 /// display name.
 pub fn init(aumid: &str, app_name: &str) -> Result<()> {
     register_aumid(aumid, app_name)?;

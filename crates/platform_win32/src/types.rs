@@ -99,6 +99,11 @@ pub struct PlatformConfig {
     /// Preview lifecycle captured when this placement intent was planned. Zero
     /// lets standalone callers bind to the current epoch at entry.
     pub preview_lifecycle_epoch: u64,
+    /// Window the preview host must sit directly below, normally the bottommost
+    /// visible tiled HWND. Every window above the tiled band then keeps its own
+    /// pixels and input while the full edge strip stays published behind it.
+    /// `None` anchors the host at the top of the normal band.
+    pub preview_host_below: Option<isize>,
 }
 
 #[cfg(test)]
@@ -113,6 +118,7 @@ mod tests {
             AnimationPlacementPolicy::AdaptiveCompositorSafe
         );
         assert_eq!(config.preview_lifecycle_epoch, 0);
+        assert_eq!(config.preview_host_below, None);
     }
 
     #[test]

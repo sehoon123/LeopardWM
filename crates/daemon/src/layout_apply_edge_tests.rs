@@ -1,8 +1,7 @@
 use super::{
-    drifted_off_monitor_window, occluder_rects_above_tiled_anchor,
-    park_offscreen_avoiding_neighbors, prepare_monitor_overflow, preview_clip_bounds,
-    suppress_persistent_previews_during_animation, visible_floating_rects, OverflowContext,
-    MIN_PREVIEW_STRIP_PX,
+    bottommost_visible_tiled_hwnd, drifted_off_monitor_window, park_offscreen_avoiding_neighbors,
+    prepare_monitor_overflow, preview_clip_bounds, suppress_persistent_previews_during_animation,
+    OverflowContext,
 };
 use crate::config::MonitorOverflowModeConfig;
 use leopardwm_core_layout::{Rect, Visibility, WindowPlacement};
@@ -66,7 +65,7 @@ fn animation_frames_park_interactive_previews_but_keep_ghost_crops() {
 }
 
 #[test]
-fn unmanaged_window_between_tiled_hwnds_is_an_occluder() {
+fn band_anchor_is_the_bottommost_visible_tiled_window() {
     let info = |hwnd, x| leopardwm_platform_win32::WindowInfo {
         hwnd,
         title: String::new(),
@@ -75,34 +74,30 @@ fn unmanaged_window_between_tiled_hwnds_is_an_occluder() {
         rect: Rect::new(x, 0, 100, 100),
         visible: true,
     };
+    // EnumWindows order is top-to-bottom: an unmanaged window sits between the
+    // two tiled HWNDs, so anchoring to the topmost tiled window would leave it
+    // below the preview host.
     let windows = vec![info(10, 10), info(20, 20), info(30, 30)];
-    let managed = std::collections::HashSet::from([10, 30]);
     let tiled = std::collections::HashSet::from([10, 30]);
 
-    assert_eq!(
-        occluder_rects_above_tiled_anchor(&windows, &managed, &tiled),
-        Some(vec![Rect::new(20, 0, 100, 100)])
-    );
+    assert_eq!(bottommost_visible_tiled_hwnd(&windows, &tiled), Some(30));
 }
 
 #[test]
-fn unmanaged_windows_behind_tiled_anchor_do_not_suppress_previews() {
-    let info = |hwnd, x| leopardwm_platform_win32::WindowInfo {
+fn band_anchor_is_absent_without_a_visible_tiled_window() {
+    let info = |hwnd| leopardwm_platform_win32::WindowInfo {
         hwnd,
         title: String::new(),
         class_name: "Test".into(),
         process_id: hwnd as u32,
-        rect: Rect::new(x, 0, 100, 100),
+        rect: Rect::new(0, 0, 100, 100),
         visible: true,
     };
-    // EnumWindows order: unmanaged-above, tiled anchor, unmanaged-behind.
-    let windows = vec![info(1, 10), info(2, 20), info(3, 30)];
-    let managed = std::collections::HashSet::from([2]);
-    let tiled = std::collections::HashSet::from([2]);
+    let windows = vec![info(1), info(2)];
 
     assert_eq!(
-        occluder_rects_above_tiled_anchor(&windows, &managed, &tiled),
-        Some(vec![Rect::new(10, 0, 100, 100)])
+        bottommost_visible_tiled_hwnd(&windows, &std::collections::HashSet::new()),
+        None
     );
 }
 
@@ -347,8 +342,6 @@ fn assert_clip_preview_distribution(column_width: i32, expected_preview: i32) {
         })
         .collect();
     let mut clips = Vec::new();
-    let floating_snapshot = visible_floating_rects(&placements);
-
     prepare_monitor_overflow(
         &mut placements,
         2,
@@ -357,7 +350,7 @@ fn assert_clip_preview_distribution(column_width: i32, expected_preview: i32) {
         &OverflowContext {
             monitors: &monitors,
             monitor_rects: &monitor_rects,
-            floating_rects: &floating_snapshot,
+            preview_host_below: Some(1),
         },
         &mut clips,
     );
@@ -507,7 +500,6 @@ fn clip_overflow(
     let monitors = side_by_side_monitors();
     let monitor_rects: Vec<_> = monitors.values().map(|monitor| monitor.rect).collect();
     let mut clips = Vec::new();
-    let floating_snapshot = visible_floating_rects(placements);
     prepare_monitor_overflow(
         placements,
         2,
@@ -516,7 +508,7 @@ fn clip_overflow(
         &OverflowContext {
             monitors: &monitors,
             monitor_rects: &monitor_rects,
-            floating_rects: &floating_snapshot,
+            preview_host_below: Some(1),
         },
         &mut clips,
     );
@@ -625,13 +617,14 @@ fn clip_mode_never_plans_a_region_that_cannot_show_pixels() {
 }
 
 #[test]
-fn clip_mode_yields_the_strip_to_a_floating_window() {
+fn clip_mode_publishes_the_whole_strip_under_a_covering_float() {
     let monitors = side_by_side_monitors();
     let owner = monitors[&2].rect;
     // A left-edge preview strip on monitor 2, covered end to end by a floating
-    // window. Floating windows sit above the tiled layer, so the float owns
-    // those pixels: previewing underneath would either be invisible or, through
-    // the thumbnail host, composite on top of the float.
+    // window. The preview host is anchored below the tiled band, so the float
+    // keeps its pixels and its input while the full strip stays published
+    // behind it. Narrowing the clip here is what truncated real previews
+    // whenever a launcher or dialog sat over the edge strip.
     let mut placements = vec![
         visible_tiled(50, Rect::new(owner.x - 600, 40, 800, 800)),
         WindowPlacement {
@@ -644,11 +637,10 @@ fn clip_mode_yields_the_strip_to_a_floating_window() {
 
     let clips = clip_overflow(&mut placements, Some(1));
 
-    assert!(clips.is_empty(), "no preview may be planned under a float");
-    assert_ne!(placements[0].visibility, Visibility::Visible);
-    assert!(monitors
-        .values()
-        .all(|monitor| !placements[0].rect.intersects(&monitor.rect)));
+    assert_eq!(clips.len(), 1, "a covering float must not cut the preview");
+    assert_eq!(clips[0].window_id, 50);
+    assert_eq!(clips[0].clip_bounds, owner);
+    assert_eq!(placements[0].visibility, Visibility::Visible);
     // The float itself is untouched.
     assert_eq!(
         placements[1].rect,
@@ -658,57 +650,34 @@ fn clip_mode_yields_the_strip_to_a_floating_window() {
 }
 
 #[test]
-fn clip_mode_narrows_a_preview_to_the_part_a_float_leaves_clear() {
+fn an_unproven_band_anchor_publishes_no_preview() {
     let monitors = side_by_side_monitors();
     let owner = monitors[&2].rect;
-    // The float covers the inner 160px only through the middle of the strip.
-    // Two-dimensional subtraction keeps the much larger clear rectangle below
-    // it instead of suppressing the preview or wasting it on a 40px side strip.
-    let mut placements = vec![
-        visible_tiled(50, Rect::new(owner.x - 600, 40, 800, 800)),
-        WindowPlacement {
-            window_id: 51,
-            rect: Rect::new(owner.x + 40, 100, 400, 400),
-            visibility: Visibility::Visible,
-            column_index: usize::MAX,
+    let monitor_rects: Vec<_> = monitors.values().map(|monitor| monitor.rect).collect();
+    let mut placements = vec![visible_tiled(50, Rect::new(owner.x - 600, 40, 800, 800))];
+    let mut clips = Vec::new();
+
+    prepare_monitor_overflow(
+        &mut placements,
+        2,
+        Some(1),
+        MonitorOverflowModeConfig::Clip,
+        &OverflowContext {
+            monitors: &monitors,
+            monitor_rects: &monitor_rects,
+            preview_host_below: None,
         },
-    ];
-
-    let clips = clip_overflow(&mut placements, Some(1));
-
-    assert_eq!(
-        clips.len(),
-        1,
-        "the clear part of the strip stays previewed"
+        &mut clips,
     );
-    assert_eq!(clips[0].window_id, 50);
-    assert_eq!(clips[0].clip_bounds.x, owner.x);
-    assert_eq!(clips[0].clip_bounds.width, owner.width);
-    assert_eq!(clips[0].clip_bounds.y, 500);
-    assert_eq!(clips[0].clip_bounds.bottom(), owner.bottom());
-    assert_eq!(placements[0].visibility, Visibility::Visible);
-}
 
-#[test]
-fn clip_mode_refuses_a_sliver_a_float_leaves_behind() {
-    let monitors = side_by_side_monitors();
-    let owner = monitors[&2].rect;
-    // Only 10px would remain clear: too narrow to recognise or to click, so the
-    // column is parked exactly as if the float covered all of it.
-    let mut placements = vec![
-        visible_tiled(50, Rect::new(owner.x - 600, 40, 800, 800)),
-        WindowPlacement {
-            window_id: 51,
-            rect: Rect::new(owner.x + 10, owner.y, 400, owner.height),
-            visibility: Visibility::Visible,
-            column_index: usize::MAX,
-        },
-    ];
-
-    let clips = clip_overflow(&mut placements, Some(1));
-
-    assert!(clips.is_empty(), "a 10px sliver is not a preview");
+    assert!(
+        clips.is_empty(),
+        "without a proven band anchor the host would paint over unknown owners"
+    );
     assert_ne!(placements[0].visibility, Visibility::Visible);
+    assert!(monitors
+        .values()
+        .all(|monitor| !placements[0].rect.intersects(&monitor.rect)));
 }
 
 #[test]
@@ -749,6 +718,7 @@ fn clip_mode_preserves_12_5_75_12_5_on_a_rightmost_monitor() {
 mod preview_clip_bounds_policy {
     use super::*;
 
+    /// A 1000x800 monitor starting at x=1000.
     const OWNER: Rect = Rect {
         x: 1000,
         y: 0,
@@ -765,104 +735,23 @@ mod preview_clip_bounds_policy {
     };
 
     #[test]
-    fn an_unobstructed_strip_is_the_owner_rect() {
+    fn an_on_owner_strip_publishes_the_whole_owner_rect() {
         assert_eq!(
-            preview_clip_bounds(CROSSING, OWNER, &[]),
+            preview_clip_bounds(CROSSING, OWNER),
             Some(OWNER),
-            "with no float in the way the clip must be unchanged"
+            "the strip is never reduced; windows above the band anchor cover it instead"
         );
     }
 
     #[test]
-    fn a_float_off_the_strip_changes_nothing() {
-        let elsewhere = Rect::new(1500, 100, 300, 300);
-        assert_eq!(
-            preview_clip_bounds(CROSSING, OWNER, &[elsewhere]),
-            Some(OWNER)
-        );
+    fn a_one_pixel_strip_still_publishes() {
+        let sliver = Rect::new(OWNER.x - 799, OWNER.y, 800, 700);
+        assert_eq!(preview_clip_bounds(sliver, OWNER), Some(OWNER));
     }
 
     #[test]
-    fn a_float_over_the_inner_end_leaves_the_edge_side() {
-        // Covers 1040..1200 only through y=100..500. The 200px-wide area below
-        // it has greater area than the 40px full-height side strip, so it wins.
-        let float = Rect::new(1040, 100, 400, 400);
-        assert_eq!(
-            preview_clip_bounds(CROSSING, OWNER, &[float]),
-            Some(Rect::new(1000, 500, OWNER.width, 300))
-        );
-    }
-
-    #[test]
-    fn a_float_over_the_edge_side_leaves_the_inner_end() {
-        // Covers 1000..1100, so the clear run is 1100..1200. Its inner side was
-        // not cut by the float, so it keeps the monitor bound: the window's own
-        // frame ends at 1200 and is what actually limits the clip.
-        let float = Rect::new(900, 100, 200, 400);
-        assert_eq!(
-            preview_clip_bounds(CROSSING, OWNER, &[float]),
-            Some(Rect::new(1100, OWNER.y, 900, OWNER.height))
-        );
-    }
-
-    #[test]
-    fn a_float_splitting_the_strip_keeps_the_wider_side() {
-        // Covers 1030..1070: the clear runs are 1000..1030 (30px) and
-        // 1070..1200 (130px), so the wider one wins. Widths are compared before
-        // the uncut inner side is extended to the monitor bound, because the run
-        // is what the user can actually see.
-        let float = Rect::new(1030, 100, 40, 400);
-        assert_eq!(
-            preview_clip_bounds(CROSSING, OWNER, &[float]),
-            Some(Rect::new(1070, OWNER.y, 930, OWNER.height))
-        );
-    }
-
-    #[test]
-    fn a_short_full_width_float_keeps_the_larger_vertical_remainder() {
-        // The float spans the whole 200px strip but only y=300..400. The old
-        // x-only subtraction rejected everything; 2-D subtraction keeps the
-        // larger rectangle below it.
-        let float = Rect::new(1000, 300, 200, 100);
-        assert_eq!(
-            preview_clip_bounds(CROSSING, OWNER, &[float]),
-            Some(Rect::new(OWNER.x, 400, OWNER.width, 400))
-        );
-    }
-
-    #[test]
-    fn a_covering_float_refuses_the_preview() {
-        let float = Rect::new(990, 0, 300, 800);
-        assert_eq!(preview_clip_bounds(CROSSING, OWNER, &[float]), None);
-    }
-
-    #[test]
-    fn a_remaining_sliver_is_refused() {
-        // Leaves MIN_PREVIEW_STRIP_PX - 1 clear at the edge.
-        let float = Rect::new(1000 + MIN_PREVIEW_STRIP_PX - 1, 0, 400, 800);
-        assert_eq!(preview_clip_bounds(CROSSING, OWNER, &[float]), None);
-    }
-
-    #[test]
-    fn exactly_the_minimum_is_kept() {
-        let float = Rect::new(1000 + MIN_PREVIEW_STRIP_PX, 0, 400, 800);
-        assert_eq!(
-            preview_clip_bounds(CROSSING, OWNER, &[float]),
-            Some(Rect::new(1000, OWNER.y, MIN_PREVIEW_STRIP_PX, OWNER.height))
-        );
-    }
-
-    #[test]
-    fn a_placement_that_shares_no_pixels_has_no_strip() {
-        let far_away = Rect::new(-4000, 40, 800, 700);
-        assert_eq!(preview_clip_bounds(far_away, OWNER, &[]), None);
-    }
-
-    #[test]
-    fn a_float_only_overlapping_vertically_off_the_strip_is_ignored() {
-        // Horizontally inside the strip but vertically clear of it: the strip is
-        // the crossing window's own band, so this must not narrow anything.
-        let float = Rect::new(1020, 760, 100, 40);
-        assert_eq!(preview_clip_bounds(CROSSING, OWNER, &[float]), Some(OWNER));
+    fn a_placement_off_the_owner_publishes_nothing() {
+        let far_away = Rect::new(0, 0, 300, 300);
+        assert_eq!(preview_clip_bounds(far_away, OWNER), None);
     }
 }

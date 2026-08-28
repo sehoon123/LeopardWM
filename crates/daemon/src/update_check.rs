@@ -9,13 +9,17 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
-const RELEASES_API: &str = "https://api.github.com/repos/jcardama/LeopardWM/releases/latest";
+/// Newest release of this fork, prereleases included. `releases/latest` skips
+/// prereleases entirely, so a fork that ships `-rc` tags would either see no
+/// release at all or, when pointed at the upstream project, be told that an
+/// unrelated upstream version is "newer" than its own prerelease.
+const RELEASES_API: &str = "https://api.github.com/repos/sehoon123/LeopardWM/releases?per_page=1";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const STARTUP_DELAY: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_secs(60 * 60 * 24);
 
 /// Public release URL for the GUI / tray click action.
-pub const RELEASES_PAGE_URL: &str = "https://github.com/jcardama/LeopardWM/releases";
+pub const RELEASES_PAGE_URL: &str = "https://github.com/sehoon123/LeopardWM/releases";
 
 /// Spawn the background update-checker thread.
 ///
@@ -76,8 +80,18 @@ fn fetch_latest_release_tag() -> Option<String> {
         .ok()?
         .into_string()
         .ok()?;
-    let json: serde_json::Value = serde_json::from_str(&body).ok()?;
-    json.get("tag_name")?.as_str().map(String::from)
+    parse_latest_release_tag(&body)
+}
+
+/// Read the newest tag from a releases-list response. Accepts a single release
+/// object too so the endpoint can be pointed back at `releases/latest`.
+fn parse_latest_release_tag(body: &str) -> Option<String> {
+    let json: serde_json::Value = serde_json::from_str(body).ok()?;
+    let release = match &json {
+        serde_json::Value::Array(releases) => releases.first()?,
+        object => object,
+    };
+    release.get("tag_name")?.as_str().map(String::from)
 }
 
 /// Compare `latest` (e.g. `v0.1.11`) against `current` (e.g. `0.1.10`).
@@ -126,6 +140,30 @@ mod tests {
     fn not_newer_when_older() {
         assert!(!is_newer("v0.1.9", "0.1.10"));
         assert!(!is_newer("0.0.1", "1.0.0"));
+    }
+
+    #[test]
+    fn fork_prereleases_are_not_superseded_by_upstream_finals() {
+        // The fork's own newest tag must not read as an update, and an upstream
+        // final release must never be compared against it at all: this is the
+        // pairing that fired a bogus "update available" toast.
+        assert!(!is_newer("v0.2.6-sehoon.24-rc3", "0.2.6-sehoon.24-rc3"));
+        assert!(is_newer("v0.2.6-sehoon.25-rc1", "0.2.6-sehoon.24-rc3"));
+        assert!(RELEASES_API.contains("sehoon123/LeopardWM"));
+        assert!(RELEASES_PAGE_URL.contains("sehoon123/LeopardWM"));
+    }
+
+    #[test]
+    fn latest_tag_is_read_from_a_prerelease_listing() {
+        let listing = r#"[{"tag_name":"v0.2.6-sehoon.24-rc3","prerelease":true}]"#;
+        assert_eq!(
+            parse_latest_release_tag(listing).as_deref(),
+            Some("v0.2.6-sehoon.24-rc3")
+        );
+        let single = r#"{"tag_name":"v0.3.0"}"#;
+        assert_eq!(parse_latest_release_tag(single).as_deref(), Some("v0.3.0"));
+        assert_eq!(parse_latest_release_tag("[]"), None);
+        assert_eq!(parse_latest_release_tag("not json"), None);
     }
 
     #[test]

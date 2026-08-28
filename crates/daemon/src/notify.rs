@@ -4,7 +4,7 @@
 //! daemon's AppUserModelID. Used to tell the user when a window can't be managed
 //! (e.g. an elevated window the non-elevated daemon is blocked from tiling).
 
-const AUMID: &str = "jcardama.LeopardWM";
+const AUMID: &str = "sehoon123.LeopardWM";
 const APP_NAME: &str = "LeopardWM";
 
 /// Register the toast identity and start the worker. Call once during startup.

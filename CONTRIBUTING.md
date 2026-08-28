@@ -55,7 +55,7 @@ We use [Conventional Commits](https://www.conventionalcommits.org/):
 # https://rustup.rs/
 
 # Clone and build
-git clone https://github.com/jcardama/LeopardWM.git
+git clone https://github.com/sehoon123/LeopardWM.git
 cd LeopardWM
 cargo build
 

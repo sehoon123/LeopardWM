@@ -7,8 +7,8 @@ The release workflow publishes GitHub Release ZIP/MSI assets only. It does not p
 There is no `publish-winget` job and no `WINGET_TOKEN` secret in this repository. After a GitHub Release succeeds:
 
 1. Download the published MSI and read its SHA-256 from `checksums.txt`.
-2. Update or submit the `jcardama.LeopardWM` manifest in `microsoft/winget-pkgs` following that repository's current contribution requirements.
-3. Verify the accepted upstream manifest with `winget show jcardama.LeopardWM` and, when available, `winget upgrade jcardama.LeopardWM` on a clean machine.
+2. Update or submit the `sehoon123.LeopardWM` manifest in `microsoft/winget-pkgs` following that repository's current contribution requirements.
+3. Verify the accepted upstream manifest with `winget show sehoon123.LeopardWM` and, when available, `winget upgrade sehoon123.LeopardWM` on a clean machine.
 
 Do not claim that a successful GitHub Release updated Winget; upstream review and merge are separate manual work.
 

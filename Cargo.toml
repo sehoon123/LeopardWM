@@ -13,8 +13,8 @@ members = [
 version = "0.2.6"
 edition = "2021"
 license = "GPL-3.0"
-repository = "https://github.com/jcardama/LeopardWM"
-authors = ["jcardama <jcardama@hey.com>"]
+repository = "https://github.com/sehoon123/LeopardWM"
+authors = ["sehoon123"]
 
 [workspace.dependencies]
 # Win32 bindings

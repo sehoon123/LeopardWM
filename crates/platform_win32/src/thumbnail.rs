@@ -34,8 +34,8 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClassInfoW, GetMessageW,
-    GetSystemMetrics, IsWindow, RegisterClassW, SetWindowPos, UnregisterClassW,
-    UpdateLayeredWindow, CW_USEDEFAULT, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, MSG,
+    GetSystemMetrics, GetWindow, IsWindow, RegisterClassW, SetWindowPos, UnregisterClassW,
+    UpdateLayeredWindow, CW_USEDEFAULT, GW_HWNDNEXT, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, MSG,
     SET_WINDOW_POS_FLAGS, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
     SM_YVIRTUALSCREEN, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
     SWP_SHOWWINDOW, ULW_ALPHA, WM_CLOSE, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
@@ -695,6 +695,10 @@ struct PersistentPreviewState {
     /// Authoritative requests from the newest committed placement pass. Kept so
     /// the retry worker does not depend on an unrelated future layout event.
     desired: Vec<PersistentPreviewRequest>,
+    /// Window the host must sit directly below, from the newest placement pass.
+    /// Retry and recovery paths reuse it so they anchor exactly like the pass
+    /// that planned the publication.
+    host_below: Option<isize>,
     generation: u64,
 }
 
@@ -1413,7 +1417,8 @@ fn activate_published_surface(state: &mut PersistentPreviewState) -> bool {
         return true;
     }
     let epoch = state.lifecycle_epoch;
-    if let Err(error) = host().raise_within_band() {
+    let host_below = state.host_below.map(|hwnd| HWND(hwnd as *mut c_void));
+    if let Err(error) = host().anchor_within_band(host_below) {
         state.host_anchored = false;
         crate::preview_input::set_preview_targets_armed(false);
         warn!("Preview host z-order anchor failed; surface remains hidden: {error}");
@@ -1676,10 +1681,16 @@ pub(crate) fn commit_persistent_previews(
     requests: &[PersistentPreviewRequest],
     refresh_source_size: bool,
     expected_lifecycle_epoch: u64,
+    host_below: Option<isize>,
 ) -> Result<usize, Win32Error> {
     #[cfg(test)]
     {
-        let _ = (requests, refresh_source_size, expected_lifecycle_epoch);
+        let _ = (
+            requests,
+            refresh_source_size,
+            expected_lifecycle_epoch,
+            host_below,
+        );
         crate::preview_input::clear_preview_click_targets();
         Ok(0)
     }
@@ -1711,6 +1722,12 @@ pub(crate) fn commit_persistent_previews(
                     .retain(|_, preview| preview.handle.belongs_to_current_host());
             }
             state.lifecycle_epoch = expected_lifecycle_epoch;
+            if state.host_below != host_below {
+                // A new band anchor must be re-verified before the surface may
+                // claim ownership of those pixels again.
+                state.host_anchored = false;
+                state.host_below = host_below;
+            }
         }
         let next_ids: std::collections::HashSet<_> =
             requests.iter().map(|request| request.window_id).collect();
@@ -2290,6 +2307,23 @@ pub fn host() -> &'static ThumbnailHost {
     })
 }
 
+/// Whether `below` is somewhere under `above` in the same z-order band.
+///
+/// Bounded so a corrupted or cyclic chain can never spin the caller. The walk
+/// covers far more top-level windows than a desktop realistically holds.
+fn is_below_in_band(above: HWND, below: HWND) -> bool {
+    const MAX_WALK: usize = 4096;
+    let mut cursor = above;
+    for _ in 0..MAX_WALK {
+        match unsafe { GetWindow(cursor, GW_HWNDNEXT) }.ok() {
+            Some(next) if next == below => return true,
+            Some(next) => cursor = next,
+            None => return false,
+        }
+    }
+    false
+}
+
 impl ThumbnailHost {
     fn new() -> Result<Self, Win32Error> {
         #[cfg(feature = "integration-probes")]
@@ -2695,16 +2729,24 @@ impl ThumbnailHost {
         .map_err(|error| Win32Error::SetPositionFailed(format!("thumbnail host hide: {error}")))
     }
 
-    fn raise_within_band(&self) -> Result<(), Win32Error> {
+    /// Anchor the host inside the normal band.
+    ///
+    /// `below` is normally the bottommost visible tiled HWND. Anchoring there
+    /// keeps every window above the tiled band — including higher-integrity
+    /// windows this process cannot move — above the preview, so the full edge
+    /// strip stays published behind them instead of being cut away. `HWND_TOP`
+    /// remains the fallback for standalone callers without an anchor.
+    fn anchor_within_band(&self, below: Option<HWND>) -> Result<(), Win32Error> {
         if !self.is_available() {
             return Err(Win32Error::SetPositionFailed(
                 "thumbnail host unavailable for z-order anchor".into(),
             ));
         }
+        let anchor = below.filter(|anchor| unsafe { IsWindow(Some(*anchor)) }.as_bool());
         unsafe {
             SetWindowPos(
                 self.hwnd(),
-                Some(HWND_TOP),
+                Some(anchor.unwrap_or(HWND_TOP)),
                 0,
                 0,
                 0,
@@ -2712,7 +2754,23 @@ impl ThumbnailHost {
                 SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
             )
         }
-        .map_err(|error| Win32Error::SetPositionFailed(format!("thumbnail host z-order: {error}")))
+        .map_err(|error| {
+            Win32Error::SetPositionFailed(format!("thumbnail host z-order: {error}"))
+        })?;
+        // An accepted request is not a committed band position: the shell can
+        // reorder during the same message pass. Without this readback the host
+        // could stay above a window that owns those pixels and paint over it.
+        // The host's own click targets are raised above it and legitimately sit
+        // between the anchor and the host, so the invariant is "below the
+        // anchor", not "immediately below" it.
+        if let Some(anchor) = anchor {
+            if !is_below_in_band(anchor, self.hwnd()) {
+                return Err(Win32Error::SetPositionFailed(
+                    "thumbnail host did not land below its tiled anchor".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn set_topmost(&self, topmost: bool) -> Result<(), Win32Error> {
@@ -2972,7 +3030,7 @@ pub mod integration_probe {
         if !crate::preview_input::wait_for_applied_generation(
             sync_generation,
             Duration::from_secs(2),
-        ) || host().raise_within_band().is_err()
+        ) || host().anchor_within_band(None).is_err()
         {
             return false;
         }
@@ -3058,7 +3116,8 @@ pub mod integration_probe {
                 return Ok(false);
             }
             let request = probe_request(source_window_id, destination)?;
-            let live = commit_persistent_previews(&[request], true, preview_lifecycle_epoch())?;
+            let live =
+                commit_persistent_previews(&[request], true, preview_lifecycle_epoch(), None)?;
             if live != 1 || unsafe { windows::Win32::Graphics::Dwm::DwmFlush() }.is_err() {
                 return Ok(false);
             }
@@ -3176,7 +3235,8 @@ pub mod integration_probe {
         }
         let _failure_reset = PublishFailureReset;
         FORCE_PREVIEW_PUBLISH_FAILURES.store(u32::MAX, Ordering::Release);
-        let initial_live = commit_persistent_previews(&[request], true, preview_lifecycle_epoch())?;
+        let initial_live =
+            commit_persistent_previews(&[request], true, preview_lifecycle_epoch(), None)?;
         std::thread::sleep(Duration::from_millis(450));
         let retained_desire = {
             let state = lock_persistent_previews();
@@ -3203,6 +3263,33 @@ pub mod integration_probe {
         }
         clear_persistent_previews()?;
         Ok(initial_live == 0 && retained_desire && recovered)
+    }
+
+    /// The band anchor must be physically honored: the host has to end up below
+    /// the anchor so every window above the tiled band keeps its own pixels,
+    /// while the host's own click targets may sit between them. A dead anchor
+    /// must fall back to the band top instead of failing the surface.
+    pub fn host_anchors_below_band_anchor(anchor_window_id: WindowId) -> bool {
+        let anchor = HWND(anchor_window_id as usize as *mut c_void);
+        // Published previews always hold the normal band (the host refuses to
+        // mix normal previews with topmost ghosts). Reproduce that precondition:
+        // a topmost host cannot be ordered below a normal-band anchor.
+        if host().set_topmost(false).is_err() {
+            return false;
+        }
+        if host().anchor_within_band(Some(anchor)).is_err() {
+            return false;
+        }
+        if !super::is_below_in_band(anchor, host().hwnd()) {
+            return false;
+        }
+        // Anchoring must be a real constraint, not a no-op: the host must not
+        // report success for an anchor it actually sits above.
+        if super::is_below_in_band(host().hwnd(), anchor) {
+            return false;
+        }
+        let dead = HWND(usize::MAX as *mut c_void);
+        host().anchor_within_band(Some(dead)).is_ok() && host().anchor_within_band(None).is_ok()
     }
 
     /// Force a real HWND through two failed cloak commits. `DWMWA_CLOAK` is
@@ -3369,7 +3456,7 @@ pub mod integration_probe {
         let epoch = preview_lifecycle_epoch();
         FORCE_NEXT_PREVIEW_PUBLISH_FAILURE.store(true, Ordering::Release);
         FORCE_RETRY_SPAWN_FAILURE.store(true, Ordering::Release);
-        let initial_live = commit_persistent_previews(&[request], true, epoch)?;
+        let initial_live = commit_persistent_previews(&[request], true, epoch, None)?;
         FORCE_RETRY_SPAWN_FAILURE.store(false, Ordering::Release);
         let obligation_survived = initial_live == 0
             && PREVIEW_RETRY_PENDING.load(Ordering::Acquire)
@@ -3433,7 +3520,7 @@ pub mod integration_probe {
             probe_request(destroyed_window_id, destroyed_destination)?,
             probe_request(surviving_window_id, surviving_destination)?,
         ];
-        let live = commit_persistent_previews(&requests, true, epoch)?;
+        let live = commit_persistent_previews(&requests, true, epoch, None)?;
         let target_raw = probe_windows()
             .into_iter()
             .find(|(_, class, id)| {
@@ -3498,7 +3585,8 @@ pub mod integration_probe {
             ));
         }
         let request = probe_request(source_window_id, destination)?;
-        let initial_live_previews = commit_persistent_previews(&[request], true, expected_epoch)?;
+        let initial_live_previews =
+            commit_persistent_previews(&[request], true, expected_epoch, None)?;
         if initial_live_previews != 1 {
             clear_persistent_previews()?;
             return Err(Win32Error::SetPositionFailed(
@@ -3677,7 +3765,7 @@ pub mod integration_probe {
         let stale_target_inert =
             !unsafe { IsWindow(Some(target)) }.as_bool() || stale_hit == HTTRANSPARENT as isize;
         let stale_commit_live_previews =
-            commit_persistent_previews(&[request], true, expected_epoch)?;
+            commit_persistent_previews(&[request], true, expected_epoch, None)?;
         clear_persistent_previews()?;
 
         let close_host = host().hwnd();

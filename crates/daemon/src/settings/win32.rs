@@ -817,9 +817,9 @@ mod tests {
     #[test]
     fn allowed_urls_include_settings_links_and_mixed_case_schemes() {
         for url in [
-            "https://github.com/jcardama/LeopardWM/graphs/contributors",
-            "https://github.com/jcardama/LeopardWM",
-            "https://buymeacoffee.com/jcardama",
+            "https://github.com/sehoon123/LeopardWM/graphs/contributors",
+            "https://github.com/sehoon123/LeopardWM",
+            "https://github.com/sehoon123/LeopardWM",
             "hTtPs://example.com",
             "HtTp://example.com",
         ] {
