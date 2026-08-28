@@ -1993,12 +1993,13 @@ fn detect_size_violations(
 
 /// Cloak newly off-screen entries and prune cloaks for windows no longer in the layout.
 ///
-/// A DWM cloak rejection is not a logical state transition. We instead attempt
-/// a monitor-clearing sentinel park, retain its durable marker, and report the
-/// original placement as failed so an animation cache cannot bless the failed
-/// DWM write. The sole exception is an explicit zero-size global-sentinel
-/// placement: that intent already has a verified physical hiding mechanism,
-/// so it may commit without a cloak receipt.
+/// A DWM cloak rejection is not a logical state transition. `DWMWA_CLOAK` only
+/// succeeds on windows this process owns, so every managed foreign HWND is
+/// denied. We therefore fall back to a monitor-clearing sentinel park and keep
+/// its durable marker. That park is verified against every monitor rectangle
+/// before it returns, which is strictly stronger evidence of a hidden window
+/// than an accepted DWM write, so it commits the hidden entry for any layout
+/// rect. Only a park that could not be verified fails the placement.
 fn sync_cloak_state(
     entries: &[DeferEntry],
     placements: &[WindowPlacement],
@@ -2025,13 +2026,10 @@ fn sync_cloak_state(
         let placement_exists = current_ids.contains(&entry.window_id);
         let should_cloak = should_cloak_entry(entry, placement_exists, false);
         if should_cloak {
-            if !commit_global_cloak_state_locked(entry.window_id, true) {
-                let parked = crate::visibility::move_window_offscreen(entry.window_id).is_ok();
-                let explicit_global_sentinel =
-                    entry.layout_rect.width == 0 && entry.layout_rect.height == 0;
-                if !parked || !explicit_global_sentinel {
-                    failed_window_ids.insert(entry.window_id);
-                }
+            if !commit_global_cloak_state_locked(entry.window_id, true)
+                && crate::visibility::move_window_offscreen(entry.window_id).is_err()
+            {
+                failed_window_ids.insert(entry.window_id);
             }
         } else if global_cloaked_contains(entry.window_id)
             && !commit_global_cloak_state_locked(entry.window_id, false)

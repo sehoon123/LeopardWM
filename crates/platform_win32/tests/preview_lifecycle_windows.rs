@@ -710,7 +710,7 @@ fn ordered_real_preview_lifecycle_contract() {
     let cloak_source = SourceWindow::new();
     assert!(
         integration_probe::placement_cloak_failure_is_not_cached(cloak_source.hwnd as u64),
-        "a failed cloak must remain retryable and use a verified sentinel fallback"
+        "an owner-only cloak denial must commit through the verified sentinel park without caching a cloak receipt"
     );
     let ownership_source = SourceWindow::new();
     assert!(

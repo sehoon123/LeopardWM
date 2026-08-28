@@ -3205,9 +3205,12 @@ pub mod integration_probe {
         Ok(initial_live == 0 && retained_desire && recovered)
     }
 
-    /// Force a real HWND through two failed cloak commits. Both calls must
-    /// return an error and leave no logical cloak/cache success; the verified
-    /// sentinel fallback keeps the source physically safe between attempts.
+    /// Force a real HWND through two failed cloak commits. `DWMWA_CLOAK` is
+    /// owner-only, so this is the ordinary production path for every managed
+    /// foreign window: both calls must commit through the verified sentinel
+    /// park, leave no logical cloak receipt, and retain park ownership. A
+    /// denied cloak must not fail the placement, otherwise no scrolled-away
+    /// column can be hidden and every real layout apply is rejected.
     pub fn placement_cloak_failure_is_not_cached(source_window_id: WindowId) -> bool {
         use leopardwm_core_layout::{Visibility, WindowPlacement};
 
@@ -3226,13 +3229,13 @@ pub mod integration_probe {
             Some(&mut cache),
             false,
         );
-        let first_safe = first.is_err()
+        let first_safe = first.is_ok()
             && !crate::placement::is_placement_cloaked(source_window_id)
             && crate::visibility::has_move_offscreen_ownership(source_window_id);
         crate::placement::integration_probe_fail_next_cloak();
         let second =
             crate::placement::apply_placements(&[placement], &config, Some(&mut cache), false);
-        let second_safe = second.is_err()
+        let second_safe = second.is_ok()
             && !crate::placement::is_placement_cloaked(source_window_id)
             && crate::visibility::has_move_offscreen_ownership(source_window_id);
         let _ = crate::visibility::restore_window_moved_offscreen(source_window_id);
