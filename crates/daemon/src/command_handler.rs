@@ -1378,6 +1378,9 @@ impl AppState {
         if !(1..=9).contains(&index) {
             return IpcResponse::error("Workspace index must be 1-9");
         }
+        if self.paused {
+            return IpcResponse::error("Cannot switch workspace while tiling is paused");
+        }
         // A switch initiated outside the overlay (hotkey, CLI) dismisses
         // an open overview; overlay-initiated switches hid it already.
         if self.overview_open {
@@ -1654,6 +1657,11 @@ impl AppState {
     fn handle_move_to_workspace(&mut self, index: u8) -> IpcResponse {
         if !(1..=9).contains(&index) {
             return IpcResponse::error("Workspace index must be 1-9");
+        }
+        if self.paused {
+            return IpcResponse::error(
+                "Cannot move windows between workspaces while tiling is paused",
+            );
         }
         let idx = (index - 1) as usize;
         let monitor = self.focused_monitor;
@@ -2082,6 +2090,28 @@ mod transaction_tests {
 
     fn state_with_monitors(monitors: Vec<MonitorInfo>) -> AppState {
         AppState::new_with_config(Config::default(), monitors)
+    }
+
+    #[test]
+    fn paused_workspace_ownership_commands_are_inert() {
+        let mut state = state_with_monitors(vec![monitor(1, 0)]);
+        state.workspaces.get_mut(&1).unwrap()[0]
+            .insert_window(10, Some(700))
+            .unwrap();
+        state.ensure_workspace_exists(1, 1);
+        state.paused = true;
+
+        assert!(matches!(
+            state.handle_command(IpcCommand::SwitchWorkspace { index: 2 }),
+            IpcResponse::Error { .. }
+        ));
+        assert!(matches!(
+            state.handle_command(IpcCommand::MoveToWorkspace { index: 2 }),
+            IpcResponse::Error { .. }
+        ));
+        assert_eq!(state.active_workspace_idx(1), 0);
+        assert_eq!(state.find_window_workspace(10), Some((1, 0)));
+        assert!(state.layout_transition.is_none());
     }
 
     #[test]
