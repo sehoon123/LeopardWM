@@ -62,6 +62,31 @@ $repository = Join-Path $testRoot 'worktree'
 
 try {
     New-Item -ItemType Directory -Path $testRoot | Out-Null
+
+    # Execute the validator's real checksum function against GNU-style
+    # lowercase output, not merely a source-text policy assertion.
+    $functionStart = $validatorSource.IndexOf('function Assert-Checksums')
+    $functionEnd = $validatorSource.IndexOf("`nif (-not `$Tag", $functionStart)
+    if ($functionStart -lt 0 -or $functionEnd -le $functionStart) {
+        throw 'Could not extract Assert-Checksums from validator'
+    }
+    Invoke-Expression $validatorSource.Substring($functionStart, $functionEnd - $functionStart)
+    $artifact = Join-Path $testRoot 'artifact.zip'
+    $checksums = Join-Path $testRoot 'checksums.txt'
+    [IO.File]::WriteAllBytes($artifact, [Text.Encoding]::UTF8.GetBytes('checksum fixture'))
+    $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $artifact).Hash
+    [IO.File]::WriteAllText($checksums, "$($hash.ToLowerInvariant())  artifact.zip`n")
+    Assert-Checksums -Path $checksums -ArtifactPaths @($artifact)
+    $wrongPrefix = if ($hash[0] -eq '0') { '1' } else { '0' }
+    [IO.File]::WriteAllText($checksums, "$($wrongPrefix + $hash.Substring(1).ToLowerInvariant())  artifact.zip`n")
+    try {
+        Assert-Checksums -Path $checksums -ArtifactPaths @($artifact)
+        throw 'Changed checksum nibble was accepted'
+    }
+    catch {
+        if ($_.Exception.Message -eq 'Changed checksum nibble was accepted') { throw }
+    }
+
     & git init --bare $remote | Out-Null
     if ($LASTEXITCODE -ne 0) {
         throw 'Could not initialize the local test remote'

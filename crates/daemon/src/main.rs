@@ -1342,14 +1342,7 @@ async fn spawn_tab_forwarders(
         "tab-rename-forwarder",
         rename_result_rx,
         event_tx.clone(),
-        |result| DaemonEvent::TabRenameSubmitted {
-            monitor: result.monitor,
-            workspace_idx: result.workspace_idx,
-            column_idx: result.column_idx,
-            tab_idx: result.tab_idx,
-            target_hwnd: result.target_hwnd,
-            new_title: result.new_title,
-        },
+        DaemonEvent::TabRenameSubmitted,
     ) {
         Ok(handle) => {
             state.lock().await.rename_result_tx = Some(rename_result_tx);
@@ -2659,7 +2652,10 @@ async fn handle_tray_event(ctx: &mut EventLoopCtx<'_>, tray_event: tray::TrayEve
             let result = if target {
                 std::env::current_exe()
                     .map_err(anyhow::Error::from)
-                    .and_then(|exe| autostart::enable_autostart(&exe))
+                    .and_then(|exe| {
+                        let resolved = autostart::preferred_autostart_executable(&exe);
+                        autostart::enable_autostart(&resolved)
+                    })
             } else {
                 autostart::disable_autostart()
             };
@@ -3174,6 +3170,7 @@ async fn handle_tab_action(
                                         column_idx,
                                         tab_idx,
                                         target_hwnd,
+                                        incarnation_token,
                                         new_title: result,
                                     });
                                 }
@@ -3285,13 +3282,17 @@ async fn handle_overview_event(
 /// Apply a rename-dialog result as a tab title override.
 async fn handle_tab_rename_submitted(
     state: &Arc<Mutex<AppState>>,
-    monitor: isize,
-    workspace_idx: usize,
-    column_idx: usize,
-    tab_idx: usize,
-    target_hwnd: u64,
-    new_title: Option<String>,
+    result: crate::events::TabRenameResult,
 ) {
+    let crate::events::TabRenameResult {
+        monitor,
+        workspace_idx,
+        column_idx,
+        tab_idx,
+        target_hwnd,
+        incarnation_token,
+        new_title,
+    } = result;
     let Some(title) = new_title else {
         // User cancelled; nothing to do.
         return;
@@ -3301,7 +3302,10 @@ async fn handle_tab_rename_submitted(
     // during the popup's lifetime would otherwise retarget
     // the override to a different window.
     let hwnd = target_hwnd;
-    if !leopardwm_platform_win32::is_window_valid(hwnd) {
+    if !leopardwm_platform_win32::is_window_valid(hwnd)
+        || leopardwm_platform_win32::current_window_event_identity(hwnd)
+            .is_none_or(|identity| identity.token != incarnation_token)
+    {
         debug!(
             "TabRenameSubmitted: target window gone (monitor={}, ws={}, col={}, tab={}, hwnd={})",
             monitor, workspace_idx, column_idx, tab_idx, hwnd
@@ -4044,24 +4048,8 @@ async fn run_daemon_event_loop(
             DaemonEvent::PreviewGesture(gesture) => {
                 handle_preview_gesture(&mut ctx, gesture).await;
             }
-            DaemonEvent::TabRenameSubmitted {
-                monitor,
-                workspace_idx,
-                column_idx,
-                tab_idx,
-                target_hwnd,
-                new_title,
-            } => {
-                handle_tab_rename_submitted(
-                    ctx.state,
-                    monitor,
-                    workspace_idx,
-                    column_idx,
-                    tab_idx,
-                    target_hwnd,
-                    new_title,
-                )
-                .await;
+            DaemonEvent::TabRenameSubmitted(result) => {
+                handle_tab_rename_submitted(ctx.state, result).await;
             }
             DaemonEvent::Settings(event) => handle_settings_event(&mut ctx, event).await,
             DaemonEvent::AnimationFrameApplied(result) => {

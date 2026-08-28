@@ -6,6 +6,7 @@
 //! Communication is via IPC: Rust → JS with `evaluate_script`, JS → Rust
 //! with `window.ipc.postMessage`.
 
+use std::collections::VecDeque;
 use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock};
 
@@ -68,8 +69,8 @@ const WM_SETTINGS_SAVE_RESULT: u32 = WM_APP + 3;
 static SETTINGS_THREAD: Mutex<Option<u32>> = Mutex::new(None);
 /// Latest rejected-bind list as a JSON array, staged for the next push.
 static PENDING_FAILED_BINDS: Mutex<Option<String>> = Mutex::new(None);
-/// Latest save result staged by the WebView IPC callback for the message loop.
-static PENDING_SAVE_RESULT: Mutex<Option<String>> = Mutex::new(None);
+/// FIFO save results staged by WebView IPC callbacks for the owning UI thread.
+static PENDING_SAVE_RESULTS: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
 /// Rendered static settings resources are shared across opens.
 static SETTINGS_HTML_RENDERED: OnceLock<String> = OnceLock::new();
 static SETTINGS_HOTKEY_CATALOG_JSON: OnceLock<String> = OnceLock::new();
@@ -430,7 +431,10 @@ pub fn run_settings_window(
                 continue;
             }
             if msg_buf.message == WM_SETTINGS_SAVE_RESULT {
-                let json = PENDING_SAVE_RESULT.lock().ok().and_then(|mut p| p.take());
+                let json = PENDING_SAVE_RESULTS
+                    .lock()
+                    .ok()
+                    .and_then(|mut pending| pending.pop_front());
                 if let Some(json) = json {
                     let js = format!(
                         "if (typeof handleSaveResult === 'function') handleSaveResult({});",
@@ -452,8 +456,8 @@ pub fn run_settings_window(
         if let Ok(mut pending) = PENDING_FAILED_BINDS.lock() {
             *pending = None;
         }
-        if let Ok(mut pending) = PENDING_SAVE_RESULT.lock() {
-            *pending = None;
+        if let Ok(mut pending) = PENDING_SAVE_RESULTS.lock() {
+            pending.clear();
         }
         // Let the daemon resume hotkeys if the window closed mid-recording.
         let _ = close_tx.send(SettingsEvent::Closed);
@@ -599,15 +603,15 @@ fn push_save_result(result: &SettingsSaveResult) {
         SettingsSaveResult::Failed => serde_json::json!({ "status": "failed" }).to_string(),
     };
 
-    let Ok(mut pending) = PENDING_SAVE_RESULT.lock() else {
+    let Ok(mut pending) = PENDING_SAVE_RESULTS.lock() else {
         return;
     };
-    *pending = Some(json);
+    pending.push_back(json);
     let posted = unsafe {
         PostThreadMessageW(thread_id, WM_SETTINGS_SAVE_RESULT, WPARAM(0), LPARAM(0)).is_ok()
     };
     if !posted {
-        *pending = None;
+        pending.pop_back();
     }
 }
 

@@ -1459,8 +1459,12 @@ impl AppState {
             }
         }
 
-        // Ensure target workspace exists (lazy creation)
+        // Ensure target workspace exists (lazy creation), then snapshot the
+        // complete monitor workspace vector. Sticky rehome changes column order,
+        // focus and minimized state, so inverse rehome is not a rollback.
         self.ensure_workspace_exists(monitor, idx);
+        let workspaces_before = self.workspaces.get(&monitor).cloned();
+        let previous_focus_before = self.previous_focused_hwnd;
 
         // Switch active workspace
         self.active_workspace.insert(monitor, idx);
@@ -1521,10 +1525,20 @@ impl AppState {
             if let Err(error) =
                 self.start_workspace_switch_transition(start_rects, exit_rects, duration)
             {
+                if let Some(snapshot) = workspaces_before.clone() {
+                    self.workspaces.insert(monitor, snapshot);
+                }
                 self.active_workspace.insert(monitor, current_idx);
-                self.rehome_sticky_windows();
+                self.previous_focused_hwnd = previous_focus_before;
+                self.last_placed_layout_rects.clear();
+                self.enter_paused_state("workspace switch transition fence failure");
+                let managed = self.all_managed_window_ids();
+                crate::state::run_visibility_recovery_pass(
+                    &managed,
+                    "workspace switch transition rollback",
+                );
                 return IpcResponse::error(format!(
-                    "Workspace switch aborted before replacing transition ownership: {error}"
+                    "Workspace switch restored model ownership but paused after transition fence failure: {error}"
                 ));
             }
         } else {
@@ -1537,9 +1551,16 @@ impl AppState {
                 })
                 .collect();
             if !failures.is_empty() {
+                if let Some(snapshot) = workspaces_before.clone() {
+                    self.workspaces.insert(monitor, snapshot);
+                }
                 self.active_workspace.insert(monitor, current_idx);
-                self.rehome_sticky_windows();
-                let rollback = self.apply_layout().err();
+                self.previous_focused_hwnd = previous_focus_before;
+                self.last_placed_layout_rects.clear();
+                let rollback = self.apply_layout();
+                if rollback.is_err() {
+                    self.enter_paused_state("workspace parking rollback failure");
+                }
                 return IpcResponse::error(format!(
                     "Workspace switch rolled back because old windows could not be parked: {failures:?}; rollback={rollback:?}"
                 ));
@@ -1553,12 +1574,23 @@ impl AppState {
             } else {
                 Ok(())
             };
+            if let Some(snapshot) = workspaces_before {
+                self.workspaces.insert(monitor, snapshot);
+            }
             self.active_workspace.insert(monitor, current_idx);
-            self.rehome_sticky_windows();
+            self.previous_focused_hwnd = previous_focus_before;
             self.last_placed_layout_rects.clear();
-            let rollback = self.apply_layout();
-            if transition_cleanup.is_err() || rollback.is_err() {
+            let rollback = if transition_cleanup.is_ok() {
+                self.apply_layout()
+            } else {
+                Err(anyhow::anyhow!(
+                    "transition cleanup failed; rollback placement suppressed"
+                ))
+            };
+            if rollback.is_err() {
                 self.enter_paused_state("workspace switch rollback failure");
+                let managed = self.all_managed_window_ids();
+                crate::state::run_visibility_recovery_pass(&managed, "workspace switch rollback");
             }
             return IpcResponse::error(format!(
                 "Failed to apply layout: {e}; transition_cleanup={transition_cleanup:?}; rollback={rollback:?}"
@@ -1859,27 +1891,36 @@ impl AppState {
             self.move_origins = move_origins_backup;
             self.previous_focused_hwnd = previous_focus;
             self.last_placed_layout_rects.clear();
+            self.enter_paused_state("move-to-workspace transition fence failure");
+            let managed = self.all_managed_window_ids();
+            crate::state::run_visibility_recovery_pass(
+                &managed,
+                "move-to-workspace transition rollback",
+            );
             return IpcResponse::error(format!(
-                "Move to workspace rolled back before transition replacement: {error}"
+                "Move to workspace restored model ownership but paused after transition fence failure: {error}"
             ));
         }
         if let Err(error) = self.apply_layout() {
+            let transition_cleanup = self.cancel_layout_transition_for_exact_landing();
             self.workspaces = workspaces_backup;
             self.move_origins = move_origins_backup;
             self.previous_focused_hwnd = previous_focus;
             self.last_placed_layout_rects.clear();
-            let rollback = if self.paused {
-                Err(anyhow::anyhow!(
-                    "tiling paused by move-to-workspace placement failure"
-                ))
-            } else {
+            let rollback = if transition_cleanup.is_ok() && !self.paused {
                 self.apply_layout()
+            } else {
+                Err(anyhow::anyhow!(
+                    "transition cleanup failed before move-to-workspace rollback"
+                ))
             };
             if rollback.is_err() {
-                self.paused = true;
+                self.enter_paused_state("move-to-workspace rollback failure");
+                let managed = self.all_managed_window_ids();
+                crate::state::run_visibility_recovery_pass(&managed, "move-to-workspace rollback");
             }
             return IpcResponse::error(format!(
-                "Move to workspace rolled back after placement failure: {error}; rollback={rollback:?}"
+                "Move to workspace rolled back after placement failure: {error}; transition_cleanup={transition_cleanup:?}; rollback={rollback:?}"
             ));
         }
         // The moved window now lives on an inactive workspace; cloak it so its
@@ -2103,9 +2144,12 @@ mod transaction_tests {
         let mut state = state_with_monitors(vec![monitor(1, 0)]);
         state.paused = false;
         state.reduce_motion = true;
-        state.workspaces.get_mut(&1).unwrap()[0]
-            .insert_window(10, Some(700))
-            .unwrap();
+        for window in [10, 11, 12] {
+            state.workspaces.get_mut(&1).unwrap()[0]
+                .insert_window(window, Some(700))
+                .unwrap();
+        }
+        state.sticky_windows.insert(11);
         state.ensure_workspace_exists(1, 1);
         state.workspaces.get_mut(&1).unwrap()[1]
             .insert_window(20, Some(700))
@@ -2118,6 +2162,12 @@ mod transaction_tests {
             IpcResponse::Error { .. }
         ));
         assert_eq!(state.active_workspace_idx(1), 0);
+        let order: Vec<_> = state.workspaces[&1][0]
+            .columns()
+            .iter()
+            .flat_map(|column| column.windows().iter().copied())
+            .collect();
+        assert_eq!(order, vec![10, 11, 12]);
     }
 
     #[test]

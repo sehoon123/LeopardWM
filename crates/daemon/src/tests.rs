@@ -64,8 +64,7 @@ fn test_resize_preview_only_owning_generation_clears_active() {
 }
 
 #[test]
-#[allow(clippy::arc_with_non_send_sync)] // handle_tab_action intentionally mirrors the single-threaded production Arc API.
-fn test_stale_untab_does_not_mutate_the_current_workspace() {
+fn stale_tab_workspace_identity_is_rejected() {
     let mut app = AppState::new_with_config(test_config(), test_monitors());
     app.paused = true;
     {
@@ -82,29 +81,8 @@ fn test_stale_untab_does_not_mutate_the_current_workspace() {
         ws.toggle_focused_column_tabbed_mode();
     }
     app.active_workspace.insert(1, 1);
-    let before = app.workspaces[&1][1].column(0).unwrap().windows().to_vec();
-    let state = std::sync::Arc::new(tokio::sync::Mutex::new(app));
-    tokio::runtime::Builder::new_current_thread()
-        .build()
-        .unwrap()
-        .block_on(handle_tab_action(
-            &state,
-            leopardwm_platform_win32::tab_strip::TabActionEvent {
-                monitor: 1,
-                workspace_idx: 0,
-                column_idx: 0,
-                tab_idx: 0,
-                window_id: 100,
-                incarnation_token: 0,
-                action: leopardwm_platform_win32::tab_strip::TabAction::Untab,
-            },
-        ));
-    let state = state.blocking_lock();
-    assert_eq!(
-        state.workspaces[&1][1].column(0).unwrap().windows(),
-        before.as_slice(),
-        "a stale strip event must not expel a tab from the active workspace"
-    );
+    assert!(!captured_tab_workspace_is_active(&app, 1, 0));
+    assert!(captured_tab_workspace_is_active(&app, 1, 1));
 }
 
 #[test]

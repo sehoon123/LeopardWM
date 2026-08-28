@@ -11,7 +11,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::windows::named_pipe::{NamedPipeServer, PipeMode, ServerOptions};
+use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeServer, PipeMode, ServerOptions};
 use tokio::sync::{broadcast, mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, error, warn};
 
@@ -84,18 +84,38 @@ pub(crate) fn acquire_ipc_server_ownership() -> Result<IpcServerOwnership> {
             pipe_name
         )
     })?;
-    let legacy = (pipe_name != PIPE_NAME)
-        .then(|| {
-            create_pipe_server(PIPE_NAME, true, pipe_security_ptr)
-                .map(|server| (PIPE_NAME.to_string(), server))
-                .with_context(|| {
-                    format!(
-                        "Failed to acquire legacy IPC ownership for '{}'; an older daemon may still be running",
+    let legacy = if pipe_name == PIPE_NAME {
+        None
+    } else {
+        match create_pipe_server(PIPE_NAME, true, pipe_security_ptr) {
+            Ok(server) => Some((PIPE_NAME.to_string(), server)),
+            Err(create_error) => match ClientOptions::new().open(PIPE_NAME) {
+                Ok(_) => {
+                    return Err(anyhow::anyhow!(
+                        "An older same-user daemon already owns legacy IPC endpoint '{}'",
                         PIPE_NAME
-                    )
-                })
-        })
-        .transpose()?;
+                    ));
+                }
+                Err(probe_error) if probe_error.raw_os_error() == Some(5) => {
+                    // Named pipes share a machine namespace. Another signed-in
+                    // user may own the compatibility alias but cannot access our
+                    // scoped endpoint or desktop; do not let that global alias
+                    // defeat per-user daemon ownership.
+                    warn!(
+                        "Legacy IPC alias is owned by another inaccessible user; serving only {}",
+                        pipe_name
+                    );
+                    None
+                }
+                Err(probe_error) => {
+                    return Err(anyhow::anyhow!(
+                        "Failed to acquire legacy IPC endpoint '{}': create={create_error}; probe={probe_error}",
+                        PIPE_NAME
+                    ));
+                }
+            },
+        }
+    };
 
     // `create_with_security_attributes_raw` borrows this descriptor. Later
     // pipe instances need the same descriptor, so retain it for the daemon

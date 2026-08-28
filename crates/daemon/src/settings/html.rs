@@ -186,12 +186,18 @@ mod tests {
         assert!(!SETTINGS_HTML.contains(".toggle input { display: none; }"));
         assert!(SETTINGS_HTML.contains(".toggle input:focus-visible ~ .track"));
         assert!(SETTINGS_HTML.contains("input.setAttribute('aria-label'"));
+        assert!(SETTINGS_HTML.contains("trigger.setAttribute('aria-haspopup', 'listbox')"));
+        assert!(SETTINGS_HTML.contains("item.setAttribute('role'"));
+        assert!(SETTINGS_HTML.contains("e.key === 'ArrowDown'"));
+        assert!(SETTINGS_HTML.contains("aria-label=\"Delete rule\""));
     }
 
     #[test]
     fn duplicate_hotkeys_block_lossy_autosave() {
         assert!(SETTINGS_HTML.contains("if (refreshDuplicateWarnings())"));
         assert!(SETTINGS_HTML.contains("Resolve duplicate hotkey bindings first."));
+        assert!(SETTINGS_HTML.contains("if (_saveInFlight)"));
+        assert!(SETTINGS_HTML.contains("if (queued) autoSave(0)"));
     }
 
     #[test]

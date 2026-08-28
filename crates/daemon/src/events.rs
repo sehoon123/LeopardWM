@@ -216,17 +216,7 @@ pub(crate) enum DaemonEvent {
     /// `new_title: None` means cancel; `Some("")` means clear the
     /// override and fall back to the live window title; `Some(name)`
     /// installs `name` as the override.
-    TabRenameSubmitted {
-        monitor: isize,
-        workspace_idx: usize,
-        column_idx: usize,
-        tab_idx: usize,
-        /// HWND captured when the popup was spawned. Authoritative
-        /// rename target — independent of the (monitor/ws/col/tab)
-        /// indices in case the column mutated while the popup was open.
-        target_hwnd: u64,
-        new_title: Option<String>,
-    },
+    TabRenameSubmitted(TabRenameResult),
     /// Debounced persist trigger. Emitted by the background save task
     /// after a quiet period following one or more persisted-state
     /// changes. Handled on the main loop, which builds the snapshot JSON
@@ -255,5 +245,6 @@ pub(crate) struct TabRenameResult {
     pub(crate) column_idx: usize,
     pub(crate) tab_idx: usize,
     pub(crate) target_hwnd: u64,
+    pub(crate) incarnation_token: u64,
     pub(crate) new_title: Option<String>,
 }

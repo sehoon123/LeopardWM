@@ -46,8 +46,12 @@ fn handle_init(output: Option<PathBuf>, force: bool, profile: Option<String>) ->
         ),
         None => generate_default_config(),
     };
-    atomic_write_config(&path, config_content.as_bytes())
-        .with_context(|| format!("Failed to write config file: {}", path.display()))?;
+    if force {
+        atomic_write_config(&path, config_content.as_bytes())
+    } else {
+        atomic_write_config_no_replace(&path, config_content.as_bytes())
+    }
+    .with_context(|| format!("Failed to write config file: {}", path.display()))?;
 
     if let Some(name) = &profile {
         println!("Created config file ({} profile): {}", name, path.display());
@@ -124,7 +128,11 @@ fn create_config_temp_file(destination: &Path) -> io::Result<(PathBuf, File)> {
 
 /// Write a complete sibling temporary file, flush it, then atomically replace
 /// the live config. A failed write or rename leaves the old destination intact.
-fn atomic_replace_config_with<F>(destination: &Path, write_contents: F) -> Result<()>
+fn atomic_replace_config_with<F>(
+    destination: &Path,
+    replace_existing: bool,
+    write_contents: F,
+) -> Result<()>
 where
     F: FnOnce(&mut File) -> io::Result<()>,
 {
@@ -150,27 +158,42 @@ where
         });
     }
 
-    if let Err(error) = fs::rename(&temporary, destination) {
+    let commit = if replace_existing {
+        fs::rename(&temporary, destination)
+    } else {
+        // A sibling hard-link publishes the fully flushed bytes only when the
+        // destination is still absent. It is an atomic no-replace commit and
+        // closes the non-force init existence-check race.
+        fs::hard_link(&temporary, destination)
+    };
+    if let Err(error) = commit {
         let _ = fs::remove_file(&temporary);
         return Err(error).with_context(|| {
             format!(
-                "Failed to atomically replace config destination {}",
+                "Failed to atomically commit config destination {}",
                 destination.display()
             )
         });
+    }
+    if !replace_existing {
+        let _ = fs::remove_file(&temporary);
     }
 
     Ok(())
 }
 
 fn atomic_write_config(destination: &Path, content: &[u8]) -> Result<()> {
-    atomic_replace_config_with(destination, |file| file.write_all(content))
+    atomic_replace_config_with(destination, true, |file| file.write_all(content))
+}
+
+fn atomic_write_config_no_replace(destination: &Path, content: &[u8]) -> Result<()> {
+    atomic_replace_config_with(destination, false, |file| file.write_all(content))
 }
 
 fn atomic_copy_config(source: &Path, destination: &Path) -> Result<()> {
     let mut source_file = File::open(source)
         .with_context(|| format!("Failed to open config source {}", source.display()))?;
-    atomic_replace_config_with(destination, |destination_file| {
+    atomic_replace_config_with(destination, true, |destination_file| {
         io::copy(&mut source_file, destination_file).map(|_| ())
     })
 }
@@ -240,7 +263,7 @@ mod atomic_tests {
         let config = dir.join("config.toml");
         fs::write(&config, b"old = true\n").unwrap();
 
-        let error = atomic_replace_config_with(&config, |_| {
+        let error = atomic_replace_config_with(&config, true, |_| {
             Err(io::Error::other("injected write failure"))
         })
         .unwrap_err();
@@ -255,6 +278,29 @@ mod atomic_tests {
                 .ends_with(".tmp")),
             "failed replacement leaves no temporary config behind"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn non_force_atomic_write_publishes_when_destination_is_absent() {
+        let dir = test_dir("no-replace-success");
+        fs::create_dir_all(&dir).unwrap();
+        let destination = dir.join("config.toml");
+
+        atomic_write_config_no_replace(&destination, b"ours = true\n").unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"ours = true\n");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn non_force_atomic_write_never_replaces_a_racing_destination() {
+        let dir = test_dir("no-replace");
+        fs::create_dir_all(&dir).unwrap();
+        let destination = dir.join("config.toml");
+        fs::write(&destination, b"racing = true\n").unwrap();
+
+        assert!(atomic_write_config_no_replace(&destination, b"ours = true\n").is_err());
+        assert_eq!(fs::read(&destination).unwrap(), b"racing = true\n");
         let _ = fs::remove_dir_all(&dir);
     }
 

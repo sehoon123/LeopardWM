@@ -1419,6 +1419,9 @@ document.querySelectorAll('.nav-item[data-section]').forEach(function(link) {
 function initCombobox(cb) {
   var trigger = cb.querySelector('.combobox-trigger');
   var popup = cb.querySelector('.combobox-popup');
+  trigger.setAttribute('aria-haspopup', 'listbox');
+  trigger.setAttribute('aria-expanded', 'false');
+  popup.setAttribute('role', 'listbox');
   trigger.addEventListener('click', function(e) {
     e.stopPropagation();
     document.querySelectorAll('.combobox.open').forEach(function(other) {
@@ -1453,8 +1456,19 @@ function initCombobox(cb) {
       }
     }
     cb.classList.toggle('open');
+    trigger.setAttribute('aria-expanded', cb.classList.contains('open') ? 'true' : 'false');
+  });
+  trigger.addEventListener('keydown', function(e) {
+    if (e.key === 'ArrowDown' || e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      if (!cb.classList.contains('open')) trigger.click();
+      var selected = cb.querySelector('.combobox-option.selected') || cb.querySelector('.combobox-option');
+      if (selected) selected.focus();
+    }
   });
   cb.querySelectorAll('.combobox-option').forEach(function(opt) {
+    opt.setAttribute('role', 'option');
+    opt.tabIndex = -1;
     opt.addEventListener('click', function(e) {
       e.stopPropagation();
       cb.querySelector('.combobox-text').textContent = opt.textContent;
@@ -1462,7 +1476,21 @@ function initCombobox(cb) {
       cb.classList.remove('open');
       cb.querySelectorAll('.combobox-option').forEach(function(o) { o.classList.remove('selected'); });
       opt.classList.add('selected');
+      trigger.setAttribute('aria-expanded', 'false');
+      trigger.focus();
       autoSave(0);
+    });
+    opt.addEventListener('keydown', function(e) {
+      var options = Array.from(cb.querySelectorAll('.combobox-option'));
+      var index = options.indexOf(opt);
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        e.preventDefault();
+        options[(index + (e.key === 'ArrowDown' ? 1 : -1) + options.length) % options.length].focus();
+      } else if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault(); opt.click();
+      } else if (e.key === 'Escape') {
+        e.preventDefault(); cb.classList.remove('open'); trigger.setAttribute('aria-expanded', 'false'); trigger.focus();
+      }
     });
   });
 }
@@ -1470,7 +1498,11 @@ document.querySelectorAll('.combobox').forEach(function(cb) {
   if (cb.querySelector('.combobox-trigger')) initCombobox(cb);
 });
 document.addEventListener('click', function() {
-  document.querySelectorAll('.combobox.open').forEach(function(cb) { cb.classList.remove('open'); });
+  document.querySelectorAll('.combobox.open').forEach(function(cb) {
+    cb.classList.remove('open');
+    var trigger = cb.querySelector('.combobox-trigger');
+    if (trigger) trigger.setAttribute('aria-expanded', 'false');
+  });
   document.querySelectorAll('.rule-opts.open').forEach(function(o) {
     o.classList.remove('open');
     o.querySelectorAll('.menu-item.subopen').forEach(function(m) { m.classList.remove('subopen'); });
@@ -1500,7 +1532,7 @@ function addPresetRow(kind, value) {
   var v = (value != null) ? value : '';
   tr.innerHTML =
     '<td><input type="text" class="preset-val" value="' + v + '" placeholder="0.5"></td>' +
-    '<td><button class="row-delete" onclick="removePresetRow(this,\'' + kind + '\')">' + deleteIcon + '</button></td>';
+    '<td><button class="row-delete" type="button" aria-label="Delete ' + kind + ' preset" onclick="removePresetRow(this,\'' + kind + '\')">' + deleteIcon + '</button></td>';
   tbody.appendChild(tr);
   wrapAllInputs(tr);
   tr.querySelector('input').addEventListener('input', function() {
@@ -2106,7 +2138,7 @@ function addRuleRow(r) {
           '<div class="menu-sub">' + cornerRadios + '</div></div>' +
       '</div>' +
     '</div></td>' +
-    '<td><button class="row-delete" onclick="this.closest(\'tr\').remove();autoSave(0)">' + deleteIcon + '</button></td>';
+    '<td><button class="row-delete" type="button" aria-label="Delete rule" onclick="this.closest(\'tr\').remove();autoSave(0)">' + deleteIcon + '</button></td>';
   tbody.appendChild(tr);
   wrapAllInputs(tr);
   tr.querySelectorAll('input').forEach(function(el) { el.addEventListener('input', function() { autoSave(500); }); });
@@ -2136,6 +2168,28 @@ function initRuleOptions(tr) {
   var cell = tr.querySelector('.rule-opts');
   var btn = tr.querySelector('.rule-opts-btn');
   var pop = tr.querySelector('.rule-opts-pop');
+  btn.setAttribute('aria-haspopup', 'menu');
+  btn.setAttribute('aria-expanded', 'false');
+  pop.setAttribute('role', 'menu');
+  var keyboardItems = Array.from(pop.querySelectorAll('.menu-item.has-sub, .menu-item.menu-toggle, .menu-radio'));
+  keyboardItems.forEach(function(item) {
+    item.tabIndex = 0;
+    var isToggle = item.classList.contains('menu-toggle');
+    var isRadio = item.classList.contains('menu-radio');
+    item.setAttribute('role', isToggle ? 'menuitemcheckbox' : (isRadio ? 'menuitemradio' : 'menuitem'));
+    if (isToggle || isRadio) item.setAttribute('aria-checked', item.classList.contains(isToggle ? 'checked' : 'selected') ? 'true' : 'false');
+    item.addEventListener('keydown', function(e) {
+      var index = keyboardItems.indexOf(item);
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        e.preventDefault();
+        keyboardItems[(index + (e.key === 'ArrowDown' ? 1 : -1) + keyboardItems.length) % keyboardItems.length].focus();
+      } else if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault(); item.click();
+      } else if (e.key === 'Escape') {
+        e.preventDefault(); cell.classList.remove('open'); btn.setAttribute('aria-expanded', 'false'); btn.focus();
+      }
+    });
+  });
   btn.addEventListener('click', function(e) {
     e.stopPropagation();
     document.querySelectorAll('.rule-opts.open').forEach(function(o) {
@@ -2164,6 +2218,7 @@ function initRuleOptions(tr) {
       updateRuleSummary(tr);
     }
     cell.classList.toggle('open');
+    btn.setAttribute('aria-expanded', cell.classList.contains('open') ? 'true' : 'false');
   });
   /* Clicks inside the flyout stay open; a click on the menu background (not an
      item) closes any open submenu. */
@@ -2201,6 +2256,9 @@ function initRuleOptions(tr) {
       parent.querySelector('.menu-value').textContent = opt.textContent;
       parent.querySelectorAll('.menu-radio').forEach(function(o) { o.classList.remove('selected'); });
       opt.classList.add('selected');
+      parent.querySelectorAll('.menu-radio').forEach(function(o) {
+        o.setAttribute('aria-checked', o === opt ? 'true' : 'false');
+      });
       parent.classList.remove('subopen');
       updateRuleSummary(tr);
       autoSave(0);
@@ -2212,6 +2270,7 @@ function initRuleOptions(tr) {
     item.addEventListener('click', function(e) {
       e.stopPropagation();
       item.classList.toggle('checked');
+      item.setAttribute('aria-checked', item.classList.contains('checked') ? 'true' : 'false');
       updateRuleSummary(tr);
       autoSave(0);
     });
@@ -2401,6 +2460,8 @@ wrapAllInputs();
 
 /* ── Auto-save ────────────────────────────────────────────────────── */
 var _saveTimer = null;
+var _saveInFlight = false;
+var _saveQueued = false;
 function showSaveNotice(title, message, isError) {
   var bar = document.getElementById('save-conflict-bar');
   if (!bar) return;
@@ -2412,10 +2473,14 @@ function showSaveNotice(title, message, isError) {
 }
 function handleSaveResult(result) {
   if (!result || !result.status) return;
+  var queued = _saveQueued;
+  _saveInFlight = false;
+  _saveQueued = false;
   var bar = document.getElementById('save-conflict-bar');
   if (result.status === 'saved') {
     window._configRevision = result.revision || window._configRevision;
     if (bar) bar.hidden = true;
+    if (queued) autoSave(0);
     return;
   }
   if (result.status === 'conflict' && result.config) {
@@ -2439,6 +2504,11 @@ function autoSave(delay) {
       showSaveNotice('Settings were not saved.', 'Resolve duplicate hotkey bindings first.', true);
       return;
     }
+    if (_saveInFlight) {
+      _saveQueued = true;
+      return;
+    }
+    _saveInFlight = true;
     window.ipc.postMessage(JSON.stringify({ action: 'save', revision: window._configRevision || '', config: readConfig() }));
   }, delay || 0);
 }

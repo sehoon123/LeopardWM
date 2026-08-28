@@ -1753,6 +1753,9 @@ fn sync_thumbnails(hwnd: HWND) {
 /// the window and, for overlay-initiated closes, sends `Dismissed` only
 /// now (see [`user_close`]).
 fn on_anim_tick(hwnd: HWND) {
+    let thumbnail_reconcile = THUMBNAIL_RECONCILE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let (anim, updates) = {
         let mut s = state();
         let anim = match s.anim.as_mut() {
@@ -1844,6 +1847,7 @@ fn on_anim_tick(hwnd: HWND) {
     for (handle, dest, opacity) in updates {
         let _ = thumbnail::update(handle, dest, opacity, true);
     }
+    drop(thumbnail_reconcile);
     if anim_progress(&anim) < 1.0 {
         return;
     }
