@@ -2859,6 +2859,17 @@ fn virtual_screen_size() -> (i32, i32) {
 pub mod integration_probe {
     use super::*;
     use windows::core::BOOL;
+
+    pub fn click_receipt_matches_target(
+        event: crate::preview_input::PreviewClickEvent,
+        target: crate::preview_input::PreviewClickTarget,
+    ) -> bool {
+        event.window_id == target.window_id
+            && event.source_process_id == target.source_process_id
+            && event.publication_generation == target.publication_generation
+            && event.preview_rect == target.rect
+            && event.gesture == crate::preview_input::PreviewGesture::Click
+    }
     use windows::Win32::Foundation::{COLORREF, LPARAM, POINT, WPARAM};
     use windows::Win32::Graphics::Gdi::{GetDC, GetPixel, ReleaseDC};
     use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -3485,6 +3496,17 @@ pub mod integration_probe {
         }
         let request = probe_request(source_window_id, destination)?;
         let initial_live_previews = commit_persistent_previews(&[request], true, expected_epoch)?;
+        let expected_click_target = {
+            let state = lock_persistent_previews();
+            preview_click_targets(&published_preview_requests(&state))
+                .into_iter()
+                .find(|target| target.window_id == source_window_id)
+        }
+        .ok_or_else(|| {
+            Win32Error::SetPositionFailed(
+                "integration probe could not capture the published click identity".into(),
+            )
+        })?;
         let windows = probe_windows();
         let host_raw = host().hwnd().0 as isize;
         let host_index = windows
@@ -3593,10 +3615,7 @@ pub mod integration_probe {
                 } else {
                     Duration::from_secs(1)
                 })
-                .is_ok_and(|event| {
-                    event.window_id == source_window_id
-                        && event.gesture == crate::preview_input::PreviewGesture::Click
-                });
+                .is_ok_and(|event| click_receipt_matches_target(event, expected_click_target));
         if cursor_saved {
             let _ = unsafe { SetCursorPos(previous_cursor.x, previous_cursor.y) };
         }

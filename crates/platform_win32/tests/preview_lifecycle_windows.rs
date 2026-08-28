@@ -6,7 +6,8 @@ use leopardwm_platform_win32::tab_strip::{
 };
 use leopardwm_platform_win32::thumbnail::integration_probe;
 use leopardwm_platform_win32::{
-    apply_placements_with_regions, MonitorInfo, PlatformConfig, WindowRegionClip,
+    apply_placements_with_regions, MonitorInfo, PlatformConfig, PreviewClickEvent,
+    PreviewClickTarget, PreviewGesture, WindowRegionClip,
 };
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -90,6 +91,61 @@ fn dual_gate_requires_the_outside_sample_on_a_distinct_monitor() {
         Rect::new(1000, 100, 800, 560),
     );
     assert_eq!(dual_gate_destination(&inset_primary, &[adjacent]), None);
+}
+
+#[test]
+fn physical_click_receipt_requires_exact_publication_identity() {
+    let target = PreviewClickTarget {
+        window_id: 42,
+        source_process_id: 7,
+        publication_generation: 11,
+        rect: Rect::new(100, 200, 40, 80),
+    };
+    let event = PreviewClickEvent {
+        window_id: target.window_id,
+        source_process_id: target.source_process_id,
+        publication_generation: target.publication_generation,
+        preview_rect: target.rect,
+        gesture: PreviewGesture::Click,
+    };
+    assert!(integration_probe::click_receipt_matches_target(
+        event, target
+    ));
+    assert!(!integration_probe::click_receipt_matches_target(
+        PreviewClickEvent {
+            publication_generation: 10,
+            ..event
+        },
+        target
+    ));
+    assert!(!integration_probe::click_receipt_matches_target(
+        PreviewClickEvent {
+            preview_rect: Rect::new(101, 200, 40, 80),
+            ..event
+        },
+        target
+    ));
+    assert!(!integration_probe::click_receipt_matches_target(
+        PreviewClickEvent {
+            window_id: 43,
+            ..event
+        },
+        target
+    ));
+    assert!(!integration_probe::click_receipt_matches_target(
+        PreviewClickEvent {
+            source_process_id: 8,
+            ..event
+        },
+        target
+    ));
+    assert!(!integration_probe::click_receipt_matches_target(
+        PreviewClickEvent {
+            gesture: PreviewGesture::Drag,
+            ..event
+        },
+        target
+    ));
 }
 
 unsafe extern "system" fn source_window_proc(
