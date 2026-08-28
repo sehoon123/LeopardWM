@@ -57,7 +57,14 @@ impl Workspace {
         // enforced.
         self.window_min_widths.remove(&window_id);
         self.window_min_heights.remove(&window_id);
-        self.minimized_windows.remove(&window_id)
+        let restored = self.minimized_windows.remove(&window_id);
+        if restored && self.find_window_location(window_id).is_some() {
+            // Restoring a tiled window changes strip geometry. An in-flight
+            // target was computed against the minimized strip and must not
+            // later overwrite the restored layout's visibility decision.
+            self.cancel_animation();
+        }
+        restored
     }
 
     /// Check if a window is currently minimized.

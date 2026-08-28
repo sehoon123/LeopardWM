@@ -4,7 +4,7 @@ pub mod operations;
 pub mod sizing;
 pub mod state;
 
-use serde::{Deserialize, Serialize};
+use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize};
 use std::collections::{HashMap, HashSet};
 
 use crate::animation::{Easing, ScrollAnimation, DEFAULT_ANIMATION_DURATION_MS};
@@ -18,9 +18,9 @@ pub enum CenteringMode {
     /// Center the focused column in the viewport.
     #[default]
     Center,
-    /// Move by the minimum distance needed to fully expose a fitting column.
-    /// For an oversized column, keep the viewport inside it without an
-    /// unnecessary edge snap.
+    /// Fully expose a fitting column at a deterministic edge anchor. For an
+    /// oversized column, keep the viewport inside it without an unnecessary
+    /// edge snap.
     JustInView,
     /// Behave like `JustInView` for fitting columns and center only when the
     /// focused column is wider than the viewport.
@@ -66,7 +66,7 @@ pub(crate) struct FloatOrigin {
 ///    `max_scroll = (total_width() - viewport_width).max(0)`.
 ///    Exception: when `center_past_edges` is true, `scroll_offset` may be
 ///    negative (centering first column) or exceed `max_scroll` (last column).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Workspace {
     /// Columns in the workspace, ordered left to right.
     pub(crate) columns: Vec<Column>,
@@ -164,6 +164,86 @@ pub struct MaximizedColumnState {
     pub sentinel_window: WindowId,
 }
 
+#[derive(Debug, Deserialize)]
+struct PersistedWorkspace {
+    #[serde(default)]
+    columns: Vec<Column>,
+    #[serde(default)]
+    focused_column: usize,
+    #[serde(default)]
+    focused_window_in_column: usize,
+    #[serde(default)]
+    scroll_offset: f64,
+    #[serde(default = "default_gap_value")]
+    gap: i32,
+    #[serde(default = "default_outer_gap_value")]
+    outer_gap_left: i32,
+    #[serde(default = "default_outer_gap_value")]
+    outer_gap_right: i32,
+    #[serde(default = "default_outer_gap_value")]
+    outer_gap_top: i32,
+    #[serde(default = "default_outer_gap_value")]
+    outer_gap_bottom: i32,
+    #[serde(default = "default_column_width_value")]
+    default_column_width: i32,
+    #[serde(default)]
+    centering_mode: CenteringMode,
+    #[serde(default)]
+    floating_windows: Vec<FloatingWindow>,
+    #[serde(default)]
+    fullscreen_window: Option<WindowId>,
+    #[serde(default)]
+    minimized_windows: HashSet<WindowId>,
+}
+
+fn default_gap_value() -> i32 {
+    DEFAULT_GAP
+}
+
+fn default_column_width_value() -> i32 {
+    DEFAULT_COLUMN_WIDTH
+}
+
+impl<'de> Deserialize<'de> for Workspace {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let persisted = PersistedWorkspace::deserialize(deserializer)?;
+        let mut workspace = Self {
+            columns: persisted.columns,
+            focused_column: persisted.focused_column,
+            focused_window_in_column: persisted.focused_window_in_column,
+            scroll_offset: sanitize_scroll_offset(persisted.scroll_offset),
+            gap: persisted.gap.max(0),
+            outer_gap_left: persisted.outer_gap_left.max(0),
+            outer_gap_right: persisted.outer_gap_right.max(0),
+            outer_gap_top: persisted.outer_gap_top.max(0),
+            outer_gap_bottom: persisted.outer_gap_bottom.max(0),
+            default_column_width: persisted.default_column_width.max(MIN_COLUMN_WIDTH),
+            centering_mode: persisted.centering_mode,
+            active_animation: None,
+            floating_windows: persisted.floating_windows,
+            fullscreen_window: persisted.fullscreen_window,
+            minimized_windows: persisted.minimized_windows,
+            window_min_widths: HashMap::new(),
+            window_min_heights: HashMap::new(),
+            pending_min_size_clears: HashSet::new(),
+            float_origin_column: HashMap::new(),
+            reduce_motion: false,
+            scroll_duration_ms: DEFAULT_ANIMATION_DURATION_MS,
+            scroll_easing: Easing::default(),
+            center_past_edges: false,
+            maximized_column: None,
+            tab_strip_reserve_px: 0,
+        };
+        workspace
+            .validate_persisted_state()
+            .map_err(|error| <D::Error as DeError>::custom(error))?;
+        Ok(workspace)
+    }
+}
+
 impl Default for Workspace {
     fn default() -> Self {
         Self {
@@ -197,6 +277,120 @@ impl Default for Workspace {
 }
 
 impl Workspace {
+    /// Reject persisted topology that would violate safe-method assumptions.
+    /// Numeric fields that have harmless legacy representations are normalized
+    /// during deserialization; ownership and focus corruption is rejected.
+    fn validate_persisted_state(&mut self) -> Result<(), String> {
+        let mut seen = HashSet::new();
+        for column in &self.columns {
+            if column.is_empty() {
+                return Err("persisted workspace contains an empty column".into());
+            }
+            for &window_id in column.windows() {
+                if !seen.insert(window_id) {
+                    return Err(format!("persisted workspace duplicates window {window_id}"));
+                }
+            }
+        }
+        for floating in &self.floating_windows {
+            if !seen.insert(floating.id) {
+                return Err(format!("persisted workspace duplicates window {}", floating.id));
+            }
+        }
+
+        if self.columns.is_empty() {
+            self.focused_column = 0;
+            self.focused_window_in_column = 0;
+        } else {
+            let Some(column) = self.columns.get(self.focused_column) else {
+                return Err("persisted workspace has an out-of-range focused column".into());
+            };
+            if self.focused_window_in_column >= column.len() {
+                return Err("persisted workspace has an out-of-range focused window".into());
+            }
+            // A focused tabbed column must render the focused tab.
+            self.columns[self.focused_column].set_active_tab(self.focused_window_in_column);
+        }
+
+        if !self.minimized_windows.is_subset(&seen) {
+            return Err("persisted workspace minimizes an unknown window".into());
+        }
+        if let Some(window_id) = self.fullscreen_window {
+            if !seen.contains(&window_id) || self.minimized_windows.contains(&window_id) {
+                return Err("persisted workspace has an invalid fullscreen window".into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Widths used by both focus scrolling and placement. Learned minimums
+    /// may transiently widen constrained columns and reduce flexible columns;
+    /// every strip calculation must use this same geometry.
+    pub(crate) fn effective_column_widths(&self) -> Vec<i32> {
+        let mut widths: Vec<i32> = self.columns.iter().map(|column| column.width()).collect();
+        if self.window_min_widths.is_empty() {
+            return widths;
+        }
+
+        let mut excess = 0i64;
+        let mut flexible_total = 0i64;
+        for (index, column) in self.columns.iter().enumerate() {
+            if !self.is_column_active(column) {
+                continue;
+            }
+            let minimum = self.column_effective_min_width(column);
+            if minimum > column.width() {
+                excess = excess.saturating_add(i64::from(minimum) - i64::from(column.width()));
+                widths[index] = minimum;
+            } else {
+                flexible_total = flexible_total.saturating_add(i64::from(column.width()));
+            }
+        }
+
+        if excess == 0 || flexible_total == 0 {
+            return widths;
+        }
+
+        let mut remaining = excess;
+        for (index, column) in self.columns.iter().enumerate() {
+            if !self.is_column_active(column) || widths[index] != column.width() {
+                continue;
+            }
+            let requested = (f64::from(column.width()) / flexible_total as f64 * excess as f64)
+                .round();
+            let proportional_share = if requested.is_finite() && requested > 0.0 {
+                requested.min(i64::MAX as f64) as i64
+            } else {
+                0
+            };
+            let capacity = i64::from(column.width().saturating_sub(MIN_COLUMN_WIDTH));
+            let shrink = proportional_share.min(remaining).min(capacity);
+            widths[index] = widths[index].saturating_sub(i64_to_i32_saturating(shrink));
+            remaining -= shrink;
+        }
+        widths
+    }
+
+    pub(crate) fn total_width_for_effective_widths(&self, widths: &[i32]) -> i32 {
+        let mut active_count = 0usize;
+        let mut column_widths = 0i64;
+        for (index, column) in self.columns.iter().enumerate() {
+            if self.is_column_active(column) {
+                active_count += 1;
+                column_widths = column_widths.saturating_add(i64::from(
+                    widths.get(index).copied().unwrap_or_else(|| column.width()),
+                ));
+            }
+        }
+        if active_count == 0 {
+            return 0;
+        }
+        let gaps = i64::from(self.gap.max(0)).saturating_mul(
+            i64::try_from(active_count.saturating_sub(1)).unwrap_or(i64::MAX),
+        );
+        i64_to_i32_saturating(column_widths.saturating_add(gaps))
+    }
+
     /// Create a new empty workspace with default settings.
     pub fn new() -> Self {
         Self::default()
@@ -351,26 +545,7 @@ impl Workspace {
     ///
     /// Note: Negative gaps are treated as zero for calculation purposes.
     pub fn total_width(&self) -> i32 {
-        // Count and sum active columns in one pass. This is called on every
-        // focus/scroll adjustment, so avoid allocating a temporary Vec.
-        let mut active_count = 0usize;
-        let mut column_widths = 0i32;
-        for column in &self.columns {
-            if self.is_column_active(column) {
-                active_count += 1;
-                column_widths = column_widths.saturating_add(column.width);
-            }
-        }
-
-        if active_count == 0 {
-            return 0;
-        }
-
-        // Strip width = columns + inter-column gaps only. Outer gaps are
-        // viewport padding, not strip content.
-        let gap = self.gap.max(0);
-        let gaps = gap.saturating_mul(active_count.saturating_sub(1) as i32);
-        column_widths.saturating_add(gaps)
+        self.total_width_for_effective_widths(&self.effective_column_widths())
     }
 
     /// Get the current scroll offset.

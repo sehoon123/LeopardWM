@@ -691,6 +691,14 @@ impl Workspace {
         Ok(())
     }
 
+    /// Whether both stored focus indices select an existing tiled window.
+    pub(crate) fn has_valid_focus(&self) -> bool {
+        self.columns
+            .get(self.focused_column)
+            .and_then(|column| column.get(self.focused_window_in_column))
+            .is_some()
+    }
+
     /// Clamp focus indices to valid column/window bounds.
     pub(crate) fn clamp_focus_indices(&mut self) {
         if self.columns.is_empty() {

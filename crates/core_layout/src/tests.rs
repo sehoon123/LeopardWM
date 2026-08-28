@@ -4352,4 +4352,158 @@ mod tests {
         // active_idx should still be 1 (not the dragged window).
         assert_eq!(ws.columns[1].active_tab_idx(), Some(1));
     }
+
+    #[test]
+    fn test_just_in_view_fitting_anchor_is_history_independent_after_resize() {
+        let target_for = |focus, prior_offset| {
+            let mut ws = Workspace::with_gaps(0, 0);
+            ws.set_centering_mode(CenteringMode::JustInView);
+            ws.insert_window(1, Some(500)).unwrap();
+            ws.insert_window(2, Some(750)).unwrap();
+            ws.set_focus(focus, 0).unwrap();
+            ws.set_scroll_offset(prior_offset);
+            ws.ensure_focused_visible(1000);
+            ws.scroll_offset()
+        };
+
+        // The 75% right column always retains its 25% left preview regardless
+        // of prior focus direction/offset. The 50% left column remains pinned
+        // to the content edge instead of inheriting a stale rightward offset.
+        assert_eq!(target_for(1, 0.0), 250.0);
+        assert_eq!(target_for(1, 250.0), 250.0);
+        assert_eq!(target_for(1, 1_000.0), 250.0);
+        assert_eq!(target_for(0, 0.0), 0.0);
+        assert_eq!(target_for(0, 250.0), 0.0);
+
+        // A previous 100%-wide neighbor may leave a 75%-wide focused column
+        // at the old edge. Once that neighbor shrinks to 75%, the canonical
+        // 25% preview is restored rather than preserving stale scroll history.
+        let mut ws = Workspace::with_gaps(0, 0);
+        ws.set_centering_mode(CenteringMode::JustInView);
+        ws.insert_window(1, Some(1000)).unwrap();
+        ws.insert_window(2, Some(750)).unwrap();
+        ws.set_focus(0, 0).unwrap();
+        ws.resize_focused_column(-250);
+        ws.set_focus(1, 0).unwrap();
+        ws.set_scroll_offset(750.0);
+        ws.ensure_focused_visible(1000);
+        assert_eq!(ws.scroll_offset(), 500.0);
+    }
+
+    #[test]
+    fn test_restore_cancels_stale_scroll_animation_before_retargeting() {
+        let mut ws = Workspace::with_gaps(0, 0);
+        ws.set_centering_mode(CenteringMode::JustInView);
+        ws.insert_window(1, Some(400)).unwrap();
+        ws.insert_window(2, Some(400)).unwrap();
+        ws.insert_window(3, Some(400)).unwrap();
+        ws.set_focus(2, 0).unwrap();
+        assert!(ws.mark_minimized(2));
+        ws.ensure_focused_visible_animated(400);
+        assert!(ws.tick_animation(50));
+
+        assert!(ws.mark_restored(2));
+        assert!(!ws.is_animating());
+        ws.ensure_focused_visible_animated(400);
+        assert!(!ws.tick_animation(10_000));
+        let focused = ws
+            .compute_placements(Rect::new(0, 0, 400, 600))
+            .into_iter()
+            .find(|placement| placement.window_id == 3)
+            .unwrap();
+        assert_eq!(focused.visibility, Visibility::Visible);
+    }
+
+    #[test]
+    fn test_focus_scroll_uses_placement_effective_widths() {
+        let mut ws = Workspace::with_gaps(0, 0);
+        ws.set_centering_mode(CenteringMode::JustInView);
+        ws.insert_window(1, Some(400)).unwrap();
+        ws.insert_window(2, Some(400)).unwrap();
+        ws.set_focus(1, 0).unwrap();
+        assert!(ws.set_window_min_width(1, 800));
+
+        ws.ensure_focused_visible(500);
+        let focused = ws
+            .compute_placements(Rect::new(0, 0, 500, 600))
+            .into_iter()
+            .find(|placement| placement.window_id == 2)
+            .unwrap();
+        assert_eq!(focused.visibility, Visibility::Visible);
+        assert!(focused.rect.x >= 0 && focused.rect.right() <= 500);
+    }
+
+    #[test]
+    fn test_workspace_deserialization_validates_and_repairs_invariants() {
+        for invalid in [
+            r#"{"columns":[{"width":400,"windows":[1]}],"focused_column":1}"#,
+            r#"{"columns":[{"width":400,"windows":[]}]}"#,
+            r#"{"columns":[{"width":400,"windows":[1]},{"width":400,"windows":[1]}]}"#,
+            r#"{"columns":[{"width":400,"windows":[1]}],"minimized_windows":[2]}"#,
+        ] {
+            assert!(serde_json::from_str::<Workspace>(invalid).is_err(), "{invalid}");
+        }
+
+        let repaired: Workspace = serde_json::from_str(
+            r#"{
+                "columns": [{
+                    "width": 1,
+                    "windows": [1, 2],
+                    "height_weights": [0.0, -1.0],
+                    "mode": {"type": "tabbed", "active_idx": 99}
+                }],
+                "focused_column": 0,
+                "focused_window_in_column": 1
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(repaired.columns()[0].width(), 100);
+        assert_eq!(repaired.columns()[0].active_tab_idx(), Some(1));
+        assert_eq!(repaired.columns()[0].height_weights(), &[0.5, 0.5]);
+        assert_eq!(repaired.focused_window(), Some(2));
+    }
+
+    #[test]
+    fn test_hidden_wide_tab_and_extreme_numeric_inputs_stay_safe() {
+        let mut tabs = Workspace::with_gaps(0, 0);
+        tabs.insert_window(1, Some(1500)).unwrap();
+        tabs.insert_window_in_column(2, 0).unwrap();
+        tabs.toggle_focused_column_tabbed_mode();
+        let hidden = tabs
+            .compute_placements(Rect::new(0, 0, 1000, 600))
+            .into_iter()
+            .find(|placement| placement.window_id == 2)
+            .unwrap();
+        assert_eq!(hidden.visibility, Visibility::OffScreenLeft);
+        assert!(i64::from(hidden.rect.x) + 1500 <= 0);
+
+        for input in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(Easing::EaseInOut.apply(input).is_finite());
+            assert_eq!(Easing::EaseInOut.apply(input), 0.0);
+        }
+
+        let mut ws = Workspace::with_gaps(0, 0);
+        ws.insert_window(1, Some(400)).unwrap();
+        ws.insert_window_in_column(2, 0).unwrap();
+        ws.set_window_min_height(1, i32::MAX);
+        ws.set_window_min_height(2, i32::MAX);
+        ws.set_scroll_offset(f64::NAN);
+        ws.scroll_by(f64::MAX, 500);
+        assert!(ws.scroll_offset().is_finite());
+        let extreme = Rect::new(i32::MAX, i32::MIN, i32::MAX, i32::MAX);
+        for placement in ws
+            .compute_placements(extreme)
+            .into_iter()
+            .chain(ws.compute_placements_animated(extreme))
+        {
+            assert!(placement.rect.width >= 0 && placement.rect.height >= 0);
+        }
+
+        let mut widths = Workspace::with_gaps(0, 0);
+        widths.insert_window(10, Some(400)).unwrap();
+        widths.insert_window(11, Some(400)).unwrap();
+        widths.set_window_min_width(10, i32::MAX);
+        widths.set_window_min_width(11, i32::MAX);
+        assert!(!widths.compute_placements(Rect::new(0, 0, 500, 600)).is_empty());
+    }
 }

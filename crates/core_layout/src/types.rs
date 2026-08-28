@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 /// Minimum width for columns in pixels.
@@ -13,6 +13,37 @@ pub const DEFAULT_COLUMN_WIDTH: i32 = 800;
 
 pub(crate) fn default_outer_gap_value() -> i32 {
     DEFAULT_OUTER_GAP
+}
+
+/// Convert widened coordinate arithmetic back into the placement domain.
+pub(crate) fn i64_to_i32_saturating(value: i64) -> i32 {
+    value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+}
+
+/// Normalize a public scroll offset before it is converted to pixels.
+pub(crate) fn sanitize_scroll_offset(offset: f64) -> f64 {
+    if offset.is_finite() {
+        offset.clamp(f64::from(i32::MIN), f64::from(i32::MAX))
+    } else {
+        0.0
+    }
+}
+
+/// Round a finite scroll offset into a safe pixel coordinate.
+pub(crate) fn rounded_scroll_offset(offset: f64) -> i32 {
+    let rounded = sanitize_scroll_offset(offset).round();
+    i64_to_i32_saturating(rounded as i64)
+}
+
+/// Convert a computed pixel size without relying on lossy float casts.
+pub(crate) fn nonnegative_f64_to_i32(value: f64) -> i32 {
+    if !value.is_finite() || value <= 0.0 {
+        0
+    } else if value >= f64::from(i32::MAX) {
+        i32::MAX
+    } else {
+        value as i32
+    }
 }
 
 /// Unique identifier for a window.
@@ -61,12 +92,35 @@ pub enum LayoutError {
 ///
 /// Note: Fields are intentionally public for convenient read access.
 /// Use `Rect::new()` to construct with dimension validation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Rect {
     pub x: i32,
     pub y: i32,
     pub width: i32,
     pub height: i32,
+}
+
+#[derive(Deserialize)]
+struct PersistedRect {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+}
+
+impl<'de> Deserialize<'de> for Rect {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let persisted = PersistedRect::deserialize(deserializer)?;
+        Ok(Self::new(
+            persisted.x,
+            persisted.y,
+            persisted.width,
+            persisted.height,
+        ))
+    }
 }
 
 impl Rect {

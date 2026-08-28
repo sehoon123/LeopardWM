@@ -2,6 +2,42 @@ use crate::*;
 
 use crate::workspace::Workspace;
 
+fn sorted_finite_presets(presets: &[f64]) -> Vec<f64> {
+    let mut sorted: Vec<f64> = presets
+        .iter()
+        .copied()
+        .filter(|preset| preset.is_finite())
+        .collect();
+    sorted.sort_by(f64::total_cmp);
+    sorted
+}
+
+fn width_fraction(width: i32, gap: i32, base: i32) -> f64 {
+    (i64::from(width) + i64::from(gap)) as f64 / f64::from(base)
+}
+
+fn preset_width(base: i32, gap: i32, fraction: f64) -> i32 {
+    nonnegative_f64_to_i32((f64::from(base) * fraction - f64::from(gap)).floor())
+}
+
+fn available_stack_height(
+    viewport_height: i32,
+    outer_top: i32,
+    outer_bottom: i32,
+    gap: i32,
+    windows: usize,
+) -> i32 {
+    let window_count = i64::try_from(windows).unwrap_or(i64::MAX);
+    let window_gaps = i64::from(gap.max(0)).saturating_mul(window_count.saturating_sub(1));
+    i64_to_i32_saturating(
+        i64::from(viewport_height)
+            .saturating_sub(i64::from(outer_top.max(0)))
+            .saturating_sub(i64::from(outer_bottom.max(0)))
+            .saturating_sub(window_gaps)
+            .max(1),
+    )
+}
+
 impl Workspace {
     // ========================================================================
     // Minimum Width Methods
@@ -12,6 +48,7 @@ impl Workspace {
     /// respect this when computing column placements. Returns whether the
     /// stored constraint changed.
     pub fn set_window_min_width(&mut self, window_id: WindowId, min_width: i32) -> bool {
+        let min_width = min_width.max(0);
         self.window_min_widths.insert(window_id, min_width) != Some(min_width)
     }
 
@@ -48,6 +85,7 @@ impl Workspace {
     /// to the window when computing placements. Returns whether the stored
     /// constraint changed.
     pub fn set_window_min_height(&mut self, window_id: WindowId, min_height: i32) -> bool {
+        let min_height = min_height.max(0);
         self.window_min_heights.insert(window_id, min_height) != Some(min_height)
     }
 
@@ -173,10 +211,15 @@ impl Workspace {
     /// Fraction should be between 0.1 and 1.0.
     pub fn set_focused_column_width_fraction(&mut self, fraction: f64, viewport_width: i32) {
         self.maximized_column = None;
-        let fraction = fraction.clamp(0.1, 1.0);
+        let fraction = if fraction.is_finite() {
+            fraction.clamp(0.1, 1.0)
+        } else {
+            0.1
+        };
         let base = self.width_base(viewport_width);
         let gap = self.gap.max(0);
-        let new_width = (base as f64 * fraction - gap as f64).floor() as i32;
+        let new_width =
+            nonnegative_f64_to_i32((f64::from(base) * fraction - f64::from(gap)).floor());
 
         if let Some(column) = self.columns.get_mut(self.focused_column) {
             column.set_width(new_width);
@@ -203,7 +246,8 @@ impl Workspace {
             .iter()
             .map(|c| self.is_column_active(c))
             .collect();
-        let active_count = active_flags.iter().filter(|&&a| a).count() as i32;
+        let active_count = i32::try_from(active_flags.iter().filter(|&&a| a).count())
+            .unwrap_or(i32::MAX);
         if active_count == 0 {
             return;
         }
@@ -211,10 +255,16 @@ impl Workspace {
         let outer_left = self.outer_gap_left.max(0);
         let outer_right = self.outer_gap_right.max(0);
         let gap = self.gap.max(0);
-        let total_gaps = gap * (active_count - 1) + outer_left + outer_right;
-        let per_column =
-            ((viewport_width - total_gaps).max(MIN_COLUMN_WIDTH * active_count)) / active_count;
-
+        let total_gaps = i64::from(gap)
+            .saturating_mul(i64::from(active_count.saturating_sub(1)))
+            .saturating_add(i64::from(outer_left))
+            .saturating_add(i64::from(outer_right));
+        let minimum_total = i64::from(MIN_COLUMN_WIDTH).saturating_mul(i64::from(active_count));
+        let per_column = i64_to_i32_saturating(
+            (i64::from(viewport_width).saturating_sub(total_gaps))
+                .max(minimum_total)
+                / i64::from(active_count),
+        );
         for (col, &is_active) in self.columns.iter_mut().zip(active_flags.iter()) {
             if is_active {
                 col.set_width(per_column);
@@ -225,7 +275,8 @@ impl Workspace {
         // Reclamp scroll offset — column widths may have shrunk
         let vis_w = self.visible_width(viewport_width);
         let max_scroll = (self.total_width() - vis_w).max(0);
-        self.scroll_offset = self.scroll_offset.clamp(0.0, max_scroll as f64);
+        self.scroll_offset =
+            sanitize_scroll_offset(self.scroll_offset).clamp(0.0, f64::from(max_scroll));
     }
 
     /// Rescale all column widths after gap values change.
@@ -252,8 +303,10 @@ impl Workspace {
         }
 
         for col in &mut self.columns {
-            let frac = (col.width + old_gap_c) as f64 / old_base as f64;
-            let new_width = (new_base as f64 * frac - new_gap as f64).round() as i32;
+            let frac = width_fraction(col.width(), old_gap_c, old_base);
+            let new_width = nonnegative_f64_to_i32(
+                (f64::from(new_base) * frac - f64::from(new_gap)).round(),
+            );
             col.set_width(new_width);
         }
     }
@@ -291,15 +344,14 @@ impl Workspace {
         if base <= 0 {
             return;
         }
-        let current_frac = (column.width + gap) as f64 / base as f64;
+        let current_frac = width_fraction(column.width(), gap, base);
 
-        let mut sorted = presets.to_vec();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let sorted = sorted_finite_presets(presets);
 
         const TOLERANCE: f64 = 0.005;
         let target = sorted.iter().find(|&&p| p > current_frac + TOLERANCE);
         if let Some(&frac) = target {
-            let new_width = (base as f64 * frac - gap as f64).floor() as i32;
+            let new_width = preset_width(base, gap, frac);
             column.set_width(new_width);
         }
     }
@@ -318,15 +370,14 @@ impl Workspace {
         if base <= 0 {
             return;
         }
-        let current_frac = (column.width + gap) as f64 / base as f64;
+        let current_frac = width_fraction(column.width(), gap, base);
 
-        let mut sorted = presets.to_vec();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let sorted = sorted_finite_presets(presets);
 
         const TOLERANCE: f64 = 0.005;
         let target = sorted.iter().rev().find(|&&p| p < current_frac - TOLERANCE);
         if let Some(&frac) = target {
-            let new_width = (base as f64 * frac - gap as f64).floor() as i32;
+            let new_width = preset_width(base, gap, frac);
             column.set_width(new_width);
         }
     }
@@ -355,14 +406,13 @@ impl Workspace {
         }
 
         // Fraction corresponding to the user's resized width
-        let current_frac = (new_width + gap) as f64 / base as f64;
+        let current_frac = width_fraction(new_width, gap, base);
 
         // Min-width constraint for this column
         let min_width = self.column_effective_min_width(column);
-        let min_frac = (min_width + gap) as f64 / base as f64;
+        let min_frac = width_fraction(min_width, gap, base);
 
-        let mut sorted = presets.to_vec();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let sorted = sorted_finite_presets(presets);
 
         // Find closest preset
         let nearest = sorted
@@ -386,7 +436,7 @@ impl Workspace {
                 frac
             };
 
-            let new_w = (base as f64 * final_frac - gap as f64).floor() as i32;
+            let new_w = preset_width(base, gap, final_frac);
             if let Some(column) = self.columns.get_mut(col_idx) {
                 column.set_width(new_w);
             }
@@ -427,14 +477,13 @@ impl Workspace {
         let outer_top = self.outer_gap_top.max(0);
         let outer_bottom = self.outer_gap_bottom.max(0);
         let gap = self.gap.max(0);
-        let window_gaps = gap.saturating_mul(column.len() as i32 - 1);
-        let available_height = (viewport_height - outer_top - outer_bottom - window_gaps).max(1);
+        let available_height =
+            available_stack_height(viewport_height, outer_top, outer_bottom, gap, column.len());
 
         // Weight corresponding to the user's resized height
         let current_weight = new_height as f64 / available_height as f64;
 
-        let mut sorted = presets.to_vec();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let sorted = sorted_finite_presets(presets);
 
         let nearest = sorted
             .iter()
@@ -487,8 +536,7 @@ impl Workspace {
         col.ensure_height_weights();
         let current_weight = col.height_weights[win_idx];
 
-        let mut sorted = presets.to_vec();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let sorted = sorted_finite_presets(presets);
 
         const TOLERANCE: f64 = 0.005;
         let target = if up {
@@ -520,9 +568,10 @@ impl Workspace {
         }
     }
 
-    /// Set scroll offset directly (bypasses clamping).
+    /// Set scroll offset directly (bypasses content clamping but not numeric
+    /// normalization).
     pub fn set_scroll_offset(&mut self, offset: f64) {
-        self.scroll_offset = offset;
+        self.scroll_offset = sanitize_scroll_offset(offset);
     }
 
     /// Set all column widths to a uniform value.
@@ -555,12 +604,11 @@ impl Workspace {
             return None;
         }
 
-        let current_frac = (current_width + gap) as f64 / base as f64;
+        let current_frac = width_fraction(current_width, gap, base);
         let min_width = self.column_effective_min_width(column);
-        let min_frac = (min_width + gap) as f64 / base as f64;
+        let min_frac = width_fraction(min_width, gap, base);
 
-        let mut sorted = presets.to_vec();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let sorted = sorted_finite_presets(presets);
 
         let nearest = sorted
             .iter()
@@ -581,7 +629,7 @@ impl Workspace {
             nearest
         };
 
-        Some((base as f64 * final_frac - gap as f64).floor() as i32)
+        Some(preset_width(base, gap, final_frac))
     }
 
     /// Compute the nearest height weight preset for a window, without mutating state.
@@ -604,13 +652,12 @@ impl Workspace {
         let outer_top = self.outer_gap_top.max(0);
         let outer_bottom = self.outer_gap_bottom.max(0);
         let gap = self.gap.max(0);
-        let window_gaps = gap.saturating_mul(column.len() as i32 - 1);
-        let available_height = (viewport_height - outer_top - outer_bottom - window_gaps).max(1);
+        let available_height =
+            available_stack_height(viewport_height, outer_top, outer_bottom, gap, column.len());
 
         let current_weight = current_height as f64 / available_height as f64;
 
-        let mut sorted = presets.to_vec();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let sorted = sorted_finite_presets(presets);
 
         sorted
             .iter()

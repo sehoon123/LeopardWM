@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize};
 
 use crate::types::{WindowId, MIN_COLUMN_WIDTH};
 
@@ -25,7 +25,7 @@ pub enum ColumnMode {
 
 /// A column in the infinite strip.
 /// A column contains one or more vertically stacked windows.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Column {
     /// Width of the column in pixels.
     pub(crate) width: i32,
@@ -38,6 +38,45 @@ pub struct Column {
     /// Display mode (Vertical or Tabbed).
     #[serde(default)]
     pub(crate) mode: ColumnMode,
+}
+
+#[derive(Debug, Deserialize)]
+struct PersistedColumn {
+    #[serde(default = "default_column_width")]
+    width: i32,
+    #[serde(default)]
+    windows: Vec<WindowId>,
+    #[serde(default)]
+    height_weights: Vec<f64>,
+    #[serde(default)]
+    mode: ColumnMode,
+}
+
+fn default_column_width() -> i32 {
+    MIN_COLUMN_WIDTH
+}
+
+impl<'de> Deserialize<'de> for Column {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let persisted = PersistedColumn::deserialize(deserializer)?;
+        let mut seen = std::collections::HashSet::new();
+        if persisted.windows.iter().any(|window_id| !seen.insert(*window_id)) {
+            return Err(<D::Error as DeError>::custom(
+                "persisted column duplicates a window",
+            ));
+        }
+        let mut column = Self {
+            width: persisted.width.max(MIN_COLUMN_WIDTH),
+            windows: persisted.windows,
+            height_weights: persisted.height_weights,
+            mode: persisted.mode,
+        };
+        column.repair_persisted_invariants();
+        Ok(column)
+    }
 }
 
 impl Column {
@@ -314,24 +353,43 @@ impl Column {
         }
     }
 
-    /// Ensure height_weights vec matches windows length (backward compat).
+    /// Ensure height weights are finite, non-negative, parallel to windows,
+    /// and normalized. Empty/mismatched legacy arrays intentionally repair to
+    /// equal shares rather than being allowed to poison placement arithmetic.
     pub(crate) fn ensure_height_weights(&mut self) {
-        if self.height_weights.len() != self.windows.len() {
-            self.equalize_height_weights();
-        }
+        self.normalize_height_weights();
     }
 
     /// Normalize height weights so they sum to 1.0.
     fn normalize_height_weights(&mut self) {
-        if self.height_weights.is_empty() {
+        if self.windows.is_empty() {
+            self.height_weights.clear();
             return;
         }
-        let sum: f64 = self.height_weights.iter().sum();
-        if sum > 0.0 && (sum - 1.0).abs() > 1e-9 {
-            for w in &mut self.height_weights {
-                *w /= sum;
-            }
+        if self.height_weights.len() != self.windows.len()
+            || self.height_weights.iter().any(|weight| !weight.is_finite() || *weight < 0.0)
+        {
+            self.equalize_height_weights();
+            return;
         }
+
+        let sum: f64 = self.height_weights.iter().sum();
+        if !sum.is_finite() || sum <= 0.0 {
+            self.equalize_height_weights();
+            return;
+        }
+        for weight in &mut self.height_weights {
+            *weight /= sum;
+        }
+    }
+
+    /// Repair fields that older or externally edited persisted state may have
+    /// bypassed. Workspace deserialization additionally rejects empty columns
+    /// and duplicate ownership, which require workspace-wide context.
+    fn repair_persisted_invariants(&mut self) {
+        self.width = self.width.max(MIN_COLUMN_WIDTH);
+        self.normalize_height_weights();
+        self.maintain_mode_invariant();
     }
 
     /// Handle the active_idx invariant after a window was removed at `idx`.

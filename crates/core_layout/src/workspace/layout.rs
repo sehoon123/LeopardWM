@@ -11,7 +11,7 @@ impl Workspace {
     /// Note: Negative gaps are treated as zero for calculation purposes.
     pub fn compute_placements(&self, viewport: Rect) -> Vec<WindowPlacement> {
         // Use rounding instead of truncation to prevent sub-pixel jitter
-        let viewport_left = self.scroll_offset.round() as i32;
+        let viewport_left = rounded_scroll_offset(self.scroll_offset);
 
         // Fullscreen mode: one window covers the entire viewport, others are off-screen
         if let Some(fs_wid) = self.fullscreen_window {
@@ -54,48 +54,11 @@ impl Workspace {
         let vis_w = self.visible_width(viewport.width);
         let visible_right = viewport_left.saturating_add(vis_w);
 
-        // Pre-compute effective column widths respecting window min-widths.
-        // If a column contains a window with a known minimum width larger than
-        // the allocated column width, widen it and shrink flexible columns.
-        // The common case has no learned minimum-width constraints. Keep
-        // that path allocation-free; only materialize an adjusted-width vector
-        // when at least one constraint can actually change a column.
-        let effective_widths = if self.window_min_widths.is_empty() {
-            None
-        } else {
-            let mut widths: Vec<i32> = self.columns.iter().map(|c| c.width).collect();
-            let mut excess = 0i32;
-            let mut flexible_total = 0i32;
-            for (col_idx, column) in self.columns.iter().enumerate() {
-                if !self.is_column_active(column) {
-                    continue;
-                }
-                let min_w = self.column_effective_min_width(column);
-                if min_w > column.width {
-                    excess += min_w - column.width;
-                    widths[col_idx] = min_w;
-                } else {
-                    flexible_total += column.width;
-                }
-            }
-            if excess > 0 && flexible_total > 0 {
-                let mut remaining = excess;
-                for (col_idx, column) in self.columns.iter().enumerate() {
-                    if !self.is_column_active(column) || widths[col_idx] != column.width {
-                        continue;
-                    }
-                    let share = ((column.width as f64 / flexible_total as f64) * excess as f64)
-                        .round() as i32;
-                    let shrink = share
-                        .min(remaining)
-                        .min(column.width - MIN_COLUMN_WIDTH)
-                        .max(0);
-                    widths[col_idx] -= shrink;
-                    remaining -= shrink;
-                }
-            }
-            Some(widths)
-        };
+        // Focus scrolling, strip bounds, and placement all share this exact
+        // effective geometry. Keeping the learned-minimum adjustment in one
+        // helper prevents a focused column from being "visible" in stored
+        // widths while placement has moved it elsewhere.
+        let effective_widths = self.effective_column_widths();
 
         // Strip starts at 0 — outer gaps are viewport padding
         let mut current_x: i32 = 0;
@@ -111,18 +74,23 @@ impl Workspace {
             min_heights.clear();
 
             let eff_width = effective_widths
-                .as_ref()
-                .map_or(column.width, |widths| widths[col_idx]);
+                .get(col_idx)
+                .copied()
+                .unwrap_or_else(|| column.width());
 
             // Calculate column position in strip coordinates
             let col_strip_x = current_x;
             let col_strip_right = col_strip_x.saturating_add(eff_width);
 
-            // Transform to screen coordinates:
-            // strip_x → screen_x = strip_x - scroll_offset + viewport.x + outer_left
-            // Must use regular arithmetic (not saturating) to allow negative screen
-            // positions for columns partially scrolled off the left edge.
-            let natural_screen_x = col_strip_x - viewport_left + viewport.x + outer_left;
+            // Transform to screen coordinates in a widened domain. This still
+            // permits negative positions for scrolled columns without making
+            // extreme public viewport/scroll values build-profile dependent.
+            let natural_screen_x = i64_to_i32_saturating(
+                i64::from(col_strip_x)
+                    .saturating_sub(i64::from(viewport_left))
+                    .saturating_add(i64::from(viewport.x))
+                    .saturating_add(i64::from(outer_left)),
+            );
 
             // Determine visibility against the visible strip area
             let visibility = if col_strip_right <= viewport_left {
@@ -212,7 +180,11 @@ impl Workspace {
             // frame after the toggle.
             if column.is_tabbed() {
                 let on_screen_idx = visible_windows.first().map(|(i, _)| *i);
-                let offscreen_x = viewport.x.saturating_sub(viewport.width.max(1));
+                // `SWP_NOSIZE` can retain a tab wider than the viewport.
+                // Move by at least that retained effective width as well as
+                // the viewport width so the fallback position truly clears it.
+                let offscreen_distance = viewport.width.max(eff_width).max(1);
+                let offscreen_x = viewport.x.saturating_sub(offscreen_distance);
                 for (i, &wid) in column.windows().iter().enumerate() {
                     if Some(i) == on_screen_idx {
                         continue;
@@ -273,28 +245,41 @@ impl Workspace {
                 visible_weights.resize(visible_windows.len(), 1.0);
             }
 
-            min_heights.extend(
-                visible_windows
-                    .iter()
-                    .map(|(_, wid)| self.window_min_heights.get(wid).copied().unwrap_or(0)),
-            );
-            let total_min: i32 = min_heights.iter().sum();
-            let flex_height = (available_height - total_min).max(0);
+            min_heights.extend(visible_windows.iter().map(|(_, wid)| {
+                self.window_min_heights
+                    .get(wid)
+                    .copied()
+                    .unwrap_or(0)
+                    .max(0)
+            }));
+            // Sum widened minimums so two valid i32::MAX public inputs cannot
+            // overflow in debug builds or wrap in release builds.
+            let total_min = min_heights.iter().fold(0i64, |sum, &height| {
+                sum.saturating_add(i64::from(height))
+            });
+            let flex_height = (i64::from(available_height) - total_min).max(0);
 
-            // Sum of weights over windows that don't have a pinned minimum.
+            // Sum only finite non-negative weights. Persisted columns repair
+            // these values, but placement remains defensive for internal and
+            // future construction paths.
             let flex_weight_sum: f64 = visible_weights
                 .iter()
                 .zip(min_heights.iter())
-                .filter(|(_, m)| **m == 0)
-                .map(|(w, _)| *w)
+                .filter(|(_, minimum)| **minimum == 0)
+                .map(|(weight, _)| if weight.is_finite() && *weight > 0.0 { *weight } else { 0.0 })
                 .sum();
             // If any flexible window exists, pinned windows get exactly their
             // minimum and flexible windows share flex_height. If every window
             // is pinned, pinned windows still get exactly their minimum and
             // the last-window remainder rule absorbs any leftover space.
-            let has_flex = flex_weight_sum > 0.0;
+            let has_flex = flex_weight_sum.is_finite() && flex_weight_sum > 0.0;
 
-            let mut current_y = viewport.y + outer_top + column_top_reserve;
+            let mut current_y = i64::from(viewport.y)
+                .saturating_add(i64::from(outer_top))
+                .saturating_add(i64::from(column_top_reserve));
+            let content_bottom = i64::from(viewport.y)
+                .saturating_add(i64::from(viewport.height))
+                .saturating_sub(i64::from(outer_bottom));
             let visible_placement_start = placements.len();
 
             for (win_idx, &(_, window_id)) in visible_windows.iter().enumerate() {
@@ -302,34 +287,50 @@ impl Workspace {
                 let height = if is_last {
                     // Last window absorbs the rounding remainder so the column
                     // stays flush with the viewport, but we honor its minimum
-                    // even if doing so causes the column to overflow downward
-                    // (the alternative — silently violating its minimum — is
-                    // what Slack/Spotify did before this fix and the whole
-                    // point of the contract is to never let that happen).
-                    let remainder =
-                        (viewport.y + viewport.height - outer_bottom - current_y).max(0);
-                    remainder.max(min_heights[win_idx])
+                    // even if doing so causes the column to overflow downward.
+                    (content_bottom - current_y)
+                        .max(0)
+                        .max(i64::from(min_heights[win_idx]))
                 } else if min_heights[win_idx] > 0 {
                     // Pinned non-last window: exactly its minimum.
-                    min_heights[win_idx]
+                    i64::from(min_heights[win_idx])
                 } else if has_flex {
                     // Flexible window: share of flex_height by weight.
-                    let share = visible_weights[win_idx] / flex_weight_sum;
-                    (flex_height as f64 * share).round() as i32
+                    let weight = visible_weights[win_idx];
+                    let share = if weight.is_finite() && weight > 0.0 {
+                        weight / flex_weight_sum
+                    } else {
+                        0.0
+                    };
+                    let requested = flex_height as f64 * share;
+                    if requested.is_finite() {
+                        requested.round().clamp(0.0, i32::MAX as f64) as i64
+                    } else {
+                        0
+                    }
                 } else {
                     // No flex windows, and this one isn't pinned — give it an
                     // even split of available_height as a last resort.
-                    available_height / visible_windows.len().max(1) as i32
+                    i64::from(available_height)
+                        / i64::try_from(visible_windows.len().max(1)).unwrap_or(i64::MAX)
                 };
+                let height = i64_to_i32_saturating(height.max(0));
 
                 placements.push(WindowPlacement {
                     window_id,
-                    rect: Rect::new(col_screen_x, current_y, eff_width, height),
+                    rect: Rect::new(
+                        col_screen_x,
+                        i64_to_i32_saturating(current_y),
+                        eff_width,
+                        height,
+                    ),
                     visibility,
                     column_index: col_idx,
                 });
 
-                current_y = current_y.saturating_add(height).saturating_add(gap);
+                current_y = current_y
+                    .saturating_add(i64::from(height))
+                    .saturating_add(i64::from(gap));
             }
 
             // Minimum heights may consume the top/bottom outer padding while
@@ -382,7 +383,7 @@ impl Workspace {
     /// to support smooth scrolling animations.
     pub fn compute_placements_animated(&self, viewport: Rect) -> Vec<WindowPlacement> {
         // Use animated scroll offset
-        let viewport_left = self.effective_scroll_offset().round() as i32;
+        let viewport_left = rounded_scroll_offset(self.effective_scroll_offset());
 
         // Fullscreen mode: one window covers the entire viewport, others are off-screen
         if let Some(fs_wid) = self.fullscreen_window {

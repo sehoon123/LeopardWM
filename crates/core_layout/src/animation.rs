@@ -21,7 +21,14 @@ impl Easing {
     /// Apply the easing function to a progress value (0.0 to 1.0).
     /// Returns the eased progress value (0.0 to 1.0).
     pub fn apply(&self, t: f64) -> f64 {
-        let t = t.clamp(0.0, 1.0);
+        // `f64::clamp` intentionally propagates NaN. Animation progress is a
+        // public numeric boundary, so normalize non-finite input before
+        // applying an easing curve and keep the documented [0, 1] contract.
+        let t = if t.is_finite() {
+            t.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
         match self {
             Easing::Linear => t,
             Easing::EaseOut => 1.0 - (1.0 - t).powi(3), // Cubic ease out
@@ -60,8 +67,8 @@ impl ScrollAnimation {
     /// Create a new scroll animation.
     pub fn new(start: f64, target: f64, duration_ms: u64, easing: Easing) -> Self {
         Self {
-            start_offset: start,
-            target_offset: target,
+            start_offset: sanitize_offset(start),
+            target_offset: sanitize_offset(target),
             duration_ms,
             elapsed_ms: 0,
             easing,
@@ -94,7 +101,11 @@ impl ScrollAnimation {
     /// Get the current scroll offset based on animation progress.
     pub fn current_offset(&self) -> f64 {
         let eased_progress = self.easing.apply(self.progress());
-        self.start_offset + (self.target_offset - self.start_offset) * eased_progress
+        // The weighted form avoids an intermediate subtraction overflowing
+        // for finite, opposite-signed public inputs.
+        sanitize_offset(
+            self.start_offset * (1.0 - eased_progress) + self.target_offset * eased_progress,
+        )
     }
 
     /// Advance the animation by the given delta time in milliseconds.
@@ -107,5 +118,16 @@ impl ScrollAnimation {
     /// Get the final target offset.
     pub fn target(&self) -> f64 {
         self.target_offset
+    }
+}
+
+/// Scroll offsets ultimately become pixel coordinates. Keep finite public
+/// inputs within the representable coordinate domain so interpolation and
+/// placement remain deterministic.
+fn sanitize_offset(offset: f64) -> f64 {
+    if offset.is_finite() {
+        offset.clamp(f64::from(i32::MIN), f64::from(i32::MAX))
+    } else {
+        0.0
     }
 }
