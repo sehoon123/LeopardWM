@@ -440,6 +440,9 @@ struct OverviewState {
     thumbnails: HashMap<u64, ThumbnailHandle>,
     /// In-flight open/close zoom animation, if any.
     anim: Option<AnimState>,
+    /// Monotonic owner for timer completion; stale ticks may not mutate a
+    /// newer show/close generation or kill its timer.
+    animation_generation: u64,
     /// Pre-rendered staged chrome-fade frames, one per
     /// [`CHROME_FADE_FACTORS`] entry, built in `show()` and freed via
     /// [`free_chrome_steps`] on hide (each ~28MB at 5120x1440). Empty
@@ -540,6 +543,7 @@ struct ChromeStep {
 
 static THUMBNAIL_RECONCILE: Mutex<()> = Mutex::new(());
 static MASK_RECONCILE: Mutex<()> = Mutex::new(());
+static ANIMATION_RECONCILE: Mutex<()> = Mutex::new(());
 
 static STATE: LazyLock<Mutex<OverviewState>> = LazyLock::new(|| {
     Mutex::new(OverviewState {
@@ -553,6 +557,7 @@ static STATE: LazyLock<Mutex<OverviewState>> = LazyLock::new(|| {
         event_tx: None,
         thumbnails: HashMap::new(),
         anim: None,
+        animation_generation: 0,
         chrome_steps: Vec::new(),
         chrome_full: None,
         pending_hover_cache: None,
@@ -1195,8 +1200,12 @@ impl OverviewOverlay {
     /// pre-render happens here, BEFORE the window shows and the clock
     /// starts, so its cost never eats into the glide.
     pub fn show(&self, monitor_rect: Rect, model: OverviewModel) {
+        let _animation_owner = ANIMATION_RECONCILE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let animate = {
             let mut s = state();
+            s.animation_generation = s.animation_generation.wrapping_add(1);
             s.selected = selection_from_model(&model);
             // Only live DWM thumbnails can glide (the chrome is static):
             // without any — AlphaDim fallback, placeholder/snapshot mode,
@@ -1314,6 +1323,9 @@ impl OverviewOverlay {
     /// Strict no-op while the window is hidden or a close animation is
     /// in flight (see [`apply_model_update`]).
     pub fn update_model(&self, model: OverviewModel) {
+        let _animation_owner = ANIMATION_RECONCILE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         if !apply_model_update(&mut state(), model) {
             return;
         }
@@ -1338,8 +1350,12 @@ impl OverviewOverlay {
     /// chrome (the close-flash). Also frees the pre-rendered chrome-fade
     /// step DIBs (~28MB each at 5120x1440).
     pub fn hide(&self) {
+        let _animation_owner = ANIMATION_RECONCILE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         {
             let mut s = state();
+            s.animation_generation = s.animation_generation.wrapping_add(1);
             s.visible = false;
             s.anim = None;
         }
@@ -1371,6 +1387,9 @@ impl OverviewOverlay {
     /// there is nothing to animate (`anim_ms == 0` or no live
     /// thumbnails); no-op when a close is already in flight.
     pub fn hide_animated(&self, target_workspace: Option<usize>) {
+        let animation_owner = ANIMATION_RECONCILE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let start = {
             let mut s = state();
             if !s.visible {
@@ -1397,7 +1416,10 @@ impl OverviewOverlay {
                 }
             }
             CloseStart::AlreadyClosing => {}
-            CloseStart::NotAnimatable => self.hide(),
+            CloseStart::NotAnimatable => {
+                drop(animation_owner);
+                self.hide();
+            }
         }
     }
 }
@@ -1541,6 +1563,7 @@ fn start_close(s: &mut OverviewState, target_workspace: Option<usize>, notify: b
         row,
         gliders
     );
+    s.animation_generation = s.animation_generation.wrapping_add(1);
     s.anim = Some(AnimState {
         phase: AnimPhase::Closing,
         started,
@@ -1559,6 +1582,9 @@ fn start_close(s: &mut OverviewState, target_workspace: Option<usize>, notify: b
 /// does its bookkeeping. Sends `Dismissed` immediately when there is
 /// nothing to animate (the daemon then hides instantly, as before).
 fn user_close(hwnd: HWND) {
+    let _animation_owner = ANIMATION_RECONCILE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     let start = {
         let mut s = state();
         if !s.visible {
@@ -1594,9 +1620,20 @@ fn drop_all_thumbnails() {
 
 impl Drop for OverviewOverlay {
     fn drop(&mut self) {
+        let animation_owner = ANIMATION_RECONCILE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        {
+            let mut s = state();
+            s.animation_generation = s.animation_generation.wrapping_add(1);
+            s.anim = None;
+            s.visible = false;
+        }
         // Unregister thumbnails BEFORE destroying their destination window
-        // so DwmUnregisterThumbnail releases valid handles.
+        // so DwmUnregisterThumbnail releases valid handles. Release animation
+        // ownership before joining so a stale UI tick can observe revocation.
         drop_all_thumbnails();
+        drop(animation_owner);
         free_chrome_steps();
         drop_hover_cache();
         drop_pending_hover_cache();
@@ -1756,7 +1793,7 @@ fn on_anim_tick(hwnd: HWND) {
     let thumbnail_reconcile = THUMBNAIL_RECONCILE
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-    let (anim, updates) = {
+    let (generation, anim, updates) = {
         let mut s = state();
         let anim = match s.anim.as_mut() {
             Some(a) => {
@@ -1841,7 +1878,7 @@ fn on_anim_tick(hwnd: HWND) {
                 Some((handle, dest, opacity))
             })
             .collect();
-        (anim, updates)
+        (s.animation_generation, anim, updates)
     };
     // DWM calls outside the state lock.
     for (handle, dest, opacity) in updates {
@@ -1851,8 +1888,27 @@ fn on_anim_tick(hwnd: HWND) {
     if anim_progress(&anim) < 1.0 {
         return;
     }
-    unsafe {
-        let _ = KillTimer(Some(hwnd), ANIM_TIMER_ID);
+    let _animation_owner = ANIMATION_RECONCILE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    {
+        let mut s = state();
+        if s.animation_generation != generation || s.anim.is_none() {
+            return;
+        }
+        unsafe {
+            let _ = KillTimer(Some(hwnd), ANIM_TIMER_ID);
+        }
+        match anim.phase {
+            AnimPhase::Opening => {
+                s.anim = None;
+                s.chrome_last_step = None;
+            }
+            AnimPhase::Closing => {
+                s.anim = None;
+                s.visible = false;
+            }
+        }
     }
     tracing::debug!(
         "overview zoom finished: {:?} after {} ticks",
@@ -1861,11 +1917,6 @@ fn on_anim_tick(hwnd: HWND) {
     );
     match anim.phase {
         AnimPhase::Opening => {
-            {
-                let mut s = state();
-                s.anim = None;
-                s.chrome_last_step = None;
-            }
             // Settle every thumbnail on its exact card body.
             sync_thumbnails(hwnd);
             // Adopt the show-time hover cache when the state is
@@ -1884,15 +1935,6 @@ fn on_anim_tick(hwnd: HWND) {
             sync_mask();
         }
         AnimPhase::Closing => {
-            // Clear the anim and the visible flag under ONE lock: a
-            // daemon refresh sneaking between the two would see "open,
-            // settled" and snap the full map back (thumbnails at the
-            // card bodies, full opacity) right before the hide.
-            {
-                let mut s = state();
-                s.anim = None;
-                s.visible = false;
-            }
             // Hide FIRST, then unregister: tearing the thumbnails down on
             // the still-visible window made DWM recomposite the bare map
             // chrome for a few ms — the "map reappears then hides" flash.
@@ -3986,6 +4028,7 @@ mod tests {
             event_tx: None,
             thumbnails: HashMap::new(),
             anim: None,
+            animation_generation: 0,
             chrome_steps: Vec::new(),
             chrome_full: None,
             pending_hover_cache: None,

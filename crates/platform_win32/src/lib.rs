@@ -77,7 +77,7 @@ pub use placement::{
 };
 pub use system::{
     are_animations_enabled, get_system_highlight_color_bgr, is_high_contrast_enabled,
-    is_on_battery_or_power_saver, scale_px, set_dpi_awareness,
+    is_on_battery_or_power_saver, other_process_in_current_session, scale_px, set_dpi_awareness,
 };
 pub use types::{
     AnimationPlacementPolicy, MonitorId, MonitorInfo, PlatformConfig, Win32Error, WindowInfo,

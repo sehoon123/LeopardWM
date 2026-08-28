@@ -1416,6 +1416,19 @@ document.querySelectorAll('.nav-item[data-section]').forEach(function(link) {
 });
 
 /* ── ComboBox ───────────────────────────────────────────────────────── */
+function closeCombobox(cb) {
+  cb.classList.remove('open');
+  var trigger = cb.querySelector('.combobox-trigger');
+  if (trigger) trigger.setAttribute('aria-expanded', 'false');
+}
+function closeRuleOptions(cell) {
+  cell.classList.remove('open');
+  cell.querySelectorAll('.menu-item.subopen').forEach(function(item) { item.classList.remove('subopen'); });
+  var trigger = cell.querySelector('.rule-opts-btn');
+  if (trigger) trigger.setAttribute('aria-expanded', 'false');
+  var row = cell.closest('tr');
+  if (row && typeof updateRuleSummary === 'function') updateRuleSummary(row);
+}
 function initCombobox(cb) {
   var trigger = cb.querySelector('.combobox-trigger');
   var popup = cb.querySelector('.combobox-popup');
@@ -1425,7 +1438,7 @@ function initCombobox(cb) {
   trigger.addEventListener('click', function(e) {
     e.stopPropagation();
     document.querySelectorAll('.combobox.open').forEach(function(other) {
-      if (other !== cb) other.classList.remove('open');
+      if (other !== cb) closeCombobox(other);
     });
     if (!cb.classList.contains('open')) {
       /* Position popup using fixed coords from trigger rect. Anchor to the
@@ -1468,14 +1481,19 @@ function initCombobox(cb) {
   });
   cb.querySelectorAll('.combobox-option').forEach(function(opt) {
     opt.setAttribute('role', 'option');
+    opt.setAttribute('aria-selected', opt.classList.contains('selected') ? 'true' : 'false');
     opt.tabIndex = -1;
     opt.addEventListener('click', function(e) {
       e.stopPropagation();
       cb.querySelector('.combobox-text').textContent = opt.textContent;
       cb.dataset.value = opt.dataset.value;
-      cb.classList.remove('open');
-      cb.querySelectorAll('.combobox-option').forEach(function(o) { o.classList.remove('selected'); });
+      closeCombobox(cb);
+      cb.querySelectorAll('.combobox-option').forEach(function(o) {
+        o.classList.remove('selected');
+        o.setAttribute('aria-selected', 'false');
+      });
       opt.classList.add('selected');
+      opt.setAttribute('aria-selected', 'true');
       trigger.setAttribute('aria-expanded', 'false');
       trigger.focus();
       autoSave(0);
@@ -1489,7 +1507,7 @@ function initCombobox(cb) {
       } else if (e.key === 'Enter' || e.key === ' ') {
         e.preventDefault(); opt.click();
       } else if (e.key === 'Escape') {
-        e.preventDefault(); cb.classList.remove('open'); trigger.setAttribute('aria-expanded', 'false'); trigger.focus();
+        e.preventDefault(); closeCombobox(cb); trigger.focus();
       }
     });
   });
@@ -1498,16 +1516,8 @@ document.querySelectorAll('.combobox').forEach(function(cb) {
   if (cb.querySelector('.combobox-trigger')) initCombobox(cb);
 });
 document.addEventListener('click', function() {
-  document.querySelectorAll('.combobox.open').forEach(function(cb) {
-    cb.classList.remove('open');
-    var trigger = cb.querySelector('.combobox-trigger');
-    if (trigger) trigger.setAttribute('aria-expanded', 'false');
-  });
-  document.querySelectorAll('.rule-opts.open').forEach(function(o) {
-    o.classList.remove('open');
-    o.querySelectorAll('.menu-item.subopen').forEach(function(m) { m.classList.remove('subopen'); });
-    var tr = o.closest('tr'); if (tr && typeof updateRuleSummary === 'function') updateRuleSummary(tr);
-  });
+  document.querySelectorAll('.combobox.open').forEach(closeCombobox);
+  document.querySelectorAll('.rule-opts.open').forEach(closeRuleOptions);
 });
 
 /* ── High Contrast live detection ─────────────────────────────────── */
@@ -2179,31 +2189,29 @@ function initRuleOptions(tr) {
     item.setAttribute('role', isToggle ? 'menuitemcheckbox' : (isRadio ? 'menuitemradio' : 'menuitem'));
     if (isToggle || isRadio) item.setAttribute('aria-checked', item.classList.contains(isToggle ? 'checked' : 'selected') ? 'true' : 'false');
     item.addEventListener('keydown', function(e) {
-      var index = keyboardItems.indexOf(item);
+      var visibleItems = keyboardItems.filter(function(candidate) { return candidate.offsetParent !== null; });
+      var index = visibleItems.indexOf(item);
       if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
         e.preventDefault();
-        keyboardItems[(index + (e.key === 'ArrowDown' ? 1 : -1) + keyboardItems.length) % keyboardItems.length].focus();
+        visibleItems[(index + (e.key === 'ArrowDown' ? 1 : -1) + visibleItems.length) % visibleItems.length].focus();
       } else if (e.key === 'Enter' || e.key === ' ') {
         e.preventDefault(); item.click();
       } else if (e.key === 'Escape') {
-        e.preventDefault(); cell.classList.remove('open'); btn.setAttribute('aria-expanded', 'false'); btn.focus();
+        e.preventDefault(); closeRuleOptions(cell); btn.focus();
       }
     });
   });
   btn.addEventListener('click', function(e) {
     e.stopPropagation();
-    document.querySelectorAll('.rule-opts.open').forEach(function(o) {
-      if (o !== cell) {
-        o.classList.remove('open');
-        o.querySelectorAll('.menu-item.subopen').forEach(function(m) { m.classList.remove('subopen'); });
-        var t = o.closest('tr'); if (t) updateRuleSummary(t);
-      }
-    });
-    document.querySelectorAll('.combobox.open').forEach(function(c) { c.classList.remove('open'); });
     if (cell.classList.contains('open')) {
-      pop.querySelectorAll('.menu-item.subopen').forEach(function(m) { m.classList.remove('subopen'); });
+      closeRuleOptions(cell);
+      return;
     }
-    if (!cell.classList.contains('open')) {
+    document.querySelectorAll('.rule-opts.open').forEach(function(other) {
+      if (other !== cell) closeRuleOptions(other);
+    });
+    document.querySelectorAll('.combobox.open').forEach(closeCombobox);
+    {
       /* Right-anchor to the button so the flyout grows inward (it lives in the
          right-side Options column) and never clips the right edge. */
       var rect = btn.getBoundingClientRect();
@@ -2214,11 +2222,17 @@ function initRuleOptions(tr) {
       } else {
         pop.style.bottom = (window.innerHeight - rect.top + 4) + 'px'; pop.style.top = 'auto';
       }
-    } else {
-      updateRuleSummary(tr);
     }
-    cell.classList.toggle('open');
-    btn.setAttribute('aria-expanded', cell.classList.contains('open') ? 'true' : 'false');
+    cell.classList.add('open');
+    btn.setAttribute('aria-expanded', 'true');
+  });
+  btn.addEventListener('keydown', function(e) {
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      if (!cell.classList.contains('open')) btn.click();
+      var first = keyboardItems.find(function(item) { return item.offsetParent !== null; });
+      if (first) first.focus();
+    }
   });
   /* Clicks inside the flyout stay open; a click on the menu background (not an
      item) closes any open submenu. */
@@ -2496,6 +2510,7 @@ function handleSaveResult(result) {
     return;
   }
   showSaveNotice('Settings were not saved.', 'The configuration could not be validated or written. Your existing file was left unchanged.', true);
+  if (queued) autoSave(0);
 }
 function autoSave(delay) {
   clearTimeout(_saveTimer);

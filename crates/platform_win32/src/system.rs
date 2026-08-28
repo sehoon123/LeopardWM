@@ -27,6 +27,58 @@ pub fn is_on_battery_or_power_saver() -> bool {
     }
 }
 
+/// Whether another process with `executable_name` runs in this interactive
+/// session. Used only to distinguish an inaccessible legacy daemon pipe owned
+/// by another session from an elevated same-session daemon.
+pub fn other_process_in_current_session(executable_name: &str) -> Result<bool, String> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+
+    unsafe {
+        let current_pid = GetCurrentProcessId();
+        let mut current_session = 0;
+        ProcessIdToSessionId(current_pid, &mut current_session)
+            .map_err(|error| format!("current session query failed: {error}"))?;
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+            .map_err(|error| format!("process snapshot failed: {error}"))?;
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let mut found = false;
+        if Process32FirstW(snapshot, &mut entry).is_ok() {
+            loop {
+                if entry.th32ProcessID != current_pid {
+                    let name_end = entry
+                        .szExeFile
+                        .iter()
+                        .position(|character| *character == 0)
+                        .unwrap_or(entry.szExeFile.len());
+                    let name = String::from_utf16_lossy(&entry.szExeFile[..name_end]);
+                    let mut session = 0;
+                    if name.eq_ignore_ascii_case(executable_name)
+                        && ProcessIdToSessionId(entry.th32ProcessID, &mut session).is_ok()
+                        && session == current_session
+                    {
+                        found = true;
+                        break;
+                    }
+                }
+                if Process32NextW(snapshot, &mut entry).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snapshot);
+        Ok(found)
+    }
+}
+
 /// Check if Windows "Show animations" accessibility setting is enabled.
 /// Returns `false` when the user has disabled client-area animations
 /// (Settings > Accessibility > Visual effects > Animation effects).
@@ -129,6 +181,11 @@ mod tests {
     fn test_scale_px_125_percent() {
         assert_eq!(scale_px(10, 1.25), 13); // 12.5 rounds to 13
         assert_eq!(scale_px(8, 1.25), 10);
+    }
+
+    #[test]
+    fn current_session_process_scan_excludes_nonexistent_name() {
+        assert!(!other_process_in_current_session("LeopardWM.Does.Not.Exist.exe").unwrap());
     }
 
     #[test]

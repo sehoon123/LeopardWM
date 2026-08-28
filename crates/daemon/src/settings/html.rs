@@ -189,6 +189,9 @@ mod tests {
         assert!(SETTINGS_HTML.contains("trigger.setAttribute('aria-haspopup', 'listbox')"));
         assert!(SETTINGS_HTML.contains("item.setAttribute('role'"));
         assert!(SETTINGS_HTML.contains("e.key === 'ArrowDown'"));
+        assert!(SETTINGS_HTML.contains("aria-selected"));
+        assert!(SETTINGS_HTML.contains("candidate.offsetParent !== null"));
+        assert!(SETTINGS_HTML.contains("closeRuleOptions(cell)"));
         assert!(SETTINGS_HTML.contains("aria-label=\"Delete rule\""));
     }
 

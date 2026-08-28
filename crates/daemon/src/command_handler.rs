@@ -1560,6 +1560,11 @@ impl AppState {
                 let rollback = self.apply_layout();
                 if rollback.is_err() {
                     self.enter_paused_state("workspace parking rollback failure");
+                    let managed = self.all_managed_window_ids();
+                    crate::state::run_visibility_recovery_pass(
+                        &managed,
+                        "workspace parking rollback",
+                    );
                 }
                 return IpcResponse::error(format!(
                     "Workspace switch rolled back because old windows could not be parked: {failures:?}; rollback={rollback:?}"
@@ -1869,7 +1874,12 @@ impl AppState {
                 self.apply_layout()
             };
             if rollback.is_err() {
-                self.paused = true;
+                self.enter_paused_state("move-to-workspace parking rollback failure");
+                let managed = self.all_managed_window_ids();
+                crate::state::run_visibility_recovery_pass(
+                    &managed,
+                    "move-to-workspace parking rollback",
+                );
             }
             return IpcResponse::error(format!(
                 "Failed to park window {focused_hwnd} on inactive workspace; move rolled back: {error}; rollback={rollback:?}"

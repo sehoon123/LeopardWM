@@ -97,15 +97,32 @@ pub(crate) fn acquire_ipc_server_ownership() -> Result<IpcServerOwnership> {
                     ));
                 }
                 Err(probe_error) if probe_error.raw_os_error() == Some(5) => {
-                    // Named pipes share a machine namespace. Another signed-in
-                    // user may own the compatibility alias but cannot access our
-                    // scoped endpoint or desktop; do not let that global alias
-                    // defeat per-user daemon ownership.
-                    warn!(
-                        "Legacy IPC alias is owned by another inaccessible user; serving only {}",
-                        pipe_name
-                    );
-                    None
+                    match leopardwm_platform_win32::other_process_in_current_session(
+                        "leopardwm.exe",
+                    ) {
+                        Ok(true) => {
+                            return Err(anyhow::anyhow!(
+                                "An elevated daemon in this session may own inaccessible legacy IPC endpoint '{}'",
+                                PIPE_NAME
+                            ));
+                        }
+                        Ok(false) => {
+                            // Named pipes share a machine namespace, while HWND
+                            // management is session-local. An inaccessible alias
+                            // with no same-session daemon belongs to another
+                            // signed-in session and must not block this user.
+                            warn!(
+                                "Legacy IPC alias belongs to another session; serving only {}",
+                                pipe_name
+                            );
+                            None
+                        }
+                        Err(error) => {
+                            return Err(anyhow::anyhow!(
+                                "Could not prove inaccessible legacy IPC endpoint is outside this session: {error}"
+                            ));
+                        }
+                    }
                 }
                 Err(probe_error) => {
                     return Err(anyhow::anyhow!(
