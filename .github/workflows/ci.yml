@@ -28,4 +28,6 @@ jobs:
         run: cargo test -p leopardwm-platform-win32 --features integration-probes --test preview_lifecycle_windows --locked -- --test-threads=1
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Lint real Win32 lifecycle probes
-        run: cargo clippy -p leopardwm-platform-win32 --features integration-probes --test preview_lifecycle_windows --locked -- -D warnings
+        run: |
+          cargo clippy -p leopardwm-platform-win32 --features integration-probes --test floating_return_windows --locked -- -D warnings
+          cargo clippy -p leopardwm-platform-win32 --features integration-probes --test preview_lifecycle_windows --locked -- -D warnings

@@ -3137,8 +3137,8 @@ pub mod integration_probe {
         std::thread::sleep(Duration::from_millis(450));
         let retained_desire = {
             let state = lock_persistent_previews();
-            state.desired.as_slice() == &[request]
-                && state.previews.get(&source_window_id).is_some()
+            state.desired.as_slice() == [request]
+                && state.previews.contains_key(&source_window_id)
                 && !state.host_anchored
         };
         FORCE_PREVIEW_PUBLISH_FAILURES.store(0, Ordering::Release);
@@ -3178,7 +3178,7 @@ pub mod integration_probe {
         let mut cache = crate::placement::PlacementCache::new();
         crate::placement::integration_probe_fail_next_cloak();
         let first = crate::placement::apply_placements(
-            &[placement.clone()],
+            std::slice::from_ref(&placement),
             &config,
             Some(&mut cache),
             false,
@@ -3293,7 +3293,7 @@ pub mod integration_probe {
         }
         let retained = {
             let state = lock_persistent_previews();
-            state.desired.as_slice() == &[request]
+            state.desired.as_slice() == [request]
                 && state
                     .previews
                     .get(&source_window_id)

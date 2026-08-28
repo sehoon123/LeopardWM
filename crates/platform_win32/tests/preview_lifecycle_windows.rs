@@ -326,6 +326,7 @@ fn verify_rejected_visible_float_return(monitor: &leopardwm_platform_win32::Moni
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // One ordered HWND lifecycle prevents parallel desktop mutation.
 fn ordered_real_preview_lifecycle_contract() {
     ensure_dpi_awareness();
     assert_daemon_absent();
