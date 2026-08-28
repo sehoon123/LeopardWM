@@ -120,6 +120,10 @@ struct PreviewInput {
     desired_raise_generation: AtomicU64,
     applied_raise_generation: AtomicU64,
     raise_host_raw: AtomicIsize,
+    /// Window the host and its targets must stay below, normally the bottommost
+    /// visible tiled HWND. Zero keeps the legacy band-top behavior for callers
+    /// without an anchor.
+    raise_anchor_raw: AtomicIsize,
     alive: Arc<AtomicBool>,
     thread_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
@@ -369,12 +373,17 @@ pub fn retain_preview_click_targets(keep: &[WindowId]) {
     let _ = sync_preview_click_targets(&remaining);
 }
 
-/// Re-anchor live overlays once after an explicit application-window raise.
+/// Order the live overlays against the host and, when given, the band anchor.
+///
 /// Returns an exact generation that is acknowledged only after every target
-/// accepted its z-order update.
-pub fn raise_preview_click_targets(host_raw: isize) -> Option<u64> {
+/// accepted its z-order update. `anchor_raw` is the window the whole preview
+/// group must stay below: the group would otherwise be ordered to the top of
+/// the normal band, where it paints over and steals input from windows that own
+/// those pixels.
+pub fn raise_preview_click_targets(host_raw: isize, anchor_raw: isize) -> Option<u64> {
     let input = input()?;
     input.raise_host_raw.store(host_raw, Ordering::Release);
+    input.raise_anchor_raw.store(anchor_raw, Ordering::Release);
     let generation = input
         .desired_raise_generation
         .fetch_add(1, Ordering::AcqRel)
@@ -447,19 +456,35 @@ pub fn integration_probe_restart_input_pump() -> bool {
         && LIVE_PREVIEW_INPUTS.load(Ordering::Acquire) == 1
 }
 
-pub fn wait_for_applied_raise_generation(generation: u64, timeout: std::time::Duration) -> bool {
+/// Outcome of waiting for one exact z-order generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RaiseAck {
+    /// The pump ordered and verified this exact generation.
+    Applied,
+    /// A newer publication replaced this request. That newer pass owns the
+    /// surface, so this one must stop without tearing the surface down.
+    Superseded,
+    /// The pump neither applied nor replaced it within the timeout.
+    NotAcknowledged,
+}
+
+pub fn wait_for_applied_raise_generation(
+    generation: u64,
+    timeout: std::time::Duration,
+) -> RaiseAck {
     let Some(input) = input() else {
-        return false;
+        return RaiseAck::NotAcknowledged;
     };
     let deadline = std::time::Instant::now() + timeout;
     loop {
         if input.applied_raise_generation.load(Ordering::Acquire) == generation {
-            return true;
+            return RaiseAck::Applied;
         }
-        if input.desired_raise_generation.load(Ordering::Acquire) != generation
-            || std::time::Instant::now() >= deadline
-        {
-            return false;
+        if input.desired_raise_generation.load(Ordering::Acquire) != generation {
+            return RaiseAck::Superseded;
+        }
+        if std::time::Instant::now() >= deadline {
+            return RaiseAck::NotAcknowledged;
         }
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
@@ -516,15 +541,16 @@ fn input() -> Option<Arc<PreviewInput>> {
     }
 }
 
-unsafe fn target_is_above_host(target: HWND, host: HWND) -> bool {
-    let mut cursor = target;
+/// Whether `above` precedes `below` in the same z-order band.
+pub(crate) unsafe fn window_is_above(above: HWND, below: HWND) -> bool {
+    let mut cursor = above;
     // EnumWindows-sized top-level chains are finite; the bound also protects
     // against a corrupted/recycled HWND producing an unexpected cycle.
     for _ in 0..16_384 {
         let Ok(next) = GetWindow(cursor, GW_HWNDNEXT) else {
             return false;
         };
-        if next == host {
+        if next == below {
             return true;
         }
         if next.is_invalid() {
@@ -615,13 +641,28 @@ impl PreviewInput {
                         continue;
                     }
                     if message.message == WM_PREVIEW_RAISE {
+                        let Some(input) = input() else {
+                            continue;
+                        };
+                        let host_raw = input.raise_host_raw.load(Ordering::Acquire);
+                        if host_raw == 0 || windows_by_id.is_empty() {
+                            continue;
+                        }
+                        let host = HWND(host_raw as *mut std::ffi::c_void);
+                        let anchor_raw = input.raise_anchor_raw.load(Ordering::Acquire);
+                        let anchor = Some(HWND(anchor_raw as *mut std::ffi::c_void))
+                            .filter(|_| anchor_raw != 0)
+                            .filter(|anchor| IsWindow(Some(*anchor)).as_bool());
+                        // Chain the group downward from its insertion point so
+                        // the final order is anchor > targets > host in one
+                        // pass. Raising each target to the band top instead
+                        // would lift the whole group above the anchor again.
+                        let mut previous = anchor.unwrap_or(HWND_TOP);
                         let mut raised = true;
-                        let mut bottommost_target = None;
                         for hwnd in windows_by_id.values() {
-                            bottommost_target.get_or_insert(*hwnd);
                             if let Err(error) = SetWindowPos(
                                 *hwnd,
-                                Some(HWND_TOP),
+                                Some(previous),
                                 0,
                                 0,
                                 0,
@@ -632,27 +673,14 @@ impl PreviewInput {
                             ) {
                                 raised = false;
                                 warn!("Preview click target z-order failed: {error}");
+                                break;
                             }
+                            previous = *hwnd;
                         }
-                        let Some(input) = input() else {
-                            continue;
-                        };
-                        let host_raw = input.raise_host_raw.load(Ordering::Acquire);
                         if raised {
-                            let Some(bottommost_target) = bottommost_target else {
-                                continue;
-                            };
-                            if host_raw == 0 {
-                                continue;
-                            }
-                            let host = HWND(host_raw as *mut std::ffi::c_void);
-                            // Each later HWND_TOP call leaves the first target at
-                            // the bottom of the target group. Insert the host once
-                            // behind that target, then verify every target really
-                            // precedes it before acknowledging this generation.
                             if let Err(error) = SetWindowPos(
                                 host,
-                                Some(bottommost_target),
+                                Some(previous),
                                 0,
                                 0,
                                 0,
@@ -665,10 +693,13 @@ impl PreviewInput {
                                 warn!("Preview host/target relative z-order failed: {error}");
                             } else if !windows_by_id
                                 .values()
-                                .all(|target| target_is_above_host(*target, host))
+                                .all(|target| window_is_above(*target, host))
                             {
                                 raised = false;
                                 warn!("Preview host/target z-order verification failed");
+                            } else if anchor.is_some_and(|anchor| !window_is_above(anchor, host)) {
+                                raised = false;
+                                warn!("Preview group did not stay below its band anchor");
                             }
                         }
                         if raised {
@@ -727,6 +758,7 @@ impl PreviewInput {
             desired_raise_generation: AtomicU64::new(0),
             applied_raise_generation: AtomicU64::new(0),
             raise_host_raw: AtomicIsize::new(0),
+            raise_anchor_raw: AtomicIsize::new(0),
             alive,
             thread_handle: Mutex::new(Some(thread_handle)),
         };

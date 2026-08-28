@@ -19,7 +19,7 @@ use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::Duration;
 #[cfg(not(test))]
 use std::time::Instant;
-use tracing::warn;
+use tracing::{debug, warn};
 use windows::core::BOOL;
 use windows::Win32::Foundation::{GetLastError, ERROR_CLASS_ALREADY_EXISTS, HWND, RECT};
 use windows::Win32::Graphics::Dwm::{
@@ -34,8 +34,8 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClassInfoW, GetMessageW,
-    GetSystemMetrics, GetWindow, IsWindow, RegisterClassW, SetWindowPos, UnregisterClassW,
-    UpdateLayeredWindow, CW_USEDEFAULT, GW_HWNDNEXT, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, MSG,
+    GetSystemMetrics, IsWindow, RegisterClassW, SetWindowPos, UnregisterClassW,
+    UpdateLayeredWindow, CW_USEDEFAULT, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, MSG,
     SET_WINDOW_POS_FLAGS, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
     SM_YVIRTUALSCREEN, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
     SWP_SHOWWINDOW, ULW_ALPHA, WM_CLOSE, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
@@ -1435,18 +1435,32 @@ fn activate_published_surface(state: &mut PersistentPreviewState) -> bool {
         let _ = host().hide_surface();
         return false;
     }
-    // The host is now in its final band. Raise targets after it so every armed
-    // target is physically above the destination HWND.
-    let targets_raised = crate::preview_input::raise_preview_click_targets(
+    // The pump owns the final relative order: anchor > targets > host. It must
+    // receive the same anchor, otherwise it would order the whole group to the
+    // top of the normal band and undo the host's band position.
+    let ack = crate::preview_input::raise_preview_click_targets(
         host().hwnd().0 as isize,
+        state.host_below.unwrap_or(0),
     )
-    .is_some_and(|generation| {
-        crate::preview_input::wait_for_applied_raise_generation(
-            generation,
-            Duration::from_millis(150),
-        )
-    });
-    if !targets_raised || epoch != preview_lifecycle_epoch() {
+    .map_or(
+        crate::preview_input::RaiseAck::NotAcknowledged,
+        |generation| {
+            crate::preview_input::wait_for_applied_raise_generation(
+                generation,
+                Duration::from_millis(150),
+            )
+        },
+    );
+    if ack == crate::preview_input::RaiseAck::Superseded || epoch != preview_lifecycle_epoch() {
+        // A newer pass replaced this request and owns the surface. Disarm input,
+        // which is what this generation actually verified, but leave the pixels:
+        // tearing them down here is a visible blank flash on every rapid relayout.
+        state.host_anchored = false;
+        crate::preview_input::set_preview_targets_armed(false);
+        debug!("Preview target z-order superseded by a newer publication");
+        return false;
+    }
+    if ack != crate::preview_input::RaiseAck::Applied {
         state.host_anchored = false;
         crate::preview_input::set_preview_targets_armed(false);
         let _ = host().hide_surface();
@@ -2307,23 +2321,6 @@ pub fn host() -> &'static ThumbnailHost {
     })
 }
 
-/// Whether `below` is somewhere under `above` in the same z-order band.
-///
-/// Bounded so a corrupted or cyclic chain can never spin the caller. The walk
-/// covers far more top-level windows than a desktop realistically holds.
-fn is_below_in_band(above: HWND, below: HWND) -> bool {
-    const MAX_WALK: usize = 4096;
-    let mut cursor = above;
-    for _ in 0..MAX_WALK {
-        match unsafe { GetWindow(cursor, GW_HWNDNEXT) }.ok() {
-            Some(next) if next == below => return true,
-            Some(next) => cursor = next,
-            None => return false,
-        }
-    }
-    false
-}
-
 impl ThumbnailHost {
     fn new() -> Result<Self, Win32Error> {
         #[cfg(feature = "integration-probes")]
@@ -2764,7 +2761,7 @@ impl ThumbnailHost {
         // between the anchor and the host, so the invariant is "below the
         // anchor", not "immediately below" it.
         if let Some(anchor) = anchor {
-            if !is_below_in_band(anchor, self.hwnd()) {
+            if !unsafe { crate::preview_input::window_is_above(anchor, self.hwnd()) } {
                 return Err(Win32Error::SetPositionFailed(
                     "thumbnail host did not land below its tiled anchor".into(),
                 ));
@@ -3035,14 +3032,15 @@ pub mod integration_probe {
             return false;
         }
         let Some(raise_generation) =
-            crate::preview_input::raise_preview_click_targets(host().hwnd().0 as isize)
+            crate::preview_input::raise_preview_click_targets(host().hwnd().0 as isize, 0)
         else {
             return false;
         };
-        if !crate::preview_input::wait_for_applied_raise_generation(
+        if crate::preview_input::wait_for_applied_raise_generation(
             raise_generation,
             Duration::from_secs(2),
-        ) {
+        ) != crate::preview_input::RaiseAck::Applied
+        {
             return false;
         }
         let windows = probe_windows();
@@ -3265,12 +3263,40 @@ pub mod integration_probe {
         Ok(initial_live == 0 && retained_desire && recovered)
     }
 
-    /// The band anchor must be physically honored: the host has to end up below
-    /// the anchor so every window above the tiled band keeps its own pixels,
-    /// while the host's own click targets may sit between them. A dead anchor
-    /// must fall back to the band top instead of failing the surface.
-    pub fn host_anchors_below_band_anchor(anchor_window_id: WindowId) -> bool {
+    /// The band anchor must be physically honored end to end.
+    ///
+    /// `above_window_id` is raised over the anchor first, so a group that is
+    /// ordered to the top of the normal band — the pre-fix behavior — lands
+    /// above the anchor and fails here. Both the host's own anchoring and the
+    /// input pump's final ordering must keep the whole group below the anchor,
+    /// otherwise the preview paints over and steals input from the windows that
+    /// own those pixels.
+    pub fn host_anchors_below_band_anchor(
+        anchor_window_id: WindowId,
+        above_window_id: WindowId,
+    ) -> bool {
         let anchor = HWND(anchor_window_id as usize as *mut c_void);
+        let above = HWND(above_window_id as usize as *mut c_void);
+        if unsafe {
+            SetWindowPos(
+                above,
+                Some(HWND_TOP),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
+            )
+        }
+        .is_err()
+        {
+            return false;
+        }
+        // Precondition: the anchor is not the band top, so "below the anchor"
+        // and "at the band top" are distinguishable outcomes.
+        if !unsafe { crate::preview_input::window_is_above(above, anchor) } {
+            return false;
+        }
         // Published previews always hold the normal band (the host refuses to
         // mix normal previews with topmost ghosts). Reproduce that precondition:
         // a topmost host cannot be ordered below a normal-band anchor.
@@ -3280,14 +3306,48 @@ pub mod integration_probe {
         if host().anchor_within_band(Some(anchor)).is_err() {
             return false;
         }
-        if !super::is_below_in_band(anchor, host().hwnd()) {
+        if !unsafe { crate::preview_input::window_is_above(anchor, host().hwnd()) } {
             return false;
         }
-        // Anchoring must be a real constraint, not a no-op: the host must not
-        // report success for an anchor it actually sits above.
-        if super::is_below_in_band(host().hwnd(), anchor) {
+
+        // The input pump owns the final relative order. Give it the same anchor
+        // and require that the acknowledged result still keeps the whole group
+        // below it.
+        let target = crate::preview_input::PreviewClickTarget {
+            window_id: 0x7ffd_2001,
+            source_process_id: std::process::id(),
+            publication_generation: 1,
+            rect: Rect::new(10, 10, 20, 20),
+        };
+        let Some(sync_generation) = crate::preview_input::sync_preview_click_targets(&[target])
+        else {
+            return false;
+        };
+        if !crate::preview_input::wait_for_applied_generation(
+            sync_generation,
+            Duration::from_secs(2),
+        ) {
             return false;
         }
+        let acknowledged = crate::preview_input::raise_preview_click_targets(
+            host().hwnd().0 as isize,
+            anchor_window_id as isize,
+        )
+        .is_some_and(|generation| {
+            crate::preview_input::wait_for_applied_raise_generation(
+                generation,
+                Duration::from_secs(2),
+            ) == crate::preview_input::RaiseAck::Applied
+        });
+        let stayed_below = unsafe {
+            crate::preview_input::window_is_above(anchor, host().hwnd())
+                && crate::preview_input::window_is_above(above, host().hwnd())
+        };
+        let _ = crate::preview_input::sync_preview_click_targets(&[]);
+        if !acknowledged || !stayed_below {
+            return false;
+        }
+
         let dead = HWND(usize::MAX as *mut c_void);
         host().anchor_within_band(Some(dead)).is_ok() && host().anchor_within_band(None).is_ok()
     }

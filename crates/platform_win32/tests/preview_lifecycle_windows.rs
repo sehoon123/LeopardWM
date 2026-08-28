@@ -708,8 +708,12 @@ fn ordered_real_preview_lifecycle_contract() {
     );
 
     let anchor_source = SourceWindow::new();
+    let above_source = SourceWindow::new();
     assert!(
-        integration_probe::host_anchors_below_band_anchor(anchor_source.hwnd as u64),
+        integration_probe::host_anchors_below_band_anchor(
+            anchor_source.hwnd as u64,
+            above_source.hwnd as u64
+        ),
         "the preview host must land below its band anchor so windows above the tiled band keep their pixels"
     );
 
