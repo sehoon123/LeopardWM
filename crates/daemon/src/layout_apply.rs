@@ -1173,7 +1173,14 @@ impl AppState {
                 // run a single guarded re-apply so the corrected layout lands on
                 // the current frame instead of waiting for another user event.
                 // The guard prevents an uncooperative app from recursing forever.
-                if (constraints_changed || geometry_changed) && !self.reapplying_after_violation {
+                if geometry_changed && self.reapplying_after_violation {
+                    Err(anyhow!(
+                        "Visible window(s) did not reach verified layout geometry after retry: {:?}",
+                        geometry_mismatches
+                    ))
+                } else if (constraints_changed || geometry_changed)
+                    && !self.reapplying_after_violation
+                {
                     self.reapplying_after_violation = true;
                     self.applying_layout = false;
                     let reapply = self.apply_layout();

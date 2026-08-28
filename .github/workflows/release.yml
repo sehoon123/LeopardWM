@@ -31,6 +31,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Run full test suite
         run: cargo test --workspace --all-targets --locked
+      - name: Run controlled Win32 floating-return probe
+        run: cargo test -p leopardwm-platform-win32 --features integration-probes --test floating_return_windows --locked -- --test-threads=1
       - name: Run Clippy with warnings denied
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Build optimized binaries

@@ -11,8 +11,8 @@ jobs:
         shell: pwsh
         run: ./.github/verify-gui-subsystems.ps1
       - run: cargo test --all
-      - name: Compile real Win32 lifecycle probes
-        run: cargo test -p leopardwm-platform-win32 --features integration-probes --test preview_lifecycle_windows --no-run
+      - name: Run controlled Win32 floating-return probe
+        run: cargo test -p leopardwm-platform-win32 --features integration-probes --test floating_return_windows -- --test-threads=1
       - run: cargo clippy --all -- -D warnings
       - name: Lint real Win32 lifecycle probes
         run: cargo clippy -p leopardwm-platform-win32 --features integration-probes --test preview_lifecycle_windows -- -D warnings

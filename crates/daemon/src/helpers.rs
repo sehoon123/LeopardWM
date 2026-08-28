@@ -5,7 +5,9 @@ use crate::state::*;
 use anyhow::Result;
 use leopardwm_core_layout::{centered_rect_for_size, FloatingSize, Rect, Workspace};
 #[cfg(not(test))]
-use leopardwm_platform_win32::{is_excluded_tool_window_hwnd, is_window_alive_and_visible};
+use leopardwm_platform_win32::{
+    is_excluded_tool_window_hwnd, is_window_alive_and_visible, is_window_valid,
+};
 use leopardwm_platform_win32::{scale_px, MonitorId};
 use tracing::{debug, info, warn};
 
@@ -14,6 +16,15 @@ use tracing::{debug, info, warn};
 /// Config values are in logical pixels (96 DPI). This struct holds the
 /// scaled values for a specific monitor, avoiding repeated scaling in
 /// multiple call sites.
+pub(crate) fn stale_window_requires_prune(
+    valid: bool,
+    alive_visible: bool,
+    minimized: bool,
+    excluded_tool: bool,
+) -> bool {
+    !valid || (!alive_visible && !minimized) || (alive_visible && excluded_tool)
+}
+
 pub(crate) struct ScaledLayoutParams {
     pub gap: i32,
     pub outer_gap_left: i32,
@@ -468,60 +479,132 @@ impl AppState {
         }
     }
 
-    /// Remove managed windows that are no longer valid or visible.
-    ///
-    /// Some apps (e.g., Electron close-to-tray) hide windows without firing
-    /// Win32 destroy/hide events. This reconciliation pass detects and removes them.
-    ///
-    /// Skipped in test builds because test window IDs are not real Win32 handles.
-    pub(crate) fn prune_stale_windows(&mut self) {
-        #[cfg(test)]
-        return;
-
+    /// Clear every HWND-incarnation cache that must not survive a real destroy
+    /// or a reconciliation prune. Keeping this centralized prevents a missed
+    /// WinEvent from leaving a ghost column with stale focus/restore metadata.
+    pub(crate) fn clear_recycled_hwnd_metadata(&mut self, wid: u64) {
+        self.scratchpad_on_window_destroyed(wid);
+        self.sticky_on_window_destroyed(wid);
+        self.floating_size_history.remove(&wid);
+        self.floating_focus.retain(|_, hwnd| *hwnd != wid);
+        self.tab_strip_icon_cache.remove(&wid);
+        self.overview_icon_cache.remove(&wid);
+        self.elevation_blocked.remove(&wid);
+        self.move_origins.remove(&wid);
+        for origin in self.move_origins.values_mut() {
+            if origin.sibling == Some(wid) {
+                origin.sibling = None;
+            }
+        }
+        for (ws_vec, _) in self.stashed_monitor_layouts.values_mut() {
+            for workspace in ws_vec.iter_mut() {
+                let _ = workspace.remove_window(wid);
+                workspace.remove_floating(wid);
+            }
+        }
+        self.stashed_monitor_layouts.retain(|_, (ws_vec, _)| {
+            ws_vec.iter().any(|workspace| {
+                workspace.window_count() > 0 || !workspace.floating_windows().is_empty()
+            })
+        });
         #[cfg(not(test))]
         {
-            let mut stale: Vec<(MonitorId, usize, u64)> = Vec::new();
-            for (&monitor_id, ws_vec) in &self.workspaces {
-                for (ws_idx, workspace) in ws_vec.iter().enumerate() {
-                    for &wid in &workspace.all_window_ids() {
-                        let alive_visible = is_window_alive_and_visible(wid);
-                        let gone = !alive_visible && !workspace.is_minimized(wid);
-                        let unmanageable = alive_visible && is_excluded_tool_window_hwnd(wid);
-                        if gone || unmanageable {
-                            stale.push((monitor_id, ws_idx, wid));
-                        }
-                    }
-                }
-            }
-            for (monitor_id, ws_idx, wid) in &stale {
-                if let Some(workspace) = self
-                    .workspaces
-                    .get_mut(monitor_id)
-                    .and_then(|v| v.get_mut(*ws_idx))
-                {
-                    let was_floating = workspace.remove_floating(*wid);
-                    if !was_floating {
-                        let _ = workspace.remove_window(*wid);
-                    }
-                    self.restore_snap_for_window(*wid);
-                    self.window_managed_at.remove(wid);
-                    info!("Pruned stale window {} from monitor {}", wid, monitor_id);
-                }
-            }
+            leopardwm_platform_win32::taskbar::taskbar_forget(wid);
+            leopardwm_platform_win32::clear_suspected_oversize(wid);
+        }
+    }
 
-            // Evict orphaned entries from window_managed_at whose HWNDs are
-            // no longer managed in any workspace (catches all removal paths).
-            if !self.window_managed_at.is_empty() || !self.window_last_maximized_at.is_empty() {
-                let managed: std::collections::HashSet<u64> = self
-                    .workspaces
-                    .values()
-                    .flat_map(|ws_vec| ws_vec.iter().flat_map(|ws| ws.all_window_ids()))
-                    .collect();
-                self.window_managed_at
-                    .retain(|hwnd, _| managed.contains(hwnd));
-                self.window_last_maximized_at
-                    .retain(|hwnd, _| managed.contains(hwnd));
+    /// Testable reconciliation core. `should_prune` receives the HWND and
+    /// whether the workspace deliberately tracks it as minimized.
+    pub(crate) fn prune_stale_windows_with(
+        &mut self,
+        mut should_prune: impl FnMut(u64, bool) -> bool,
+    ) -> usize {
+        let mut stale: Vec<(MonitorId, usize, u64)> = Vec::new();
+        for (&monitor_id, ws_vec) in &self.workspaces {
+            for (ws_idx, workspace) in ws_vec.iter().enumerate() {
+                for wid in workspace.all_window_ids() {
+                    if should_prune(wid, workspace.is_minimized(wid)) {
+                        stale.push((monitor_id, ws_idx, wid));
+                    }
+                }
             }
+        }
+        if stale.is_empty() {
+            return 0;
+        }
+        self.settle_scroll_animations();
+        if let Err(error) = self.cancel_layout_transition_for_exact_landing() {
+            warn!("Could not prune stale windows behind transition ownership: {error}");
+            return 0;
+        }
+
+        for (monitor_id, ws_idx, wid) in &stale {
+            if let Some(workspace) = self
+                .workspaces
+                .get_mut(monitor_id)
+                .and_then(|workspaces| workspaces.get_mut(*ws_idx))
+            {
+                if !workspace.remove_floating(*wid) {
+                    let _ = workspace.remove_window(*wid);
+                }
+            }
+            self.clear_recycled_hwnd_metadata(*wid);
+            self.last_placed_layout_rects.remove(wid);
+            self.hidden_column_widths.remove(wid);
+            self.tab_title_overrides.remove(wid);
+            self.window_managed_at.remove(wid);
+            self.window_last_maximized_at.remove(wid);
+            self.recently_hidden_hwnds.remove(wid);
+            if self.previous_focused_hwnd == Some(*wid) {
+                self.previous_focused_hwnd = None;
+            }
+            #[cfg(not(test))]
+            {
+                leopardwm_platform_win32::snapshot::snapshot_remove(*wid);
+                self.restore_snap_for_window(*wid);
+            }
+            info!("Pruned stale window {} from monitor {}", wid, monitor_id);
+        }
+
+        let affected: std::collections::HashSet<(MonitorId, usize)> = stale
+            .iter()
+            .map(|(monitor, workspace, _)| (*monitor, *workspace))
+            .collect();
+        for (monitor, workspace_idx) in affected {
+            let viewport_width = self.viewport_width_for(monitor);
+            if let Some(workspace) = self
+                .workspaces
+                .get_mut(&monitor)
+                .and_then(|workspaces| workspaces.get_mut(workspace_idx))
+            {
+                workspace.ensure_focused_visible(viewport_width);
+            }
+        }
+        stale.len()
+    }
+
+    /// Remove managed windows that are no longer valid or visible.
+    /// Minimized windows remain managed even though User32 reports them outside
+    /// the desktop. Returns the number removed so callers can decide whether an
+    /// exact relayout is required.
+    pub(crate) fn prune_stale_windows(&mut self) -> usize {
+        #[cfg(test)]
+        {
+            0
+        }
+        #[cfg(not(test))]
+        {
+            self.prune_stale_windows_with(|wid, minimized| {
+                let valid = is_window_valid(wid);
+                let alive_visible = valid && is_window_alive_and_visible(wid);
+                stale_window_requires_prune(
+                    valid,
+                    alive_visible,
+                    minimized,
+                    alive_visible && is_excluded_tool_window_hwnd(wid),
+                )
+            })
         }
     }
 

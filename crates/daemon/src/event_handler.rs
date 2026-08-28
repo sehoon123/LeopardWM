@@ -686,53 +686,7 @@ impl AppState {
         // is cloaked, so only a real destroy (not a spurious Hidden
         // from cloaking) should clear its designation.
         if !is_hidden_event {
-            self.scratchpad_on_window_destroyed(hwnd);
-            self.sticky_on_window_destroyed(hwnd);
-            // A destroyed HWND can be recycled for an unrelated window, so
-            // its session-only manual floating size must not survive it.
-            self.floating_size_history.remove(&hwnd);
-            // Forget any remembered floating focus for this window so
-            // a recycled HWND can't wrongly re-focus on workspace return.
-            self.floating_focus.retain(|_, &mut h| h != hwnd);
-            // Drop cached window icons: the HICON dies with its window,
-            // and a recycled HWND must re-probe.
-            self.tab_strip_icon_cache.remove(&hwnd);
-            self.overview_icon_cache.remove(&hwnd);
-            // Drop it from the taskbar hidden set so a recycled HWND isn't
-            // skipped by the hide change-gate.
-            leopardwm_platform_win32::taskbar::taskbar_forget(hwnd);
-            // Forget an elevation-blocked window once it's truly gone, so a
-            // recycled HWND for a normal window isn't wrongly skipped.
-            self.elevation_blocked.remove(&hwnd);
-            // Drop any remembered move-back origin so a recycled HWND doesn't
-            // inherit a stale column restore.
-            self.move_origins.remove(&hwnd);
-            // This window may have anchored another's restore; drop the stale
-            // sibling so a recycled HWND can't redirect a move-back to the wrong
-            // column (it falls back to the remembered index instead).
-            for origin in self.move_origins.values_mut() {
-                if origin.sibling == Some(hwnd) {
-                    origin.sibling = None;
-                }
-            }
-            // Drop any size-violation suspect state so the map stays bounded and
-            // a recycled HWND doesn't inherit it.
-            leopardwm_platform_win32::clear_suspected_oversize(hwnd);
-            // Scrub a window that dies while its monitor is stashed (disconnected),
-            // so it isn't resurrected as a ghost column when the monitor returns.
-            for (ws_vec, _) in self.stashed_monitor_layouts.values_mut() {
-                for ws in ws_vec.iter_mut() {
-                    let _ = ws.remove_window(hwnd);
-                    ws.remove_floating(hwnd);
-                }
-            }
-            // Drop a stash emptied by window deaths so the map stays bounded when
-            // a disconnected monitor never returns.
-            self.stashed_monitor_layouts.retain(|_, (ws_vec, _)| {
-                ws_vec
-                    .iter()
-                    .any(|ws| ws.window_count() > 0 || !ws.floating_windows().is_empty())
-            });
+            self.clear_recycled_hwnd_metadata(hwnd);
         }
 
         // For Hidden events, verify the window is actually gone.
@@ -1012,6 +966,26 @@ impl AppState {
     }
 
     fn on_window_focused(&mut self, hwnd: u64) {
+        let now = std::time::Instant::now();
+        // Reconcile before same-focus deduplication. A missed Destroy event can
+        // otherwise survive forever while sync_foreground_window repeatedly
+        // generates the already-focused event that returns below.
+        if self
+            .last_prune_at
+            .is_none_or(|last| now.duration_since(last).as_secs() >= 1)
+        {
+            self.last_prune_at = Some(now);
+            let pruned = self.prune_stale_windows();
+            if pruned > 0 {
+                if let Err(error) = self.apply_layout() {
+                    warn!(
+                        "Failed to apply layout after pruning {} stale window(s): {}",
+                        pruned, error
+                    );
+                }
+            }
+        }
+
         // Skip if this window is already our tracked focus — avoids
         // feedback loops where sync_foreground_window triggers another
         // EVENT_SYSTEM_FOREGROUND for the same window.
@@ -1029,7 +1003,6 @@ impl AppState {
         // change. The command handler sets `pending_tab_focus`
         // before triggering it; we consume that flag here so the
         // expected event flows through.
-        let now = std::time::Instant::now();
         if let Some(prev_hwnd) = self.previous_focused_hwnd {
             if let Some(last_change) = self.last_focus_change_at {
                 if now.duration_since(last_change).as_millis() < 200 {
@@ -1066,27 +1039,6 @@ impl AppState {
                             }
                         }
                     }
-                }
-            }
-        }
-
-        // Reconcile: prune windows that vanished without events
-        // (e.g., Electron close-to-tray apps).
-        // Throttle to at most once per second to avoid per-event overhead.
-        if self
-            .last_prune_at
-            .is_none_or(|t| now.duration_since(t).as_secs() >= 1)
-        {
-            self.last_prune_at = Some(now);
-            let pre_count = self.all_managed_window_ids().len();
-            self.prune_stale_windows();
-            let pruned = pre_count - self.all_managed_window_ids().len();
-            if pruned > 0 {
-                if let Err(e) = self.apply_layout() {
-                    warn!(
-                        "Failed to apply layout after pruning {} stale window(s): {}",
-                        pruned, e
-                    );
                 }
             }
         }

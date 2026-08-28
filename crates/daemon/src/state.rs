@@ -87,6 +87,9 @@ pub(crate) struct ScratchpadState {
     /// columns added/removed while stashed); `None` means it was alone in its
     /// column, so it returns as its own column at `origin_column`.
     pub(crate) origin_sibling: Option<u64>,
+    /// Width of the original tiled column. A solo-column scratchpad must not
+    /// silently return at the default width and shift the whole strip.
+    pub(crate) origin_width: Option<i32>,
     /// Last user-selected scratchpad size in logical pixels. Position is
     /// intentionally omitted so each summon can re-center on its target monitor.
     pub(crate) last_size: Option<FloatingSize>,
@@ -592,6 +595,11 @@ pub(crate) struct AppState {
     /// Optional test-only behavior override for placement application.
     #[cfg(test)]
     pub(crate) injected_apply_placements_behavior: Option<TestApplyPlacementsBehavior>,
+    /// Fault injection for scratchpad's direct verified park/raise operations.
+    #[cfg(test)]
+    pub(crate) injected_scratchpad_park_failure: bool,
+    #[cfg(test)]
+    pub(crate) injected_scratchpad_raise_failure: bool,
     /// Number of late-worker recovery passes executed after cancellation.
     #[cfg(test)]
     pub(crate) late_worker_recovery_count: Arc<AtomicUsize>,
@@ -843,6 +851,10 @@ impl AppState {
             injected_window_info: HashMap::new(),
             #[cfg(test)]
             injected_apply_placements_behavior: None,
+            #[cfg(test)]
+            injected_scratchpad_park_failure: false,
+            #[cfg(test)]
+            injected_scratchpad_raise_failure: false,
             #[cfg(test)]
             late_worker_recovery_count: Arc::new(AtomicUsize::new(0)),
             // Capacity 256 is comfortable for human-rate events. A

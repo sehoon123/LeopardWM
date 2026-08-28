@@ -2,6 +2,42 @@
 
 All notable changes to LeopardWM will be documented in this file.
 
+## 0.2.6-sehoon.24-rc2
+
+### Fixes
+
+- **Floating or releasing a scratchpad can no longer leave the focused layout
+  off-screen.** Re-tiling now restores the original column width, focuses the
+  returned window and synchronously scrolls that column into view before the
+  physical apply. Float and scratchpad ownership changes fence every queued
+  animation frame—even when no structural transition object exists—and are
+  rejected while paused or during a live OS move/resize.
+- **Float and scratchpad commands are now physical transactions.** They resolve
+  the live foreground only within the active workspace, verify visible HWND
+  geometry, propagate park/summon/apply errors, and roll the workspace and HWND
+  back instead of committing a model-only success. Hidden scratchpads retain a
+  verified off-monitor ownership receipt; shown scratchpads and ordinary floats
+  must physically land before the command reports success.
+- **A missed destroy event can no longer become a blank focused column.** Stale
+  HWNDs—including destroyed windows formerly marked minimized—are pruned before
+  float/scratchpad removal and before focus-event deduplication. Pruning clears
+  incarnation-scoped focus, restore, icon, taskbar and placement metadata and
+  repairs the surviving focused viewport.
+- **Off-screen recovery evidence survives until return is proven.** Direct
+  `MoveOffScreen` ownership is tracked atomically in-process and by a
+  crash-surviving HWND property, participates in compositor-return repair, and
+  is cleared only after visible-edge readback and renderer repair succeed.
+  Invalid placement batches are rejected before mutating valid siblings, while
+  interrupted renderer nudges retain their recovery obligation.
+
+### Improvements
+
+- **Controlled real-HWND floating-return tests now execute in CI and release
+  builds.** The probe rejects mixed valid/dead batches before side effects,
+  forces a visible float to disobey `SetWindowPos`, verifies marker retention on
+  failed landing and failed emergency restore, and refuses to run alongside a
+  live LeopardWM daemon so temporary probe HWNDs cannot pollute a user workspace.
+
 ## 0.2.6-sehoon.24-rc1
 
 ### Fixes

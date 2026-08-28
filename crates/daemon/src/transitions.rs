@@ -128,6 +128,29 @@ impl AppState {
         Ok(true)
     }
 
+    /// Fence every queued animation frame before a command changes workspace
+    /// ownership. `cancel_layout_transition_for_exact_landing` owns this edge
+    /// when a structural transition exists; plain scroll frames need the same
+    /// epoch/barrier even when `layout_transition` is `None`.
+    pub(crate) fn prepare_workspace_ownership_change(&mut self) -> anyhow::Result<()> {
+        self.settle_scroll_animations();
+        if self.cancel_layout_transition_for_exact_landing()? {
+            return Ok(());
+        }
+        self.apply_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self
+            .animation_worker_control
+            .as_ref()
+            .is_some_and(|worker| !worker.wait_for_barrier(std::time::Duration::from_millis(750)))
+        {
+            return Err(anyhow::anyhow!(
+                "animation worker barrier timed out before workspace ownership change"
+            ));
+        }
+        Ok(())
+    }
+
     /// Collapse an unsafe size-changing transition to its final state.
     ///
     /// Pure scroll and position-only workspace/layout transitions stay smooth.

@@ -558,14 +558,14 @@ impl AppState {
             IpcCommand::QueryAllWindows => self.handle_query_all_windows(),
             IpcCommand::CloseWindow => self.handle_close_window(),
             IpcCommand::ToggleFloating => self.handle_toggle_floating(),
-            IpcCommand::ScratchpadStash => {
-                self.scratchpad_stash();
-                IpcResponse::Ok
-            }
-            IpcCommand::ScratchpadToggle => {
-                self.scratchpad_toggle();
-                IpcResponse::Ok
-            }
+            IpcCommand::ScratchpadStash => match self.scratchpad_stash() {
+                Ok(()) => IpcResponse::Ok,
+                Err(error) => IpcResponse::error(format!("Scratchpad stash failed: {error}")),
+            },
+            IpcCommand::ScratchpadToggle => match self.scratchpad_toggle() {
+                Ok(()) => IpcResponse::Ok,
+                Err(error) => IpcResponse::error(format!("Scratchpad toggle failed: {error}")),
+            },
             IpcCommand::ToggleSticky => {
                 self.toggle_sticky();
                 IpcResponse::Ok
@@ -1058,56 +1058,168 @@ impl AppState {
 
     /// Handle `IpcCommand::ToggleFloating`.
     fn handle_toggle_floating(&mut self) -> IpcResponse {
-        let floating_hwnd = self.previous_focused_hwnd.filter(|hwnd| {
-            self.focused_workspace()
-                .is_some_and(|workspace| workspace.is_floating(*hwnd))
-        });
+        if self.paused {
+            return IpcResponse::error("Cannot toggle floating while tiling is paused");
+        }
+        if self.drag_state.is_some() || self.resize_hwnd.is_some() {
+            return IpcResponse::error(
+                "Cannot toggle floating while Windows owns an active move/resize",
+            );
+        }
+        if let Err(error) = self.prepare_workspace_ownership_change() {
+            return IpcResponse::error(format!(
+                "Cannot toggle floating until queued layout work lands: {error}"
+            ));
+        }
+        // A missed Destroy event must not become the next focused column when
+        // the current tile is removed. Pruning owns the same transition fence.
+        self.prune_stale_windows();
 
-        if let Some(hwnd) = floating_hwnd {
+        let monitor = self.focused_monitor;
+        let workspace_idx = self.active_workspace_idx(monitor);
+        #[cfg(not(test))]
+        let live_foreground = leopardwm_platform_win32::get_foreground_window().filter(|hwnd| {
+            self.workspaces
+                .get(&monitor)
+                .and_then(|workspaces| workspaces.get(workspace_idx))
+                .is_some_and(|workspace| workspace.contains_window(*hwnd))
+        });
+        #[cfg(test)]
+        let live_foreground = None;
+        let target = live_foreground
+            .or_else(|| {
+                self.previous_focused_hwnd.filter(|hwnd| {
+                    self.workspaces
+                        .get(&monitor)
+                        .and_then(|workspaces| workspaces.get(workspace_idx))
+                        .is_some_and(|workspace| workspace.contains_window(*hwnd))
+                })
+            })
+            .or_else(|| {
+                self.workspaces
+                    .get(&monitor)
+                    .and_then(|workspaces| workspaces.get(workspace_idx))
+                    .and_then(|workspace| workspace.focused_window())
+            });
+        let Some(target) = target else {
+            return IpcResponse::Ok;
+        };
+        let Some(workspace_backup) = self
+            .workspaces
+            .get(&monitor)
+            .and_then(|workspaces| workspaces.get(workspace_idx))
+            .cloned()
+        else {
+            return IpcResponse::error("Focused workspace is unavailable");
+        };
+        let previous_focus = self.previous_focused_hwnd;
+        if live_foreground == Some(target) {
+            // This is a synchronous observation, not speculative layout intent.
+            // Preserve it so tile→float keeps the window the user actually
+            // invoked the command on as the floating foreground preference.
+            self.previous_focused_hwnd = Some(target);
+        }
+        let remembered_size = self.floating_size_history.get(&target).copied();
+        let was_floating = workspace_backup.is_floating(target);
+        let viewport_width = self.viewport_width_for(monitor);
+
+        let changed = if was_floating {
             // The managed rect is the last user-confirmed/requested floating
-            // geometry. DWM extended frame bounds can lag a rapid
-            // SetWindowPos/toggle, so querying DWM here would re-learn a
-            // stale, slightly smaller size on every cycle.
-            if let Some(rect) = self.floating_rect_for_window(hwnd) {
-                let _ = self.update_floating_geometry(hwnd, rect);
+            // geometry. DWM bounds can lag a rapid SetWindowPos/toggle.
+            if let Some(rect) = self.floating_rect_for_window(target) {
+                let _ = self.update_floating_geometry(target, rect);
             }
-            if self
-                .focused_workspace_mut()
-                .is_some_and(|workspace| workspace.unfloat_window(hwnd))
-            {
-                self.disable_snap_for_window(hwnd);
-                info!("Unfloated window {} back to tiling", hwnd);
-            }
-        } else if let Some(wid) = self
-            .focused_workspace()
-            .and_then(|workspace| workspace.focused_window())
-        {
+            self.workspaces
+                .get_mut(&monitor)
+                .and_then(|workspaces| workspaces.get_mut(workspace_idx))
+                .is_some_and(|workspace| {
+                    let changed = workspace.unfloat_window(target);
+                    if changed {
+                        workspace.ensure_focused_visible(viewport_width);
+                    }
+                    changed
+                })
+        } else {
             let logical_size = if self.config.layout.remember_floating_sizes {
                 self.floating_size_history
-                    .get(&wid)
+                    .get(&target)
                     .copied()
                     .unwrap_or_else(|| self.default_floating_size())
             } else {
                 self.default_floating_size()
             };
             let rect = self.centered_rect_for_logical_floating_size(
-                self.focused_monitor,
+                monitor,
                 logical_size,
                 FLOATING_TOTAL_MARGIN,
             );
-            if self
-                .focused_workspace_mut()
-                .and_then(|workspace| workspace.toggle_floating(rect))
-                .is_some()
-            {
-                self.restore_snap_for_window(wid);
-                info!("Toggled window {} to floating", wid);
+            self.workspaces
+                .get_mut(&monitor)
+                .and_then(|workspaces| workspaces.get_mut(workspace_idx))
+                .is_some_and(|workspace| {
+                    if workspace.focus_window(target).is_err() {
+                        return false;
+                    }
+                    let changed = workspace.toggle_floating(rect).is_some();
+                    if changed {
+                        workspace.ensure_focused_visible(viewport_width);
+                    }
+                    changed
+                })
+        };
+        if !changed {
+            return IpcResponse::error(format!(
+                "Window {target} could not change floating ownership"
+            ));
+        }
+
+        if was_floating {
+            self.disable_snap_for_window(target);
+        } else {
+            self.restore_snap_for_window(target);
+        }
+        self.last_placed_layout_rects.clear();
+        if let Err(error) = self.apply_layout() {
+            if let Some(workspaces) = self.workspaces.get_mut(&monitor) {
+                if let Some(workspace) = workspaces.get_mut(workspace_idx) {
+                    *workspace = workspace_backup;
+                }
             }
+            self.previous_focused_hwnd = previous_focus;
+            match remembered_size {
+                Some(size) => {
+                    self.floating_size_history.insert(target, size);
+                }
+                None => {
+                    self.floating_size_history.remove(&target);
+                }
+            }
+            if was_floating {
+                self.restore_snap_for_window(target);
+            } else {
+                self.disable_snap_for_window(target);
+            }
+            self.last_placed_layout_rects.clear();
+            let rollback = if self.paused {
+                Err(anyhow::anyhow!("tiling paused by failed placement"))
+            } else {
+                self.apply_layout()
+            };
+            if rollback.is_err() {
+                self.paused = true;
+            }
+            return IpcResponse::error(format!(
+                "Floating toggle rolled back after physical placement failure: {error}; rollback={rollback:?}"
+            ));
         }
-        if let Err(e) = self.apply_layout() {
-            return IpcResponse::error(format!("Failed to apply layout: {}", e));
-        }
+
+        self.sync_taskbar_buttons();
         self.sync_foreground_window();
+        info!(
+            "Window {} is now {}",
+            target,
+            if was_floating { "tiled" } else { "floating" }
+        );
         IpcResponse::Ok
     }
 

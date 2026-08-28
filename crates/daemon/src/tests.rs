@@ -979,6 +979,7 @@ fn test_app_state_apply_config() {
         shown: false,
         origin_column: 0,
         origin_sibling: None,
+        origin_width: Some(800),
         last_size: Some(FloatingSize::new(1100, 700)),
     });
     let mut new_config = test_config();
@@ -2710,15 +2711,33 @@ fn test_cmd_close_window_empty() {
 #[test]
 fn test_cmd_toggle_floating_empty() {
     let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.paused = false;
     let resp = state.handle_command(IpcCommand::ToggleFloating);
     assert_eq!(resp, IpcResponse::Ok);
 }
 
 #[test]
+fn test_toggle_floating_is_rejected_while_paused_without_mutation() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state
+        .focused_workspace_mut()
+        .unwrap()
+        .insert_window(100, Some(800))
+        .unwrap();
+
+    assert!(matches!(
+        state.handle_command(IpcCommand::ToggleFloating),
+        IpcResponse::Error { .. }
+    ));
+    assert!(!state.focused_workspace().unwrap().is_floating(100));
+}
+
+#[test]
 fn test_toggle_floating_roundtrip() {
     let mut state = AppState::new_with_config(test_config(), test_monitors());
-    // Avoid real Win32 positioning on synthetic test window IDs.
-    state.paused = true;
+    state.paused = false;
+    state.injected_apply_placements_behavior =
+        Some(TestApplyPlacementsBehavior::SleepAndSucceed(Duration::ZERO));
     let ws = state.focused_workspace_mut().unwrap();
     ws.insert_window(100, Some(800)).unwrap();
     assert!(!ws.is_floating(100));
@@ -2749,6 +2768,135 @@ fn test_toggle_floating_roundtrip() {
         "window should be back to tiled after roundtrip"
     );
     assert!(ws.contains_window(100));
+}
+
+#[test]
+fn test_unfloat_makes_the_restored_focused_column_physically_visible_in_the_model() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.paused = false;
+    state.injected_apply_placements_behavior =
+        Some(TestApplyPlacementsBehavior::SleepAndSucceed(Duration::ZERO));
+    {
+        let workspace = state.focused_workspace_mut().unwrap();
+        for wid in [100, 200, 300, 400] {
+            workspace.insert_window(wid, Some(1500)).unwrap();
+        }
+        workspace.focus_window(100).unwrap();
+    }
+    state.previous_focused_hwnd = Some(100);
+    assert_eq!(
+        state.handle_command(IpcCommand::ToggleFloating),
+        IpcResponse::Ok
+    );
+    {
+        let viewport = state.layout_viewport(1);
+        let workspace = state.focused_workspace_mut().unwrap();
+        workspace.focus_window(400).unwrap();
+        workspace.ensure_focused_visible(viewport.width);
+    }
+    state.previous_focused_hwnd = Some(100);
+    assert_eq!(
+        state.handle_command(IpcCommand::ToggleFloating),
+        IpcResponse::Ok
+    );
+
+    let viewport = state.layout_viewport(1);
+    let workspace = state.focused_workspace().unwrap();
+    assert_eq!(workspace.focused_window(), Some(100));
+    let placement = workspace
+        .compute_placements(viewport)
+        .into_iter()
+        .find(|placement| placement.window_id == 100)
+        .unwrap();
+    assert_eq!(placement.visibility, Visibility::Visible);
+    assert!(placement.rect.x >= viewport.x);
+    assert!(placement.rect.right() <= viewport.right());
+    assert!(placement.rect.y >= viewport.y);
+    assert!(placement.rect.bottom() <= viewport.bottom());
+}
+
+#[test]
+fn test_toggle_floating_apply_failure_restores_the_model() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.paused = false;
+    state
+        .focused_workspace_mut()
+        .unwrap()
+        .insert_window(100, Some(800))
+        .unwrap();
+    state.injected_apply_placements_behavior =
+        Some(TestApplyPlacementsBehavior::SleepAndFail(Duration::ZERO));
+
+    assert!(matches!(
+        state.handle_command(IpcCommand::ToggleFloating),
+        IpcResponse::Error { .. }
+    ));
+    let workspace = state.focused_workspace().unwrap();
+    assert!(workspace.contains_window(100));
+    assert!(!workspace.is_floating(100));
+}
+
+#[test]
+fn test_toggle_floating_lands_active_transition_before_mutation() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.paused = false;
+    state.injected_apply_placements_behavior =
+        Some(TestApplyPlacementsBehavior::SleepAndSucceed(Duration::ZERO));
+    state
+        .focused_workspace_mut()
+        .unwrap()
+        .insert_window(100, Some(800))
+        .unwrap();
+    state.layout_transition = Some(LayoutTransition {
+        start_rects: HashMap::from([(100, Rect::new(10, 10, 800, 600))]),
+        exit_rects: HashMap::new(),
+        exit_column_indices: HashMap::new(),
+        elapsed_ms: 10,
+        duration_ms: 150,
+        easing: leopardwm_core_layout::Easing::default(),
+        requires_compositor_safe_snap: false,
+        ghosted_wids: HashSet::new(),
+        exit_park_failures: 0,
+    });
+
+    assert_eq!(
+        state.handle_command(IpcCommand::ToggleFloating),
+        IpcResponse::Ok
+    );
+    assert!(state.layout_transition.is_none());
+    assert!(state.focused_workspace().unwrap().is_floating(100));
+}
+
+#[test]
+fn test_toggle_floating_queued_frame_fence_failure_does_not_mutate_workspace() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.paused = false;
+    state
+        .focused_workspace_mut()
+        .unwrap()
+        .insert_window(100, Some(800))
+        .unwrap();
+    let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let worker = animation_worker::AnimationWorkerHandle::spawn(
+        event_tx,
+        state.apply_worker_cancelled.clone(),
+        state.apply_epoch.clone(),
+    )
+    .unwrap();
+    state.animation_worker_control = Some(worker.control());
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    worker.send_test_block(release_rx);
+
+    assert!(matches!(
+        state.handle_command(IpcCommand::ToggleFloating),
+        IpcResponse::Error { .. }
+    ));
+    assert!(!state.focused_workspace().unwrap().is_floating(100));
+    assert!(state.layout_transition.is_none());
+
+    release_tx.send(()).unwrap();
+    assert!(worker.wait_for_barrier(Duration::from_secs(1)));
+    drop(worker);
 }
 
 #[test]
@@ -2823,25 +2971,33 @@ fn test_floating_size_memory_can_be_disabled() {
 fn test_scratchpad_size_memory_can_be_disabled() {
     let mut config = test_config();
     config.layout.remember_scratchpad_size = false;
-    let mut state = AppState::new_with_config(config, test_monitors());
+    let mut state = scratchpad_test_state(config, test_monitors());
     state
         .focused_workspace_mut()
         .unwrap()
         .insert_window(100, Some(800))
         .unwrap();
 
-    state.scratchpad_stash();
-    state.scratchpad_toggle();
+    state.scratchpad_stash().unwrap();
+    state.scratchpad_toggle().unwrap();
     assert!(state.update_floating_geometry(100, Rect::new(50, 75, 1200, 800)));
     assert_eq!(state.scratchpad.unwrap().last_size, None);
-    state.scratchpad_toggle();
-    state.scratchpad_toggle();
+    state.scratchpad_toggle().unwrap();
+    state.scratchpad_toggle().unwrap();
 
     assert_eq!(
         state.focused_workspace().unwrap().floating_rect(100),
         Some(Rect::new(510, 220, 900, 600)),
         "disabled memory always summons at the configured default"
     );
+}
+
+fn floating_test_state(config: Config, monitors: Vec<MonitorInfo>) -> AppState {
+    let mut state = AppState::new_with_config(config, monitors);
+    state.paused = false;
+    state.injected_apply_placements_behavior =
+        Some(TestApplyPlacementsBehavior::SleepAndSucceed(Duration::ZERO));
+    state
 }
 
 #[test]
@@ -2851,7 +3007,7 @@ fn test_manual_float_uses_configured_dpi_scaled_size() {
     config.layout.default_floating_height = 500;
     let mut monitors = test_monitors();
     monitors[0].scale_factor = 1.5;
-    let mut state = AppState::new_with_config(config, monitors);
+    let mut state = floating_test_state(config, monitors);
     state
         .focused_workspace_mut()
         .unwrap()
@@ -2872,7 +3028,7 @@ fn test_manual_float_uses_configured_dpi_scaled_size() {
 
 #[test]
 fn test_manual_float_refloat_restores_last_size_and_recenters() {
-    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    let mut state = floating_test_state(test_config(), test_monitors());
     state
         .focused_workspace_mut()
         .unwrap()
@@ -2919,7 +3075,7 @@ fn test_manual_float_history_scales_and_recenters_on_a_new_monitor() {
         device_name: "DISPLAY2".to_string(),
         scale_factor: 2.0,
     });
-    let mut state = AppState::new_with_config(test_config(), monitors);
+    let mut state = floating_test_state(test_config(), monitors);
     state
         .focused_workspace_mut()
         .unwrap()
@@ -2968,7 +3124,7 @@ fn test_manual_float_clamps_configured_size_to_viewport() {
     let mut config = test_config();
     config.layout.default_floating_width = 5000;
     config.layout.default_floating_height = 5000;
-    let mut state = AppState::new_with_config(config, test_monitors());
+    let mut state = floating_test_state(config, test_monitors());
     state
         .focused_workspace_mut()
         .unwrap()
@@ -2989,7 +3145,7 @@ fn test_manual_float_clamps_configured_size_to_viewport() {
 
 #[test]
 fn test_destroyed_window_drops_manual_floating_size_history() {
-    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    let mut state = floating_test_state(test_config(), test_monitors());
     state
         .focused_workspace_mut()
         .unwrap()
@@ -4653,6 +4809,56 @@ fn test_sticky_compositor_scroll_policy_is_shared_by_pointer_focus() {
 }
 
 #[test]
+fn test_prune_stale_trailing_window_repairs_focus_and_viewport() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    {
+        let workspace = state.focused_workspace_mut().unwrap();
+        workspace.insert_window(100, Some(1500)).unwrap();
+        workspace.insert_window(200, Some(1500)).unwrap();
+        workspace.focus_window(200).unwrap();
+        workspace.ensure_focused_visible(1920);
+    }
+    state.previous_focused_hwnd = Some(200);
+    state
+        .floating_size_history
+        .insert(200, FloatingSize::new(900, 600));
+
+    assert_eq!(
+        state.prune_stale_windows_with(|wid, _minimized| wid == 200),
+        1
+    );
+    assert!(state.find_window_workspace(200).is_none());
+    assert_eq!(state.previous_focused_hwnd, None);
+    assert!(!state.floating_size_history.contains_key(&200));
+    let viewport = state.layout_viewport(1);
+    let workspace = state.focused_workspace().unwrap();
+    assert_eq!(workspace.focused_window(), Some(100));
+    let placement = workspace
+        .compute_placements(viewport)
+        .into_iter()
+        .find(|placement| placement.window_id == 100)
+        .unwrap();
+    assert_eq!(placement.visibility, Visibility::Visible);
+    assert!(placement.rect.x >= viewport.x);
+    assert!(placement.rect.right() <= viewport.right());
+    assert!(placement.rect.y >= viewport.y);
+    assert!(placement.rect.bottom() <= viewport.bottom());
+}
+
+#[test]
+fn test_destroyed_minimized_window_is_not_exempt_from_pruning() {
+    assert!(crate::helpers::stale_window_requires_prune(
+        false, false, true, false
+    ));
+    assert!(!crate::helpers::stale_window_requires_prune(
+        true, false, true, false
+    ));
+    assert!(crate::helpers::stale_window_requires_prune(
+        true, false, false, false
+    ));
+}
+
+#[test]
 fn test_lookup_window_info_returns_injected() {
     let mut state = AppState::new_with_config(test_config(), test_monitors());
     let info = make_test_window_info(42);
@@ -5657,9 +5863,45 @@ fn test_broadcast_focused_window_emits_on_clear() {
     assert_eq!(state.last_broadcast_focused, Some((1, None)));
 }
 
+fn scratchpad_test_state(config: Config, monitors: Vec<MonitorInfo>) -> AppState {
+    let mut state = AppState::new_with_config(config, monitors);
+    state.paused = false;
+    state.injected_apply_placements_behavior =
+        Some(TestApplyPlacementsBehavior::SleepAndSucceed(Duration::ZERO));
+    state
+}
+
+#[test]
+fn test_scratchpad_ownership_is_rejected_while_paused() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state
+        .focused_workspace_mut()
+        .unwrap()
+        .insert_window(100, Some(800))
+        .unwrap();
+
+    assert!(state.scratchpad_stash().is_err());
+    assert!(state.scratchpad.is_none());
+    assert!(state.focused_workspace().unwrap().contains_window(100));
+}
+
+#[test]
+fn test_scratchpad_stash_never_targets_inactive_previous_focus() {
+    let mut state = scratchpad_test_state(test_config(), test_monitors());
+    state.ensure_workspace_exists(1, 1);
+    state.workspaces.get_mut(&1).unwrap()[1]
+        .insert_window(200, Some(800))
+        .unwrap();
+    state.previous_focused_hwnd = Some(200);
+
+    assert!(state.scratchpad_stash().is_err());
+    assert!(state.scratchpad.is_none());
+    assert!(state.workspaces[&1][1].contains_window(200));
+}
+
 #[test]
 fn test_scratchpad_stash_designates_and_removes_window() {
-    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    let mut state = scratchpad_test_state(test_config(), test_monitors());
     state
         .focused_workspace_mut()
         .unwrap()
@@ -5670,7 +5912,7 @@ fn test_scratchpad_stash_designates_and_removes_window() {
         Some(100)
     );
 
-    state.scratchpad_stash();
+    state.scratchpad_stash().unwrap();
 
     let sp = state.scratchpad.expect("scratchpad designated");
     assert_eq!(sp.window_id, 100);
@@ -5682,17 +5924,43 @@ fn test_scratchpad_stash_designates_and_removes_window() {
 }
 
 #[test]
-fn test_scratchpad_toggle_summons_then_hides() {
-    let mut state = AppState::new_with_config(test_config(), test_monitors());
+fn test_scratchpad_stash_lands_active_transition_before_detach() {
+    let mut state = scratchpad_test_state(test_config(), test_monitors());
     state
         .focused_workspace_mut()
         .unwrap()
         .insert_window(100, Some(800))
         .unwrap();
-    state.scratchpad_stash();
+    state.layout_transition = Some(LayoutTransition {
+        start_rects: HashMap::from([(100, Rect::new(10, 10, 800, 600))]),
+        exit_rects: HashMap::new(),
+        exit_column_indices: HashMap::new(),
+        elapsed_ms: 10,
+        duration_ms: 150,
+        easing: leopardwm_core_layout::Easing::default(),
+        requires_compositor_safe_snap: false,
+        ghosted_wids: HashSet::new(),
+        exit_park_failures: 0,
+    });
+
+    state.scratchpad_stash().unwrap();
+    assert!(state.layout_transition.is_none());
+    assert!(state.scratchpad.is_some_and(|scratchpad| !scratchpad.shown));
+    assert!(!state.focused_workspace().unwrap().contains_window(100));
+}
+
+#[test]
+fn test_scratchpad_toggle_summons_then_hides() {
+    let mut state = scratchpad_test_state(test_config(), test_monitors());
+    state
+        .focused_workspace_mut()
+        .unwrap()
+        .insert_window(100, Some(800))
+        .unwrap();
+    state.scratchpad_stash().unwrap();
 
     // Summon: floating + shown.
-    state.scratchpad_toggle();
+    state.scratchpad_toggle().unwrap();
     assert!(state.scratchpad.unwrap().shown);
     assert!(
         state.focused_workspace().unwrap().is_floating(100),
@@ -5700,21 +5968,21 @@ fn test_scratchpad_toggle_summons_then_hides() {
     );
 
     // Hide: removed + not shown.
-    state.scratchpad_toggle();
+    state.scratchpad_toggle().unwrap();
     assert!(!state.scratchpad.unwrap().shown);
     assert!(!state.focused_workspace().unwrap().contains_window(100));
 }
 
 #[test]
 fn test_external_hidden_event_marks_shown_scratchpad_hidden() {
-    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    let mut state = scratchpad_test_state(test_config(), test_monitors());
     state
         .focused_workspace_mut()
         .unwrap()
         .insert_window(100, Some(800))
         .unwrap();
-    state.scratchpad_stash();
-    state.scratchpad_toggle();
+    state.scratchpad_stash().unwrap();
+    state.scratchpad_toggle().unwrap();
     assert!(state.scratchpad.unwrap().shown);
 
     state.handle_window_event(WindowEvent::Hidden(100));
@@ -5726,7 +5994,7 @@ fn test_external_hidden_event_marks_shown_scratchpad_hidden() {
     assert!(!state.scratchpad.unwrap().shown);
     assert!(!state.focused_workspace().unwrap().contains_window(100));
 
-    state.scratchpad_toggle();
+    state.scratchpad_toggle().unwrap();
     assert!(state.scratchpad.unwrap().shown);
     assert!(state.focused_workspace().unwrap().is_floating(100));
 }
@@ -5738,16 +6006,16 @@ fn test_scratchpad_first_summon_uses_configured_dpi_scaled_size() {
     config.layout.default_scratchpad_height = 400;
     let mut monitors = test_monitors();
     monitors[0].scale_factor = 1.5;
-    let mut state = AppState::new_with_config(config, monitors);
+    let mut state = scratchpad_test_state(config, monitors);
     state
         .focused_workspace_mut()
         .unwrap()
         .insert_window(100, Some(800))
         .unwrap();
 
-    state.scratchpad_stash();
+    state.scratchpad_stash().unwrap();
     assert_eq!(state.scratchpad.unwrap().last_size, None);
-    state.scratchpad_toggle();
+    state.scratchpad_toggle().unwrap();
 
     assert_eq!(
         state.focused_workspace().unwrap().floating_rect(100),
@@ -5775,14 +6043,14 @@ fn test_scratchpad_remembers_logical_size_across_monitors_and_clamps() {
         device_name: "DISPLAY3".to_string(),
         scale_factor: 2.0,
     });
-    let mut state = AppState::new_with_config(test_config(), monitors);
+    let mut state = scratchpad_test_state(test_config(), monitors);
     state
         .focused_workspace_mut()
         .unwrap()
         .insert_window(100, Some(800))
         .unwrap();
-    state.scratchpad_stash();
-    state.scratchpad_toggle();
+    state.scratchpad_stash().unwrap();
+    state.scratchpad_toggle().unwrap();
 
     // The scratchpad belongs to workspace 1, but the user moved it onto
     // monitor 2. The source DPI must come from this actual rect, not the
@@ -5798,7 +6066,7 @@ fn test_scratchpad_remembers_logical_size_across_monitors_and_clamps() {
         "shown scratchpads do not overwrite ordinary floating history"
     );
 
-    state.scratchpad_toggle();
+    state.scratchpad_toggle().unwrap();
     assert!(!state.scratchpad.unwrap().shown);
     assert_eq!(
         state.scratchpad.unwrap().last_size,
@@ -5806,7 +6074,7 @@ fn test_scratchpad_remembers_logical_size_across_monitors_and_clamps() {
     );
 
     state.focused_monitor = 3;
-    state.scratchpad_toggle();
+    state.scratchpad_toggle().unwrap();
     assert_eq!(
         state.focused_workspace().unwrap().floating_rect(100),
         Some(Rect::new(3560, 40, 920, 620)),
@@ -5821,7 +6089,7 @@ fn test_scratchpad_remembers_logical_size_across_monitors_and_clamps() {
 
 #[test]
 fn test_stashing_a_focused_float_captures_its_size_with_tiles_present() {
-    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    let mut state = scratchpad_test_state(test_config(), test_monitors());
     {
         let workspace = state.focused_workspace_mut().unwrap();
         workspace.insert_window(200, Some(800)).unwrap();
@@ -5831,7 +6099,7 @@ fn test_stashing_a_focused_float_captures_its_size_with_tiles_present() {
     }
     state.previous_focused_hwnd = Some(100);
 
-    state.scratchpad_stash();
+    state.scratchpad_stash().unwrap();
 
     let scratchpad = state.scratchpad.expect("floating scratchpad designated");
     assert_eq!(scratchpad.window_id, 100, "the focused float is stashed");
@@ -5848,13 +6116,13 @@ fn test_stashing_a_focused_float_captures_its_size_with_tiles_present() {
 
 #[test]
 fn test_scratchpad_cleared_when_window_destroyed() {
-    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    let mut state = scratchpad_test_state(test_config(), test_monitors());
     state
         .focused_workspace_mut()
         .unwrap()
         .insert_window(100, Some(800))
         .unwrap();
-    state.scratchpad_stash();
+    state.scratchpad_stash().unwrap();
     assert!(state.scratchpad.is_some());
 
     state.scratchpad_on_window_destroyed(100);
@@ -5866,21 +6134,21 @@ fn test_scratchpad_cleared_when_window_destroyed() {
         .unwrap()
         .insert_window(200, Some(800))
         .unwrap();
-    state.scratchpad_stash();
+    state.scratchpad_stash().unwrap();
     state.scratchpad_on_window_destroyed(999);
     assert!(state.scratchpad.is_some());
 }
 
 #[test]
 fn test_scratchpad_stash_on_scratchpad_releases_to_tiling() {
-    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    let mut state = scratchpad_test_state(test_config(), test_monitors());
     state
         .focused_workspace_mut()
         .unwrap()
         .insert_window(100, Some(800))
         .unwrap();
-    state.scratchpad_stash(); // designate + hide 100
-    state.scratchpad_toggle(); // summon (floating, focused)
+    state.scratchpad_stash().unwrap(); // designate + hide 100
+    state.scratchpad_toggle().unwrap(); // summon (floating, focused)
     assert!(state.focused_workspace().unwrap().is_floating(100));
 
     // Simulate the OS foreground landing on the summoned (floating)
@@ -5888,7 +6156,7 @@ fn test_scratchpad_stash_on_scratchpad_releases_to_tiling() {
     state.previous_focused_hwnd = Some(100);
 
     // Stashing the focused scratchpad releases it back to tiling.
-    state.scratchpad_stash();
+    state.scratchpad_stash().unwrap();
     assert!(state.scratchpad.is_none(), "designation cleared on release");
     assert!(state.focused_workspace().unwrap().contains_window(100));
     assert!(
@@ -5899,7 +6167,7 @@ fn test_scratchpad_stash_on_scratchpad_releases_to_tiling() {
 
 #[test]
 fn test_scratchpad_designating_new_releases_old() {
-    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    let mut state = scratchpad_test_state(test_config(), test_monitors());
     {
         let ws = state.focused_workspace_mut().unwrap();
         ws.insert_window(100, Some(800)).unwrap();
@@ -5910,11 +6178,11 @@ fn test_scratchpad_designating_new_releases_old() {
         .unwrap()
         .focus_window(100)
         .unwrap();
-    state.scratchpad_stash(); // 100 becomes scratchpad (hidden)
+    state.scratchpad_stash().unwrap(); // 100 becomes scratchpad (hidden)
     assert_eq!(state.scratchpad.unwrap().window_id, 100);
-    state.scratchpad_toggle();
+    state.scratchpad_toggle().unwrap();
     assert!(state.update_floating_geometry(100, Rect::new(100, 100, 1200, 800)));
-    state.scratchpad_toggle();
+    state.scratchpad_toggle().unwrap();
     assert_eq!(
         state.scratchpad.unwrap().last_size,
         Some(FloatingSize::new(1200, 800))
@@ -5925,7 +6193,7 @@ fn test_scratchpad_designating_new_releases_old() {
         .unwrap()
         .focus_window(200)
         .unwrap();
-    state.scratchpad_stash(); // 200 becomes scratchpad; 100 released
+    state.scratchpad_stash().unwrap(); // 200 becomes scratchpad; 100 released
     let replacement = state.scratchpad.expect("replacement scratchpad");
     assert_eq!(replacement.window_id, 200);
     assert_eq!(
@@ -5941,7 +6209,7 @@ fn test_scratchpad_designating_new_releases_old() {
         "new scratchpad is hidden"
     );
 
-    state.scratchpad_toggle();
+    state.scratchpad_toggle().unwrap();
     assert_eq!(
         state.focused_workspace().unwrap().floating_rect(200),
         Some(Rect::new(510, 220, 900, 600)),
@@ -5953,7 +6221,7 @@ fn test_scratchpad_designating_new_releases_old() {
 fn test_scratchpad_release_rejoins_original_column() {
     // A window stashed from a stacked column should rejoin that column on
     // release, not land in its own new column.
-    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    let mut state = scratchpad_test_state(test_config(), test_monitors());
     {
         let ws = state.focused_workspace_mut().unwrap();
         ws.insert_window(100, Some(400)).unwrap(); // column 0
@@ -5966,10 +6234,10 @@ fn test_scratchpad_release_rejoins_original_column() {
         .unwrap();
     assert_eq!(state.focused_workspace().unwrap().column_count(), 1);
 
-    state.scratchpad_stash(); // stash 200 (origin column 0, sibling 100)
-    state.scratchpad_toggle(); // summon (floating)
+    state.scratchpad_stash().unwrap(); // stash 200 (origin column 0, sibling 100)
+    state.scratchpad_toggle().unwrap(); // summon (floating)
     state.previous_focused_hwnd = Some(200); // OS foreground lands on it
-    state.scratchpad_stash(); // stash-on-self releases it back to tiling
+    state.scratchpad_stash().unwrap(); // stash-on-self releases it back to tiling
 
     let ws = state.focused_workspace().unwrap();
     assert!(state.scratchpad.is_none(), "released");
@@ -5994,21 +6262,90 @@ fn test_scratchpad_release_rejoins_original_column() {
 fn test_scratchpad_solo_window_releases_to_new_column() {
     // A window that was alone in its column has no sibling, so on release it
     // returns as its own column at the original index (failsafe path).
-    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    let mut state = scratchpad_test_state(test_config(), test_monitors());
     state
         .focused_workspace_mut()
         .unwrap()
         .insert_window(100, Some(400))
         .unwrap();
-    state.scratchpad_stash(); // solo: origin_sibling = None
+    state.scratchpad_stash().unwrap(); // solo: origin_sibling = None
     assert!(state.scratchpad.unwrap().origin_sibling.is_none());
-    state.scratchpad_toggle(); // summon
+    state.scratchpad_toggle().unwrap(); // summon
     state.previous_focused_hwnd = Some(100);
-    state.scratchpad_stash(); // release
+    state.scratchpad_stash().unwrap(); // release
 
     let ws = state.focused_workspace().unwrap();
     assert!(ws.contains_window(100));
     assert!(!ws.is_floating(100), "released as a tiled window");
+    let column = ws.find_window_location(100).unwrap().0;
+    assert_eq!(ws.column(column).unwrap().width(), 400);
+}
+
+#[test]
+fn test_scratchpad_release_makes_an_offviewport_origin_visible() {
+    let mut state = scratchpad_test_state(test_config(), test_monitors());
+    {
+        let workspace = state.focused_workspace_mut().unwrap();
+        for wid in [100, 200, 300, 400] {
+            workspace.insert_window(wid, Some(1500)).unwrap();
+        }
+        workspace.focus_window(100).unwrap();
+    }
+    state.scratchpad_stash().unwrap();
+    {
+        let viewport = state.layout_viewport(1);
+        let workspace = state.focused_workspace_mut().unwrap();
+        workspace.focus_window(400).unwrap();
+        workspace.ensure_focused_visible(viewport.width);
+    }
+    state.scratchpad_toggle().unwrap();
+    state.previous_focused_hwnd = Some(100);
+    state.scratchpad_stash().unwrap();
+
+    let viewport = state.layout_viewport(1);
+    let workspace = state.focused_workspace().unwrap();
+    assert_eq!(workspace.focused_window(), Some(100));
+    let placement = workspace
+        .compute_placements(viewport)
+        .into_iter()
+        .find(|placement| placement.window_id == 100)
+        .unwrap();
+    assert_eq!(placement.visibility, Visibility::Visible);
+    assert!(placement.rect.x >= viewport.x);
+    assert!(placement.rect.right() <= viewport.right());
+    assert!(placement.rect.y >= viewport.y);
+    assert!(placement.rect.bottom() <= viewport.bottom());
+}
+
+#[test]
+fn test_scratchpad_park_failure_rolls_back_designation_and_workspace() {
+    let mut state = scratchpad_test_state(test_config(), test_monitors());
+    state
+        .focused_workspace_mut()
+        .unwrap()
+        .insert_window(100, Some(800))
+        .unwrap();
+    state.injected_scratchpad_park_failure = true;
+
+    assert!(state.scratchpad_stash().is_err());
+    assert!(state.scratchpad.is_none());
+    assert!(state.focused_workspace().unwrap().contains_window(100));
+}
+
+#[test]
+fn test_scratchpad_summon_failure_keeps_hidden_ownership() {
+    let mut state = scratchpad_test_state(test_config(), test_monitors());
+    state
+        .focused_workspace_mut()
+        .unwrap()
+        .insert_window(100, Some(800))
+        .unwrap();
+    state.scratchpad_stash().unwrap();
+    state.injected_scratchpad_raise_failure = true;
+
+    assert!(state.scratchpad_toggle().is_err());
+    assert!(state.scratchpad.is_some_and(|scratchpad| !scratchpad.shown));
+    assert!(!state.focused_workspace().unwrap().contains_window(100));
 }
 
 #[test]
@@ -6017,7 +6354,7 @@ fn test_scratchpad_stash_uses_tiled_focus_over_stale_foreground() {
     // pointing at a window the user just moved off of. Stash must take the
     // tiled-focused window, not the stale foreground one (the bug stashed a
     // column's stackmate and left the intended window stranded alone).
-    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    let mut state = scratchpad_test_state(test_config(), test_monitors());
     {
         let ws = state.focused_workspace_mut().unwrap();
         ws.insert_window(100, Some(400)).unwrap();
@@ -6031,7 +6368,7 @@ fn test_scratchpad_stash_uses_tiled_focus_over_stale_foreground() {
     // Stale foreground from the window focus just left.
     state.previous_focused_hwnd = Some(100);
 
-    state.scratchpad_stash();
+    state.scratchpad_stash().unwrap();
 
     let sp = state.scratchpad.expect("scratchpad designated");
     assert_eq!(

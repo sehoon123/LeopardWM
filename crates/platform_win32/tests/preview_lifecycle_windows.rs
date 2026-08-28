@@ -13,10 +13,10 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetForegroundWindow,
-    GetMessageW, IsWindow, PostThreadMessageW, RegisterClassW, SendMessageW, UnregisterClassW,
-    CW_USEDEFAULT, MSG, WINDOWPOS, WM_QUIT, WM_RBUTTONUP, WM_WINDOWPOSCHANGING, WNDCLASSW,
-    WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, FindWindowW,
+    GetForegroundWindow, GetMessageW, IsWindow, PostThreadMessageW, RegisterClassW, SendMessageW,
+    UnregisterClassW, CW_USEDEFAULT, MSG, WINDOWPOS, WM_QUIT, WM_RBUTTONUP, WM_WINDOWPOSCHANGING,
+    WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 
 unsafe extern "system" fn source_window_proc(
@@ -37,6 +37,23 @@ unsafe extern "system" fn stubborn_source_window_proc(
     if message == WM_WINDOWPOSCHANGING {
         let position = &mut *(lparam.0 as *mut WINDOWPOS);
         if position.x.unsigned_abs() > 1000 || position.y.unsigned_abs() > 1000 {
+            position.x = 100;
+            position.y = 100;
+        }
+    }
+    DefWindowProcW(hwnd, message, wparam, lparam)
+}
+
+unsafe extern "system" fn return_rejecting_source_window_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if message == WM_WINDOWPOSCHANGING {
+        let position = &mut *(lparam.0 as *mut WINDOWPOS);
+        let is_sentinel = position.x <= -10_000 && position.y <= -10_000;
+        if !is_sentinel {
             position.x = 100;
             position.y = 100;
         }
@@ -87,6 +104,10 @@ impl SourceWindow {
         Self::new_with_mode(2)
     }
 
+    fn new_with_rejected_return() -> Self {
+        Self::new_with_mode(3)
+    }
+
     fn new_with_mode(constraint_mode: u8) -> Self {
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(isize, u32), String>>();
         let thread = std::thread::Builder::new()
@@ -103,6 +124,7 @@ impl SourceWindow {
                     lpfnWndProc: Some(match constraint_mode {
                         1 => stubborn_source_window_proc,
                         2 => emergency_only_source_window_proc,
+                        3 => return_rejecting_source_window_proc,
                         _ => source_window_proc,
                     }),
                     lpszClassName: PCWSTR(class.as_ptr()),
@@ -195,9 +217,63 @@ fn preview_park_case(source: &SourceWindow) -> (WindowPlacement, WindowRegionCli
     )
 }
 
+fn assert_daemon_absent() {
+    let daemon_class: Vec<u16> = "LeopardWMSysEventClass\0".encode_utf16().collect();
+    assert!(
+        unsafe { FindWindowW(PCWSTR(daemon_class.as_ptr()), PCWSTR::null()) }.is_err(),
+        "stop LeopardWM before running owned-HWND probes; a live daemon would manage and corrupt probe windows"
+    );
+}
+
+fn verify_rejected_visible_float_return(monitor: &leopardwm_platform_win32::MonitorInfo) {
+    let rejecting = SourceWindow::new_with_rejected_return();
+    let window_id = rejecting.hwnd as u64;
+    leopardwm_platform_win32::move_window_offscreen(window_id)
+        .expect("return-rejecting source must accept sentinel park");
+    assert!(leopardwm_platform_win32::has_move_offscreen_ownership(
+        window_id
+    ));
+    let requested = Rect::new(
+        monitor.work_area.x + 700,
+        monitor.work_area.y + 300,
+        320,
+        240,
+    );
+    assert!(leopardwm_platform_win32::position_window(window_id, requested).is_err());
+    assert!(
+        leopardwm_platform_win32::has_move_offscreen_ownership(window_id),
+        "failed visible readback must retain recovery ownership"
+    );
+    let result = apply_placements_with_regions(
+        &[WindowPlacement {
+            window_id,
+            rect: requested,
+            visibility: Visibility::Visible,
+            column_index: usize::MAX,
+        }],
+        &[],
+        &PlatformConfig::default(),
+        None,
+        false,
+    )
+    .expect("float mismatch is returned as a receipt, not a false landing");
+    assert_eq!(result.geometry_mismatches, vec![window_id]);
+    assert!(leopardwm_platform_win32::has_move_offscreen_ownership(
+        window_id
+    ));
+    assert!(
+        leopardwm_platform_win32::restore_window_moved_offscreen(window_id)
+            .expect("explicit recovery consumes retained ownership")
+    );
+    assert!(!leopardwm_platform_win32::has_move_offscreen_ownership(
+        window_id
+    ));
+}
+
 #[test]
 fn ordered_real_preview_lifecycle_contract() {
     ensure_dpi_awareness();
+    assert_daemon_absent();
     assert!(
         integration_probe::host_initial_spawn_failure_recovers(),
         "a transient first host failure must recover lazily"
@@ -288,6 +364,9 @@ fn ordered_real_preview_lifecycle_contract() {
         .into_iter()
         .find(|monitor| monitor.is_primary)
         .expect("primary monitor");
+
+    verify_rejected_visible_float_return(&monitor);
+
     let source = SourceWindow::new();
     let source_hwnd = HWND(source.hwnd as *mut c_void);
     let destination_width = 40.min(monitor.work_area.width.max(1));

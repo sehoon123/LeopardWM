@@ -79,10 +79,11 @@ pub use types::{
     AnimationPlacementPolicy, MonitorId, MonitorInfo, PlatformConfig, Win32Error, WindowInfo,
 };
 pub use visibility::{
-    cascade_windows, is_move_offscreen_sentinel_position, is_move_offscreen_sentinel_rect,
-    move_window_offscreen, position_window, raise_window,
+    cascade_windows, has_move_offscreen_ownership, is_move_offscreen_sentinel_position,
+    is_move_offscreen_sentinel_rect, move_window_offscreen, position_window, raise_window,
     restore_all_windows_moved_offscreen_best_effort, restore_window_moved_offscreen,
-    restore_windows_moved_offscreen, uncloak_all_managed_windows, uncloak_all_visible_windows,
+    restore_windows_moved_offscreen, show_window_no_activate, uncloak_all_managed_windows,
+    uncloak_all_visible_windows,
 };
 pub use window_query::{
     cursor_is_over_window, get_cursor_pos, get_window_chrome_rect, get_window_corner_radius,

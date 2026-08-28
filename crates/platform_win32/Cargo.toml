@@ -27,5 +27,10 @@ name = "preview_lifecycle_windows"
 path = "tests/preview_lifecycle_windows.rs"
 required-features = ["integration-probes"]
 
+[[test]]
+name = "floating_return_windows"
+path = "tests/floating_return_windows.rs"
+required-features = ["integration-probes"]
+
 [lints]
 workspace = true

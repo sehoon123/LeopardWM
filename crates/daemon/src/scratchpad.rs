@@ -8,8 +8,11 @@
 //! not persisted across a daemon restart.
 
 use crate::state::{AppState, ScratchpadState, SCRATCHPAD_TOTAL_MARGIN};
+use anyhow::{anyhow, Result};
 use leopardwm_core_layout::Rect;
-use tracing::{info, warn};
+use tracing::info;
+#[cfg(not(test))]
+use tracing::warn;
 
 impl AppState {
     /// Remove `wid` from whichever workspace currently holds it (tiled or
@@ -33,129 +36,199 @@ impl AppState {
         false
     }
 
-    /// A centered default scratchpad rectangle on the focused monitor's work
-    /// area. Scratchpads with a remembered size use that size at summon time.
-    fn centered_default_scratchpad_rect(&self) -> Rect {
-        self.centered_rect_for_logical_floating_size(
-            self.focused_monitor,
-            self.default_scratchpad_size(),
-            SCRATCHPAD_TOTAL_MARGIN,
-        )
+    fn park_scratchpad_window(&self, wid: u64) -> Result<()> {
+        #[cfg(test)]
+        {
+            if self.injected_scratchpad_park_failure {
+                return Err(anyhow!("injected scratchpad park failure"));
+            }
+            let _ = wid;
+            Ok(())
+        }
+        #[cfg(not(test))]
+        {
+            leopardwm_platform_win32::move_window_offscreen(wid)
+                .map_err(|error| anyhow!(error.to_string()))
+        }
+    }
+
+    fn cloak_scratchpad_window(&self, wid: u64) {
+        #[cfg(not(test))]
+        leopardwm_platform_win32::dwm_cloak_window(wid);
+        #[cfg(test)]
+        let _ = wid;
+    }
+
+    fn uncloak_scratchpad_window(&self, wid: u64) {
+        #[cfg(not(test))]
+        leopardwm_platform_win32::dwm_uncloak_window(wid);
+        #[cfg(test)]
+        let _ = wid;
+    }
+
+    fn show_scratchpad_window(&self, wid: u64) -> Result<()> {
+        #[cfg(test)]
+        {
+            let _ = wid;
+            Ok(())
+        }
+        #[cfg(not(test))]
+        {
+            leopardwm_platform_win32::show_window_no_activate(wid)
+                .map_err(|error| anyhow!(error.to_string()))
+        }
+    }
+
+    fn restore_scratchpad_window(&self, wid: u64, rect: Rect) -> Result<()> {
+        #[cfg(test)]
+        {
+            let _ = (wid, rect);
+            Ok(())
+        }
+        #[cfg(not(test))]
+        {
+            leopardwm_platform_win32::position_window(wid, rect)
+                .map_err(|error| anyhow!(error.to_string()))
+        }
+    }
+
+    fn raise_scratchpad_window(&self, wid: u64) -> Result<()> {
+        #[cfg(test)]
+        {
+            if self.injected_scratchpad_raise_failure {
+                return Err(anyhow!("injected scratchpad raise failure"));
+            }
+            let _ = wid;
+            Ok(())
+        }
+        #[cfg(not(test))]
+        {
+            leopardwm_platform_win32::raise_window(wid).map_err(|error| anyhow!(error.to_string()))
+        }
+    }
+
+    fn prepare_scratchpad_ownership_change(&mut self) -> Result<()> {
+        if self.paused {
+            return Err(anyhow!(
+                "scratchpad ownership cannot change while tiling is paused"
+            ));
+        }
+        if self.drag_state.is_some() || self.resize_hwnd.is_some() {
+            return Err(anyhow!(
+                "scratchpad ownership cannot change during an active move/resize"
+            ));
+        }
+        self.prepare_workspace_ownership_change()
+            .map_err(|error| anyhow!("could not fence queued layout work: {error}"))?;
+        self.prune_stale_windows();
+        #[cfg(not(test))]
+        if let Some(dead) = self
+            .scratchpad
+            .map(|scratchpad| scratchpad.window_id)
+            .filter(|window_id| !leopardwm_platform_win32::is_window_valid(*window_id))
+        {
+            self.clear_recycled_hwnd_metadata(dead);
+        }
+        Ok(())
     }
 
     /// Designate the focused window as the scratchpad and hide it. If a
     /// different scratchpad is already stashed, summon it back first so it
     /// is not stranded hidden.
-    pub(crate) fn scratchpad_stash(&mut self) {
-        // Prefer the OS-foreground window only when the active workspace
-        // confirms it is floating. Floating focus is tracked outside the
-        // column focus model, so always preferring `Workspace::focused_window`
-        // would stash a tile instead of a focused regular float. Otherwise the
-        // tiled focus remains authoritative and immune to a stale foreground
-        // event from a tiled window the user just left.
-        let tiled_focus = self.focused_workspace().and_then(|ws| ws.focused_window());
-        let floating_focus = self.previous_focused_hwnd.filter(|wid| {
+    pub(crate) fn scratchpad_stash(&mut self) -> Result<()> {
+        self.prepare_scratchpad_ownership_change()?;
+        let tiled_focus = self
+            .focused_workspace()
+            .and_then(|workspace| workspace.focused_window());
+        #[cfg(not(test))]
+        let live_foreground = leopardwm_platform_win32::get_foreground_window().filter(|wid| {
             self.focused_workspace()
-                .is_some_and(|workspace| workspace.is_floating(*wid))
+                .is_some_and(|workspace| workspace.contains_window(*wid))
         });
+        #[cfg(test)]
+        let live_foreground = None;
+        let floating_focus = live_foreground
+            .or(self.previous_focused_hwnd)
+            .filter(|wid| {
+                self.focused_workspace()
+                    .is_some_and(|workspace| workspace.is_floating(*wid))
+            });
         let wid = floating_focus
+            .or(live_foreground)
             .or(tiled_focus)
-            .or(self.previous_focused_hwnd);
-        let Some(wid) = wid else {
-            info!("Scratchpad stash: no focused window");
-            return;
-        };
+            .ok_or_else(|| {
+                anyhow!("scratchpad stash has no focused window on the active workspace")
+            })?;
 
-        // Stashing the window that is already the scratchpad releases it
-        // back to the tiled layout. Capture its geometry while the
-        // designation still owns it, then clear the designation before
-        // reattaching the window.
-        if let Some(sp) = self.scratchpad {
-            if sp.window_id == wid {
-                let _ = self.snapshot_managed_floating_geometry(wid);
-                self.scratchpad = None;
-                self.release_to_tiling(wid, sp.origin_column, sp.origin_sibling);
-                // Keep focus on the returned window — it was focused while
-                // summoned, so re-tiling it (especially back into a stack)
-                // shouldn't hand focus to a sibling.
-                if let Some(ws) = self.focused_workspace_mut() {
-                    let _ = ws.focus_window(wid);
-                }
-                let _ = self.apply_layout();
-                self.sync_foreground_window();
-                info!("Scratchpad: released window {} back to tiling", wid);
-                return;
-            }
+        if let Some(state) = self.scratchpad.filter(|state| state.window_id == wid) {
+            let _ = self.snapshot_managed_floating_geometry(wid);
+            self.release_to_tiling(state)?;
+            self.scratchpad = None;
+            self.sync_taskbar_buttons();
+            self.sync_foreground_window();
+            info!("Scratchpad: released window {} back to tiling", wid);
+            return Ok(());
         }
 
-        // Only stash a window that still exists; otherwise we would cloak /
-        // move a dead HWND and record a dangling designation.
         #[cfg(not(test))]
         if !leopardwm_platform_win32::is_window_valid(wid) {
-            info!(
-                "Scratchpad stash: focused window {} is no longer valid",
-                wid
-            );
-            return;
+            return Err(anyhow!("scratchpad source {wid} is no longer valid"));
         }
 
-        // Designating a new scratchpad: release any existing one back to
-        // tiling first so it is not orphaned hidden. Capture a shown window
-        // while its designation still owns its size, then clear the
-        // designation before reattaching it.
-        if let Some(prev) = self.scratchpad {
-            let _ = self.snapshot_managed_floating_geometry(prev.window_id);
+        // Never strand an older designation. Its release is itself verified
+        // before ownership of the newly selected source is recorded.
+        if let Some(previous) = self.scratchpad {
+            let _ = self.snapshot_managed_floating_geometry(previous.window_id);
+            self.release_to_tiling(previous)?;
             self.scratchpad = None;
-            self.release_to_tiling(prev.window_id, prev.origin_column, prev.origin_sibling);
         }
 
-        // Preserve a regular floating window's current size when it becomes
-        // a scratchpad. Tiled windows start with no size memory and use the
-        // configured scratchpad default on their first summon.
         let last_size = if self.config.layout.remember_scratchpad_size {
             self.snapshot_managed_floating_geometry(wid)
                 .map(|rect| self.logical_floating_size_for_rect(rect))
         } else {
             None
         };
-
-        // Remember where it sat so releasing later restores it to the same
-        // spot: the column index (fallback) and a window that shared the
-        // column (so it can rejoin that exact column even if indices shift).
-        let (origin_column, origin_sibling) = self
+        let (origin_column, origin_sibling, origin_width) = self
             .focused_workspace()
-            .and_then(|ws| {
-                ws.find_window_location(wid).map(|(col, _)| {
-                    let sibling = ws
-                        .columns()
-                        .get(col)
-                        .and_then(|c| c.windows().iter().copied().find(|&w| w != wid));
-                    (col, sibling)
+            .and_then(|workspace| {
+                workspace.find_window_location(wid).and_then(|(column, _)| {
+                    let source = workspace.column(column)?;
+                    let sibling = source
+                        .windows()
+                        .iter()
+                        .copied()
+                        .find(|window| *window != wid);
+                    Some((column, sibling, Some(source.width())))
                 })
             })
             .unwrap_or_else(|| {
-                let col = self
-                    .focused_workspace()
-                    .map(|ws| ws.focused_column_index())
-                    .unwrap_or(0);
-                (col, None)
+                (
+                    self.focused_workspace()
+                        .map(|workspace| workspace.focused_column_index())
+                        .unwrap_or(0),
+                    None,
+                    None,
+                )
             });
-
-        // Record the designation BEFORE hiding, so if anything aborts
-        // mid-hide the daemon still knows it owns this window (the destroyed
-        // handler, next toggle, and shutdown/emergency recovery can all act
-        // on it) rather than leaving it cloaked/off-screen with no owner.
+        let previous_designation = self.scratchpad;
         self.scratchpad = Some(ScratchpadState {
             window_id: wid,
             shown: false,
             origin_column,
             origin_sibling,
+            origin_width,
             last_size,
         });
-        self.hide_window_to_holding(wid);
-        let _ = self.apply_layout();
+        self.move_origins.remove(&wid);
+        if let Err(error) = self.hide_window_to_holding(wid) {
+            self.scratchpad = previous_designation;
+            return Err(error);
+        }
+        self.sync_taskbar_buttons();
         self.sync_foreground_window();
         info!("Scratchpad: stashed window {}", wid);
+        Ok(())
     }
 
     /// Return `wid` to the active workspace as a tiled window: detach any
@@ -164,33 +237,64 @@ impl AppState {
     /// works even if column indices shifted). If that column is gone, fall back
     /// to a new column at `origin_column`. The subsequent `apply_layout`
     /// repositions it on-screen, overriding any off-screen parking.
-    fn release_to_tiling(&mut self, wid: u64, origin_column: usize, origin_sibling: Option<u64>) {
+    fn release_to_tiling(&mut self, state: ScratchpadState) -> Result<()> {
+        let wid = state.window_id;
+        let workspaces_backup = self.workspaces.clone();
+        let previous_focus = self.previous_focused_hwnd;
         self.detach_window_from_workspace(wid);
-        leopardwm_platform_win32::dwm_uncloak_window(wid);
+        self.uncloak_scratchpad_window(wid);
+        let viewport_width = self.viewport_width_for(self.focused_monitor);
         let reinserted = self
             .focused_workspace_mut()
-            .map(|ws| {
-                let rejoin_column = origin_sibling
-                    .and_then(|s| ws.find_window_location(s))
-                    .map(|(col, _)| col);
-                match rejoin_column {
-                    Some(col) => ws.insert_window_in_column(wid, col).is_ok(),
-                    None => ws.insert_window_at_column(wid, None, origin_column).is_ok(),
+            .map(|workspace| {
+                let rejoin_column = state
+                    .origin_sibling
+                    .and_then(|sibling| workspace.find_window_location(sibling))
+                    .map(|(column, _)| column);
+                let inserted = match rejoin_column {
+                    Some(column) => workspace.insert_window_in_column(wid, column).is_ok(),
+                    None => workspace
+                        .insert_window_at_column(wid, state.origin_width, state.origin_column)
+                        .is_ok(),
+                };
+                if inserted {
+                    let _ = workspace.focus_window(wid);
+                    workspace.ensure_focused_visible(viewport_width);
                 }
+                inserted
             })
             .unwrap_or(false);
         if !reinserted {
-            // Reattach failed (no workspace, or a duplicate that detach
-            // somehow missed). The window is uncloaked but may still be
-            // parked off-screen from the holding state, so pull it back
-            // on-screen rather than leave it lost.
-            warn!(
-                "Scratchpad: could not re-tile window {}; restoring it on-screen",
-                wid
-            );
-            let rect = self.centered_default_scratchpad_rect();
-            let _ = leopardwm_platform_win32::position_window(wid, rect);
+            self.workspaces = workspaces_backup;
+            self.previous_focused_hwnd = previous_focus;
+            return Err(anyhow!(
+                "scratchpad source {wid} could not return to tiling"
+            ));
         }
+
+        self.last_placed_layout_rects.clear();
+        if let Err(error) = self.apply_layout() {
+            self.workspaces = workspaces_backup;
+            self.previous_focused_hwnd = previous_focus;
+            self.last_placed_layout_rects.clear();
+            let physical_rollback = if state.shown {
+                self.uncloak_scratchpad_window(wid);
+                self.apply_layout()
+            } else {
+                self.cloak_scratchpad_window(wid);
+                self.park_scratchpad_window(wid)
+                    .and_then(|_| self.apply_layout())
+            };
+            if physical_rollback.is_err() {
+                self.paused = true;
+            }
+            return Err(anyhow!(
+                "scratchpad release rolled back after placement failure: {error}; rollback={physical_rollback:?}"
+            ));
+        }
+        self.disable_snap_for_window(wid);
+        self.move_origins.remove(&wid);
+        Ok(())
     }
 
     /// Remove `wid` from its workspace and hide it: cloak (hides from
@@ -199,22 +303,69 @@ impl AppState {
     /// alone does not reliably hide it. Both are recovery-safe: shutdown /
     /// panic / `emergency-uncloak` drains the direct-cloak set and
     /// re-homes any off-screen window.
-    fn hide_window_to_holding(&mut self, wid: u64) {
+    fn hide_window_to_holding(&mut self, wid: u64) -> Result<()> {
+        let workspaces_backup = self.workspaces.clone();
+        let previous_focus = self.previous_focused_hwnd;
+        let original_rect = leopardwm_platform_win32::get_window_chrome_rect(wid);
         let _ = self.snapshot_managed_floating_geometry(wid);
         self.detach_window_from_workspace(wid);
-        leopardwm_platform_win32::dwm_cloak_window(wid);
-        let _ = leopardwm_platform_win32::move_window_offscreen(wid);
+        self.cloak_scratchpad_window(wid);
+        if let Err(error) = self.park_scratchpad_window(wid) {
+            self.workspaces = workspaces_backup;
+            self.previous_focused_hwnd = previous_focus;
+            self.uncloak_scratchpad_window(wid);
+            self.last_placed_layout_rects.clear();
+            let rollback = if self.paused {
+                Err(anyhow!("tiling paused before rollback"))
+            } else {
+                self.apply_layout()
+            };
+            if rollback.is_err() {
+                self.paused = true;
+            }
+            return Err(anyhow!(
+                "scratchpad source {wid} could not be parked: {error}; rollback={rollback:?}"
+            ));
+        }
+
+        let viewport_width = self.viewport_width_for(self.focused_monitor);
+        if let Some(workspace) = self.focused_workspace_mut() {
+            workspace.ensure_focused_visible(viewport_width);
+        }
+        self.last_placed_layout_rects.clear();
+        if let Err(error) = self.apply_layout() {
+            self.workspaces = workspaces_backup;
+            self.previous_focused_hwnd = previous_focus;
+            self.uncloak_scratchpad_window(wid);
+            let reposition = original_rect
+                .ok_or_else(|| anyhow!("original scratchpad geometry unavailable"))
+                .and_then(|rect| self.restore_scratchpad_window(wid, rect));
+            self.last_placed_layout_rects.clear();
+            let relayout = if self.paused {
+                Err(anyhow!("tiling paused before rollback"))
+            } else {
+                self.apply_layout()
+            };
+            if reposition.is_err() || relayout.is_err() {
+                self.paused = true;
+            }
+            return Err(anyhow!(
+                "scratchpad hide rolled back after sibling relayout failure: {error}; reposition={reposition:?}; relayout={relayout:?}"
+            ));
+        }
+        #[cfg(not(test))]
+        leopardwm_platform_win32::taskbar::taskbar_hide(wid);
+        Ok(())
     }
 
     /// Add `wid` as a floating, centered window on the active workspace,
     /// uncloak it, position it, and let the OS foreground event drive
     /// focus + the border. Returns `false` if the window is gone or could
     /// not be floated, so the caller can drop the designation.
-    fn scratchpad_show(&mut self, wid: u64) -> bool {
+    fn scratchpad_show(&mut self, wid: u64) -> Result<()> {
         #[cfg(not(test))]
         if !leopardwm_platform_win32::is_window_valid(wid) {
-            warn!("Scratchpad: cannot summon window {}; it is gone", wid);
-            return false;
+            return Err(anyhow!("scratchpad source {wid} is gone"));
         }
         let logical_size = if self.config.layout.remember_scratchpad_size {
             self.scratchpad
@@ -229,80 +380,106 @@ impl AppState {
             logical_size,
             SCRATCHPAD_TOTAL_MARGIN,
         );
+        let workspaces_backup = self.workspaces.clone();
+        let previous_focus = self.previous_focused_hwnd;
         self.detach_window_from_workspace(wid);
-        leopardwm_platform_win32::dwm_uncloak_window(wid);
+        self.uncloak_scratchpad_window(wid);
+        if let Err(error) = self.show_scratchpad_window(wid) {
+            self.workspaces = workspaces_backup;
+            self.previous_focused_hwnd = previous_focus;
+            self.cloak_scratchpad_window(wid);
+            let _ = self.park_scratchpad_window(wid);
+            return Err(anyhow!(
+                "scratchpad source {wid} could not be shown: {error}"
+            ));
+        }
         let floated = self
             .focused_workspace_mut()
-            .map(|ws| {
-                let ok = ws.add_floating(wid, rect).is_ok();
-                if ok {
-                    let _ = ws.focus_window(wid);
+            .map(|workspace| {
+                let added = workspace.add_floating(wid, rect).is_ok();
+                if added {
+                    let _ = workspace.focus_window(wid);
                 }
-                ok
+                added
             })
             .unwrap_or(false);
         if !floated {
-            // Uncloaked but not attached to a workspace. Pull it on-screen so
-            // the now-visible window is not stranded at its off-screen park.
-            warn!("Scratchpad: could not float window {} on summon", wid);
-            let _ = leopardwm_platform_win32::position_window(wid, rect);
-            return false;
+            self.workspaces = workspaces_backup;
+            self.previous_focused_hwnd = previous_focus;
+            self.cloak_scratchpad_window(wid);
+            let _ = self.park_scratchpad_window(wid);
+            return Err(anyhow!(
+                "scratchpad source {wid} could not attach as a float"
+            ));
         }
-        let _ = self.apply_layout();
-        // Layout places floating windows asynchronously; force the final
-        // position synchronously so the window is physically centered.
-        let _ = leopardwm_platform_win32::position_window(wid, rect);
-        // Deliberately do NOT pre-set previous_focused_hwnd here. Setting
-        // the OS foreground fires EVENT_SYSTEM_FOREGROUND; the Focused
-        // handler then shows the border once the window has composited at
-        // its new spot (its DWM frame bounds, which the border reads, are
-        // stale for a frame right after uncloak+move). Pre-setting the
-        // focus would make that handler dedupe-skip and the border would
-        // track the stale rect — the "no border on first summon" bug.
+
+        self.last_placed_layout_rects.clear();
+        let placement = self
+            .apply_layout()
+            .and_then(|_| self.raise_scratchpad_window(wid));
+        if let Err(error) = placement {
+            self.workspaces = workspaces_backup;
+            self.previous_focused_hwnd = previous_focus;
+            self.cloak_scratchpad_window(wid);
+            let park = self.park_scratchpad_window(wid);
+            self.last_placed_layout_rects.clear();
+            let relayout = if self.paused {
+                Err(anyhow!("tiling paused before rollback"))
+            } else {
+                self.apply_layout()
+            };
+            if park.is_err() || relayout.is_err() {
+                self.paused = true;
+            }
+            return Err(anyhow!(
+                "scratchpad summon rolled back after physical placement failure: {error}; park={park:?}; relayout={relayout:?}"
+            ));
+        }
+
         #[cfg(not(test))]
         {
-            let _ = leopardwm_platform_win32::set_foreground_window(wid);
+            leopardwm_platform_win32::taskbar::taskbar_show(wid);
+            if !leopardwm_platform_win32::set_foreground_window(wid).unwrap_or(false) {
+                warn!("Scratchpad {wid} is visible but Windows refused foreground transfer");
+            }
         }
-        true
+        self.move_origins.remove(&wid);
+        Ok(())
     }
 
     /// Hide the currently-shown scratchpad window.
-    fn scratchpad_hide(&mut self, wid: u64) {
-        self.hide_window_to_holding(wid);
-        let _ = self.apply_layout();
+    fn scratchpad_hide(&mut self, wid: u64) -> Result<()> {
+        self.hide_window_to_holding(wid)?;
         self.sync_foreground_window();
+        Ok(())
     }
 
     /// Toggle scratchpad visibility (summon if hidden, hide if shown).
-    pub(crate) fn scratchpad_toggle(&mut self) {
-        let Some(state) = self.scratchpad else {
-            info!("Scratchpad toggle: none designated");
-            return;
-        };
+    pub(crate) fn scratchpad_toggle(&mut self) -> Result<()> {
+        self.prepare_scratchpad_ownership_change()?;
+        let state = self
+            .scratchpad
+            .ok_or_else(|| anyhow!("no scratchpad is designated"))?;
         if state.shown {
-            self.scratchpad_hide(state.window_id);
+            self.scratchpad_hide(state.window_id)?;
             if let Some(current) = self.scratchpad.as_mut() {
                 if current.window_id == state.window_id {
                     current.shown = false;
                 }
             }
+            self.sync_taskbar_buttons();
             info!("Scratchpad: hid window {}", state.window_id);
-        } else if self.scratchpad_show(state.window_id) {
+        } else {
+            self.scratchpad_show(state.window_id)?;
             if let Some(current) = self.scratchpad.as_mut() {
                 if current.window_id == state.window_id {
                     current.shown = true;
                 }
             }
+            self.sync_taskbar_buttons();
             info!("Scratchpad: summoned window {}", state.window_id);
-        } else {
-            // Window vanished or could not be floated; drop the designation
-            // rather than keep a dangling, un-summonable scratchpad.
-            self.scratchpad = None;
-            info!(
-                "Scratchpad: summon of window {} failed; cleared designation",
-                state.window_id
-            );
         }
+        Ok(())
     }
 
     /// Clear the scratchpad designation if `wid` was the scratchpad

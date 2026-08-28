@@ -23,8 +23,9 @@ use windows::Win32::Graphics::Dwm::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, GetClassNameW, GetWindowRect,
-    IsHungAppWindow, IsIconic, IsWindow, IsZoomed, SetWindowPos, ShowWindow, SET_WINDOW_POS_FLAGS,
-    SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_RESTORE,
+    GetWindowThreadProcessId, IsHungAppWindow, IsIconic, IsWindow, IsZoomed, SetWindowPos,
+    ShowWindow, SET_WINDOW_POS_FLAGS, SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+    SWP_NOSIZE, SWP_NOZORDER, SW_RESTORE,
 };
 
 /// Undocumented but well-known DWM attribute for cloaking windows.
@@ -420,7 +421,7 @@ pub struct ApplyPlacementsResult {
     pub width_violations: Vec<WidthViolation>,
     /// Height violations detected after positioning (windows taller than requested).
     pub height_violations: Vec<HeightViolation>,
-    /// Visible tiled windows whose DWM frame did not land on the requested
+    /// Visible windows whose DWM frame did not land on the requested
     /// left/top/right/bottom edges. The daemon performs one guarded corrective
     /// landing after stale insets have been invalidated.
     pub geometry_mismatches: Vec<WindowId>,
@@ -507,6 +508,7 @@ pub(crate) fn returns_from_offscreen_park(
     current_visibility: Visibility,
     had_preview: bool,
     was_cloaked: bool,
+    was_directly_parked: bool,
     previous: Option<(Rect, Visibility)>,
 ) -> bool {
     if current_visibility != Visibility::Visible {
@@ -514,6 +516,7 @@ pub(crate) fn returns_from_offscreen_park(
     }
     had_preview
         || was_cloaked
+        || was_directly_parked
         || previous.is_some_and(|(_, visibility)| visibility != Visibility::Visible)
 }
 
@@ -597,14 +600,15 @@ pub fn apply_placements_with_regions(
     // overlap and the layout gaps disappear.  Zero the insets to keep correct spacing.
     let high_contrast = crate::is_high_contrast_enabled();
 
-    let (
+    let DeferBuild {
         entries,
         preview_requests,
         new_preview_count,
         skipped,
         safe_fallbacks,
         unsafe_hung_sensitive,
-    ) = build_defer_entries(
+        unavailable_window_ids,
+    } = build_defer_entries(
         placements,
         region_clips,
         &mut cache,
@@ -613,6 +617,11 @@ pub fn apply_placements_with_regions(
         high_contrast,
     );
 
+    if !unavailable_window_ids.is_empty() {
+        return Err(Win32Error::SetPositionFailed(format!(
+            "layout contains invalid window(s): {unavailable_window_ids:?}"
+        )));
+    }
     if !unsafe_hung_sensitive.is_empty() {
         return Err(Win32Error::SetPositionFailed(format!(
             "hung compositor-sensitive window(s) require exact landing: {unsafe_hung_sensitive:?}"
@@ -776,6 +785,18 @@ pub fn apply_placements_with_regions(
         for window_id in nudge_sticky_compositor_windows(&nudge_targets) {
             latch_return_repair(window_id);
             failed_window_ids.insert(window_id);
+        }
+
+        // A MoveOffScreen marker is a crash-surviving ownership receipt.
+        // Release it only after visible-edge readback and any required renderer
+        // nudge both committed. API acceptance is not physical completion.
+        let mismatched: HashSet<WindowId> = geometry_mismatches.iter().copied().collect();
+        for entry in entries.iter().filter(|entry| {
+            entry.visibility == Visibility::Visible
+                && !failed_window_ids.contains(&entry.window_id)
+                && !mismatched.contains(&entry.window_id)
+        }) {
+            crate::visibility::clear_move_offscreen_marker(entry.window_id);
         }
     }
 
@@ -941,6 +962,16 @@ fn persistent_preview_request(
     })
 }
 
+struct DeferBuild {
+    entries: Vec<DeferEntry>,
+    preview_requests: Vec<PersistentPreviewRequest>,
+    new_preview_count: usize,
+    skipped: u32,
+    safe_fallbacks: u32,
+    unsafe_hung_sensitive: Vec<WindowId>,
+    unavailable_window_ids: Vec<WindowId>,
+}
+
 /// Build the defer-entry list for all placements, skipping cache-unchanged windows.
 fn build_defer_entries(
     placements: &[WindowPlacement],
@@ -949,30 +980,45 @@ fn build_defer_entries(
     animation_frame: bool,
     policy: AnimationPlacementPolicy,
     high_contrast: bool,
-) -> (
-    Vec<DeferEntry>,
-    Vec<PersistentPreviewRequest>,
-    usize,
-    u32,
-    u32,
-    Vec<WindowId>,
-) {
+) -> DeferBuild {
     let mut skipped = 0u32;
     let mut safe_fallbacks = 0u32;
     let mut entries: Vec<DeferEntry> = Vec::with_capacity(placements.len());
     let mut preview_requests = Vec::with_capacity(region_clips.len());
     let mut new_preview_count = 0usize;
     let mut unsafe_hung_sensitive = Vec::new();
+    let mut unavailable_window_ids = Vec::new();
+    let mut validated_hwnds = HashMap::with_capacity(placements.len());
+    // Complete a side-effect-free validity pass for the whole batch before
+    // restoring, registering previews, or latching renderer repair on any
+    // member. A pre-existing dead sibling cannot partially mutate live HWNDs.
+    for requested in placements {
+        match window_id_to_hwnd(requested.window_id) {
+            Ok(hwnd) if unsafe { IsWindow(Some(hwnd)).as_bool() } => {
+                validated_hwnds.insert(requested.window_id, hwnd);
+            }
+            _ => unavailable_window_ids.push(requested.window_id),
+        }
+    }
+    if !unavailable_window_ids.is_empty() {
+        return DeferBuild {
+            entries,
+            preview_requests,
+            new_preview_count,
+            skipped,
+            safe_fallbacks,
+            unsafe_hung_sensitive,
+            unavailable_window_ids,
+        };
+    }
 
     for requested in placements {
         let region_clip = region_clips
             .iter()
             .find(|clip| clip.window_id == requested.window_id);
-        let Ok(hwnd) = window_id_to_hwnd(requested.window_id) else {
-            continue;
-        };
+        let hwnd = validated_hwnds[&requested.window_id];
         unsafe {
-            if !IsWindow(Some(hwnd)).as_bool() || IsIconic(hwnd).as_bool() {
+            if IsIconic(hwnd).as_bool() {
                 continue;
             }
             if requested.visibility == Visibility::Visible
@@ -1001,6 +1047,8 @@ fn build_defer_entries(
         // durable evidence that the window is returning from a parked preview.
         let had_preview = has_persistent_preview(requested.window_id);
         let was_cloaked = is_placement_cloaked(requested.window_id);
+        let was_directly_parked =
+            crate::visibility::has_move_offscreen_ownership(requested.window_id);
         let mut preview_source = false;
         let mut preview_was_published = false;
         let mut placement = requested.clone();
@@ -1031,7 +1079,11 @@ fn build_defer_entries(
             .as_ref()
             .and_then(|cache| cache.positions.get(&placement.window_id).copied());
         let unchanged = previous == Some((placement.rect, placement.visibility));
-        if unchanged && region_clip.is_none() && !has_owned_window_region(placement.window_id) {
+        if unchanged
+            && !was_directly_parked
+            && region_clip.is_none()
+            && !has_owned_window_region(placement.window_id)
+        {
             skipped += 1;
             continue;
         }
@@ -1103,8 +1155,13 @@ fn build_defer_entries(
             let frame_h = placement.rect.height + inset_t + inset_b;
             let flags = visible_position_flags(animation_frame, dispatch, position_only);
             // Read the state the window is leaving *before* this pass changes it.
-            if returns_from_offscreen_park(placement.visibility, had_preview, was_cloaked, previous)
-            {
+            if returns_from_offscreen_park(
+                placement.visibility,
+                had_preview,
+                was_cloaked,
+                was_directly_parked,
+                previous,
+            ) {
                 // Latched rather than acted on here: only the exact landing may
                 // resize, and an animation frame would otherwise consume the
                 // evidence before the landing sees it.
@@ -1150,14 +1207,15 @@ fn build_defer_entries(
         }
     }
 
-    (
+    DeferBuild {
         entries,
         preview_requests,
         new_preview_count,
         skipped,
         safe_fallbacks,
         unsafe_hung_sensitive,
-    )
+        unavailable_window_ids,
+    }
 }
 
 /// Install a bridge before uncloaking or moving. Unsupported application-owned
@@ -1196,11 +1254,6 @@ fn should_cloak_entry(
 
 /// Uncloak entries becoming visible and drop them from the tracking set.
 fn uncloak_becoming_visible(entries: &[DeferEntry], failed_window_ids: &HashSet<WindowId>) {
-    for entry in entries.iter().filter(|entry| {
-        entry.visibility == Visibility::Visible && !failed_window_ids.contains(&entry.window_id)
-    }) {
-        crate::visibility::clear_move_offscreen_marker(entry.window_id);
-    }
     let _commit = lock_cloak_commit();
     let to_consider: Vec<WindowId> = {
         let mut cloaked = lock_cloaked();
@@ -1412,6 +1465,7 @@ fn lock_suspected_oversize() -> std::sync::MutexGuard<'static, Option<HashMap<u6
 pub fn clear_suspected_oversize(window_id: WindowId) {
     forget_persistent_preview(window_id);
     forget_return_repair(window_id);
+    crate::visibility::clear_move_offscreen_marker(window_id);
     crate::window_region::forget_window_region(window_id);
     let mut guard = lock_suspected_oversize();
     if let Some(map) = guard.as_mut() {
@@ -1472,6 +1526,10 @@ fn geometry_mismatch_flags(visible: Rect, requested: Rect) -> (bool, bool, bool)
     )
 }
 
+fn should_verify_visible_landing(visibility: Visibility, _column_index: usize) -> bool {
+    visibility == Visibility::Visible
+}
+
 /// Verify all four visible DWM edges and detect genuine min-size violations
 /// on the synchronous landing pass.
 fn detect_size_violations(
@@ -1498,8 +1556,7 @@ fn detect_size_violations(
         let _ = DwmFlush();
     }
     for entry in entries {
-        if entry.column_index == usize::MAX
-            || entry.visibility != Visibility::Visible
+        if !should_verify_visible_landing(entry.visibility, entry.column_index)
             || failed_window_ids.contains(&entry.window_id)
         {
             continue;
@@ -1519,6 +1576,7 @@ fn detect_size_violations(
             )
             .is_err()
             {
+                geometry_mismatches.push(entry.window_id);
                 continue;
             }
             Rect::new(
@@ -1557,6 +1615,33 @@ fn detect_size_violations(
                 geometry_mismatches.push(entry.window_id);
                 continue;
             }
+        }
+
+        // Floating geometry is user-visible state too, but it must never seed
+        // tiled min-size constraints. Any missed edge is a placement mismatch
+        // that the daemon may retry once and then roll back transactionally.
+        if entry.column_index == usize::MAX {
+            // A floating app may enforce a larger minimum size; unlike a tiled
+            // column there is no constraint model to update, and a larger float
+            // whose requested top-left landed is still honestly visible. A
+            // displaced or undersized float is not acceptable.
+            if position_mismatch || undersized {
+                tracing::debug!(
+                    "Floating geometry mismatch: hwnd={:?} requested={:?} visible={:?}",
+                    entry.hwnd,
+                    requested,
+                    visible_rect
+                );
+                geometry_mismatches.push(entry.window_id);
+            } else if edge_mismatch {
+                tracing::debug!(
+                    "Floating window enforced a larger size: hwnd={:?} requested={:?} visible={:?}",
+                    entry.hwnd,
+                    requested,
+                    visible_rect
+                );
+            }
+            continue;
         }
 
         // Stale-bounds ratio — a genuine min-size violation usually has the
@@ -1741,6 +1826,17 @@ struct NudgeTarget {
     h: i32,
 }
 
+fn window_incarnation_identity(hwnd: HWND) -> Option<(u32, u32, String)> {
+    if !unsafe { IsWindow(Some(hwnd)).as_bool() } {
+        return None;
+    }
+    let mut process_id = 0u32;
+    let thread_id = unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process_id)) };
+    let class = window_class_name(hwnd);
+    (process_id != 0 && thread_id != 0 && !class.is_empty())
+        .then_some((process_id, thread_id, class))
+}
+
 /// Send a (w-1 -> w) synchronous SetWindowPos pair to each known
 /// compositor-sensitive window. The final restore also forces non-client
 /// recalculation, then one DwmFlush publishes the repaired surfaces before the
@@ -1749,12 +1845,11 @@ fn nudge_sticky_compositor_windows(targets: &[NudgeTarget]) -> Vec<WindowId> {
     let mut repaired = Vec::new();
     let mut failed = Vec::new();
     for t in targets {
-        unsafe {
-            if !IsWindow(Some(t.hwnd)).as_bool() {
-                continue;
-            }
-        }
-        let class = window_class_name(t.hwnd);
+        let Some(identity) = window_incarnation_identity(t.hwnd) else {
+            failed.push(t.window_id);
+            continue;
+        };
+        let class = identity.2.clone();
         if !crate::thumbnail::is_compositor_sensitive_class_str(&class) {
             continue;
         }
@@ -1771,10 +1866,8 @@ fn nudge_sticky_compositor_windows(targets: &[NudgeTarget]) -> Vec<WindowId> {
             // handle validity and the class name catches recycling. If either
             // fails the target is left at w-1 rather than risk resizing the
             // wrong window — next apply pass will correct it.
-            if !IsWindow(Some(t.hwnd)).as_bool() {
-                continue;
-            }
-            if window_class_name(t.hwnd) != class {
+            if window_incarnation_identity(t.hwnd).as_ref() != Some(&identity) {
+                failed.push(t.window_id);
                 continue;
             }
             if let Err(e) = SetWindowPos(t.hwnd, None, t.x, t.y, t.w, t.h, flags | SWP_FRAMECHANGED)
@@ -1789,6 +1882,10 @@ fn nudge_sticky_compositor_windows(targets: &[NudgeTarget]) -> Vec<WindowId> {
                 failed.push(t.window_id);
                 continue;
             }
+        }
+        if window_incarnation_identity(t.hwnd).as_ref() != Some(&identity) {
+            failed.push(t.window_id);
+            continue;
         }
         repaired.push(t.window_id);
         tracing::debug!(
@@ -2195,6 +2292,19 @@ mod tests {
     }
 
     #[test]
+    fn invalid_nudge_target_is_reported_as_failed() {
+        let failed = nudge_sticky_compositor_windows(&[NudgeTarget {
+            window_id: 77,
+            hwnd: HWND::default(),
+            x: 0,
+            y: 0,
+            w: 800,
+            h: 600,
+        }]);
+        assert_eq!(failed, vec![77]);
+    }
+
+    #[test]
     fn test_zero_sized_offscreen_marker_uses_global_sentinel() {
         let placement = WindowPlacement {
             window_id: 1,
@@ -2220,7 +2330,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_placements_skips_invalid_windows() {
+    fn test_apply_placements_rejects_invalid_windows() {
         let config = PlatformConfig::default();
         let placements = vec![WindowPlacement {
             window_id: 0,
@@ -2229,9 +2339,9 @@ mod tests {
             column_index: 0,
         }];
 
-        // Invalid windows (hwnd 0) are silently skipped in the deferred batch
+        // A skipped invalid HWND cannot satisfy a requested layout receipt.
         let result = apply_placements(&placements, &config, None, false);
-        assert!(result.is_ok());
+        assert!(result.is_err());
     }
 
     /// Verifies the OR-cloak invariant by directly manipulating the two
@@ -2367,6 +2477,25 @@ mod inset_plausibility_tests {
 }
 
 #[cfg(test)]
+mod visible_landing_policy_tests {
+    use super::should_verify_visible_landing;
+    use leopardwm_core_layout::Visibility;
+
+    #[test]
+    fn visible_floats_require_physical_landing_verification() {
+        assert!(should_verify_visible_landing(
+            Visibility::Visible,
+            usize::MAX
+        ));
+        assert!(should_verify_visible_landing(Visibility::Visible, 0));
+        assert!(!should_verify_visible_landing(
+            Visibility::OffScreenLeft,
+            usize::MAX
+        ));
+    }
+}
+
+#[cfg(test)]
 mod compositor_return_repair_tests {
     use super::returns_from_offscreen_park;
     use leopardwm_core_layout::{Rect, Visibility};
@@ -2390,6 +2519,7 @@ mod compositor_return_repair_tests {
             Visibility::Visible,
             true,
             false,
+            false,
             None
         ));
     }
@@ -2400,6 +2530,18 @@ mod compositor_return_repair_tests {
             Visibility::Visible,
             false,
             true,
+            false,
+            None
+        ));
+    }
+
+    #[test]
+    fn a_window_leaving_a_direct_sentinel_park_is_repaired() {
+        assert!(returns_from_offscreen_park(
+            Visibility::Visible,
+            false,
+            false,
+            true,
             None
         ));
     }
@@ -2408,6 +2550,7 @@ mod compositor_return_repair_tests {
     fn a_cached_parked_window_becoming_visible_is_repaired() {
         assert!(returns_from_offscreen_park(
             Visibility::Visible,
+            false,
             false,
             false,
             parked()
@@ -2422,10 +2565,12 @@ mod compositor_return_repair_tests {
             Visibility::Visible,
             false,
             false,
+            false,
             onscreen()
         ));
         assert!(!returns_from_offscreen_park(
             Visibility::Visible,
+            false,
             false,
             false,
             None
@@ -2438,6 +2583,7 @@ mod compositor_return_repair_tests {
         for previous in [None, parked(), onscreen()] {
             assert!(!returns_from_offscreen_park(
                 Visibility::OffScreenRight,
+                true,
                 true,
                 true,
                 previous
