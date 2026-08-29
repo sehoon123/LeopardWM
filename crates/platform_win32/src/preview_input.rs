@@ -645,7 +645,20 @@ impl PreviewInput {
                             continue;
                         };
                         let host_raw = input.raise_host_raw.load(Ordering::Acquire);
-                        if host_raw == 0 || windows_by_id.is_empty() {
+                        if windows_by_id.is_empty() {
+                            // Nothing to order is trivially ordered. Leaving the
+                            // generation unacknowledged made the publisher wait
+                            // out its window and retry, which is what produced
+                            // repeated "not acknowledged" reports and a retry
+                            // burst whenever a pass carried no target — an
+                            // animation frame, for one.
+                            let generation = input.desired_raise_generation.load(Ordering::Acquire);
+                            input
+                                .applied_raise_generation
+                                .store(generation, Ordering::Release);
+                            continue;
+                        }
+                        if host_raw == 0 {
                             continue;
                         }
                         let host = HWND(host_raw as *mut std::ffi::c_void);
