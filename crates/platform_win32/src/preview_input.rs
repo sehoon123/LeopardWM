@@ -653,16 +653,22 @@ impl PreviewInput {
                         let anchor = Some(HWND(anchor_raw as *mut std::ffi::c_void))
                             .filter(|_| anchor_raw != 0)
                             .filter(|anchor| IsWindow(Some(*anchor)).as_bool());
-                        // Chain the group downward from its insertion point so
-                        // the final order is anchor > targets > host in one
-                        // pass. Raising each target to the band top instead
-                        // would lift the whole group above the anchor again.
-                        let mut previous = anchor.unwrap_or(HWND_TOP);
+                        // Reference only our own windows: UIPI refuses a
+                        // higher-integrity window as the z-order reference, and
+                        // an absolute HWND_TOP would lift the whole group over
+                        // the windows that own those pixels. Inserting every
+                        // target directly below the host and then moving the
+                        // host below the deepest target reorders the group in
+                        // place, wherever the host was anchored.
+                        // Each insert lands directly below the host, so the
+                        // first one ends up deepest; the host must then move
+                        // below that deepest target, not the last inserted one.
+                        let mut deepest_target = None;
                         let mut raised = true;
                         for hwnd in windows_by_id.values() {
                             if let Err(error) = SetWindowPos(
                                 *hwnd,
-                                Some(previous),
+                                Some(host),
                                 0,
                                 0,
                                 0,
@@ -675,12 +681,12 @@ impl PreviewInput {
                                 warn!("Preview click target z-order failed: {error}");
                                 break;
                             }
-                            previous = *hwnd;
+                            deepest_target.get_or_insert(*hwnd);
                         }
                         if raised {
                             if let Err(error) = SetWindowPos(
                                 host,
-                                Some(previous),
+                                Some(deepest_target.unwrap_or(host)),
                                 0,
                                 0,
                                 0,

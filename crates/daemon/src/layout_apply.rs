@@ -263,57 +263,65 @@ fn preview_clip_bounds(
     Some(owner_rect)
 }
 
-/// Bottommost visible tiled HWND in z-order: the window the preview host must
-/// sit directly below. Using the topmost tiled HWND would leave dialogs that
-/// are sandwiched between tiled windows underneath the preview.
-pub(crate) fn bottommost_visible_tiled_hwnd(
+/// Window the preview host must sit directly below, in z-order.
+///
+/// Every window that owns pixels inside a published strip must stay above the
+/// host, otherwise the preview paints over it and steals its input. Unmanaged
+/// windows are not necessarily above the tiled band — a game launcher can sit
+/// behind every tiled window and still cover an edge strip — so the anchor is
+/// the deepest window that either covers a strip or is an on-screen tiled
+/// window. Parked sources sit off every monitor and therefore never match.
+pub(crate) fn preview_host_band_anchor(
     windows_top_to_bottom: &[leopardwm_platform_win32::WindowInfo],
+    preview_strips: &[leopardwm_core_layout::Rect],
     visible_tiled_window_ids: &std::collections::HashSet<u64>,
 ) -> Option<u64> {
     windows_top_to_bottom
         .iter()
         .rev()
-        .find(|window| visible_tiled_window_ids.contains(&window.hwnd))
+        .find(|window| {
+            visible_tiled_window_ids.contains(&window.hwnd)
+                || preview_strips
+                    .iter()
+                    .any(|strip| window.rect.intersects(strip))
+        })
         .map(|window| window.hwnd)
 }
 
-/// Resolve the window the preview host must sit directly below for this pass.
-///
-/// `None` is fail-closed: without a proven band anchor the host would be left
-/// at the top of the normal band, where it would paint over and steal input
-/// from windows that own those pixels, so previews are suppressed instead.
-fn resolve_preview_host_band_anchor(
-    visible_tiled_window_ids: &std::collections::HashSet<u64>,
+/// Anchor for this pass, or `None` when no preview will be published or the
+/// occluder snapshot could not be proven.
+fn resolve_preview_host_below(
+    occluders: Option<&[leopardwm_platform_win32::WindowInfo]>,
+    preview_strips: &[leopardwm_core_layout::Rect],
+    placements: &[leopardwm_core_layout::WindowPlacement],
 ) -> Option<u64> {
+    let occluders = occluders?;
+    if preview_strips.is_empty() {
+        return None;
+    }
+    let visible_tiled_ids: std::collections::HashSet<u64> = placements
+        .iter()
+        .filter(|placement| {
+            placement.column_index != usize::MAX
+                && placement.visibility == leopardwm_core_layout::Visibility::Visible
+        })
+        .map(|placement| placement.window_id)
+        .collect();
+    preview_host_band_anchor(occluders, preview_strips, &visible_tiled_ids)
+}
+
+/// Z-ordered snapshot of windows that may own pixels over an edge preview.
+///
+/// `None` is fail-closed: without it the host's band position cannot be proven,
+/// so previews are suppressed instead of being published over an unknown owner.
+fn visible_occluder_snapshot() -> Option<Vec<leopardwm_platform_win32::WindowInfo>> {
     #[cfg(test)]
     {
-        let _ = visible_tiled_window_ids;
         None
     }
     #[cfg(not(test))]
     {
-        leopardwm_platform_win32::enumerate_visible_top_level_occluders()
-            .ok()
-            .and_then(|windows| bottommost_visible_tiled_hwnd(&windows, visible_tiled_window_ids))
-    }
-}
-
-impl AppState {
-    /// Window the preview host must be anchored below for the placements about
-    /// to be applied.
-    fn preview_host_band_anchor(
-        &self,
-        placements: &[leopardwm_core_layout::WindowPlacement],
-    ) -> Option<u64> {
-        let visible_tiled_ids: std::collections::HashSet<u64> = placements
-            .iter()
-            .filter(|placement| {
-                placement.column_index != usize::MAX
-                    && placement.visibility == leopardwm_core_layout::Visibility::Visible
-            })
-            .map(|placement| placement.window_id)
-            .collect();
-        resolve_preview_host_band_anchor(&visible_tiled_ids)
+        leopardwm_platform_win32::enumerate_visible_top_level_occluders().ok()
     }
 }
 
@@ -368,9 +376,10 @@ pub(crate) struct OverflowContext<'a> {
     >,
     /// Every monitor rectangle, used to park a window clear of all of them.
     pub monitor_rects: &'a [leopardwm_core_layout::Rect],
-    /// Window the preview host will be anchored below. `None` means the band
-    /// anchor could not be proven, so no edge preview may be published.
-    pub preview_host_below: Option<u64>,
+    /// Whether a z-ordered occluder snapshot was proven for this pass. Without
+    /// it the host's band position cannot be verified, so no edge preview may
+    /// be published.
+    pub occluders_known: bool,
 }
 
 fn prepare_monitor_overflow(
@@ -380,16 +389,17 @@ fn prepare_monitor_overflow(
     mode: crate::config::MonitorOverflowModeConfig,
     desktop: &OverflowContext<'_>,
     region_clips: &mut Vec<leopardwm_platform_win32::WindowRegionClip>,
+    preview_strips: &mut Vec<leopardwm_core_layout::Rect>,
 ) {
     let OverflowContext {
         monitors,
         monitor_rects,
-        preview_host_below,
+        occluders_known,
     } = desktop;
     use crate::config::MonitorOverflowModeConfig;
     use leopardwm_core_layout::Visibility;
 
-    if mode == MonitorOverflowModeConfig::Hide || preview_host_below.is_none() {
+    if mode == MonitorOverflowModeConfig::Hide || !occluders_known {
         park_offscreen_avoiding_neighbors(
             placements,
             owner_id,
@@ -470,6 +480,9 @@ fn prepare_monitor_overflow(
             continue;
         }
 
+        if let Some(strip) = intersection(placement.rect, owner_rect) {
+            preview_strips.push(strip);
+        }
         upsert_region_clip(
             region_clips,
             leopardwm_platform_win32::WindowRegionClip {
@@ -700,14 +713,15 @@ impl AppState {
         if let Some(ref transition) = self.layout_transition {
             Self::apply_transition_interpolation(transition, &mut all_placements);
         }
-        // Band anchor for this pass: the preview host is published below the
-        // tiled band so unmanaged owners above it keep their pixels and input.
-        let preview_host_below = self.preview_host_band_anchor(&all_placements);
+        // Band anchor for this pass: the host is published below every window
+        // that owns pixels inside a strip, so those owners keep pixels and input.
+        let occluders = visible_occluder_snapshot();
         let desktop = OverflowContext {
             monitors: &self.monitors,
             monitor_rects: &monitor_rects,
-            preview_host_below,
+            occluders_known: occluders.is_some(),
         };
+        let mut preview_strips = Vec::new();
         for (owner_id, focused_column, start, end) in owner_ranges {
             prepare_monitor_overflow(
                 &mut all_placements[start..end],
@@ -716,8 +730,11 @@ impl AppState {
                 self.config.layout.monitor_overflow,
                 &desktop,
                 &mut region_clips,
+                &mut preview_strips,
             );
         }
+        self.preview_host_below =
+            resolve_preview_host_below(occluders.as_deref(), &preview_strips, &all_placements);
         // `apply_transition_interpolation` appends exiting windows. They are
         // few, so resolve only those owners rather than allocating a per-frame
         // HWND-to-monitor map for every placement.
@@ -736,6 +753,7 @@ impl AppState {
                     crate::config::MonitorOverflowModeConfig::Hide,
                     &desktop,
                     &mut region_clips,
+                    &mut preview_strips,
                 );
             }
         }
@@ -1224,12 +1242,13 @@ impl AppState {
             }
         }
 
-        let preview_host_below = self.preview_host_band_anchor(&all_placements);
+        let occluders = visible_occluder_snapshot();
         let desktop = OverflowContext {
             monitors: &self.monitors,
             monitor_rects: &monitor_rects,
-            preview_host_below,
+            occluders_known: occluders.is_some(),
         };
+        let mut preview_strips = Vec::new();
         for (owner_id, focused_column, start, end) in owner_ranges {
             prepare_monitor_overflow(
                 &mut all_placements[start..end],
@@ -1238,8 +1257,11 @@ impl AppState {
                 self.config.layout.monitor_overflow,
                 &desktop,
                 &mut region_clips,
+                &mut preview_strips,
             );
         }
+        let preview_host_below =
+            resolve_preview_host_below(occluders.as_deref(), &preview_strips, &all_placements);
 
         (all_placements, region_clips, preview_host_below)
     }

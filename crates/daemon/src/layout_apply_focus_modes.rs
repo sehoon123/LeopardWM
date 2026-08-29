@@ -70,9 +70,10 @@ fn apply_clip(
         &OverflowContext {
             monitors: &monitors,
             monitor_rects: &monitor_rects,
-            preview_host_below: Some(1),
+            occluders_known: true,
         },
         &mut clips,
+        &mut Vec::new(),
     );
     (placements, clips)
 }

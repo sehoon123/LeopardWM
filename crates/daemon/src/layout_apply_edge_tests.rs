@@ -1,6 +1,6 @@
 use super::{
-    bottommost_visible_tiled_hwnd, drifted_off_monitor_window, park_offscreen_avoiding_neighbors,
-    prepare_monitor_overflow, preview_clip_bounds, suppress_persistent_previews_during_animation,
+    drifted_off_monitor_window, park_offscreen_avoiding_neighbors, prepare_monitor_overflow,
+    preview_clip_bounds, preview_host_band_anchor, suppress_persistent_previews_during_animation,
     OverflowContext,
 };
 use crate::config::MonitorOverflowModeConfig;
@@ -65,7 +65,7 @@ fn animation_frames_park_interactive_previews_but_keep_ghost_crops() {
 }
 
 #[test]
-fn band_anchor_is_the_bottommost_visible_tiled_window() {
+fn band_anchor_is_the_deepest_strip_owner() {
     let info = |hwnd, x| leopardwm_platform_win32::WindowInfo {
         hwnd,
         title: String::new(),
@@ -74,29 +74,51 @@ fn band_anchor_is_the_bottommost_visible_tiled_window() {
         rect: Rect::new(x, 0, 100, 100),
         visible: true,
     };
-    // EnumWindows order is top-to-bottom: an unmanaged window sits between the
-    // two tiled HWNDs, so anchoring to the topmost tiled window would leave it
-    // below the preview host.
-    let windows = vec![info(10, 10), info(20, 20), info(30, 30)];
-    let tiled = std::collections::HashSet::from([10, 30]);
+    // EnumWindows order is top-to-bottom. The launcher (30) covers the strip
+    // and sits *below* both tiled windows, which is exactly the case that an
+    // anchor derived from the tiled band alone gets wrong: the host would be
+    // ordered above it and paint over pixels it owns.
+    let windows = vec![info(10, 0), info(20, 500), info(30, 40)];
+    let tiled = std::collections::HashSet::from([10, 20]);
+    let strip = Rect::new(0, 0, 200, 100);
 
-    assert_eq!(bottommost_visible_tiled_hwnd(&windows, &tiled), Some(30));
+    assert_eq!(
+        preview_host_band_anchor(&windows, &[strip], &tiled),
+        Some(30)
+    );
 }
 
 #[test]
-fn band_anchor_is_absent_without_a_visible_tiled_window() {
-    let info = |hwnd| leopardwm_platform_win32::WindowInfo {
+fn band_anchor_falls_back_to_the_deepest_visible_tiled_window() {
+    let info = |hwnd, x| leopardwm_platform_win32::WindowInfo {
         hwnd,
         title: String::new(),
         class_name: "Test".into(),
         process_id: hwnd as u32,
-        rect: Rect::new(0, 0, 100, 100),
+        rect: Rect::new(x, 0, 100, 100),
         visible: true,
     };
-    let windows = vec![info(1), info(2)];
+    // Nothing covers the strip: staying under the tiled band is still required
+    // so a dialog sandwiched between tiled windows keeps its pixels.
+    let windows = vec![info(10, 900), info(20, 950), info(30, 990)];
+    let tiled = std::collections::HashSet::from([10, 20]);
+    let strip = Rect::new(0, 0, 200, 100);
 
     assert_eq!(
-        bottommost_visible_tiled_hwnd(&windows, &std::collections::HashSet::new()),
+        preview_host_band_anchor(&windows, &[strip], &tiled),
+        Some(20)
+    );
+}
+
+#[test]
+fn band_anchor_is_absent_without_any_candidate() {
+    let windows: Vec<leopardwm_platform_win32::WindowInfo> = Vec::new();
+    assert_eq!(
+        preview_host_band_anchor(
+            &windows,
+            &[Rect::new(0, 0, 10, 10)],
+            &std::collections::HashSet::new()
+        ),
         None
     );
 }
@@ -350,9 +372,10 @@ fn assert_clip_preview_distribution(column_width: i32, expected_preview: i32) {
         &OverflowContext {
             monitors: &monitors,
             monitor_rects: &monitor_rects,
-            preview_host_below: Some(1),
+            occluders_known: true,
         },
         &mut clips,
+        &mut Vec::new(),
     );
 
     let actual: Vec<_> = placements
@@ -508,9 +531,10 @@ fn clip_overflow(
         &OverflowContext {
             monitors: &monitors,
             monitor_rects: &monitor_rects,
-            preview_host_below: Some(1),
+            occluders_known: true,
         },
         &mut clips,
+        &mut Vec::new(),
     );
     clips
 }
@@ -665,9 +689,10 @@ fn an_unproven_band_anchor_publishes_no_preview() {
         &OverflowContext {
             monitors: &monitors,
             monitor_rects: &monitor_rects,
-            preview_host_below: None,
+            occluders_known: false,
         },
         &mut clips,
+        &mut Vec::new(),
     );
 
     assert!(

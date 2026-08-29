@@ -34,8 +34,8 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClassInfoW, GetMessageW,
-    GetSystemMetrics, IsWindow, RegisterClassW, SetWindowPos, UnregisterClassW,
-    UpdateLayeredWindow, CW_USEDEFAULT, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, MSG,
+    GetSystemMetrics, GetWindow, IsWindow, RegisterClassW, SetWindowPos, UnregisterClassW,
+    UpdateLayeredWindow, CW_USEDEFAULT, GW_HWNDNEXT, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, MSG,
     SET_WINDOW_POS_FLAGS, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
     SM_YVIRTUALSCREEN, SWP_HIDEWINDOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
     SWP_SHOWWINDOW, ULW_ALPHA, WM_CLOSE, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE,
@@ -2726,48 +2726,61 @@ impl ThumbnailHost {
         .map_err(|error| Win32Error::SetPositionFailed(format!("thumbnail host hide: {error}")))
     }
 
-    /// Anchor the host inside the normal band.
+    /// Anchor the host inside the normal band, below `constraint`.
     ///
-    /// `below` is normally the bottommost visible tiled HWND. Anchoring there
-    /// keeps every window above the tiled band — including higher-integrity
-    /// windows this process cannot move — above the preview, so the full edge
-    /// strip stays published behind them instead of being cut away. `HWND_TOP`
-    /// remains the fallback for standalone callers without an anchor.
-    fn anchor_within_band(&self, below: Option<HWND>) -> Result<(), Win32Error> {
+    /// `constraint` is the deepest window that owns pixels inside a published
+    /// strip. Referencing it directly is often refused: UIPI returns
+    /// `E_ACCESSDENIED` when a higher-integrity window is used as the z-order
+    /// reference, and an elevated game launcher covering an edge strip is
+    /// exactly that case. Walk deeper until the OS accepts a reference and the
+    /// readback proves the host really landed below the constraint, so the
+    /// windows that own those pixels keep them and their input.
+    fn anchor_within_band(&self, constraint: Option<HWND>) -> Result<(), Win32Error> {
         if !self.is_available() {
             return Err(Win32Error::SetPositionFailed(
                 "thumbnail host unavailable for z-order anchor".into(),
             ));
         }
-        let anchor = below.filter(|anchor| unsafe { IsWindow(Some(*anchor)) }.as_bool());
-        unsafe {
-            SetWindowPos(
-                self.hwnd(),
-                Some(anchor.unwrap_or(HWND_TOP)),
-                0,
-                0,
-                0,
-                0,
-                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
-            )
-        }
-        .map_err(|error| {
-            Win32Error::SetPositionFailed(format!("thumbnail host z-order: {error}"))
-        })?;
-        // An accepted request is not a committed band position: the shell can
-        // reorder during the same message pass. Without this readback the host
-        // could stay above a window that owns those pixels and paint over it.
-        // The host's own click targets are raised above it and legitimately sit
-        // between the anchor and the host, so the invariant is "below the
-        // anchor", not "immediately below" it.
-        if let Some(anchor) = anchor {
-            if !unsafe { crate::preview_input::window_is_above(anchor, self.hwnd()) } {
-                return Err(Win32Error::SetPositionFailed(
-                    "thumbnail host did not land below its tiled anchor".into(),
-                ));
+        let host = self.hwnd();
+        let flags = SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW;
+        let Some(constraint) = constraint.filter(|c| unsafe { IsWindow(Some(*c)) }.as_bool())
+        else {
+            return unsafe { SetWindowPos(host, Some(HWND_TOP), 0, 0, 0, 0, flags) }.map_err(
+                |error| Win32Error::SetPositionFailed(format!("thumbnail host z-order: {error}")),
+            );
+        };
+
+        // Bounded: a desktop holds far fewer top-level windows, and the bound
+        // also stops a recycled handle from producing an endless walk.
+        const MAX_STEPS: usize = 512;
+        let mut candidate = constraint;
+        let mut last_error = None;
+        for _ in 0..MAX_STEPS {
+            match unsafe { SetWindowPos(host, Some(candidate), 0, 0, 0, 0, flags) } {
+                Ok(()) => {
+                    // An accepted request is not a committed band position: the
+                    // shell can reorder during the same message pass.
+                    if unsafe { crate::preview_input::window_is_above(constraint, host) } {
+                        return Ok(());
+                    }
+                }
+                Err(error) => last_error = Some(error),
+            }
+            let mut next = unsafe { GetWindow(candidate, GW_HWNDNEXT) }.ok();
+            if next == Some(host) {
+                next = unsafe { GetWindow(host, GW_HWNDNEXT) }.ok();
+            }
+            match next {
+                Some(next) if !next.is_invalid() => candidate = next,
+                _ => break,
             }
         }
-        Ok(())
+        Err(Win32Error::SetPositionFailed(format!(
+            "thumbnail host could not be ordered below its strip owner{}",
+            last_error
+                .map(|error| format!(": {error}"))
+                .unwrap_or_default()
+        )))
     }
 
     fn set_topmost(&self, topmost: bool) -> Result<(), Win32Error> {
