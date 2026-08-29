@@ -2,10 +2,13 @@
 
 All notable changes to LeopardWM will be documented in this file.
 
-## 0.2.6-sehoon.24-rc6
+## 0.2.7-sehoon.24-rc6
 
 ### Fixes
 
+- **Version bumped to 0.2.7,** so the MSI's third version field finally changes
+  between releases and Windows Installer treats an install over an older build
+  as an ordinary major upgrade rather than a same-version replacement.
 - **The daemon log is bounded.** It was a single never-rotated file, so a
   repeating failure grew it without limit: one failing layout apply left 13,338
   identical lines in a 14 MB log on the development host. An oversized log is
