@@ -1757,29 +1757,27 @@ pub(crate) fn commit_persistent_previews(
         // whose destination the next frame invalidates, and the settled landing
         // still runs the full armed transaction.
         if !input_armed && !next_ids.is_empty() {
-            let published_ids: std::collections::HashSet<_> = {
-                let state = lock_persistent_previews();
-                published_preview_requests(&state)
-                    .into_iter()
-                    .map(|receipt| receipt.request.window_id)
-                    .collect()
-            };
-            if published_ids == next_ids {
-                crate::preview_input::set_preview_targets_armed(false);
-                let outcome = {
-                    let mut state = lock_persistent_previews();
-                    if state.lifecycle_epoch != expected_lifecycle_epoch {
-                        return Ok(0);
-                    }
-                    state.desired = requests.to_vec();
-                    publish_preview_requests_locked(&mut state, requests, refresh_source_size)
-                };
-                if outcome.retry_needed {
-                    schedule_preview_retry();
+            crate::preview_input::set_preview_targets_armed(false);
+            let outcome = {
+                let mut state = lock_persistent_previews();
+                if state.lifecycle_epoch != expected_lifecycle_epoch {
+                    return Ok(0);
                 }
-                return Ok(outcome.live);
+                // Retire only what this frame stopped requesting. Dropping the
+                // entry unregisters its DWM handle (`ThumbnailHandle::drop`), so
+                // a column that stopped crossing stops rendering without hiding
+                // the surface or nulling the receipts of the previews that
+                // remain. Those are updated in place below.
+                state.previews.retain(|id, _| next_ids.contains(id));
+                state.desired = requests.to_vec();
+                publish_preview_requests_locked(&mut state, requests, refresh_source_size)
+            };
+            if outcome.retry_needed {
+                schedule_preview_retry();
             }
+            return Ok(outcome.live);
         }
+
         let publication_changed = {
             let mut state = lock_persistent_previews();
             let mut published: Vec<_> = published_preview_requests(&state)
@@ -3277,8 +3275,13 @@ pub mod integration_probe {
                 return Ok(false);
             }
             let request = probe_request(source_window_id, destination)?;
-            let live =
-                commit_persistent_previews(&[request], true, preview_lifecycle_epoch(), None, true)?;
+            let live = commit_persistent_previews(
+                &[request],
+                true,
+                preview_lifecycle_epoch(),
+                None,
+                true,
+            )?;
             if live != 1 || unsafe { windows::Win32::Graphics::Dwm::DwmFlush() }.is_err() {
                 return Ok(false);
             }
