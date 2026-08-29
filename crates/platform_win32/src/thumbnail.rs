@@ -1451,20 +1451,21 @@ fn activate_published_surface(state: &mut PersistentPreviewState) -> bool {
             )
         },
     );
-    if ack == crate::preview_input::RaiseAck::Superseded || epoch != preview_lifecycle_epoch() {
-        // A newer pass replaced this request and owns the surface. Disarm input,
-        // which is what this generation actually verified, but leave the pixels:
-        // tearing them down here is a visible blank flash on every rapid relayout.
+    if ack != crate::preview_input::RaiseAck::Applied || epoch != preview_lifecycle_epoch() {
+        // Only input depends on this acknowledgement: the host's own band
+        // position was already verified above, and an unacknowledged target
+        // order can at worst leave a click falling through the transparent
+        // host. Disarm input and let the retry re-acknowledge, but keep the
+        // published pixels: tearing them down here is a visible blank flash on
+        // every rapid relayout and on the first publication after a pump start,
+        // where the acknowledgement can simply arrive late.
         state.host_anchored = false;
         crate::preview_input::set_preview_targets_armed(false);
-        debug!("Preview target z-order superseded by a newer publication");
-        return false;
-    }
-    if ack != crate::preview_input::RaiseAck::Applied {
-        state.host_anchored = false;
-        crate::preview_input::set_preview_targets_armed(false);
-        let _ = host().hide_surface();
-        warn!("Preview target z-order/lifecycle could not be acknowledged; surface hidden");
+        if ack == crate::preview_input::RaiseAck::Superseded {
+            debug!("Preview target z-order superseded by a newer publication");
+        } else {
+            warn!("Preview target z-order was not acknowledged; input disarmed pending retry");
+        }
         return false;
     }
     state.host_anchored = true;

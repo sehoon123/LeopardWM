@@ -2,6 +2,18 @@
 
 All notable changes to LeopardWM will be documented in this file.
 
+## 0.2.6-sehoon.24-rc5
+
+### Fixes
+
+- **An unacknowledged target order no longer blanks the preview.** Only input
+  depends on that acknowledgement: the host's own band position is verified
+  separately, and an unordered target can at worst let a click fall through the
+  transparent host. Input is disarmed and the retry re-acknowledges while the
+  published pixels stay, which removed the blank flash and the four warnings
+  observed on the first publication after a fresh install, where the pump's
+  acknowledgement simply arrived after the 150ms window.
+
 ## 0.2.6-sehoon.24-rc4
 
 ### Fixes
