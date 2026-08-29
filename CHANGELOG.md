@@ -2,6 +2,23 @@
 
 All notable changes to LeopardWM will be documented in this file.
 
+## 0.2.8
+
+### Fixes
+
+- **Preview paths that fail closed now leave a trace.** A failed occluder
+  snapshot, a superseded lifecycle epoch, and a declined activation each
+  abandoned the pass silently, which made an edge that stopped rendering
+  indistinguishable from one that was never asked to render.
+- **Two tests no longer race over the same global flag.** Both reset the rescan
+  obligation and then asserted on it, so parallel execution could clear the flag
+  one had just observed; this rejected a commit whose CI run was green.
+
+### Notes
+
+- Edge previews are an animation-phase mechanism: at rest a straddling window is
+  clipped in place, so no preview surface is expected once motion settles.
+
 ## 0.2.7-sehoon.24-rc10
 
 ### Fixes
