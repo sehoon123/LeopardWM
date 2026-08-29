@@ -650,8 +650,8 @@ impl PreviewInput {
                         }
                         let host = HWND(host_raw as *mut std::ffi::c_void);
                         let anchor_raw = input.raise_anchor_raw.load(Ordering::Acquire);
-                        let anchor = Some(HWND(anchor_raw as *mut std::ffi::c_void))
-                            .filter(|_| anchor_raw != 0)
+                        let anchor = (anchor_raw != 0)
+                            .then_some(HWND(anchor_raw as *mut std::ffi::c_void))
                             .filter(|anchor| IsWindow(Some(*anchor)).as_bool());
                         // Reference only our own windows: UIPI refuses a
                         // higher-integrity window as the z-order reference, and
