@@ -815,8 +815,8 @@ mod tests {
             identity: None,
         })
         .unwrap();
-let _serialized = RESCAN_FLAG_TESTS.lock().unwrap_or_else(|e| e.into_inner());
-                EVENT_RESCAN_REQUIRED.store(true, Ordering::Release);
+        let _serialized = RESCAN_FLAG_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        EVENT_RESCAN_REQUIRED.store(true, Ordering::Release);
 
         flush_event_rescan_signal();
         assert!(EVENT_RESCAN_REQUIRED.load(Ordering::Acquire));
