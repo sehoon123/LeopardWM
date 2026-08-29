@@ -879,6 +879,16 @@ impl AppState {
             Ok(false) => {
                 debug!("Window {} already lacks WS_MAXIMIZEBOX, skipping", hwnd);
             }
+            // A `WindowNotFound` here is the recycled-HWND fence doing its job:
+            // the numeric handle no longer names the incarnation this request was
+            // built for, so refusing it is correct and needs no operator action.
+            // Only a real style-write failure is worth a warning.
+            Err(leopardwm_platform_win32::Win32Error::WindowNotFound(_)) => {
+                debug!(
+                    "Skipped WS_MAXIMIZEBOX removal for window {}: no longer the same incarnation",
+                    hwnd
+                );
+            }
             Err(e) => {
                 warn!("Failed to remove WS_MAXIMIZEBOX for window {}: {}", hwnd, e);
             }
