@@ -3846,8 +3846,10 @@ pub mod integration_probe {
         let cursor_saved =
             !require_physical_click && unsafe { GetCursorPos(&mut previous_cursor) }.is_ok();
         let routed_input_sent = if require_physical_click {
+            // BEL: this gate depends on a human reacting inside 60 seconds, and
+            // the prompt otherwise scrolls past in a build log.
             eprintln!(
-                "PHYSICAL_CLICK_REQUIRED: left-click the preview at screen coordinate ({}, {}) within 60 seconds",
+                "\u{7}PHYSICAL_CLICK_REQUIRED: left-click the preview at screen coordinate ({}, {}) within 60 seconds",
                 point.x, point.y
             );
             point_hits_target
