@@ -13,6 +13,9 @@ All notable changes to LeopardWM will be documented in this file.
   published pixels stay, which removed the blank flash and the four warnings
   observed on the first publication after a fresh install, where the pump's
   acknowledgement simply arrived after the 150ms window.
+- **The physical-click gate is operable.** The prompt is audible and its wait is
+  set with `LEOPARDWM_PHYSICAL_CLICK_TIMEOUT_SECS` (default 60, capped at 1800),
+  so a missed 60-second window no longer costs a whole probe run.
 
 ## 0.2.6-sehoon.24-rc4
 

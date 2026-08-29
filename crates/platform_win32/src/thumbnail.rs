@@ -2986,6 +2986,21 @@ pub mod integration_probe {
         CallNextHookEx(None, code, wparam, lparam)
     }
 
+    /// How long the physical-click gate waits. A human has to notice the prompt,
+    /// move to the printed coordinate and click, so the operator sets the budget
+    /// with `LEOPARDWM_PHYSICAL_CLICK_TIMEOUT_SECS`; a missed window otherwise
+    /// costs a whole probe run. Bounded so a typo cannot hang a release gate.
+    fn physical_click_timeout() -> Duration {
+        const DEFAULT_SECS: u64 = 60;
+        const MAX_SECS: u64 = 1800;
+        std::env::var("LEOPARDWM_PHYSICAL_CLICK_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|secs| *secs > 0)
+            .map(|secs| Duration::from_secs(secs.min(MAX_SECS)))
+            .unwrap_or(Duration::from_secs(DEFAULT_SECS))
+    }
+
     /// Wait for one routed click and prove where it came from.
     fn wait_for_physical_click(
         click_rx: &mpsc::Receiver<crate::preview_input::PreviewClickEvent>,
@@ -3849,8 +3864,10 @@ pub mod integration_probe {
             // BEL: this gate depends on a human reacting inside 60 seconds, and
             // the prompt otherwise scrolls past in a build log.
             eprintln!(
-                "\u{7}PHYSICAL_CLICK_REQUIRED: left-click the preview at screen coordinate ({}, {}) within 60 seconds",
-                point.x, point.y
+                "\u{7}PHYSICAL_CLICK_REQUIRED: left-click the preview at screen coordinate ({}, {}) within {} seconds",
+                point.x,
+                point.y,
+                physical_click_timeout().as_secs()
             );
             point_hits_target
         } else {
@@ -3882,7 +3899,7 @@ pub mod integration_probe {
         };
         let click_event_delivered = routed_input_sent
             && if require_physical_click {
-                wait_for_physical_click(&click_rx, expected_click_target, Duration::from_secs(60))
+                wait_for_physical_click(&click_rx, expected_click_target, physical_click_timeout())
             } else {
                 click_rx
                     .recv_timeout(Duration::from_secs(1))

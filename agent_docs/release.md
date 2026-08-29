@@ -65,8 +65,9 @@ The header must be exactly `## X.Y.Z` (or `## X.Y.Z-prerelease` for a prerelease
    .\.github\verify-no-leopardwm-daemon.ps1
    $env:LEOPARDWM_REQUIRE_DUAL_MONITOR = '1'
    $env:LEOPARDWM_REQUIRE_PHYSICAL_CLICK = '1'
+   $env:LEOPARDWM_PHYSICAL_CLICK_TIMEOUT_SECS = '300'   # optional, default 60, max 1800
    cargo test -p leopardwm-platform-win32 --features integration-probes --test preview_lifecycle_windows --locked -- --nocapture --test-threads=1
-   Remove-Item Env:LEOPARDWM_REQUIRE_DUAL_MONITOR, Env:LEOPARDWM_REQUIRE_PHYSICAL_CLICK
+   Remove-Item Env:LEOPARDWM_REQUIRE_DUAL_MONITOR, Env:LEOPARDWM_REQUIRE_PHYSICAL_CLICK, Env:LEOPARDWM_PHYSICAL_CLICK_TIMEOUT_SECS -ErrorAction SilentlyContinue
    ```
 5. Commit the release preparation and independently review the exact diff from the prior release.
 6. Push the candidate to `main` without force and wait for the required `check` workflow.
