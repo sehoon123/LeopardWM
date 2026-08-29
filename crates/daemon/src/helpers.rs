@@ -90,6 +90,50 @@ impl ScaledLayoutParams {
     }
 }
 
+/// Log a repeating failure at most once per interval, reporting how many
+/// identical occurrences were suppressed.
+///
+/// A single failing layout apply emitted 13,338 identical warnings on this host,
+/// because the move/resize snap-back retries on every event. The failure still
+/// has to be visible, but at event rate it drowns every other line and grows the
+/// log without bound.
+pub(crate) fn warn_throttled(key: &'static str, message: impl std::fmt::Display) {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+
+    const INTERVAL: Duration = Duration::from_secs(10);
+    static STATE: Mutex<Option<HashMap<&'static str, (Instant, u64)>>> = Mutex::new(None);
+
+    let mut guard = match STATE.lock() {
+        Ok(guard) => guard,
+        // A poisoned mutex must not silence a failure report.
+        Err(error) => error.into_inner(),
+    };
+    let state = guard.get_or_insert_with(HashMap::new);
+    let now = Instant::now();
+    match state.get_mut(key) {
+        Some((last, suppressed)) if now.duration_since(*last) < INTERVAL => {
+            *suppressed += 1;
+        }
+        Some((last, suppressed)) => {
+            let hidden = std::mem::take(suppressed);
+            *last = now;
+            drop(guard);
+            if hidden > 0 {
+                warn!("{message} ({hidden} identical occurrence(s) suppressed)");
+            } else {
+                warn!("{message}");
+            }
+        }
+        None => {
+            state.insert(key, (now, 0));
+            drop(guard);
+            warn!("{message}");
+        }
+    }
+}
+
 impl AppState {
     /// Look up window info for a given window handle.
     ///

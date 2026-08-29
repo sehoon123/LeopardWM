@@ -2037,7 +2037,10 @@ impl AppState {
                     // this the window stays where the user dragged it.
                     self.last_placed_layout_rects.remove(&hwnd);
                     if let Err(e) = self.apply_layout() {
-                        warn!("Failed to snap back layout after move/resize: {}", e);
+                        crate::helpers::warn_throttled(
+                            "snap-back-after-move-resize",
+                            format_args!("Failed to snap back layout after move/resize: {e}"),
+                        );
                     }
                 }
             }

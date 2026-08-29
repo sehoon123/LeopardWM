@@ -2,6 +2,18 @@
 
 All notable changes to LeopardWM will be documented in this file.
 
+## 0.2.6-sehoon.24-rc6
+
+### Fixes
+
+- **The daemon log is bounded.** It was a single never-rotated file, so a
+  repeating failure grew it without limit: one failing layout apply left 13,338
+  identical lines in a 14 MB log on the development host. An oversized log is
+  retired to a single `.1` backup at startup, keeping the stable filename the
+  banner, `collect-logs` and the tray action point at, and the repeating
+  move/resize snap-back failure is now reported at most once per ten seconds
+  with the suppressed count instead of at event rate.
+
 ## 0.2.6-sehoon.24-rc5
 
 ### Fixes

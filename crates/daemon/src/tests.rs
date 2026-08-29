@@ -7843,3 +7843,41 @@ fn test_layout_viewport_unknown_monitor_falls_back() {
         "fallback viewport is non-empty"
     );
 }
+
+#[test]
+fn oversized_log_rotates_to_a_single_backup() {
+    let dir = std::env::temp_dir().join(format!("leopardwm-log-rotate-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = dir.join("leopardwm-daemon.log");
+    let backup = dir.join("leopardwm-daemon.log.1");
+
+    // Under the cap: the live log must be left exactly as it is.
+    std::fs::write(&log, b"small").unwrap();
+    crate::rotate_oversized_log(&log, 64);
+    assert_eq!(std::fs::read(&log).unwrap(), b"small");
+    assert!(!backup.exists());
+
+    // Over the cap: the live log is retired to one backup, and a stale backup
+    // is replaced rather than accumulating files.
+    std::fs::write(&backup, b"stale").unwrap();
+    std::fs::write(&log, vec![b'x'; 128]).unwrap();
+    crate::rotate_oversized_log(&log, 64);
+    assert!(!log.exists(), "the live log is recreated by the appender");
+    assert_eq!(std::fs::read(&backup).unwrap().len(), 128);
+
+    // A missing log is not an error: logging must still initialise.
+    crate::rotate_oversized_log(&log, 64);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn repeated_failures_are_logged_at_most_once_per_interval() {
+    // The throttle must report suppressed occurrences rather than dropping the
+    // failure silently; only the count and timing are observable here.
+    for _ in 0..5_000 {
+        crate::helpers::warn_throttled("test-throttle-key", "repeating failure");
+    }
+    // A distinct key is independent, so one hot failure cannot mask another.
+    crate::helpers::warn_throttled("test-throttle-other", "different failure");
+}

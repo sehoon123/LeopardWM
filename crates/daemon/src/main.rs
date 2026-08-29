@@ -1017,6 +1017,11 @@ fn bootstrap_config() -> Result<(Config, Vec<config::ConfigWarning>)> {
     use tracing_subscriber::prelude::*;
     let log_dir = leopardwm_ipc::log_dir();
     let _ = std::fs::create_dir_all(&log_dir);
+    // A single never-rotated file grows without bound: one repeating failure
+    // wrote 13,338 identical lines into a 14 MB log on this host. Keep the
+    // stable filename that the banner, `collect-logs` and the tray "View Logs"
+    // action point at, and retire an oversized log to one backup at startup.
+    rotate_oversized_log(&log_dir.join("leopardwm-daemon.log"), MAX_LOG_BYTES);
     let file_appender = tracing_appender::rolling::never(&log_dir, "leopardwm-daemon.log");
     tracing_subscriber::registry()
         .with(tracing_subscriber::filter::LevelFilter::from_level(
@@ -1038,6 +1043,26 @@ fn bootstrap_config() -> Result<(Config, Vec<config::ConfigWarning>)> {
     }
 
     Ok((config, config_warnings))
+}
+
+/// Largest daemon log retained before it is rotated at startup. Two files of
+/// this size are the entire on-disk budget.
+const MAX_LOG_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Move an oversized log to a single `.1` backup so the live file starts fresh.
+///
+/// Best effort by design: logging must never fail to initialise because a
+/// previous log is locked or its directory is read-only.
+fn rotate_oversized_log(path: &std::path::Path, max_bytes: u64) {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return;
+    };
+    if metadata.len() <= max_bytes {
+        return;
+    }
+    let backup = path.with_file_name("leopardwm-daemon.log.1");
+    let _ = std::fs::remove_file(&backup);
+    let _ = std::fs::rename(path, &backup);
 }
 
 /// Install a panic hook that uncloaks all windows and writes a crash report.
