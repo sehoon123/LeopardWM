@@ -2,6 +2,28 @@
 
 All notable changes to LeopardWM will be documented in this file.
 
+## 0.2.7-sehoon.24-rc8
+
+### Fixes
+
+- **Edge previews no longer blink during animation.** Dropping the region clips
+  on every animation frame shrank the published request set, which turned
+  `publication_changed` true and ran the hidden teardown — surface hidden, every
+  receipt nulled, registrations dropped — after which the autonomous worker
+  republished about 100ms later. Clips now survive the animation, a frame that
+  cannot arm input updates its destinations in place, and a frame whose crossing
+  set changed retires only the previews it stopped requesting. Input safety is
+  kept by not entering the activation contract on such a frame rather than by
+  weakening it: `activate_published_surface` is unchanged, remains the only
+  writer that may claim an anchored surface, and its failure still creates the
+  retry obligation. Measured over a 42-frame scroll and focus burst: no frame
+  publishes zero previews, against per-frame cycling between two, one and zero
+  before.
+- **A z-order generation with no targets is acknowledged,** since nothing to
+  order is trivially ordered. Leaving it unacknowledged made the publisher wait
+  out its window and retry, which produced repeated "not acknowledged" reports
+  and retry bursts on exactly those frames.
+
 ## 0.2.7-sehoon.24-rc7
 
 ### Fixes
