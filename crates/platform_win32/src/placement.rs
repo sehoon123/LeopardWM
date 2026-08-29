@@ -918,6 +918,10 @@ pub fn apply_placements_with_regions_fenced(
         !animation_frame || new_preview_count > 0,
         config.preview_lifecycle_epoch,
         config.preview_host_below,
+        // Animation frames may not arm hit testing: the DWM surface and the
+        // input HWND cannot be moved atomically, so a click could land on a
+        // target the next frame invalidates.
+        !animation_frame,
     )?;
 
     // If the source move failed, retain an older LeopardWM region rather than

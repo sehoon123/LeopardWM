@@ -1697,6 +1697,7 @@ pub(crate) fn commit_persistent_previews(
     refresh_source_size: bool,
     expected_lifecycle_epoch: u64,
     host_below: Option<isize>,
+    input_armed: bool,
 ) -> Result<usize, Win32Error> {
     #[cfg(test)]
     {
@@ -1705,6 +1706,7 @@ pub(crate) fn commit_persistent_previews(
             refresh_source_size,
             expected_lifecycle_epoch,
             host_below,
+            input_armed,
         );
         crate::preview_input::clear_preview_click_targets();
         Ok(0)
@@ -1746,6 +1748,38 @@ pub(crate) fn commit_persistent_previews(
         }
         let next_ids: std::collections::HashSet<_> =
             requests.iter().map(|request| request.window_id).collect();
+        // An animation frame moves an existing preview's destination. Entering
+        // the hidden withdraw/republish transaction for that would hide the
+        // host, null every receipt and let the autonomous worker republish
+        // ~100ms later, which is exactly the observed per-frame blink. Update
+        // those pixels in place instead. Hit testing stays disarmed and
+        // `host_anchored` is left untouched, so no click can reach a preview
+        // whose destination the next frame invalidates, and the settled landing
+        // still runs the full armed transaction.
+        if !input_armed && !next_ids.is_empty() {
+            let published_ids: std::collections::HashSet<_> = {
+                let state = lock_persistent_previews();
+                published_preview_requests(&state)
+                    .into_iter()
+                    .map(|receipt| receipt.request.window_id)
+                    .collect()
+            };
+            if published_ids == next_ids {
+                crate::preview_input::set_preview_targets_armed(false);
+                let outcome = {
+                    let mut state = lock_persistent_previews();
+                    if state.lifecycle_epoch != expected_lifecycle_epoch {
+                        return Ok(0);
+                    }
+                    state.desired = requests.to_vec();
+                    publish_preview_requests_locked(&mut state, requests, refresh_source_size)
+                };
+                if outcome.retry_needed {
+                    schedule_preview_retry();
+                }
+                return Ok(outcome.live);
+            }
+        }
         let publication_changed = {
             let mut state = lock_persistent_previews();
             let mut published: Vec<_> = published_preview_requests(&state)
@@ -1853,11 +1887,17 @@ pub(crate) fn commit_persistent_previews(
             crate::preview_input::set_preview_targets_armed(false);
             return Ok(0);
         }
-        let activated = {
+        // A disarmed frame never enters the activation contract: arming is the
+        // only thing it would grant, and `activate_published_surface` is the
+        // single writer that may claim `host_anchored`.
+        let activated = if input_armed {
             let mut state = lock_persistent_previews();
             state.generation == commit_generation
                 && state.lifecycle_epoch == expected_lifecycle_epoch
                 && activate_published_surface(&mut state)
+        } else {
+            crate::preview_input::set_preview_targets_armed(false);
+            false
         };
         if outcome.retry_needed || !activated {
             schedule_preview_retry();
@@ -3238,7 +3278,7 @@ pub mod integration_probe {
             }
             let request = probe_request(source_window_id, destination)?;
             let live =
-                commit_persistent_previews(&[request], true, preview_lifecycle_epoch(), None)?;
+                commit_persistent_previews(&[request], true, preview_lifecycle_epoch(), None, true)?;
             if live != 1 || unsafe { windows::Win32::Graphics::Dwm::DwmFlush() }.is_err() {
                 return Ok(false);
             }
@@ -3357,7 +3397,7 @@ pub mod integration_probe {
         let _failure_reset = PublishFailureReset;
         FORCE_PREVIEW_PUBLISH_FAILURES.store(u32::MAX, Ordering::Release);
         let initial_live =
-            commit_persistent_previews(&[request], true, preview_lifecycle_epoch(), None)?;
+            commit_persistent_previews(&[request], true, preview_lifecycle_epoch(), None, true)?;
         std::thread::sleep(Duration::from_millis(450));
         let retained_desire = {
             let state = lock_persistent_previews();
@@ -3639,7 +3679,7 @@ pub mod integration_probe {
         let epoch = preview_lifecycle_epoch();
         FORCE_NEXT_PREVIEW_PUBLISH_FAILURE.store(true, Ordering::Release);
         FORCE_RETRY_SPAWN_FAILURE.store(true, Ordering::Release);
-        let initial_live = commit_persistent_previews(&[request], true, epoch, None)?;
+        let initial_live = commit_persistent_previews(&[request], true, epoch, None, true)?;
         FORCE_RETRY_SPAWN_FAILURE.store(false, Ordering::Release);
         let obligation_survived = initial_live == 0
             && PREVIEW_RETRY_PENDING.load(Ordering::Acquire)
@@ -3703,7 +3743,7 @@ pub mod integration_probe {
             probe_request(destroyed_window_id, destroyed_destination)?,
             probe_request(surviving_window_id, surviving_destination)?,
         ];
-        let live = commit_persistent_previews(&requests, true, epoch, None)?;
+        let live = commit_persistent_previews(&requests, true, epoch, None, true)?;
         let target_raw = probe_windows()
             .into_iter()
             .find(|(_, class, id)| {
@@ -3769,7 +3809,7 @@ pub mod integration_probe {
         }
         let request = probe_request(source_window_id, destination)?;
         let initial_live_previews =
-            commit_persistent_previews(&[request], true, expected_epoch, None)?;
+            commit_persistent_previews(&[request], true, expected_epoch, None, true)?;
         if initial_live_previews != 1 {
             clear_persistent_previews()?;
             return Err(Win32Error::SetPositionFailed(
@@ -3952,7 +3992,7 @@ pub mod integration_probe {
         let stale_target_inert =
             !unsafe { IsWindow(Some(target)) }.as_bool() || stale_hit == HTTRANSPARENT as isize;
         let stale_commit_live_previews =
-            commit_persistent_previews(&[request], true, expected_epoch, None)?;
+            commit_persistent_previews(&[request], true, expected_epoch, None, true)?;
         clear_persistent_previews()?;
 
         let close_host = host().hwnd();

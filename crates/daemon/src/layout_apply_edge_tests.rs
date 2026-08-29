@@ -1,7 +1,6 @@
 use super::{
     drifted_off_monitor_window, park_offscreen_avoiding_neighbors, prepare_monitor_overflow,
-    preview_clip_bounds, preview_host_band_anchor, suppress_persistent_previews_during_animation,
-    OverflowContext,
+    preview_clip_bounds, preview_host_band_anchor, OverflowContext,
 };
 use crate::config::MonitorOverflowModeConfig;
 use leopardwm_core_layout::{Rect, Visibility, WindowPlacement};
@@ -18,50 +17,6 @@ fn monitor(id: MonitorId, x: i32) -> MonitorInfo {
         device_name: format!("DISPLAY{id}"),
         scale_factor: 1.0,
     }
-}
-
-#[test]
-fn animation_frames_park_interactive_previews_but_keep_ghost_crops() {
-    let fallback = Rect::new(-100_000, -100_000, 800, 600);
-    let mut placements = vec![
-        WindowPlacement {
-            window_id: 10,
-            rect: Rect::new(1800, 0, 800, 600),
-            visibility: Visibility::Visible,
-            column_index: 0,
-        },
-        WindowPlacement {
-            window_id: 20,
-            rect: Rect::new(1800, 0, 800, 600),
-            visibility: Visibility::Visible,
-            column_index: 1,
-        },
-    ];
-    let mut clips = vec![
-        leopardwm_platform_win32::WindowRegionClip {
-            window_id: 10,
-            clip_bounds: Rect::new(1800, 0, 120, 600),
-            fallback_rect: fallback,
-            fallback_visibility: Visibility::OffScreenRight,
-        },
-        leopardwm_platform_win32::WindowRegionClip {
-            window_id: 20,
-            clip_bounds: Rect::new(1800, 0, 120, 600),
-            fallback_rect: fallback,
-            fallback_visibility: Visibility::OffScreenRight,
-        },
-    ];
-    let ghosts = std::collections::HashSet::from([20]);
-
-    suppress_persistent_previews_during_animation(&mut placements, &mut clips, Some(&ghosts));
-
-    assert_eq!(placements[0].rect, fallback);
-    assert_eq!(placements[0].visibility, Visibility::OffScreenRight);
-    assert_eq!(placements[1].rect, Rect::new(1800, 0, 800, 600));
-    assert_eq!(
-        clips.iter().map(|clip| clip.window_id).collect::<Vec<_>>(),
-        vec![20]
-    );
 }
 
 #[test]

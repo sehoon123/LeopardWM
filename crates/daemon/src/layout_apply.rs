@@ -325,31 +325,6 @@ fn visible_occluder_snapshot() -> Option<Vec<leopardwm_platform_win32::WindowInf
     }
 }
 
-/// Moving DWM preview pixels and a separately-pumped input HWND on every frame
-/// cannot be atomic. During animation, park non-ghost edge sources at their
-/// safe fallback and publish no persistent preview; the exact landing publishes
-/// one settled pixel/input surface. Ghost clips remain because their source and
-/// destination are owned by the animation worker and are not interactive.
-fn suppress_persistent_previews_during_animation(
-    placements: &mut [leopardwm_core_layout::WindowPlacement],
-    clips: &mut Vec<leopardwm_platform_win32::WindowRegionClip>,
-    ghosted: Option<&std::collections::HashSet<u64>>,
-) {
-    clips.retain(|clip| {
-        if ghosted.is_some_and(|ids| ids.contains(&clip.window_id)) {
-            return true;
-        }
-        if let Some(placement) = placements
-            .iter_mut()
-            .find(|placement| placement.window_id == clip.window_id)
-        {
-            placement.rect = clip.fallback_rect;
-            placement.visibility = clip.fallback_visibility;
-        }
-        false
-    });
-}
-
 fn upsert_region_clip(
     clips: &mut Vec<leopardwm_platform_win32::WindowRegionClip>,
     clip: leopardwm_platform_win32::WindowRegionClip,
@@ -768,13 +743,10 @@ impl AppState {
             }
         }
 
-        suppress_persistent_previews_during_animation(
-            &mut all_placements,
-            &mut region_clips,
-            self.layout_transition
-                .as_ref()
-                .map(|transition| &transition.ghosted_wids),
-        );
+        // Edge previews now survive animation frames: the platform layer moves
+        // their pixels in place and leaves hit testing disarmed until the
+        // settled landing, so a moving preview never owns a click. Dropping the
+        // clips per frame is what blinked the preview on every scroll.
 
         self.arm_moved_or_resized_suppression(all_placements.iter().map(|p| p.window_id));
         self.applying_layout = true;
