@@ -780,8 +780,14 @@ mod tests {
             .remove(&window_id);
     }
 
+    // The rescan obligation is one process-global flag, so two tests that both
+    // reset it and then assert on it can only pass by luck. This failed once in
+    // the release workflow while the same commit was green everywhere else.
+    static RESCAN_FLAG_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn lifecycle_event_without_identity_becomes_only_a_rescan_obligation() {
+        let _serialized = RESCAN_FLAG_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         EVENT_RESCAN_REQUIRED.store(false, Ordering::Release);
         for event in [
             WindowEvent::Hidden(u64::MAX),
@@ -809,7 +815,8 @@ mod tests {
             identity: None,
         })
         .unwrap();
-        EVENT_RESCAN_REQUIRED.store(true, Ordering::Release);
+let _serialized = RESCAN_FLAG_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+                EVENT_RESCAN_REQUIRED.store(true, Ordering::Release);
 
         flush_event_rescan_signal();
         assert!(EVENT_RESCAN_REQUIRED.load(Ordering::Acquire));
