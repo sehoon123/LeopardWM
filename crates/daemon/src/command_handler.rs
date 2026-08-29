@@ -951,7 +951,15 @@ impl AppState {
         let target = match cmd {
             IpcCommand::WorkspacePrev => (current + COUNT - 1) % COUNT,
             IpcCommand::WorkspaceNext => (current + 1) % COUNT,
-            _ => unreachable!(),
+            // A window manager must not die because an internal dispatch
+            // invariant slipped: report the mismatch instead of panicking, and
+            // keep it loud in debug builds and tests.
+            other => {
+                debug_assert!(false, "handle_workspace_prev_next called with {other:?}");
+                return IpcResponse::Error {
+                    message: "internal dispatch error: not a workspace prev/next command".into(),
+                };
+            }
         };
         self.handle_command(IpcCommand::SwitchWorkspace {
             index: (target + 1) as u8,

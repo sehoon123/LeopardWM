@@ -606,7 +606,14 @@ impl AppState {
                         }
                         ok
                     }
-                    config::WindowAction::Ignore => unreachable!(),
+                    // Reached only if a future admission path forwards an
+                    // ignored window here. Ignoring it is the action's own
+                    // meaning, so treat it as "not added" instead of taking the
+                    // whole window manager down over a config value.
+                    config::WindowAction::Ignore => {
+                        debug_assert!(false, "ignored window reached the add path");
+                        false
+                    }
                 };
 
                 if added {

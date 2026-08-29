@@ -415,15 +415,16 @@ pub fn register_system_events() -> Result<SystemEventHandle, Win32Error> {
                 None,
             );
 
-            if hwnd.is_err() {
+            // Bind the success case here rather than re-checking and unwrapping:
+            // the two used to be eight lines apart, so an edit between them could
+            // introduce a panic on this system-event thread.
+            let Ok(hwnd) = hwnd else {
                 let _ = init_tx.send(Err(Win32Error::HotkeyRegistrationFailed(
                     "Failed to create message window".to_string(),
                 )));
                 retire_sysevent_thread(thread_id);
                 return;
-            }
-
-            let hwnd = hwnd.unwrap();
+            };
 
             // Register for power state notifications on this window and retain
             // every successful handle for symmetric teardown.
