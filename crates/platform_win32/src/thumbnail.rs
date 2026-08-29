@@ -2938,17 +2938,111 @@ pub mod integration_probe {
             && event.preview_rect == target.rect
             && event.gesture == crate::preview_input::PreviewGesture::Click
     }
-    use windows::Win32::Foundation::{COLORREF, LPARAM, POINT, WPARAM};
+    use windows::Win32::Foundation::{COLORREF, LPARAM, LRESULT, POINT, WPARAM};
     use windows::Win32::Graphics::Gdi::{GetDC, GetPixel, ReleaseDC};
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         SendInput, INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
         MOUSEINPUT,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetClassNameW, GetCursorPos, GetWindowLongPtrW, IsWindow, IsWindowVisible,
-        SendMessageW, SetCursorPos, SetWindowPos, WindowFromPoint, GWLP_USERDATA, HTTRANSPARENT,
-        HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WM_NCHITTEST,
+        CallNextHookEx, DispatchMessageW, EnumWindows, GetClassNameW, GetCursorPos,
+        GetWindowLongPtrW, IsWindow, IsWindowVisible, PeekMessageW, SendMessageW, SetCursorPos,
+        SetWindowPos, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WindowFromPoint,
+        GWLP_USERDATA, HTTRANSPARENT, HWND_TOPMOST, LLMHF_INJECTED, LLMHF_LOWER_IL_INJECTED, MSG,
+        MSLLHOOKSTRUCT, PM_REMOVE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WH_MOUSE_LL,
+        WM_LBUTTONDOWN, WM_NCHITTEST,
     };
+
+    /// Provenance detector for the physical-click gate.
+    ///
+    /// Without it the gate proves only that *some* left-click reached the
+    /// preview, so a `SendInput` burst from any process — including this
+    /// tooling — satisfies it and the hardware evidence can be fabricated. A
+    /// low-level mouse hook is the only place the provenance survives.
+    ///
+    /// `LLMHF_INJECTED` alone cannot be the rejection rule: vendor HID stacks
+    /// exist whose ordinary hardware clicks arrive flagged, carrying a nonzero
+    /// `dwExtraInfo` signature. Unprovenanced software injection is what this
+    /// tooling produces and what must be refused: flagged, with no extra info.
+    /// The accepted provenance is printed so a release receipt records exactly
+    /// what was proven. `LEOPARDWM_REQUIRE_NONINJECTED_CLICK` additionally
+    /// refuses any flagged click, for hosts with a clean input stack.
+    static PHYSICAL_CLICK_FLAGS: AtomicU32 = AtomicU32::new(0);
+    static PHYSICAL_CLICK_EXTRA: AtomicU64 = AtomicU64::new(0);
+    static PHYSICAL_CLICK_SEEN: AtomicBool = AtomicBool::new(false);
+
+    unsafe extern "system" fn injection_detector_proc(
+        code: i32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        if code >= 0 && wparam.0 as u32 == WM_LBUTTONDOWN {
+            let info = &*(lparam.0 as *const MSLLHOOKSTRUCT);
+            PHYSICAL_CLICK_FLAGS.store(info.flags, Ordering::Release);
+            PHYSICAL_CLICK_EXTRA.store(info.dwExtraInfo as u64, Ordering::Release);
+            PHYSICAL_CLICK_SEEN.store(true, Ordering::Release);
+        }
+        CallNextHookEx(None, code, wparam, lparam)
+    }
+
+    /// Wait for one routed click and prove where it came from.
+    fn wait_for_physical_click(
+        click_rx: &mpsc::Receiver<crate::preview_input::PreviewClickEvent>,
+        expected: crate::preview_input::PreviewClickTarget,
+        timeout: Duration,
+    ) -> bool {
+        PHYSICAL_CLICK_SEEN.store(false, Ordering::Release);
+        PHYSICAL_CLICK_FLAGS.store(0, Ordering::Release);
+        PHYSICAL_CLICK_EXTRA.store(0, Ordering::Release);
+        let installed =
+            unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(injection_detector_proc), None, 0) };
+        let Ok(hook) = installed else {
+            eprintln!("PHYSICAL_CLICK_REJECTED: provenance detector could not be installed");
+            return false;
+        };
+        let deadline = Instant::now() + timeout;
+        let mut matched = false;
+        while Instant::now() < deadline {
+            let mut message = MSG::default();
+            while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
+                let _ = unsafe { TranslateMessage(&message) };
+                unsafe { DispatchMessageW(&message) };
+            }
+            match click_rx.try_recv() {
+                Ok(event) => {
+                    matched = click_receipt_matches_target(event, expected);
+                    break;
+                }
+                Err(mpsc::TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(5)),
+                Err(mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+        let _ = unsafe { UnhookWindowsHookEx(hook) };
+        if !matched {
+            return false;
+        }
+        if !PHYSICAL_CLICK_SEEN.load(Ordering::Acquire) {
+            eprintln!("PHYSICAL_CLICK_REJECTED: no button-down provenance was observed");
+            return false;
+        }
+        let flags = PHYSICAL_CLICK_FLAGS.load(Ordering::Acquire);
+        let extra = PHYSICAL_CLICK_EXTRA.load(Ordering::Acquire);
+        let injected = flags & (LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED) != 0;
+        eprintln!("PHYSICAL_CLICK_PROVENANCE: flags=0x{flags:X} extra_info=0x{extra:X}");
+        if injected && extra == 0 {
+            eprintln!(
+                "PHYSICAL_CLICK_REJECTED: unprovenanced software injection; this gate requires input from a real device"
+            );
+            return false;
+        }
+        if injected && std::env::var_os("LEOPARDWM_REQUIRE_NONINJECTED_CLICK").is_some() {
+            eprintln!(
+                "PHYSICAL_CLICK_REJECTED: strict mode refuses any flagged click on this host"
+            );
+            return false;
+        }
+        true
+    }
 
     #[derive(Debug)]
     pub struct PreviewLifecycleProbeReport {
@@ -3784,13 +3878,13 @@ pub mod integration_probe {
                 }
         };
         let click_event_delivered = routed_input_sent
-            && click_rx
-                .recv_timeout(if require_physical_click {
-                    Duration::from_secs(60)
-                } else {
-                    Duration::from_secs(1)
-                })
-                .is_ok_and(|event| click_receipt_matches_target(event, expected_click_target));
+            && if require_physical_click {
+                wait_for_physical_click(&click_rx, expected_click_target, Duration::from_secs(60))
+            } else {
+                click_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .is_ok_and(|event| click_receipt_matches_target(event, expected_click_target))
+            };
         if cursor_saved {
             let _ = unsafe { SetCursorPos(previous_cursor.x, previous_cursor.y) };
         }

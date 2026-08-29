@@ -2,6 +2,40 @@
 
 All notable changes to LeopardWM will be documented in this file.
 
+## 0.2.6-sehoon.24-rc4
+
+### Fixes
+
+- **Hidden placements commit again.** `DWMWA_CLOAK` only succeeds on windows the
+  calling process owns, so every managed foreign HWND is denied it. The fallback
+  off-monitor park was accepted only for explicit zero-size sentinel placements,
+  so a single scrolled-away column failed the whole batch and every layout apply
+  was rejected: tiling, hotkeys and pause all stopped working. The park verifies
+  that the window clears every monitor before it returns, which is stronger
+  evidence of a hidden window than an accepted DWM write, so it now commits
+  hidden entries for any layout rect.
+- **Edge previews publish the whole strip.** The strip is no longer reduced to
+  the largest rectangle left uncovered by other windows, which truncated the
+  preview whenever a launcher or dialog sat over it. The preview host is instead
+  ordered below every window that owns pixels inside the strip, so those windows
+  keep their pixels and their input while the full preview stays published
+  behind them. UIPI refuses a higher-integrity window as a z-order reference, so
+  the host walks deeper until the OS accepts one and proves the landing by
+  readback; the input pump reorders the group using only owned handles.
+- **Rapid relayout no longer blanks previews.** A superseding publication is
+  reported as such instead of as a failed z-order acknowledgement, and only
+  disarms input rather than tearing down published pixels.
+- **The physical-click gate proves provenance.** It previously accepted any
+  routed left-click, so a `SendInput` burst — including from this tooling —
+  satisfied the hardware evidence it exists to produce. A low-level hook now
+  records the button-down flags and `dwExtraInfo`, refuses unprovenanced
+  software injection, prints the accepted provenance for the release receipt,
+  and offers a strict mode for hosts whose input stack never flags real devices.
+- **Update checks follow this fork.** They query this repository including
+  prereleases instead of the upstream project, whose final releases always
+  compare newer than a prerelease tag and produced a bogus update notice.
+  Publisher, notification, installer and manifest identities follow the fork.
+
 ## 0.2.6-sehoon.24-rc3
 
 ### Fixes
