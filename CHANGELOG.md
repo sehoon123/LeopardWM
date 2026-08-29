@@ -2,7 +2,7 @@
 
 All notable changes to LeopardWM will be documented in this file.
 
-## 0.2.8
+## 0.2.8-sehoon.25
 
 ### Fixes
 
