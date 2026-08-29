@@ -321,7 +321,14 @@ fn visible_occluder_snapshot() -> Option<Vec<leopardwm_platform_win32::WindowInf
     }
     #[cfg(not(test))]
     {
-        leopardwm_platform_win32::enumerate_visible_top_level_occluders().ok()
+        leopardwm_platform_win32::enumerate_visible_top_level_occluders()
+            .map_err(|error| {
+                // Without a snapshot the band anchor cannot be resolved and
+                // previews fail closed to Hide. Silent before: a monitor edge
+                // that stopped rendering left no trace to search for.
+                warn!("Occluder snapshot failed; edge previews stay hidden this pass: {error}");
+            })
+            .ok()
     }
 }
 

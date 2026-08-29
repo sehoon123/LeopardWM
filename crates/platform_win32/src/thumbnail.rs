@@ -1401,6 +1401,17 @@ fn activate_published_surface(state: &mut PersistentPreviewState) -> bool {
         .values()
         .any(|preview| !preview.handle.belongs_to_current_host());
     if state.lifecycle_epoch != preview_lifecycle_epoch() || stale_host_registration {
+        // Both are ordinary races, but they are not the same failure: an epoch
+        // change means a newer desire won, while a stale registration means the
+        // host was recreated under live handles. Recording which one fired is
+        // the difference between reading one line and bisecting the pipeline.
+        debug!(
+            "Preview activation declined: state_epoch={} current_epoch={} stale_host_registration={} previews={}",
+            state.lifecycle_epoch,
+            preview_lifecycle_epoch(),
+            stale_host_registration,
+            state.previews.len()
+        );
         state.host_anchored = false;
         crate::preview_input::set_preview_targets_armed(false);
         let _ = host().hide_surface();
@@ -1724,6 +1735,10 @@ pub(crate) fn commit_persistent_previews(
             expected_lifecycle_epoch
         };
         if expected_lifecycle_epoch != preview_lifecycle_epoch() {
+            debug!(
+                "Preview commit declined: expected_epoch={expected_lifecycle_epoch} current_epoch={}",
+                preview_lifecycle_epoch()
+            );
             return Ok(0);
         }
         {
