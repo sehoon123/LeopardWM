@@ -1451,6 +1451,9 @@ fn activate_published_surface(state: &mut PersistentPreviewState) -> bool {
             )
         },
     );
+    // Only ordering proven over a real target set may authorize hit testing. The
+    // raise reconciles the current desire before ordering, so an empty set now
+    // means the desire itself is empty, never a deferred withdrawal.
     if ack != crate::preview_input::RaiseAck::Applied || epoch != preview_lifecycle_epoch() {
         // Only input depends on this acknowledgement: the host's own band
         // position was already verified above, and an unacknowledged target
@@ -1463,6 +1466,8 @@ fn activate_published_surface(state: &mut PersistentPreviewState) -> bool {
         crate::preview_input::set_preview_targets_armed(false);
         if ack == crate::preview_input::RaiseAck::Superseded {
             debug!("Preview target z-order superseded by a newer publication");
+        } else if ack == crate::preview_input::RaiseAck::AppliedWithoutOrdering {
+            debug!("Preview z-order acknowledged with nothing to order; input stays disarmed");
         } else {
             warn!("Preview target z-order was not acknowledged; input disarmed pending retry");
         }

@@ -119,6 +119,10 @@ struct PreviewInput {
     applied_generation: AtomicU64,
     desired_raise_generation: AtomicU64,
     applied_raise_generation: AtomicU64,
+    /// Raise generation acknowledged with nothing to order. Written by the pump
+    /// at the same instant as `applied_raise_generation`, so an acknowledgement
+    /// can never be read as stronger than what the pump actually verified.
+    unordered_raise_generation: AtomicU64,
     raise_host_raw: AtomicIsize,
     /// Window the host and its targets must stay below, normally the bottommost
     /// visible tiled HWND. Zero keeps the legacy band-top behavior for callers
@@ -459,8 +463,13 @@ pub fn integration_probe_restart_input_pump() -> bool {
 /// Outcome of waiting for one exact z-order generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RaiseAck {
-    /// The pump ordered and verified this exact generation.
+    /// The pump ordered and verified this exact generation over a real target
+    /// set: the anchor above every target, every target above the host.
     Applied,
+    /// The pump acknowledged this generation with nothing to order, which proves
+    /// no ordering. It exists so a desire-less pass cannot stall the publisher
+    /// into a retry burst, and must never authorize hit testing.
+    AppliedWithoutOrdering,
     /// A newer publication replaced this request. That newer pass owns the
     /// surface, so this one must stop without tearing the surface down.
     Superseded,
@@ -478,7 +487,11 @@ pub fn wait_for_applied_raise_generation(
     let deadline = std::time::Instant::now() + timeout;
     loop {
         if input.applied_raise_generation.load(Ordering::Acquire) == generation {
-            return RaiseAck::Applied;
+            return if input.unordered_raise_generation.load(Ordering::Acquire) == generation {
+                RaiseAck::AppliedWithoutOrdering
+            } else {
+                RaiseAck::Applied
+            };
         }
         if input.desired_raise_generation.load(Ordering::Acquire) != generation {
             return RaiseAck::Superseded;
@@ -641,6 +654,13 @@ impl PreviewInput {
                         continue;
                     }
                     if message.message == WM_PREVIEW_RAISE {
+                        // Order the *current* desire, not whatever the pump
+                        // happens to own. A withdrawal that deferred behind
+                        // mouse capture can otherwise leave the surviving
+                        // overlay uncreated, and the raise would then be
+                        // acknowledged over an empty set — an acknowledgement
+                        // that proves no ordering at all.
+                        reconcile_pending(&class, &mut windows_by_id);
                         let Some(input) = input() else {
                             continue;
                         };
@@ -653,6 +673,9 @@ impl PreviewInput {
                             // burst whenever a pass carried no target — an
                             // animation frame, for one.
                             let generation = input.desired_raise_generation.load(Ordering::Acquire);
+                            input
+                                .unordered_raise_generation
+                                .store(generation, Ordering::Release);
                             input
                                 .applied_raise_generation
                                 .store(generation, Ordering::Release);
@@ -776,6 +799,7 @@ impl PreviewInput {
             applied_generation: AtomicU64::new(0),
             desired_raise_generation: AtomicU64::new(0),
             applied_raise_generation: AtomicU64::new(0),
+            unordered_raise_generation: AtomicU64::new(0),
             raise_host_raw: AtomicIsize::new(0),
             raise_anchor_raw: AtomicIsize::new(0),
             alive,

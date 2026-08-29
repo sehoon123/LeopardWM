@@ -2,6 +2,22 @@
 
 All notable changes to LeopardWM will be documented in this file.
 
+## 0.2.7-sehoon.24-rc9
+
+### Fixes
+
+- **A z-order acknowledgement now means what its consumer assumes.** The pump
+  ordered whatever overlays it happened to own, so a withdrawal deferred behind
+  mouse capture could leave the surviving overlay uncreated and the raise was
+  then acknowledged over an empty set — an acknowledgement proving no ordering,
+  which `activate_published_surface` nevertheless read as authorization to arm
+  hit testing. The raise now reconciles the current desire before ordering it,
+  and the pump records at the same instant whether the generation was ordered at
+  all, so an empty desire is acknowledged without claiming ordering and only
+  proven ordering may arm input. The distinction is not yet covered by a probe:
+  the ordered contract is one long stateful sequence, and asserting it from
+  inside that sequence perturbed whichever step followed.
+
 ## 0.2.7-sehoon.24-rc8
 
 ### Fixes
