@@ -2,6 +2,20 @@
 
 All notable changes to LeopardWM will be documented in this file.
 
+## 0.2.7-sehoon.24-rc10
+
+### Fixes
+
+- **The raise-acknowledgement rule is now separate from the pump and covered by
+  tests.** Deciding what an acknowledgement means was interleaved with the
+  process-global counters it reads, so the rule could only be exercised by
+  driving the real pump — which perturbed whatever preview state ran next and
+  left the distinction untested. The decision is a pure function over
+  (generation, applied, unordered, desired) with the waiter as a loop around it,
+  and unit tests pin all six cases: ordered, acknowledged-with-nothing-to-order,
+  a stale unordered mark from an older generation, superseded, applied observed
+  together with a superseding desire, and not-yet-resolved.
+
 ## 0.2.7-sehoon.24-rc9
 
 ### Fixes

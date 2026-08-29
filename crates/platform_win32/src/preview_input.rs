@@ -477,6 +477,35 @@ pub enum RaiseAck {
     NotAcknowledged,
 }
 
+/// What one observation of the pump's raise counters means for `generation`.
+///
+/// Pure on purpose: the pump's counters are process-global, so a test that drives
+/// them through the real pump perturbs whatever preview state runs next. Keeping
+/// the decision separate from the mechanism makes it directly testable, and
+/// leaves the waiter below as a loop over this single rule.
+///
+/// `None` means "keep waiting": nothing has resolved this generation yet.
+fn classify_raise_ack(
+    generation: u64,
+    applied: u64,
+    unordered: u64,
+    desired: u64,
+) -> Option<RaiseAck> {
+    if applied == generation {
+        // The pump records `unordered` at the same instant as `applied`, so an
+        // acknowledgement can never be read as stronger than what it verified.
+        return Some(if unordered == generation {
+            RaiseAck::AppliedWithoutOrdering
+        } else {
+            RaiseAck::Applied
+        });
+    }
+    if desired != generation {
+        return Some(RaiseAck::Superseded);
+    }
+    None
+}
+
 pub fn wait_for_applied_raise_generation(
     generation: u64,
     timeout: std::time::Duration,
@@ -486,15 +515,13 @@ pub fn wait_for_applied_raise_generation(
     };
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        if input.applied_raise_generation.load(Ordering::Acquire) == generation {
-            return if input.unordered_raise_generation.load(Ordering::Acquire) == generation {
-                RaiseAck::AppliedWithoutOrdering
-            } else {
-                RaiseAck::Applied
-            };
-        }
-        if input.desired_raise_generation.load(Ordering::Acquire) != generation {
-            return RaiseAck::Superseded;
+        if let Some(ack) = classify_raise_ack(
+            generation,
+            input.applied_raise_generation.load(Ordering::Acquire),
+            input.unordered_raise_generation.load(Ordering::Acquire),
+            input.desired_raise_generation.load(Ordering::Acquire),
+        ) {
+            return ack;
         }
         if std::time::Instant::now() >= deadline {
             return RaiseAck::NotAcknowledged;
@@ -1429,6 +1456,37 @@ unsafe extern "system" fn target_proc(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn raise_ack_never_reads_stronger_than_what_the_pump_verified() {
+        use super::{classify_raise_ack, RaiseAck};
+
+        // Ordered over a real target set: the only outcome that may arm input.
+        assert_eq!(
+            classify_raise_ack(7, 7, 0, 7),
+            Some(RaiseAck::Applied),
+            "an acknowledgement not marked unordered proves ordering"
+        );
+        // Acknowledged with nothing to order: no stall, but no proof either.
+        assert_eq!(
+            classify_raise_ack(7, 7, 7, 7),
+            Some(RaiseAck::AppliedWithoutOrdering),
+            "an acknowledgement marked unordered must never read as proven ordering"
+        );
+        // A stale unordered mark from an older generation must not weaken this one.
+        assert_eq!(
+            classify_raise_ack(7, 7, 6, 7),
+            Some(RaiseAck::Applied),
+            "the unordered mark is keyed by generation, not sticky"
+        );
+        // A newer request owns the surface; this waiter must stop, not fail.
+        assert_eq!(classify_raise_ack(7, 0, 0, 8), Some(RaiseAck::Superseded));
+        // Applied wins over a superseding desire observed in the same instant:
+        // the work for this exact generation did complete.
+        assert_eq!(classify_raise_ack(7, 7, 0, 8), Some(RaiseAck::Applied));
+        // Nothing resolved yet: keep waiting rather than reporting a failure.
+        assert_eq!(classify_raise_ack(7, 6, 0, 7), None);
+    }
+
     use super::{
         generation_ack_state, generation_needs_reconcile, press_move_decision, reconcile_plan,
         record_desired_targets, targets_are_armed_for_lifecycle, DesiredTargets,
