@@ -1793,6 +1793,23 @@ pub(crate) fn commit_persistent_previews(
                 // remain. Those are updated in place below.
                 state.previews.retain(|id, _| next_ids.contains(id));
                 state.desired = requests.to_vec();
+                // This frame already produced the physical proof the fence asks
+                // for: the sources were parked, the landings verified, the
+                // cloak and region released, and both flushes burned before
+                // this call. Without clearing it here a newly registered
+                // preview could never publish from an animation frame, because
+                // only an armed commit clears the fence. Each wheel notch
+                // creates exactly one such registration, so the frame published
+                // nothing, demanded a relayout, and left a retry worker hiding
+                // the whole strip while the other previews kept rendering -
+                // tens of blank/restore cycles a second. Clearing the fence
+                // grants publication, never input: this branch has already
+                // disarmed hit testing and never reaches activation.
+                for request in requests {
+                    if let Some(preview) = state.previews.get_mut(&request.window_id) {
+                        preview.requires_physical_commit = false;
+                    }
+                }
                 publish_preview_requests_locked(&mut state, requests, refresh_source_size)
             };
             if outcome.retry_needed {

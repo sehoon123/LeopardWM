@@ -2,6 +2,25 @@
 
 All notable changes to LeopardWM will be documented in this file.
 
+## 0.2.10-sehoon.27
+
+### Fixes
+
+- **Wheel navigation no longer strobes the edge strip.** Each notch changes the
+  focused column, which makes the previously focused crossing column need a
+  preview for the first time. That new registration carries a fence that only an
+  armed commit could clear, so the animation frame that had already parked the
+  source, verified the landing, released the cloak and region, and burned both
+  flushes still published nothing: it demanded a relayout instead, which forced
+  an exact landing that snapped the animation, and left a retry worker hiding the
+  whole strip every 75 ms while the remaining previews kept rendering. At the
+  150 ms gesture cooldown that is on the order of a dozen blank-and-restore
+  cycles a second. The frame that produced the physical proof now clears the
+  fence for the previews it commits. It grants publication only: hit testing is
+  already disarmed on that path and input is still armed solely by an
+  acknowledged activation, and the retry worker's own publish still cannot clear
+  it.
+
 ## 0.2.9-sehoon.26
 
 ### Fixes
