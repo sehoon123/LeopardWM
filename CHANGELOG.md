@@ -2,6 +2,26 @@
 
 All notable changes to LeopardWM will be documented in this file.
 
+## 0.2.9-sehoon.26
+
+### Fixes
+
+- **The edge strip no longer blanks at the end of a scroll.** A settled commit
+  treated any difference from the published receipts as a change of owners and
+  ran the full hidden transaction: hide the host, withdraw the click targets and
+  wait for an acknowledgement, null every receipt, republish, flush, wait again,
+  then show and re-arm. The landing rect always differs from the last
+  interpolated frame, so this ran on every scroll, and the sources are parked
+  off-desktop, so nothing covered those pixels while it did. The comparison now
+  separates which previews exist from where they are: a move updates
+  destinations under a still-visible but disarmed host. Hide and withdraw remain
+  for a real owner change and for any failed step.
+- **That path is now covered.** `commit_persistent_previews` is a no-op under
+  `cfg(test)` and the existing probes only exercised an owner change and a
+  failed park, so nothing observed the withdrawal. The contract now counts host
+  withdrawals across two armed commits that move the same preview and requires
+  zero.
+
 ## 0.2.8-sehoon.25
 
 ### Fixes
