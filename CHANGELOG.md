@@ -2,6 +2,21 @@
 
 All notable changes to LeopardWM will be documented in this file.
 
+## 0.2.13-sehoon.30
+
+### Fixes
+
+- **One window that refuses its rect no longer stops the whole manager.** After a
+  single guarded correction, a window whose visible frame still missed a
+  requested edge turned the entire apply into an error, discarding a layout that
+  had already landed for every other window. A window in its own fullscreen mode
+  never accepts a tile rect, so every subsequent event re-applied and failed
+  again: focus commands were logged and nothing moved. Observed on the reporting
+  host with a fullscreen Firefox video window, 49 failed applies and 35 failed
+  reconciliations in one session. The layout that landed is now kept, the
+  offending windows are named and excluded from further corrective applies, and
+  the rest of the workspace keeps working.
+
 ## 0.2.12-sehoon.29
 
 ### Fixes

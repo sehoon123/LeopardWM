@@ -1064,10 +1064,22 @@ impl AppState {
                 // the current frame instead of waiting for another user event.
                 // The guard prevents an uncooperative app from recursing forever.
                 if geometry_changed && self.reapplying_after_violation {
-                    Err(anyhow!(
-                        "Visible window(s) did not reach verified layout geometry after retry: {:?}",
+                    // The placement itself succeeded; these windows simply
+                    // refused the rect they were given, which a window in its
+                    // own fullscreen mode always will. Failing the whole apply
+                    // for them discarded a layout that had already landed for
+                    // every other window, and since the next event re-applied
+                    // and failed again, one uncooperative window made the
+                    // manager look completely dead. Report it, stop correcting
+                    // those windows, and keep the layout that did land.
+                    warn!(
+                        "Keeping the applied layout; {} window(s) would not accept their \
+                         requested geometry and are left as they are: {:?}",
+                        geometry_mismatches.len(),
                         geometry_mismatches
-                    ))
+                    );
+                    self.arm_moved_or_resized_suppression(geometry_mismatches.iter().copied());
+                    result
                 } else if (constraints_changed || geometry_changed)
                     && !self.reapplying_after_violation
                 {
