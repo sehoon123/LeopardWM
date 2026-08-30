@@ -712,6 +712,9 @@ static PERSISTENT_PREVIEWS: OnceLock<Mutex<PersistentPreviewState>> = OnceLock::
 /// Revokes every producer (frame, exact apply, autonomous retry) across display
 /// topology and emergency cleanup boundaries.
 static PREVIEW_LIFECYCLE_EPOCH: AtomicU64 = AtomicU64::new(1);
+// Every withdrawal of the host surface is counted so a probe can prove that
+// moving a published preview does not blank the strip.
+static HOST_HIDE_COUNT: AtomicU64 = AtomicU64::new(0);
 #[cfg_attr(test, allow(dead_code))]
 static NEXT_PREVIEW_PUBLICATION: AtomicU64 = AtomicU64::new(1);
 static PERSISTENT_PREVIEW_TRANSACTION: Mutex<()> = Mutex::new(());
@@ -2789,6 +2792,7 @@ impl ThumbnailHost {
         if self.raw_hwnd() == 0 {
             return Ok(());
         }
+        HOST_HIDE_COUNT.fetch_add(1, Ordering::AcqRel);
         crate::preview_input::set_preview_targets_armed(false);
         unsafe {
             SetWindowPos(
@@ -3563,6 +3567,42 @@ pub mod integration_probe {
     /// park, leave no logical cloak receipt, and retain park ownership. A
     /// denied cloak must not fail the placement, otherwise no scrolled-away
     /// column can be hidden and every real layout apply is rejected.
+    /// Two armed commits that move the same preview must not withdraw the host
+    /// between them. Hiding there blanked the strip for the whole
+    /// withdraw/republish round-trip, which is what a viewer saw as a blink at
+    /// the end of every scroll.
+    pub fn moving_a_published_preview_never_blanks_the_host(
+        window_id: WindowId,
+        first_destination: Rect,
+        second_destination: Rect,
+    ) -> Result<bool, Win32Error> {
+        invalidate_persistent_preview_surface();
+        let _ = clear_persistent_previews_best_effort();
+        let epoch = preview_lifecycle_epoch();
+        if !prepare_persistent_preview(window_id) {
+            clear_persistent_previews()?;
+            return Ok(false);
+        }
+        let first = [probe_request(window_id, first_destination)?];
+        let live_first = commit_persistent_previews(&first, true, epoch, None, true)?;
+        let shown_after_first = unsafe { IsWindowVisible(host().hwnd()) }.as_bool();
+
+        let hides_before = HOST_HIDE_COUNT.load(Ordering::Acquire);
+        let second = [probe_request(window_id, second_destination)?];
+        let live_second = commit_persistent_previews(&second, true, epoch, None, true)?;
+        let hides_during_move = HOST_HIDE_COUNT.load(Ordering::Acquire) - hides_before;
+        let shown_after_second = unsafe { IsWindowVisible(host().hwnd()) }.as_bool();
+
+        invalidate_persistent_preview_surface();
+        clear_persistent_previews()?;
+
+        Ok(live_first == 1
+            && live_second == 1
+            && shown_after_first
+            && shown_after_second
+            && hides_during_move == 0)
+    }
+
     pub fn placement_cloak_failure_is_not_cached(source_window_id: WindowId) -> bool {
         use leopardwm_core_layout::{Visibility, WindowPlacement};
 

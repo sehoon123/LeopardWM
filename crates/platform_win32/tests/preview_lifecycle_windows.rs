@@ -717,6 +717,20 @@ fn ordered_real_preview_lifecycle_contract() {
         "the preview host must land below its band anchor so windows above the tiled band keep their pixels"
     );
 
+    // A move must not blank the strip: the landing used to hide the host for any
+    // difference from the published receipts, and the landing rect always
+    // differs from the last interpolated frame.
+    let moving_source = SourceWindow::new();
+    assert!(
+        integration_probe::moving_a_published_preview_never_blanks_the_host(
+            moving_source.hwnd as u64,
+            Rect::new(40, 40, 200, 150),
+            Rect::new(90, 40, 200, 150),
+        )
+        .expect("moving a published preview must not fail"),
+        "moving a published preview must keep the host surface shown; hiding it blanks the edge strip for the whole withdraw/republish round-trip"
+    );
+
     let cloak_source = SourceWindow::new();
     assert!(
         integration_probe::placement_cloak_failure_is_not_cached(cloak_source.hwnd as u64),
