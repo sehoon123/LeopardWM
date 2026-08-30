@@ -1798,7 +1798,7 @@ pub(crate) fn commit_persistent_previews(
             return Ok(outcome.live);
         }
 
-        let publication_changed = {
+        let (publication_changed, owner_set_changed) = {
             let mut state = lock_persistent_previews();
             let mut published: Vec<_> = published_preview_requests(&state)
                 .into_iter()
@@ -1808,17 +1808,36 @@ pub(crate) fn commit_persistent_previews(
             published.sort_by_key(|request| request.window_id);
             requested.sort_by_key(|request| request.window_id);
             let changed = published != requested;
+            // Which previews exist is a different question from where they are.
+            // Only the first needs the destructive round-trip below.
+            let owners_changed = published.len() != requested.len()
+                || published
+                    .iter()
+                    .zip(requested.iter())
+                    .any(|(a, b)| a.window_id != b.window_id);
             if changed {
                 state.host_anchored = false;
             }
-            changed
+            (changed, owners_changed)
         };
 
-        // Geometry changes are a short hidden transaction. Disarm hit testing,
+        // A change of owners is a short hidden transaction: disarm hit testing,
         // hide the host, and acknowledge withdrawal before changing DWM pixels.
         // New targets are positioned while transparent; only then is the host
         // shown and hit testing armed.
-        if publication_changed {
+        //
+        // Moving the same previews is not that. Hiding there blanked the strip
+        // for the whole withdraw/republish round-trip - two acknowledgement
+        // waits and a DwmFlush - and nothing else covers those pixels, because
+        // the source is already parked off-desktop. That is the residual blink
+        // at the end of every scroll: the animation frames had already stopped
+        // doing this, and only the landing was left on the destructive path.
+        // Destinations move under a still-visible but disarmed host, and input
+        // is re-armed by the single acknowledged activation below.
+        if publication_changed && !owner_set_changed {
+            crate::preview_input::set_preview_targets_armed(false);
+        }
+        if publication_changed && owner_set_changed {
             if let Err(error) = host().hide_surface() {
                 warn!("Preview surface could not be hidden for reconciliation: {error}");
                 crate::preview_input::set_preview_targets_armed(false);
