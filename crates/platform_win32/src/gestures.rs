@@ -37,6 +37,18 @@ const LLMHF_INJECTED: u32 = 0x01;
 const GESTURE_SCROLL_THRESHOLD: i32 = 360;
 const WHEEL_DELTA: i32 = 120;
 const STREAM_END_MS: u128 = 80;
+/// Coarse wall-clock milliseconds for throttling one diagnostic.
+fn coarse_now_millis() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+static LAST_MODIFIER_MISS_LOG_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 const NAVIGATION_COOLDOWN_MS: u128 = 150;
 
 /// Timeout in milliseconds: if no swipe event arrives within this window,
@@ -566,6 +578,32 @@ unsafe extern "system" fn gesture_mouse_hook_proc(
                     mods_held,
                     swipe_candidate,
                 });
+
+                // A wheel notch that fails the modifier check is the one outcome
+                // with no visible trace at debug level, because every other
+                // navigation line is downstream of mods_held. Some windows take
+                // the keyboard below user mode - VMware's enhanced virtual
+                // keyboard is one - so Ctrl and Alt never appear in the async
+                // key state and navigation is silently inert over them. Report
+                // it once a second so the cause is one log line instead of an
+                // investigation, without one line per notch.
+                if axis == WheelAxis::Vertical && delta != 0 && !mods_held {
+                    let now = coarse_now_millis();
+                    let last = LAST_MODIFIER_MISS_LOG_MS.load(Ordering::Acquire);
+                    if now.saturating_sub(last) >= 1000
+                        && LAST_MODIFIER_MISS_LOG_MS
+                            .compare_exchange(last, now, Ordering::AcqRel, Ordering::Acquire)
+                            .is_ok()
+                    {
+                        tracing::debug!(
+                            delta,
+                            modifier_flags,
+                            "Wheel navigation ignored: the configured scroll modifiers are not held \
+                             in this process's key state; a window that takes the keyboard below \
+                             user mode starves them"
+                        );
+                    }
+                }
 
                 tracing::trace!(
                     ?axis,

@@ -2,6 +2,18 @@
 
 All notable changes to LeopardWM will be documented in this file.
 
+## 0.2.11-sehoon.28
+
+### Fixes
+
+- **Wheel navigation now says why it did nothing.** A notch that fails the
+  modifier check was the one outcome with no trace at debug level, because every
+  other navigation line is downstream of the check. Some windows take the
+  keyboard below user mode - VMware's enhanced virtual keyboard is one - so Ctrl
+  and Alt never enter this process's key state and navigation is silently inert
+  over them while working everywhere else. The reason is now reported once a
+  second at debug level instead of requiring trace logging and a bisection.
+
 ## 0.2.10-sehoon.27
 
 ### Fixes
