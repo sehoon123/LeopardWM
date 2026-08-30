@@ -1231,16 +1231,23 @@ unsafe extern "system" fn target_proc(
     }
     if message == WM_NCHITTEST {
         let armed_epoch = TARGETS_ARMED_EPOCH.load(Ordering::Acquire);
-        // Validate the exact publication incarnation, not merely the numeric
-        // HWND. A retained capture target must stay transparent even if a fresh
-        // registration later supersedes its destroy tombstone.
-        let target_is_current = target_of(hwnd).is_some_and(source_process_still_matches);
-        if !target_is_current
-            || !targets_are_armed_for_lifecycle(
-                armed_epoch,
-                crate::thumbnail::preview_lifecycle_epoch(),
-            )
-        {
+        // Answer from atomics alone while disarmed. The identity test below
+        // takes the preview state mutex, and a raise is awaited while that mutex
+        // is held, so a hand resting on the wheel - one message every few
+        // milliseconds - parked this pump for the whole 150 ms wait and the
+        // raise it was supposed to acknowledge timed out. A disarmed overlay is
+        // transparent no matter whose publication it belongs to, so the cheap
+        // test is also the complete answer.
+        if !targets_are_armed_for_lifecycle(
+            armed_epoch,
+            crate::thumbnail::preview_lifecycle_epoch(),
+        ) {
+            return LRESULT(HTTRANSPARENT as isize);
+        }
+        // Armed: validate the exact publication incarnation, not merely the
+        // numeric HWND. A retained capture target must stay transparent even if
+        // a fresh registration later supersedes its destroy tombstone.
+        if !target_of(hwnd).is_some_and(source_process_still_matches) {
             return LRESULT(HTTRANSPARENT as isize);
         }
     }

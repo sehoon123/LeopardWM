@@ -2,6 +2,22 @@
 
 All notable changes to LeopardWM will be documented in this file.
 
+## 0.2.12-sehoon.29
+
+### Fixes
+
+- **A hand resting on the wheel no longer disarms preview clicks.** The raise
+  acknowledgement is awaited while the preview state mutex is held, and a hit
+  test took that same mutex to validate the publication incarnation - even while
+  disarmed, when the answer is transparent regardless. A mouse message every few
+  milliseconds therefore parked the pump for the whole 150 ms wait, so the raise
+  it was supposed to acknowledge timed out, input was disarmed, and the failure
+  was recycled as a publication retry until the burst exhausted. Measured over a
+  single session before the fix: 42 unacknowledged raises at about three per
+  second and 12 exhausted bursts at about one per second. A disarmed hit test now
+  answers from atomics alone and the identity test runs only when armed. The same
+  navigation burst afterwards: zero of each.
+
 ## 0.2.11-sehoon.28
 
 ### Fixes
