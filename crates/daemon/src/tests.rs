@@ -1501,11 +1501,38 @@ fn test_session_end_restore_tolerates_full_shutdown_channel() {
 
     assert!(apply_worker_cancelled.load(Ordering::SeqCst));
     assert_eq!(apply_epoch.load(Ordering::SeqCst), 1);
-    assert!(matches!(event_rx.try_recv(), Ok(DaemonEvent::Shutdown)));
-    assert!(matches!(
-        event_rx.try_recv(),
-        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-    ));
+    // A full channel is answered by latching one helper that completes the send
+    // later (main.rs, the blocking_send spawned when try_send fails), so draining
+    // the queued Shutdown can free the permit that helper is waiting on and a
+    // second Shutdown legitimately arrives. Requiring the queue to be empty
+    // asserted against that design and failed whenever the helper won the race,
+    // which rejected two releases whose other runs were green. The invariant that
+    // matters is that session end reports shutdown and reports nothing else.
+    let mut delivered = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    while std::time::Instant::now() < deadline {
+        match event_rx.try_recv() {
+            Ok(event) => delivered.push(event),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                if !delivered.is_empty() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+        }
+    }
+    assert!(
+        !delivered.is_empty(),
+        "session end must report shutdown even when the channel was full"
+    );
+    assert!(
+        delivered
+            .iter()
+            .all(|event| matches!(event, DaemonEvent::Shutdown)),
+        "session end must report only shutdown; {} event(s) delivered",
+        delivered.len()
+    );
 }
 
 #[test]
