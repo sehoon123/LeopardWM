@@ -1,13 +1,13 @@
 {
-    "version": "0.2.15-sehoon.32",
+    "version": "0.2.16-sehoon.33",
     "description": "Scroll-first tiling window manager for Windows, inspired by niri.",
     "homepage": "https://github.com/sehoon123/LeopardWM",
     "license": "GPL-3.0-only",
     "architecture": {
         "64bit": {
-            "url": "https://github.com/sehoon123/LeopardWM/releases/download/v0.2.15-sehoon.32/LeopardWM-0.2.15-sehoon.32-x86_64-windows.zip",
-            "hash": "6c58cd35b2b2d3fdca39135beda4d86838f31bfc55a41f780dcb898e39ce16e6",
-            "extract_dir": "LeopardWM-0.2.15-sehoon.32-x86_64-windows"
+            "url": "https://github.com/sehoon123/LeopardWM/releases/download/v0.2.16-sehoon.33/LeopardWM-0.2.16-sehoon.33-x86_64-windows.zip",
+            "hash": "bf7daab78cc4cfe9b7d1b264ad5fbef4041a0ade6ee4d0b900811e9d638d8aec",
+            "extract_dir": "LeopardWM-0.2.16-sehoon.33-x86_64-windows"
         }
     },
     "bin": [
