@@ -22,6 +22,10 @@ impl AppState {
     /// Doing this after the mutation would make rollback ambiguous if parking an
     /// exiting workspace window fails.
     fn prepare_drag_layout_change(&mut self, context: &str) -> bool {
+        if self.paused {
+            warn!("{context}: drag commit rejected while tiling is paused");
+            return false;
+        }
         match self.prepare_workspace_ownership_change() {
             Ok(()) => {
                 self.abort_active_ghost_transition();
@@ -51,6 +55,104 @@ impl AppState {
                 false
             }
         }
+    }
+
+    fn restore_drag_after_failed_preflight(&mut self, hwnd: u64, drag: &DragState, context: &str) {
+        self.clear_drag_placeholder();
+        if !self.restore_drag_source_state(hwnd, drag, true) {
+            warn!("{context}: failed to reconstruct drag source {hwnd}");
+        }
+        self.pending_drag_hint = Some(DragHintAction::Hide);
+    }
+
+    /// Restore a drag model after its physical commit or transition setup
+    /// fails. New transition ownership must be released before replacing the
+    /// workspaces it references; if that fence fails, retain forward ownership
+    /// and pause instead of manufacturing an unsafe rollback.
+    fn rollback_drag_commit(
+        &mut self,
+        hwnd: u64,
+        drag: &DragState,
+        workspaces_before: std::collections::HashMap<
+            MonitorId,
+            Vec<leopardwm_core_layout::Workspace>,
+        >,
+        focused_monitor_before: MonitorId,
+        context: &str,
+    ) -> anyhow::Result<()> {
+        if let Err(error) = self.cancel_layout_transition_for_exact_landing() {
+            self.enter_paused_state(context);
+            let managed = self.all_managed_window_ids();
+            crate::layout_apply::run_layout_apply_recovery_pass(&managed, context);
+            return Err(anyhow::anyhow!(
+                "could not release failed drag transition: {error}"
+            ));
+        }
+        self.workspaces = workspaces_before;
+        self.focused_monitor = focused_monitor_before;
+        self.clear_drag_placeholder();
+        if !self.restore_drag_source_state(hwnd, drag, true) {
+            self.enter_paused_state(context);
+            let managed = self.all_managed_window_ids();
+            crate::layout_apply::run_layout_apply_recovery_pass(&managed, context);
+            return Err(anyhow::anyhow!(
+                "drag source ownership could not be reconstructed"
+            ));
+        }
+        self.last_placed_layout_rects.clear();
+        let rollback = if self.paused {
+            Err(anyhow::anyhow!(
+                "tiling paused before drag rollback landing"
+            ))
+        } else {
+            self.apply_layout()
+        };
+        if rollback.is_err() {
+            self.enter_paused_state(context);
+            let managed = self.all_managed_window_ids();
+            crate::layout_apply::run_layout_apply_recovery_pass(&managed, context);
+        }
+        rollback
+    }
+
+    fn rollback_live_drag_preview(
+        &mut self,
+        workspaces_before: std::collections::HashMap<
+            MonitorId,
+            Vec<leopardwm_core_layout::Workspace>,
+        >,
+        drag_before: Option<DragState>,
+        context: &str,
+    ) {
+        if let Err(error) = self.cancel_layout_transition_for_exact_landing() {
+            warn!("{context}: could not release failed preview transition: {error}");
+            self.enter_paused_state(context);
+            return;
+        }
+        self.workspaces = workspaces_before;
+        self.drag_state = drag_before;
+        self.clear_drag_placeholder();
+        self.last_placed_layout_rects.clear();
+        self.pending_drag_hint = Some(DragHintAction::Hide);
+        let rollback = if self.paused {
+            Err(anyhow::anyhow!(
+                "tiling paused before preview rollback landing"
+            ))
+        } else {
+            self.apply_layout()
+        };
+        if let Err(error) = rollback {
+            warn!("{context}: preview rollback landing failed: {error}");
+            self.enter_paused_state(context);
+        }
+    }
+
+    fn drag_cursor_pos(&self) -> Option<(i32, i32)> {
+        #[cfg(test)]
+        if self.injected_drag_cursor.is_some() {
+            return self.injected_drag_cursor;
+        }
+        leopardwm_platform_win32::get_cursor_pos()
     }
 
     /// Remove the live-preview placeholder from the one workspace named by
@@ -101,7 +203,7 @@ impl AppState {
         // crossed the seam. Cursor-first selection is cheaper and transfers as
         // soon as the user's pointer enters the other monitor. Only query the
         // window as a rare fallback when GetCursorPos fails.
-        let (cursor_x, cursor_y) = match leopardwm_platform_win32::get_cursor_pos() {
+        let (cursor_x, cursor_y) = match self.drag_cursor_pos() {
             Some(point) => point,
             None => {
                 let Some(win_info) = self.lookup_window_info(hwnd) else {
@@ -304,6 +406,8 @@ impl AppState {
                 if !self.prepare_drag_layout_change("live drag preview") {
                     return;
                 }
+                let workspaces_before = self.workspaces.clone();
+                let drag_before = self.drag_state.clone();
                 let snapshot = self.snapshot_layout();
 
                 self.remove_drag_window_from_source(hwnd, source_monitor, source_ws_idx);
@@ -315,6 +419,11 @@ impl AppState {
                     window_slot,
                     target_monitor_id,
                 ) else {
+                    self.rollback_live_drag_preview(
+                        workspaces_before,
+                        drag_before,
+                        "live drag placeholder rollback",
+                    );
                     return;
                 };
                 // Skip the live-preview transition for Tabbed targets.
@@ -328,13 +437,24 @@ impl AppState {
                 // will land.
                 if !target_is_tabbed_final {
                     if !self.start_drag_layout_transition(snapshot, "live drag preview") {
+                        self.rollback_live_drag_preview(
+                            workspaces_before,
+                            drag_before,
+                            "live drag transition rollback",
+                        );
                         return;
                     }
                 } else {
                     let _ = snapshot;
                 }
-                if let Err(e) = self.apply_layout() {
-                    warn!("Failed to apply layout during live drag preview: {}", e);
+                if let Err(error) = self.apply_layout() {
+                    self.rollback_live_drag_preview(
+                        workspaces_before,
+                        drag_before,
+                        "live drag apply rollback",
+                    );
+                    warn!("Failed to apply layout during live drag preview: {error}");
+                    return;
                 }
             }
 
@@ -467,6 +587,8 @@ impl AppState {
             if !self.prepare_drag_layout_change("live column reorder") {
                 return;
             }
+            let workspaces_before = self.workspaces.clone();
+            let drag_before = self.drag_state.clone();
             let snapshot = self.snapshot_layout();
             if let Some(workspace) = self
                 .workspaces
@@ -479,10 +601,21 @@ impl AppState {
                 drag.current_column_index = target_idx;
             }
             if !self.start_drag_layout_transition(snapshot, "live column reorder") {
+                self.rollback_live_drag_preview(
+                    workspaces_before,
+                    drag_before,
+                    "live column transition rollback",
+                );
                 return;
             }
-            if let Err(e) = self.apply_layout() {
-                warn!("Failed to apply layout during live drag reorder: {}", e);
+            if let Err(error) = self.apply_layout() {
+                self.rollback_live_drag_preview(
+                    workspaces_before,
+                    drag_before,
+                    "live column apply rollback",
+                );
+                warn!("Failed to apply layout during live drag reorder: {error}");
+                return;
             }
         }
 
@@ -526,6 +659,8 @@ impl AppState {
             if !self.prepare_drag_layout_change("same-column live reorder") {
                 return;
             }
+            let workspaces_before = self.workspaces.clone();
+            let drag_before = self.drag_state.clone();
             let snapshot = self.snapshot_layout();
             let idx = self.active_workspace_idx(target_monitor_id);
             if let Some(ws) = self
@@ -537,10 +672,20 @@ impl AppState {
                 let _ = ws.insert_window_in_column_at(hwnd, target_col, window_slot);
             }
             if !self.start_drag_layout_transition(snapshot, "same-column live reorder") {
+                self.rollback_live_drag_preview(
+                    workspaces_before,
+                    drag_before,
+                    "same-column transition rollback",
+                );
                 return;
             }
-            if let Err(e) = self.apply_layout() {
-                warn!("Failed to apply layout during live drag reorder: {}", e);
+            if let Err(error) = self.apply_layout() {
+                self.rollback_live_drag_preview(
+                    workspaces_before,
+                    drag_before,
+                    "same-column apply rollback",
+                );
+                warn!("Failed to apply layout during live drag reorder: {error}");
             }
         }
     }
@@ -736,7 +881,7 @@ impl AppState {
                 return;
             };
             let column_bounds = column_bounds_from_placements(workspace, target_viewport);
-            let (cx, cy) = leopardwm_platform_win32::get_cursor_pos().unwrap_or_else(|| {
+            let (cx, cy) = self.drag_cursor_pos().unwrap_or_else(|| {
                 (
                     win_rect.x + win_rect.width / 2,
                     win_rect.y + win_rect.height / 2,
@@ -835,9 +980,11 @@ impl AppState {
 
         // Snapshot AFTER all early returns, right before structural changes.
         if !self.prepare_drag_layout_change("window merge drop") {
+            self.restore_drag_after_failed_preflight(hwnd, drag, "window merge preflight");
             return;
         }
-        let snapshot = self.snapshot_layout();
+        let workspaces_before = self.workspaces.clone();
+        let focused_monitor_before = self.focused_monitor;
 
         // Remove the window from its source column (skip if already removed during drag).
         if !already_removed {
@@ -937,11 +1084,19 @@ impl AppState {
             hwnd, effective_target_col, window_slot, target_monitor
         );
 
-        if !self.start_drag_layout_transition(snapshot, "window merge drop") {
+        // Final drag ownership commits synchronously. Publishing foreground
+        // under a transition would accept apply_layout's transition no-op and
+        // discard the only rollback receipt before a physical frame lands.
+        if let Err(error) = self.apply_layout() {
+            let rollback = self.rollback_drag_commit(
+                hwnd,
+                drag,
+                workspaces_before,
+                focused_monitor_before,
+                "window merge apply rollback failure",
+            );
+            warn!("Failed to apply layout after window merge: {error}; rollback={rollback:?}");
             return;
-        }
-        if let Err(e) = self.apply_layout() {
-            warn!("Failed to apply layout after window merge: {}", e);
         }
         self.sync_foreground_window();
     }
@@ -980,13 +1135,11 @@ impl AppState {
             // either the placeholder or source window. On failure the complete
             // pre-drop model and caller-owned DragState remain recoverable.
             if !self.prepare_drag_layout_change("finalize drag merge") {
-                self.clear_drag_placeholder();
-                if !self.restore_drag_source_state(hwnd, drag, true) {
-                    warn!(
-                        "Failed to restore drag source after finalize preflight failure for {hwnd}"
-                    );
-                }
-                self.pending_drag_hint = Some(DragHintAction::Hide);
+                self.restore_drag_after_failed_preflight(
+                    hwnd,
+                    drag,
+                    "finalize drag merge preflight",
+                );
                 return;
             }
             // Capture source column info BEFORE any removals.
@@ -1018,6 +1171,13 @@ impl AppState {
             {
                 let _ = ws.remove_window(DRAG_PLACEHOLDER_HWND);
             }
+
+            // The placeholder is preview-only and must not survive the drop, so
+            // snapshot the stable model after removing it but before committing
+            // real ownership. A detached live-preview HWND is reconstructed from
+            // DragState during rollback.
+            let workspaces_before = self.workspaces.clone();
+            let focused_monitor_before = self.focused_monitor;
 
             // Remove real window from source (if not already removed during drag).
             if !drag.removed_from_source {
@@ -1103,8 +1263,17 @@ impl AppState {
             // leaving the window where the user dropped it instead of
             // snapping it back to its layout slot.
             self.last_placed_layout_rects.remove(&hwnd);
-            if let Err(e) = self.apply_layout() {
-                warn!("Failed to apply layout after drag merge: {}", e);
+            if let Err(error) = self.apply_layout() {
+                let rollback = self.rollback_drag_commit(
+                    hwnd,
+                    drag,
+                    workspaces_before,
+                    focused_monitor_before,
+                    "drag merge rollback failure",
+                );
+                warn!("Failed to apply layout after drag merge: {error}; rollback={rollback:?}");
+                self.pending_drag_hint = Some(DragHintAction::Hide);
+                return;
             }
             self.sync_foreground_window();
         } else {
@@ -1213,9 +1382,11 @@ impl AppState {
         workspace.ensure_focused_visible_animated(viewport_width);
 
         if !self.prepare_drag_layout_change("standalone window drop") {
+            self.restore_drag_after_failed_preflight(hwnd, drag, "standalone drop preflight");
             return;
         }
-        let snapshot = self.snapshot_layout();
+        let workspaces_before = self.workspaces.clone();
+        let focused_monitor_before = self.focused_monitor;
         self.workspaces.get_mut(&monitor).unwrap()[workspace_idx] = workspace;
         self.focused_monitor = monitor;
         self.last_placed_layout_rects.remove(&hwnd);
@@ -1231,11 +1402,17 @@ impl AppState {
             {
                 workspace.stop_animation();
             }
-        } else if !self.start_drag_layout_transition(snapshot, "standalone window drop") {
-            return;
         }
         if let Err(error) = self.apply_layout() {
-            warn!("Failed to apply standalone window drag: {}", error);
+            let rollback = self.rollback_drag_commit(
+                hwnd,
+                drag,
+                workspaces_before,
+                focused_monitor_before,
+                "standalone window apply rollback failure",
+            );
+            warn!("Failed to apply standalone window drag: {error}; rollback={rollback:?}");
+            return;
         }
         self.sync_foreground_window();
     }
@@ -1324,9 +1501,11 @@ impl AppState {
         target_workspace.ensure_focused_visible_animated(target_viewport.width);
 
         if !self.prepare_drag_layout_change("cross-monitor window drop") {
+            self.restore_drag_after_failed_preflight(hwnd, drag, "cross-monitor drop preflight");
             return;
         }
-        let snapshot = self.snapshot_layout();
+        let workspaces_before = self.workspaces.clone();
+        let focused_monitor_before = self.focused_monitor;
         self.workspaces.get_mut(&source_monitor).unwrap()[source_idx] = source_workspace;
         self.workspaces.get_mut(&target_monitor).unwrap()[target_idx] = target_workspace;
         self.focused_monitor = target_monitor;
@@ -1345,11 +1524,17 @@ impl AppState {
             {
                 target_workspace.stop_animation();
             }
-        } else if !self.start_drag_layout_transition(snapshot, "cross-monitor window drop") {
-            return;
         }
         if let Err(error) = self.apply_layout() {
-            warn!("Failed to apply cross-monitor window drop: {}", error);
+            let rollback = self.rollback_drag_commit(
+                hwnd,
+                drag,
+                workspaces_before,
+                focused_monitor_before,
+                "cross-monitor window apply rollback failure",
+            );
+            warn!("Failed to apply cross-monitor window drop: {error}; rollback={rollback:?}");
+            return;
         }
         self.sync_foreground_window();
     }
@@ -1463,9 +1648,17 @@ impl AppState {
         target_monitor: MonitorId,
         visible_rect: Rect,
     ) -> bool {
+        if self.paused {
+            warn!("Floating drag commit rejected while tiling is paused");
+            return false;
+        }
         let Some(target_work_area) = self.monitors.get(&target_monitor).map(|m| m.work_area) else {
             return false;
         };
+        if let Err(error) = self.prepare_workspace_ownership_change() {
+            warn!("Floating drag commit could not fence queued layout work: {error}");
+            return false;
+        }
         let clamped_rect = clamp_rect_to_work_area(visible_rect, target_work_area);
         // A cross-monitor drop has two model owners plus focus/geometry state.
         // Keep all of them until the required physical clamp/re-home lands.
@@ -1559,9 +1752,11 @@ impl AppState {
     ) {
         let source_monitor = drag.source_monitor;
         if !self.prepare_drag_layout_change("cross-monitor column drop") {
+            self.restore_drag_after_failed_preflight(hwnd, drag, "cross-monitor column preflight");
             return;
         }
-        let snapshot = self.snapshot_layout();
+        let workspaces_before = self.workspaces.clone();
+        let focused_monitor_before = self.focused_monitor;
 
         // Use the workspace index from drag start — it's stable even if
         // active workspace changed during drag.
@@ -1696,11 +1891,18 @@ impl AppState {
         self.last_placed_layout_rects.remove(&hwnd);
         leopardwm_platform_win32::clear_inset_cache();
 
-        if !self.start_drag_layout_transition(snapshot, "cross-monitor column drop") {
+        if let Err(error) = self.apply_layout() {
+            let rollback = self.rollback_drag_commit(
+                hwnd,
+                drag,
+                workspaces_before,
+                focused_monitor_before,
+                "cross-monitor column apply rollback failure",
+            );
+            warn!(
+                "Failed to apply layout after cross-monitor drag: {error}; rollback={rollback:?}"
+            );
             return;
-        }
-        if let Err(e) = self.apply_layout() {
-            warn!("Failed to apply layout after cross-monitor drag: {}", e);
         }
         self.sync_foreground_window();
     }
@@ -1903,6 +2105,330 @@ mod tests {
 
         assert_eq!(bounds.len(), 1);
         assert_eq!(bounds[0].column_index, 0);
+    }
+
+    #[test]
+    fn finalize_drag_merge_apply_failure_restores_preview_ownership() {
+        use crate::config::Config;
+        use crate::state::TestApplyPlacementsBehavior;
+        use leopardwm_platform_win32::MonitorInfo;
+
+        let monitor = |id, x| MonitorInfo {
+            id,
+            rect: Rect::new(x, 0, 1920, 1080),
+            work_area: Rect::new(x, 0, 1920, 1040),
+            is_primary: id == 1,
+            device_name: format!("DISPLAY{id}"),
+            scale_factor: 1.0,
+        };
+        let mut state =
+            AppState::new_with_config(Config::default(), vec![monitor(1, 0), monitor(2, 1920)]);
+        state.paused = false;
+        {
+            let source = &mut state.workspaces.get_mut(&1).unwrap()[0];
+            source.insert_window(10, Some(700)).unwrap();
+            source.insert_window_in_column_at(11, 0, 1).unwrap();
+            source.remove_window(10).unwrap();
+        }
+        {
+            let target = &mut state.workspaces.get_mut(&2).unwrap()[0];
+            target.insert_window(20, Some(700)).unwrap();
+            target
+                .insert_window_in_column_at(DRAG_PLACEHOLDER_HWND, 0, 1)
+                .unwrap();
+        }
+        state.focused_monitor = 1;
+        state.previous_focused_hwnd = Some(11);
+        state.injected_apply_placements_behavior =
+            Some(TestApplyPlacementsBehavior::FailWorkerSpawn);
+        let drag = DragState {
+            hwnd: 10,
+            is_tiled: true,
+            mode: DragMode::Window,
+            source_monitor: 1,
+            source_workspace_idx: 0,
+            source_column_index: 0,
+            source_window_index: 0,
+            source_sibling: Some(11),
+            source_column_width: 700,
+            current_column_index: 0,
+            last_drop_target: None,
+            last_hint_update: None,
+            removed_from_source: true,
+        };
+
+        state.finalize_drag_merge(10, &drag, 2, &Rect::new(2000, 100, 700, 700));
+
+        assert_eq!(state.workspaces[&1][0].columns()[0].windows(), &[10, 11]);
+        assert!(state.workspaces[&2][0].contains_window(20));
+        assert!(!state.workspaces[&2][0].contains_window(10));
+        assert!(state.workspaces.values().all(|workspaces| workspaces
+            .iter()
+            .all(|workspace| !workspace.contains_window(DRAG_PLACEHOLDER_HWND))));
+        assert_eq!(state.focused_monitor, 1);
+        assert_eq!(state.previous_focused_hwnd, Some(11));
+        assert!(state.paused, "failed compensation must pause tiling");
+    }
+
+    #[test]
+    fn finalize_drag_merge_without_placeholder_failure_restores_source() {
+        use crate::config::Config;
+        use crate::state::TestApplyPlacementsBehavior;
+        use leopardwm_platform_win32::MonitorInfo;
+
+        let monitor = |id, x| MonitorInfo {
+            id,
+            rect: Rect::new(x, 0, 1920, 1080),
+            work_area: Rect::new(x, 0, 1920, 1040),
+            is_primary: id == 1,
+            device_name: format!("DISPLAY{id}"),
+            scale_factor: 1.0,
+        };
+        let mut state =
+            AppState::new_with_config(Config::default(), vec![monitor(1, 0), monitor(2, 1920)]);
+        state.paused = false;
+        state.reduce_motion = true;
+        {
+            let source = &mut state.workspaces.get_mut(&1).unwrap()[0];
+            source.insert_window(10, Some(700)).unwrap();
+            source.insert_window_in_column_at(11, 0, 1).unwrap();
+            source.remove_window(10).unwrap();
+        }
+        state.workspaces.get_mut(&2).unwrap()[0]
+            .insert_window(20, Some(700))
+            .unwrap();
+        state.focused_monitor = 1;
+        state.previous_focused_hwnd = Some(11);
+        state.injected_drag_cursor = Some((2000, 100));
+        state.injected_apply_placements_behavior =
+            Some(TestApplyPlacementsBehavior::FailWorkerSpawn);
+        let drag = DragState {
+            hwnd: 10,
+            is_tiled: true,
+            mode: DragMode::Window,
+            source_monitor: 1,
+            source_workspace_idx: 0,
+            source_column_index: 0,
+            source_window_index: 0,
+            source_sibling: Some(11),
+            source_column_width: 700,
+            current_column_index: 0,
+            last_drop_target: None,
+            last_hint_update: None,
+            removed_from_source: true,
+        };
+
+        state.finalize_drag_merge(10, &drag, 2, &Rect::new(2000, 100, 700, 700));
+
+        assert_eq!(state.workspaces[&1][0].columns()[0].windows(), &[10, 11]);
+        assert!(state.workspaces[&2][0].contains_window(20));
+        assert!(!state.workspaces[&2][0].contains_window(10));
+        assert_eq!(state.focused_monitor, 1);
+        assert_eq!(state.previous_focused_hwnd, Some(11));
+        assert!(state.paused);
+    }
+
+    #[test]
+    fn live_drag_preview_apply_failure_restores_source_and_placeholder() {
+        use crate::config::Config;
+        use crate::state::TestApplyPlacementsBehavior;
+        use leopardwm_platform_win32::MonitorInfo;
+
+        let mut state = AppState::new_with_config(
+            Config::default(),
+            vec![MonitorInfo {
+                id: 1,
+                rect: Rect::new(0, 0, 1920, 1080),
+                work_area: Rect::new(0, 0, 1920, 1040),
+                is_primary: true,
+                device_name: "DISPLAY1".into(),
+                scale_factor: 1.0,
+            }],
+        );
+        state.paused = false;
+        state.reduce_motion = true;
+        {
+            let workspace = &mut state.workspaces.get_mut(&1).unwrap()[0];
+            workspace.insert_window(10, Some(700)).unwrap();
+            workspace.insert_window_in_column_at(11, 0, 1).unwrap();
+            workspace.insert_window(20, Some(700)).unwrap();
+        }
+        let viewport = state.layout_viewport(1);
+        let target = state.workspaces[&1][0]
+            .compute_placements(viewport)
+            .into_iter()
+            .find(|placement| placement.window_id == 20)
+            .unwrap()
+            .rect;
+        state.injected_drag_cursor =
+            Some((target.x + target.width / 2, target.y + target.height / 2));
+        state.drag_state = Some(DragState {
+            hwnd: 10,
+            is_tiled: true,
+            mode: DragMode::Window,
+            source_monitor: 1,
+            source_workspace_idx: 0,
+            source_column_index: 0,
+            source_window_index: 0,
+            source_sibling: Some(11),
+            source_column_width: 700,
+            current_column_index: 0,
+            last_drop_target: None,
+            last_hint_update: None,
+            removed_from_source: false,
+        });
+        state.injected_apply_placements_behavior =
+            Some(TestApplyPlacementsBehavior::FailWorkerSpawn);
+
+        state.update_drag_hint(10);
+
+        let workspace = &state.workspaces[&1][0];
+        assert_eq!(workspace.column(0).unwrap().windows(), &[10, 11]);
+        assert_eq!(workspace.column(1).unwrap().windows(), &[20]);
+        assert!(!workspace.contains_window(DRAG_PLACEHOLDER_HWND));
+        assert!(state
+            .drag_state
+            .as_ref()
+            .is_some_and(|drag| !drag.removed_from_source));
+        assert!(matches!(
+            state.pending_drag_hint,
+            Some(DragHintAction::Hide)
+        ));
+        assert!(state.paused);
+    }
+
+    #[test]
+    fn floating_drag_fences_transition_and_rolls_back_failed_exact_commit() {
+        use crate::config::Config;
+        use crate::state::{LayoutTransition, TestApplyPlacementsBehavior};
+        use leopardwm_platform_win32::MonitorInfo;
+
+        let monitor = |id, x| MonitorInfo {
+            id,
+            rect: Rect::new(x, 0, 1920, 1080),
+            work_area: Rect::new(x, 0, 1920, 1040),
+            is_primary: id == 1,
+            device_name: format!("DISPLAY{id}"),
+            scale_factor: 1.0,
+        };
+        let mut state =
+            AppState::new_with_config(Config::default(), vec![monitor(1, 0), monitor(2, 1920)]);
+        state.paused = false;
+        state.workspaces.get_mut(&1).unwrap()[0]
+            .add_floating(30, Rect::new(100, 100, 500, 400))
+            .unwrap();
+        state.layout_transition = Some(LayoutTransition {
+            start_rects: std::collections::HashMap::from([(40, Rect::new(0, 0, 700, 700))]),
+            exit_rects: std::collections::HashMap::new(),
+            exit_column_indices: std::collections::HashMap::new(),
+            elapsed_ms: 16,
+            duration_ms: 150,
+            easing: leopardwm_core_layout::Easing::default(),
+            requires_compositor_safe_snap: false,
+            ghosted_wids: std::collections::HashSet::new(),
+            exit_park_failures: 0,
+        });
+        state.injected_apply_placements_behavior =
+            Some(TestApplyPlacementsBehavior::FailOnceThenSucceed);
+        let drag = DragState {
+            hwnd: 30,
+            is_tiled: false,
+            mode: DragMode::Window,
+            source_monitor: 1,
+            source_workspace_idx: 0,
+            source_column_index: 0,
+            source_window_index: 0,
+            source_sibling: None,
+            source_column_width: 0,
+            current_column_index: 0,
+            last_drop_target: None,
+            last_hint_update: None,
+            removed_from_source: false,
+        };
+
+        assert!(!state.finish_floating_drag(30, &drag, 2, Rect::new(2100, 100, 500, 400),));
+        assert!(state.workspaces[&1][0].is_floating(30));
+        assert!(!state.workspaces[&2][0].contains_window(30));
+        assert_eq!(state.focused_monitor, 1);
+        assert!(state.layout_transition.is_none());
+        assert_eq!(
+            state
+                .injected_apply_placements_count
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+    }
+
+    #[test]
+    fn paused_drag_commits_restore_tiled_and_float_ownership() {
+        use crate::config::Config;
+        use leopardwm_platform_win32::MonitorInfo;
+
+        let monitor = |id, x| MonitorInfo {
+            id,
+            rect: Rect::new(x, 0, 1920, 1080),
+            work_area: Rect::new(x, 0, 1920, 1040),
+            is_primary: id == 1,
+            device_name: format!("DISPLAY{id}"),
+            scale_factor: 1.0,
+        };
+        let mut state =
+            AppState::new_with_config(Config::default(), vec![monitor(1, 0), monitor(2, 1920)]);
+        {
+            let source = &mut state.workspaces.get_mut(&1).unwrap()[0];
+            source.insert_window(10, Some(700)).unwrap();
+            source.insert_window_in_column_at(11, 0, 1).unwrap();
+            source.remove_window(10).unwrap();
+            source
+                .add_floating(30, Rect::new(100, 100, 500, 400))
+                .unwrap();
+        }
+        state.workspaces.get_mut(&2).unwrap()[0]
+            .insert_window(DRAG_PLACEHOLDER_HWND, Some(700))
+            .unwrap();
+        let tiled_drag = DragState {
+            hwnd: 10,
+            is_tiled: true,
+            mode: DragMode::Window,
+            source_monitor: 1,
+            source_workspace_idx: 0,
+            source_column_index: 0,
+            source_window_index: 0,
+            source_sibling: Some(11),
+            source_column_width: 700,
+            current_column_index: 0,
+            last_drop_target: None,
+            last_hint_update: None,
+            removed_from_source: true,
+        };
+        let float_drag = DragState {
+            hwnd: 30,
+            is_tiled: false,
+            mode: DragMode::Window,
+            source_monitor: 1,
+            source_workspace_idx: 0,
+            source_column_index: 0,
+            source_window_index: 0,
+            source_sibling: None,
+            source_column_width: 0,
+            current_column_index: 0,
+            last_drop_target: None,
+            last_hint_update: None,
+            removed_from_source: false,
+        };
+
+        state.finalize_drag_merge(10, &tiled_drag, 2, &Rect::new(2000, 100, 700, 700));
+        assert!(state.workspaces[&1][0].contains_window(10));
+        assert!(!state.workspaces[&2][0].contains_window(10));
+        assert!(!state
+            .workspaces
+            .values()
+            .flatten()
+            .any(|workspace| workspace.contains_window(DRAG_PLACEHOLDER_HWND)));
+        assert!(!state.finish_floating_drag(30, &float_drag, 2, Rect::new(2100, 100, 500, 400),));
+        assert!(state.workspaces[&1][0].is_floating(30));
+        assert!(!state.workspaces[&2][0].contains_window(30));
+        assert_eq!(state.focused_monitor, 1);
     }
 
     #[test]

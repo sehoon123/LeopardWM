@@ -1447,7 +1447,8 @@ impl AppState {
 
                 #[cfg(test)]
                 if let Some(behavior) = injected_behavior {
-                    injected_apply_placements_count.fetch_add(1, Ordering::SeqCst);
+                    let execution =
+                        injected_apply_placements_count.fetch_add(1, Ordering::SeqCst) + 1;
                     let (result, geometry_mismatches) = match behavior {
                         TestApplyPlacementsBehavior::SleepAndSucceed(delay) => {
                             std::thread::sleep(delay);
@@ -1466,6 +1467,13 @@ impl AppState {
                                 Err(anyhow!("injected apply_placements failure")),
                                 Vec::new(),
                             )
+                        }
+                        TestApplyPlacementsBehavior::FailOnceThenSucceed => {
+                            if execution == 1 {
+                                (Err(anyhow!("injected first placement failure")), Vec::new())
+                            } else {
+                                (Ok(()), Vec::new())
+                            }
                         }
                         TestApplyPlacementsBehavior::FailIfWorkerRuns => (
                             Err(anyhow!(

@@ -1853,6 +1853,7 @@ fn test_cmd_move_to_monitor_right_single() {
 #[test]
 fn test_cmd_move_to_monitor_right_rollback_on_insert_failure() {
     let mut state = AppState::new_with_config(test_config(), two_monitors());
+    state.paused = false;
     state.focused_monitor = 1;
     state.workspaces.get_mut(&1).unwrap()[0]
         .insert_window(100, Some(800))
@@ -1882,6 +1883,7 @@ fn test_cmd_move_to_monitor_right_rollback_on_insert_failure() {
 #[test]
 fn test_cmd_move_to_monitor_left_rollback_on_insert_failure() {
     let mut state = AppState::new_with_config(test_config(), two_monitors());
+    state.paused = false;
     state.focused_monitor = 2;
     state.workspaces.get_mut(&2).unwrap()[0]
         .insert_window(200, Some(800))
@@ -1971,10 +1973,16 @@ fn test_drag_mode_latches_standalone_override_and_shift_priority() {
     );
 }
 
+fn enable_test_drag_commit(state: &mut AppState) {
+    state.paused = false;
+    state.injected_apply_placements_behavior =
+        Some(TestApplyPlacementsBehavior::SleepAndSucceed(Duration::ZERO));
+}
+
 #[test]
 fn test_same_monitor_standalone_drag_splits_window_without_consuming() {
     let mut state = AppState::new_with_config(test_config(), test_monitors());
-    state.paused = true;
+    enable_test_drag_commit(&mut state);
     {
         let workspace = &mut state.workspaces.get_mut(&1).unwrap()[0];
         workspace.insert_window(100, Some(700)).unwrap();
@@ -2011,7 +2019,7 @@ fn test_same_monitor_standalone_drag_splits_window_without_consuming() {
 #[test]
 fn test_same_monitor_standalone_drag_reorders_single_window_column() {
     let mut state = AppState::new_with_config(test_config(), test_monitors());
-    state.paused = true;
+    enable_test_drag_commit(&mut state);
     {
         let workspace = &mut state.workspaces.get_mut(&1).unwrap()[0];
         workspace.insert_window(100, Some(600)).unwrap();
@@ -2046,7 +2054,7 @@ fn test_same_monitor_standalone_drag_reorders_single_window_column() {
 #[test]
 fn test_cross_monitor_standalone_drag_never_merges_existing_column() {
     let mut state = AppState::new_with_config(test_config(), two_monitors());
-    state.paused = true;
+    enable_test_drag_commit(&mut state);
     state.workspaces.get_mut(&1).unwrap()[0]
         .insert_window(100, Some(600))
         .unwrap();
@@ -2139,7 +2147,7 @@ fn test_clamp_rect_to_work_area_keeps_all_four_edges_visible() {
 #[test]
 fn test_plain_cross_monitor_drop_into_empty_workspace_creates_fitting_column() {
     let mut state = AppState::new_with_config(test_config(), two_monitors());
-    state.paused = true;
+    enable_test_drag_commit(&mut state);
     {
         let source = &mut state.workspaces.get_mut(&1).unwrap()[0];
         source.insert_window(100, Some(2400)).unwrap();
@@ -2190,7 +2198,7 @@ fn test_plain_cross_monitor_drop_preserves_logical_width_across_dpi() {
     let mut monitors = two_monitors();
     monitors[1].scale_factor = 1.5;
     let mut state = AppState::new_with_config(test_config(), monitors);
-    state.paused = true;
+    enable_test_drag_commit(&mut state);
     state.workspaces.get_mut(&1).unwrap()[0]
         .insert_window(100, Some(600))
         .unwrap();
@@ -2220,7 +2228,7 @@ fn test_shift_cross_monitor_drop_preserves_column_and_logical_width() {
     let mut monitors = two_monitors();
     monitors[1].scale_factor = 1.5;
     let mut state = AppState::new_with_config(test_config(), monitors);
-    state.paused = true;
+    enable_test_drag_commit(&mut state);
     let source = &mut state.workspaces.get_mut(&1).unwrap()[0];
     source.insert_window(100, Some(600)).unwrap();
     source.insert_window_in_column(101, 0).unwrap();
@@ -2441,7 +2449,7 @@ fn test_cancel_drag_recreates_source_column_when_sibling_closed() {
 #[test]
 fn test_floating_cross_monitor_drop_rehomes_clamps_and_preserves_pin() {
     let mut state = AppState::new_with_config(test_config(), two_monitors());
-    state.paused = true;
+    enable_test_drag_commit(&mut state);
     state.workspaces.get_mut(&1).unwrap()[0]
         .add_floating(200, Rect::new(200, 100, 800, 600))
         .unwrap();
@@ -2486,7 +2494,7 @@ fn test_floating_cross_monitor_drop_records_target_dpi_logical_size() {
     let mut monitors = two_monitors();
     monitors[1].scale_factor = 1.5;
     let mut state = AppState::new_with_config(test_config(), monitors);
-    state.paused = true;
+    enable_test_drag_commit(&mut state);
     state.workspaces.get_mut(&1).unwrap()[0]
         .add_floating(200, Rect::new(200, 100, 800, 600))
         .unwrap();
@@ -4025,6 +4033,193 @@ fn test_focus_changes_monitor() {
 }
 
 #[test]
+fn focus_driven_inactive_workspace_apply_failure_rolls_back_without_event() {
+    let mut state = AppState::new_with_config(test_config(), two_monitors());
+    state.paused = false;
+    state.reduce_motion = true;
+    state.ensure_workspace_exists(2, 1);
+    {
+        let target = &mut state.workspaces.get_mut(&2).unwrap()[1];
+        target.insert_window(20, Some(800)).unwrap();
+        target.insert_window(21, Some(800)).unwrap();
+        target.focus_window(20).unwrap();
+    }
+    state.previous_focused_hwnd = Some(999);
+    state.injected_apply_placements_behavior =
+        Some(TestApplyPlacementsBehavior::SleepAndFail(Duration::ZERO));
+    let mut events = state.event_broadcaster.subscribe();
+
+    state.handle_window_event(WindowEvent::Focused(21));
+
+    assert_eq!(state.active_workspace_idx(2), 0);
+    assert_eq!(state.focused_monitor, 1);
+    assert_eq!(state.workspaces[&2][1].focused_window(), Some(20));
+    assert_eq!(state.previous_focused_hwnd, Some(999));
+    assert!(state.paused, "failed physical compensation must pause");
+    while let Ok(event) = events.try_recv() {
+        assert!(
+            !matches!(event, leopardwm_ipc::IpcEvent::WorkspaceChanged { .. }),
+            "a rolled-back switch must not be published"
+        );
+    }
+}
+
+#[test]
+fn paused_focus_does_not_switch_to_inactive_workspace() {
+    let mut state = AppState::new_with_config(test_config(), two_monitors());
+    state.ensure_workspace_exists(2, 1);
+    state.workspaces.get_mut(&2).unwrap()[1]
+        .insert_window(21, Some(800))
+        .unwrap();
+    state.paused = true;
+    let mut events = state.event_broadcaster.subscribe();
+
+    state.handle_window_event(WindowEvent::Focused(21));
+
+    assert_eq!(state.active_workspace_idx(2), 0);
+    assert_eq!(state.focused_monitor, 1);
+    assert!(state.layout_transition.is_none());
+    while let Ok(event) = events.try_recv() {
+        assert!(!matches!(
+            event,
+            leopardwm_ipc::IpcEvent::WorkspaceChanged { .. }
+        ));
+    }
+}
+
+#[test]
+fn focus_workspace_rollback_reasserts_previous_foreground_after_compensation() {
+    let mut state = AppState::new_with_config(test_config(), two_monitors());
+    state.paused = false;
+    state.reduce_motion = true;
+    state.workspaces.get_mut(&1).unwrap()[0]
+        .insert_window(100, Some(800))
+        .unwrap();
+    state.ensure_workspace_exists(2, 1);
+    state.workspaces.get_mut(&2).unwrap()[1]
+        .insert_window(21, Some(800))
+        .unwrap();
+    state.previous_focused_hwnd = Some(100);
+    state.injected_apply_placements_behavior =
+        Some(TestApplyPlacementsBehavior::FailOnceThenSucceed);
+
+    state.handle_window_event(WindowEvent::Focused(21));
+
+    assert_eq!(state.active_workspace_idx(2), 0);
+    assert_eq!(state.focused_monitor, 1);
+    assert_eq!(state.previous_focused_hwnd, Some(100));
+    assert_eq!(state.injected_foreground_reassertions, vec![100]);
+    assert!(!state.paused);
+}
+
+#[test]
+fn focus_workspace_rollback_park_failure_retains_forward_model_and_pauses() {
+    let mut state = AppState::new_with_config(test_config(), two_monitors());
+    state.paused = false;
+    state.reduce_motion = true;
+    state.ensure_workspace_exists(2, 1);
+    state.workspaces.get_mut(&2).unwrap()[1]
+        .insert_window(21, Some(800))
+        .unwrap();
+    state.injected_apply_placements_behavior =
+        Some(TestApplyPlacementsBehavior::FailOnceThenSucceed);
+    state.injected_scratchpad_park_failure = true;
+    let mut events = state.event_broadcaster.subscribe();
+
+    state.handle_window_event(WindowEvent::Focused(21));
+
+    assert_eq!(
+        state.active_workspace_idx(2),
+        1,
+        "failed target parking must retain the coherent forward model"
+    );
+    assert_eq!(state.focused_monitor, 2);
+    assert!(state.paused);
+    while let Ok(event) = events.try_recv() {
+        assert!(!matches!(
+            event,
+            leopardwm_ipc::IpcEvent::WorkspaceChanged { .. }
+        ));
+    }
+}
+
+#[test]
+fn focus_driven_inactive_workspace_switch_emits_workspace_changed_on_commit() {
+    let mut state = AppState::new_with_config(test_config(), two_monitors());
+    state.paused = false;
+    state.reduce_motion = true;
+    state.ensure_workspace_exists(2, 1);
+    {
+        let target = &mut state.workspaces.get_mut(&2).unwrap()[1];
+        target.insert_window(20, Some(800)).unwrap();
+        target.insert_window(21, Some(800)).unwrap();
+        target.focus_window(20).unwrap();
+    }
+    state.injected_apply_placements_behavior =
+        Some(TestApplyPlacementsBehavior::SleepAndSucceed(Duration::ZERO));
+    let mut events = state.event_broadcaster.subscribe();
+
+    state.handle_window_event(WindowEvent::Focused(21));
+
+    assert_eq!(state.active_workspace_idx(2), 1);
+    assert_eq!(state.focused_monitor, 2);
+    assert_eq!(state.workspaces[&2][1].focused_window(), Some(21));
+    assert_eq!(state.previous_focused_hwnd, Some(21));
+    let mut workspace_events = 0;
+    while let Ok(event) = events.try_recv() {
+        if matches!(
+            event,
+            leopardwm_ipc::IpcEvent::WorkspaceChanged {
+                monitor: 2,
+                old_index: 0,
+                new_index: 1,
+                ..
+            }
+        ) {
+            workspace_events += 1;
+        }
+    }
+    assert_eq!(workspace_events, 1);
+}
+
+#[test]
+fn explicit_workspace_switch_fence_failure_does_not_mutate() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.paused = false;
+    state
+        .focused_workspace_mut()
+        .unwrap()
+        .insert_window(100, Some(800))
+        .unwrap();
+    state.ensure_workspace_exists(1, 1);
+    state.workspaces.get_mut(&1).unwrap()[1]
+        .insert_window(200, Some(800))
+        .unwrap();
+    let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let worker = animation_worker::AnimationWorkerHandle::spawn(
+        event_tx,
+        state.apply_worker_cancelled.clone(),
+        state.apply_epoch.clone(),
+    )
+    .unwrap();
+    state.animation_worker_control = Some(worker.control());
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    worker.send_test_block(release_rx);
+
+    assert!(matches!(
+        state.handle_command(IpcCommand::SwitchWorkspace { index: 2 }),
+        IpcResponse::Error { .. }
+    ));
+    assert_eq!(state.active_workspace_idx(1), 0);
+    assert!(state.workspaces[&1][0].contains_window(100));
+    assert!(state.workspaces[&1][1].contains_window(200));
+
+    release_tx.send(()).unwrap();
+    assert!(worker.wait_for_barrier(Duration::from_secs(1)));
+    drop(worker);
+}
+
+#[test]
 fn test_minimized_only_window_no_crash() {
     let mut state = AppState::new_with_config(test_config(), test_monitors());
     let ws = state.focused_workspace_mut().unwrap();
@@ -4088,6 +4283,87 @@ fn test_multiple_monitors_focus_cross_monitor() {
     // Verify the focused workspace is on monitor 2
     let ws = &state.workspaces.get(&state.focused_monitor).unwrap()[0];
     assert!(ws.contains_window(200));
+}
+
+#[test]
+#[allow(clippy::arc_with_non_send_sync, clippy::drop_non_drop)]
+fn tray_exit_does_not_wait_for_normal_queue_capacity() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let state = Arc::new(Mutex::new(AppState::new_with_config(
+            test_config(),
+            test_monitors(),
+        )));
+        let (cancelled, epoch) = {
+            let state = state.lock().await;
+            (
+                state.apply_worker_cancelled.clone(),
+                state.apply_epoch.clone(),
+            )
+        };
+        let (animation_tx, _animation_rx) = tokio::sync::mpsc::unbounded_channel();
+        let animation_worker =
+            animation_worker::AnimationWorkerHandle::spawn(animation_tx, cancelled, epoch).unwrap();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1);
+        event_tx.try_send(DaemonEvent::HideSnapHint).unwrap();
+        let mut hotkey_state = HotkeyState {
+            handle: None,
+            hook: None,
+            forwarder: None,
+            mapping: HashMap::new(),
+            requested_count: 0,
+            registered_count: 0,
+            failed_binds: Vec::new(),
+            recording: false,
+            disabled_by_cli: true,
+        };
+        let tray_manager = None;
+        let snap_hint_overlay = None;
+        let (settings_sync_tx, _settings_sync_rx) = std::sync::mpsc::channel();
+        let mut settings_handle = None;
+        let mut animation_in_flight_epoch = None;
+        let mut last_frame_instant = None;
+        let mut snap_hint_timer_handle = None;
+        let mut focus_follows_mouse_timer = None;
+        let mut display_change_timer = None;
+        let mut mouse_hook_handle = None;
+        let mut forwarding_threads = Vec::new();
+        let mut ctx = EventLoopCtx {
+            state: &state,
+            event_tx: &event_tx,
+            hotkey_state: &mut hotkey_state,
+            tray_manager: &tray_manager,
+            snap_hint_overlay: &snap_hint_overlay,
+            settings_sync_tx: &settings_sync_tx,
+            settings_handle: &mut settings_handle,
+            animation_worker: &animation_worker,
+            animation_in_flight_epoch: &mut animation_in_flight_epoch,
+            last_frame_instant: &mut last_frame_instant,
+            snap_hint_timer_handle: &mut snap_hint_timer_handle,
+            focus_follows_mouse_timer: &mut focus_follows_mouse_timer,
+            display_change_timer: &mut display_change_timer,
+            mouse_hook_handle: &mut mouse_hook_handle,
+            forwarding_threads: &mut forwarding_threads,
+        };
+
+        let direct = tokio::time::timeout(
+            Duration::from_millis(100),
+            handle_tray_event(&mut ctx, tray::TrayEvent::Exit),
+        )
+        .await
+        .expect("tray Exit must never wait on its own queue");
+        assert!(direct);
+        drop(ctx);
+        assert!(matches!(event_rx.try_recv(), Ok(DaemonEvent::HideSnapHint)));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+        drop(animation_worker);
+    });
 }
 
 #[test]

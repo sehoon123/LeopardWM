@@ -222,45 +222,54 @@ impl AppState {
         if scroll_anims_settled {
             self.sync_taskbar_buttons();
         }
-        if let Some(ref mut transition) = self.layout_transition {
+        let completed_exit_windows = self.layout_transition.as_mut().and_then(|transition| {
             if transition.tick(delta_ms) {
                 still_animating = true;
+                None
             } else {
-                // Transition ownership ends only after every live exit is parked.
-                let failures: Vec<_> = transition
-                    .exit_rects
-                    .keys()
-                    .filter_map(|window_id| {
-                        leopardwm_platform_win32::move_window_offscreen(*window_id)
-                            .err()
-                            .filter(|_| leopardwm_platform_win32::is_valid_window(*window_id))
-                            .map(|error| (*window_id, error))
+                Some(transition.exit_rects.keys().copied().collect::<Vec<_>>())
+            }
+        });
+        if let Some(exit_windows) = completed_exit_windows {
+            // End the transition borrow before calling the shared verified park
+            // helper. Dead HWNDs are already absent; live HWNDs must prove their
+            // off-screen landing before ownership can be released.
+            let failures: Vec<_> = exit_windows
+                .into_iter()
+                .filter_map(|window_id| {
+                    self.park_window_for_inactive_workspace(window_id)
+                        .err()
+                        .map(|error| (window_id, error))
+                })
+                .collect();
+            if failures.is_empty() {
+                self.layout_transition = None;
+                self.sync_taskbar_buttons();
+                // Exact landing follows successful ownership release.
+                still_animating = true;
+            } else {
+                let failure_count = self
+                    .layout_transition
+                    .as_mut()
+                    .map(|transition| {
+                        transition.exit_park_failures =
+                            transition.exit_park_failures.saturating_add(1);
+                        transition.exit_park_failures
                     })
-                    .collect();
-                if failures.is_empty() {
-                    self.layout_transition = None;
-                    self.sync_taskbar_buttons();
+                    .unwrap_or(3);
+                tracing::warn!(
+                    "Transition exit parking attempt {failure_count}/3 failed: {:?}",
+                    failures
+                        .iter()
+                        .map(|(window_id, _)| format!("{window_id:#x}"))
+                        .collect::<Vec<_>>()
+                );
+                if failure_count >= 3 {
+                    // Retain the complete transition as the resume/recovery
+                    // receipt, but establish every physical/UI paused postcondition.
+                    self.enter_paused_state("transition exit parking retry exhaustion");
+                    still_animating = false;
                 } else {
-                    transition.exit_park_failures = transition.exit_park_failures.saturating_add(1);
-                    tracing::warn!(
-                        "Transition exit parking attempt {}/3 failed: {:?}",
-                        transition.exit_park_failures,
-                        failures
-                            .iter()
-                            .map(|(window_id, _)| format!("{window_id:#x}"))
-                            .collect::<Vec<_>>()
-                    );
-                    if transition.exit_park_failures >= 3 {
-                        // Retain ownership for an explicit resume/recovery, but
-                        // stop the frame-cadence retry loop.
-                        self.paused = true;
-                        still_animating = false;
-                    } else {
-                        still_animating = true;
-                    }
-                }
-                if self.layout_transition.is_none() {
-                    // Exact landing follows successful ownership release.
                     still_animating = true;
                 }
             }
@@ -916,6 +925,62 @@ mod tests {
             .layout_transition
             .as_ref()
             .is_some_and(|transition| transition.exit_rects.contains_key(&41)));
+    }
+
+    #[test]
+    fn completed_transition_park_failure_pauses_with_ownership_and_cleanup() {
+        use crate::config::Config;
+        use crate::state::{AppState, DragHintAction, LayoutTransition};
+        use leopardwm_platform_win32::MonitorInfo;
+
+        let mut state = AppState::new_with_config(
+            Config::default(),
+            vec![MonitorInfo {
+                id: 1,
+                rect: Rect::new(0, 0, 1920, 1080),
+                work_area: Rect::new(0, 0, 1920, 1040),
+                is_primary: true,
+                device_name: "DISPLAY1".into(),
+                scale_factor: 1.0,
+            }],
+        );
+        state.paused = false;
+        state.layout_transition = Some(LayoutTransition {
+            start_rects: HashMap::from([(41, Rect::new(0, 0, 800, 600))]),
+            exit_rects: HashMap::from([(41, Rect::new(0, -1040, 800, 600))]),
+            exit_column_indices: HashMap::new(),
+            elapsed_ms: 16,
+            duration_ms: 1,
+            easing: leopardwm_core_layout::Easing::default(),
+            requires_compositor_safe_snap: false,
+            ghosted_wids: HashSet::new(),
+            exit_park_failures: 0,
+        });
+        state.injected_scratchpad_park_failure = true;
+
+        assert!(state.tick_animations(0));
+        assert_eq!(
+            state.layout_transition.as_ref().unwrap().exit_park_failures,
+            1
+        );
+        assert!(state.tick_animations(0));
+        assert_eq!(
+            state.layout_transition.as_ref().unwrap().exit_park_failures,
+            2
+        );
+        assert!(!state.tick_animations(0));
+        let transition = state
+            .layout_transition
+            .as_ref()
+            .expect("failed exits remain owned for resume");
+        assert_eq!(transition.exit_park_failures, 3);
+        assert!(transition.exit_rects.contains_key(&41));
+        assert!(state.paused);
+        assert!(!state.post_animation_landing_pending);
+        assert!(matches!(
+            state.pending_drag_hint,
+            Some(DragHintAction::Hide)
+        ));
     }
 
     #[test]

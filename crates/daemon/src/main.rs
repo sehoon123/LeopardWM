@@ -2455,7 +2455,7 @@ async fn launch_config_editor(ctx: &mut EventLoopCtx<'_>) {
     leopardwm_platform_win32::shell::open(&path);
 }
 
-async fn handle_tray_event(ctx: &mut EventLoopCtx<'_>, tray_event: tray::TrayEvent) {
+async fn handle_tray_event(ctx: &mut EventLoopCtx<'_>, tray_event: tray::TrayEvent) -> bool {
     match tray_event {
         tray::TrayEvent::Refresh => {
             info!("Tray: Refresh requested");
@@ -2491,9 +2491,10 @@ async fn handle_tray_event(ctx: &mut EventLoopCtx<'_>, tray_event: tray::TrayEve
         }
         tray::TrayEvent::Exit => {
             info!("Tray: Exit requested");
-            // Route tray exit through the unified shutdown path so all
-            // cleanup (save_state + uncloak/reset) stays consistent.
-            let _ = ctx.event_tx.send(DaemonEvent::Shutdown).await;
+            // This handler runs inside the sole normal-queue consumer. Return
+            // control directly; awaiting capacity to enqueue Shutdown into our
+            // own full queue deadlocks the consumer before cleanup can run.
+            return true;
         }
         tray::TrayEvent::TogglePause => {
             let mut state = ctx.state.lock().await;
@@ -2564,7 +2565,7 @@ async fn handle_tray_event(ctx: &mut EventLoopCtx<'_>, tray_event: tray::TrayEve
                     log_dir.display(),
                     e
                 );
-                return;
+                return false;
             }
             leopardwm_platform_win32::shell::open(&log_dir);
         }
@@ -2759,6 +2760,7 @@ async fn handle_tray_event(ctx: &mut EventLoopCtx<'_>, tray_event: tray::TrayEve
             sync_tray_toggles(ctx.tray_manager, &state.config);
         }
     }
+    false
 }
 
 /// Refresh tab-strip overlays so background icon-only changes stay fresh.
@@ -3623,11 +3625,12 @@ async fn handle_animation_frame_applied(
         .unwrap_or(16);
     *ctx.last_frame_instant = Some(std::time::Instant::now());
 
-    let (still_animating, dispatch_failed) = {
+    let (still_animating, dispatch_failed, terminal_pause) = {
         let mut state = ctx.state.lock().await;
         let running = state.tick_animations(delta_ms);
+        let terminal_pause = state.paused;
         let mut dispatch_failed = false;
-        let frame_sent = if running || state.is_animating() {
+        let frame_sent = if !terminal_pause && (running || state.is_animating()) {
             match state.send_animation_frame(ctx.animation_worker) {
                 Ok(Some(frame_epoch)) => {
                     *ctx.animation_in_flight_epoch = Some(frame_epoch);
@@ -3645,18 +3648,17 @@ async fn handle_animation_frame_applied(
             false
         };
         // send_animation_frame positions the border for a dispatched frame.
-        // Only do it here when no frame was sent; the previous unconditional
-        // call rendered the same interpolated border twice per frame.
-        if !frame_sent {
+        // Never redraw it after terminal paused cleanup just hid it.
+        if !frame_sent && !terminal_pause {
             if let Some(hwnd) = state.previous_focused_hwnd {
                 if state.config.appearance.active_border {
                     state.show_border(hwnd);
                 }
             }
         }
-        (frame_sent, dispatch_failed)
+        (frame_sent, dispatch_failed, terminal_pause)
     };
-    if dispatch_failed {
+    if dispatch_failed || terminal_pause {
         *ctx.animation_in_flight_epoch = None;
         *ctx.last_frame_instant = None;
         return;
@@ -4055,7 +4057,12 @@ async fn run_daemon_event_loop(
                     break;
                 }
             }
-            DaemonEvent::Tray(event) => handle_tray_event(&mut ctx, event).await,
+            DaemonEvent::Tray(event) => {
+                if handle_tray_event(&mut ctx, event).await {
+                    run_shutdown_cleanup(ctx.state, ShutdownMode::Graceful).await;
+                    break;
+                }
+            }
             DaemonEvent::UpdateAvailable(tag) => {
                 if let Some(manager) = ctx.tray_manager {
                     manager.set_available_update(Some(tag));

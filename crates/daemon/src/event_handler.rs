@@ -8,7 +8,7 @@ use crate::state::{
 use leopardwm_core_layout::Rect;
 use leopardwm_platform_win32::{
     enumerate_monitors, get_process_executable, is_ctrl_alt_pressed, is_shift_key_pressed,
-    WindowEvent,
+    MonitorId, WindowEvent,
 };
 use tracing::{debug, info, warn};
 
@@ -18,6 +18,14 @@ const SNAPBACK_SETTLE_AFTER_CREATE: std::time::Duration = std::time::Duration::f
 /// How recently a window must have been seen maximized to defer snapping it back
 /// while settling.
 const SNAPBACK_MAXIMIZE_GRACE: std::time::Duration = std::time::Duration::from_millis(1200);
+
+struct FocusWorkspaceSwitchReceipt {
+    active_idx_before: usize,
+    focused_monitor_before: MonitorId,
+    workspaces_before: Vec<leopardwm_core_layout::Workspace>,
+    previous_focus_before: Option<u64>,
+    animated: bool,
+}
 
 /// Whether to defer snapping a tiled window back to its layout slot because it
 /// opened maximized and is still settling. An app opening several windows/tabs
@@ -1016,6 +1024,113 @@ impl AppState {
         true
     }
 
+    fn reassert_rollback_foreground(&mut self, hwnd: u64) {
+        #[cfg(test)]
+        {
+            self.injected_foreground_reassertions.push(hwnd);
+        }
+        #[cfg(not(test))]
+        {
+            if !leopardwm_platform_win32::is_valid_window(hwnd) {
+                return;
+            }
+            match leopardwm_platform_win32::set_foreground_window(hwnd) {
+                Ok(true) => {}
+                Ok(false) => warn!("Windows refused rollback foreground transfer to {hwnd}"),
+                Err(error) => warn!("Rollback foreground transfer to {hwnd} failed: {error}"),
+            }
+        }
+    }
+
+    fn rollback_focus_workspace_switch(
+        &mut self,
+        monitor_id: MonitorId,
+        receipt: FocusWorkspaceSwitchReceipt,
+        context: &str,
+    ) -> Result<(), String> {
+        if let Err(error) = self.cancel_layout_transition_for_exact_landing() {
+            // The retained transition still owns the forward model. Replacing
+            // that model would detach its only exit-parking receipt.
+            self.enter_paused_state(context);
+            let managed = self.all_managed_window_ids();
+            crate::state::run_visibility_recovery_pass(&managed, context);
+            return Err(format!("transition cleanup failed: {error}"));
+        }
+        // A failed Win32 batch may have positioned only a subset of the target
+        // workspace. The old-model rollback never includes those now-inactive
+        // HWNDs, so prove they are parked while the forward model still names
+        // them. If any park fails, retain that coherent forward model and pause.
+        let forward_idx = self.active_workspace_idx(monitor_id);
+        let forward_windows = self
+            .workspaces
+            .get(&monitor_id)
+            .and_then(|workspaces| workspaces.get(forward_idx))
+            .map(|workspace| workspace.all_window_ids())
+            .unwrap_or_default();
+        let park_failures: Vec<_> = forward_windows
+            .into_iter()
+            .filter_map(|window_id| {
+                self.park_window_for_inactive_workspace(window_id)
+                    .err()
+                    .map(|error| (window_id, error))
+            })
+            .collect();
+        if !park_failures.is_empty() {
+            self.enter_paused_state(context);
+            let managed = self.all_managed_window_ids();
+            crate::state::run_visibility_recovery_pass(&managed, context);
+            return Err(format!(
+                "could not park partially committed target workspace: {park_failures:?}"
+            ));
+        }
+        let previous_focus = receipt.previous_focus_before;
+        self.workspaces
+            .insert(monitor_id, receipt.workspaces_before);
+        self.active_workspace
+            .insert(monitor_id, receipt.active_idx_before);
+        self.focused_monitor = receipt.focused_monitor_before;
+        self.previous_focused_hwnd = previous_focus;
+        self.last_placed_layout_rects.clear();
+        let rollback = if self.paused {
+            Err("tiling was already paused before rollback".into())
+        } else {
+            self.apply_layout().map_err(|error| error.to_string())
+        };
+        if let Err(error) = rollback {
+            self.enter_paused_state(context);
+            let managed = self.all_managed_window_ids();
+            crate::state::run_visibility_recovery_pass(&managed, context);
+            Err(error)
+        } else {
+            if let Some(hwnd) = previous_focus {
+                self.reassert_rollback_foreground(hwnd);
+            }
+            Ok(())
+        }
+    }
+
+    fn commit_focus_workspace_switch(
+        &mut self,
+        monitor_id: MonitorId,
+        workspace_idx: usize,
+        receipt: FocusWorkspaceSwitchReceipt,
+    ) {
+        self.sync_taskbar_buttons();
+        self.broadcast_event(leopardwm_ipc::IpcEvent::WorkspaceChanged {
+            monitor: monitor_id as i64,
+            old_index: receipt.active_idx_before as u8,
+            new_index: workspace_idx as u8,
+            name: self.config.workspaces.name_for(workspace_idx),
+        });
+        debug!(
+            "Auto workspace switch committed: monitor {} {} -> {} (animated={})",
+            monitor_id, receipt.active_idx_before, workspace_idx, receipt.animated
+        );
+    }
+
+    // Keep the focus/workspace transaction linear: splitting three lines only
+    // to satisfy the size threshold would hide its rollback ordering.
+    #[allow(clippy::too_many_lines)]
     fn on_window_focused(&mut self, hwnd: u64) {
         let now = std::time::Instant::now();
         // Determine user origin before any rapid same-column suppression. The
@@ -1121,21 +1236,31 @@ impl AppState {
             if self.try_edit_config_pull(hwnd, monitor_id, ws_idx) {
                 return;
             }
-            // Update focused monitor to match the window's monitor
-            self.focused_monitor = monitor_id;
+            let focused_monitor_before = self.focused_monitor;
+            let mut auto_switch_receipt = None;
 
-            // Auto-switch workspace if the focused window is on an inactive workspace
-            // (e.g., user Alt+Tabbed to it)
             let active_idx = self.active_workspace_idx(monitor_id);
             if ws_idx != active_idx {
+                if self.paused {
+                    debug!(
+                        "Ignoring inactive-workspace focus {} while tiling is paused",
+                        hwnd
+                    );
+                    return;
+                }
                 info!(
                     "Auto-switching to workspace {} on monitor {} (focus follows window)",
                     ws_idx + 1,
                     monitor_id
                 );
 
-                // Cancel any in-progress drag before switching ownership.
-                // Restore both detached plain-preview state and Shift reorder.
+                if let Err(error) = self.prepare_workspace_ownership_change() {
+                    warn!(
+                        "Auto workspace switch deferred until queued layout work is safe: {error}"
+                    );
+                    return;
+                }
+                // Snapshot only after restoring any in-progress drag.
                 if let Some(drag_hwnd) = self.drag_state.as_ref().map(|drag| drag.hwnd) {
                     let restore_window = leopardwm_platform_win32::is_valid_window(drag_hwnd);
                     if let Some(aborted_hwnd) = self.abort_active_drag(restore_window) {
@@ -1143,13 +1268,21 @@ impl AppState {
                     }
                 }
                 self.pending_drag_hint = Some(crate::state::DragHintAction::Hide);
-                if let Err(error) = self.cancel_layout_transition_for_exact_landing() {
-                    warn!(
-                        "Auto workspace switch deferred until transition exits are safe: {error}"
-                    );
-                    return;
-                }
                 self.abort_active_ghost_transition();
+                let workspaces_before = self
+                    .workspaces
+                    .get(&monitor_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let previous_focus_before = self.previous_focused_hwnd;
+                self.focused_monitor = monitor_id;
+                auto_switch_receipt = Some(FocusWorkspaceSwitchReceipt {
+                    active_idx_before: active_idx,
+                    focused_monitor_before,
+                    workspaces_before,
+                    previous_focus_before,
+                    animated: false,
+                });
 
                 let slide_height = self
                     .monitors
@@ -1224,34 +1357,51 @@ impl AppState {
                 // don't linger as ghosts (reduce_motion skips the transition that
                 // would otherwise move them off-screen).
                 let animating = !start_rects.is_empty() && !self.reduce_motion;
+                if let Some(receipt) = auto_switch_receipt.as_mut() {
+                    receipt.animated = animating;
+                }
                 if animating {
                     let duration = self.config.animation.workspace_switch_duration_ms;
                     if let Err(error) =
                         self.start_workspace_switch_transition(start_rects, exit_rects, duration)
                     {
-                        self.active_workspace.insert(monitor_id, active_idx);
-                        warn!("Auto workspace switch retained prior transition ownership: {error}");
+                        let rollback = auto_switch_receipt.take().map_or(Ok(()), |receipt| {
+                            self.rollback_focus_workspace_switch(
+                                monitor_id,
+                                receipt,
+                                "auto workspace transition-start rollback",
+                            )
+                        });
+                        warn!(
+                            "Auto workspace switch transition failed: {error}; rollback={rollback:?}"
+                        );
                         return;
                     }
                 } else {
                     let failures: Vec<_> = old_placements
                         .iter()
                         .filter_map(|(wid, _)| {
-                            leopardwm_platform_win32::move_window_offscreen(*wid)
+                            self.park_window_for_inactive_workspace(*wid)
                                 .err()
                                 .map(|error| (*wid, error))
                         })
                         .collect();
                     if !failures.is_empty() {
-                        self.active_workspace.insert(monitor_id, active_idx);
+                        let rollback = auto_switch_receipt.take().map_or(Ok(()), |receipt| {
+                            self.rollback_focus_workspace_switch(
+                                monitor_id,
+                                receipt,
+                                "auto workspace parking rollback",
+                            )
+                        });
                         warn!(
-                            "Auto workspace switch rolled back because old windows could not be parked: {:?}",
-                            failures
+                            "Auto workspace switch parking failed: {failures:?}; rollback={rollback:?}"
                         );
-                        let _ = self.apply_layout();
                         return;
                     }
                 }
+            } else {
+                self.focused_monitor = monitor_id;
             }
 
             let viewport_width = self.viewport_width_for(monitor_id);
@@ -1287,9 +1437,19 @@ impl AppState {
             if user_initiated && self.layout_transition.is_some() {
                 self.settle_scroll_animations();
                 if let Err(error) = self.cancel_layout_transition_for_exact_landing() {
-                    self.paused = true;
+                    let rollback = match auto_switch_receipt.take() {
+                        Some(receipt) => self.rollback_focus_workspace_switch(
+                            monitor_id,
+                            receipt,
+                            "auto workspace focus-fence rollback",
+                        ),
+                        None => {
+                            self.enter_paused_state("physical focus transition fence failure");
+                            Err("no auto-switch receipt; tiling paused".to_string())
+                        }
+                    };
                     warn!(
-                        "Physical focus to {hwnd} could not park transition exits; tiling paused: {error}"
+                        "Physical focus to {hwnd} could not park transition exits: {error}; rollback={rollback:?}"
                     );
                     return;
                 }
@@ -1309,7 +1469,18 @@ impl AppState {
                     "Keeping fullscreen window {} focused; ignoring non-user focus to {}",
                     fs_wid, hwnd
                 );
-                self.reassert_fullscreen_focus(fs_wid);
+                if let Some(receipt) = auto_switch_receipt.take() {
+                    let rollback = self.rollback_focus_workspace_switch(
+                        monitor_id,
+                        receipt,
+                        "auto workspace fullscreen-focus rollback",
+                    );
+                    if let Err(error) = rollback {
+                        warn!("Auto workspace fullscreen-focus rollback degraded: {error}");
+                    }
+                } else {
+                    self.reassert_fullscreen_focus(fs_wid);
+                }
                 return;
             }
             if let Some(workspace) = self
@@ -1342,8 +1513,23 @@ impl AppState {
             }
             // Always apply layout — even if focus_window failed (floating windows),
             // we still need to repaint if we just switched workspaces.
-            if let Err(e) = self.apply_layout() {
-                warn!("Failed to apply layout after focus change: {}", e);
+            if let Err(error) = self.apply_layout() {
+                if let Some(receipt) = auto_switch_receipt.take() {
+                    let rollback = self.rollback_focus_workspace_switch(
+                        monitor_id,
+                        receipt,
+                        "auto workspace apply rollback",
+                    );
+                    warn!(
+                        "Failed to apply auto workspace focus change: {error}; rollback={rollback:?}"
+                    );
+                    return;
+                }
+                warn!("Failed to apply layout after focus change: {error}");
+            }
+
+            if let Some(receipt) = auto_switch_receipt.take() {
+                self.commit_focus_workspace_switch(monitor_id, ws_idx, receipt);
             }
 
             // Update border only — do NOT call sync_foreground_window()

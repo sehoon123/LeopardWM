@@ -26,6 +26,7 @@ pub(crate) enum DragMode {
 }
 
 /// Tracks an in-progress window drag for column reorder.
+#[derive(Clone)]
 pub(crate) struct DragState {
     /// HWND being dragged.
     pub(crate) hwnd: u64,
@@ -176,6 +177,7 @@ pub(crate) enum TestApplyPlacementsBehavior {
     SleepAndSucceed(Duration),
     SleepAndSucceedWithGeometryMismatch(Duration, u64),
     SleepAndFail(Duration),
+    FailOnceThenSucceed,
     FailIfWorkerRuns,
     FailWorkerSpawn,
 }
@@ -652,6 +654,12 @@ pub(crate) struct AppState {
     /// Injected visible HWND geometry for deterministic MovedOrResized tests.
     #[cfg(test)]
     pub(crate) injected_window_visible_rects: HashMap<u64, Rect>,
+    /// Injected cursor position for deterministic drag destination tests.
+    #[cfg(test)]
+    pub(crate) injected_drag_cursor: Option<(i32, i32)>,
+    /// Foreground HWNDs reasserted after successful model/physical rollback.
+    #[cfg(test)]
+    pub(crate) injected_foreground_reassertions: Vec<u64>,
     /// Optional test-only behavior override for placement application.
     #[cfg(test)]
     pub(crate) injected_apply_placements_behavior: Option<TestApplyPlacementsBehavior>,
@@ -965,6 +973,10 @@ impl AppState {
             injected_window_info: HashMap::new(),
             #[cfg(test)]
             injected_window_visible_rects: HashMap::new(),
+            #[cfg(test)]
+            injected_drag_cursor: None,
+            #[cfg(test)]
+            injected_foreground_reassertions: Vec::new(),
             #[cfg(test)]
             injected_apply_placements_behavior: None,
             #[cfg(test)]

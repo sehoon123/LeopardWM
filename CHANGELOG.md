@@ -2,6 +2,31 @@
 
 All notable changes to LeopardWM will be documented in this file.
 
+## 0.2.15-sehoon.32
+
+### Fixes
+
+- Make tray Exit return directly to the sole event-loop consumer instead of
+  awaiting capacity to enqueue Shutdown into its own bounded queue.
+- Retain transition exit ownership through verified parking retries. A third
+  failure now establishes full paused cleanup, and the frame loop cannot redraw
+  UI or claim a paused no-op as a successful final landing.
+- Fence queued animation work before cross-monitor and explicit/focus-driven
+  workspace ownership changes. Failed physical commits restore the complete
+  settled model, reject paused no-op compensation, run recovery when needed,
+  and reassert prior foreground focus after a proven rollback.
+- Publish taskbar and `WorkspaceChanged` state only after a focus-driven
+  workspace switch commits; paused focus cannot switch an inactive workspace.
+- Make tiled and floating drag commits synchronous transactions. Placeholder,
+  no-placeholder, standalone, cross-monitor window/column, and live-preview
+  failures restore workspace and drag receipts before any foreground publish.
+
+### Tests
+
+- Add deterministic queue-capacity, transition-parking, worker-barrier,
+  timeout-compensation, paused-focus/drag, workspace-event, foreground-reassert,
+  and drag fallback/live-preview fault tests.
+
 ## 0.2.14-sehoon.31
 
 ### Fixes

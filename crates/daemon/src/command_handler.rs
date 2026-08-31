@@ -1045,6 +1045,23 @@ impl AppState {
         let monitors: Vec<_> = self.monitors.values().cloned().collect();
         if let Some(target) = select(&monitors, self.focused_monitor) {
             let target_id = target.id;
+            if self.paused {
+                return IpcResponse::error(
+                    "Cannot move windows between monitors while tiling is paused",
+                );
+            }
+            if self.managed_focused_window().is_none() {
+                info!("No focused window to move");
+                return IpcResponse::Ok;
+            }
+            // Settle/cancel every older frame before snapshotting or changing
+            // monitor ownership. Otherwise apply_layout sees the retained
+            // transition and reports a successful no-op after the move.
+            if let Err(error) = self.prepare_workspace_ownership_change() {
+                return IpcResponse::error(format!(
+                    "Cannot move a window between monitors until queued layout work lands: {error}"
+                ));
+            }
             let source_id = self.focused_monitor;
             let source_idx = self.active_workspace_idx(source_id);
             let target_idx = self.active_workspace_idx(target_id);
@@ -1071,9 +1088,20 @@ impl AppState {
                         }
                         self.focused_monitor = focused_before;
                         self.last_placed_layout_rects.clear();
-                        let rollback = self.apply_layout();
+                        let rollback = if self.paused {
+                            Err(anyhow::anyhow!(
+                                "tiling paused before cross-monitor rollback landing"
+                            ))
+                        } else {
+                            self.apply_layout()
+                        };
                         if rollback.is_err() {
                             self.enter_paused_state("cross-monitor move rollback failure");
+                            let managed = self.all_managed_window_ids();
+                            crate::state::run_visibility_recovery_pass(
+                                &managed,
+                                "cross-monitor move rollback",
+                            );
                         }
                         return IpcResponse::error(format!(
                             "Failed to apply layout: {e}; rollback={rollback:?}"
@@ -1081,8 +1109,26 @@ impl AppState {
                     }
                     self.sync_foreground_window();
                 }
-                Ok(None) => info!("No focused window to move"),
-                Err(message) => return IpcResponse::error(message),
+                Ok(None) => {
+                    self.last_placed_layout_rects.clear();
+                    if let Err(error) = self.apply_layout() {
+                        self.enter_paused_state("cross-monitor move empty transaction landing");
+                        return IpcResponse::error(format!(
+                            "Focused window disappeared after the ownership fence; original layout could not be landed: {error}"
+                        ));
+                    }
+                    info!("No focused window to move");
+                }
+                Err(message) => {
+                    self.last_placed_layout_rects.clear();
+                    let landing = self.apply_layout();
+                    if landing.is_err() {
+                        self.enter_paused_state("cross-monitor move transaction failure landing");
+                    }
+                    return IpcResponse::error(format!(
+                        "{message}; original-layout landing={landing:?}"
+                    ));
+                }
             }
         } else {
             info!("No monitor {}", dir);
@@ -1400,6 +1446,11 @@ impl AppState {
         if idx == current_idx {
             return IpcResponse::Ok;
         }
+        if let Err(error) = self.prepare_workspace_ownership_change() {
+            return IpcResponse::error(format!(
+                "Cannot switch workspace until queued layout work lands: {error}"
+            ));
+        }
 
         // Remember the floating window focused on the workspace we
         // are leaving, so returning re-focuses it. If the last focus
@@ -1438,11 +1489,6 @@ impl AppState {
             }
         }
         self.pending_drag_hint = Some(crate::state::DragHintAction::Hide);
-        if let Err(error) = self.cancel_layout_transition_for_exact_landing() {
-            return IpcResponse::error(format!(
-                "Cannot switch workspace until the current transition exits are safe: {error}"
-            ));
-        }
         self.abort_active_ghost_transition();
 
         let slide_height = self
@@ -1602,8 +1648,12 @@ impl AppState {
             self.active_workspace.insert(monitor, current_idx);
             self.previous_focused_hwnd = previous_focus_before;
             self.last_placed_layout_rects.clear();
-            let rollback = if transition_cleanup.is_ok() {
+            let rollback = if transition_cleanup.is_ok() && !self.paused {
                 self.apply_layout()
+            } else if self.paused {
+                Err(anyhow::anyhow!(
+                    "tiling paused before workspace-switch rollback landing"
+                ))
             } else {
                 Err(anyhow::anyhow!(
                     "transition cleanup failed; rollback placement suppressed"
@@ -2194,6 +2244,65 @@ mod transaction_tests {
     }
 
     #[test]
+    fn cross_monitor_timeout_never_reports_paused_rollback_as_success() {
+        let mut state = state_with_monitors(vec![monitor(1, 0), monitor(2, 1920)]);
+        state.paused = false;
+        state.layout_apply_timeout = Duration::from_millis(10);
+        state.workspaces.get_mut(&1).unwrap()[0]
+            .insert_window(10, Some(700))
+            .unwrap();
+        state.injected_apply_placements_behavior = Some(
+            TestApplyPlacementsBehavior::SleepAndSucceed(Duration::from_millis(40)),
+        );
+
+        let response = state.handle_command(IpcCommand::MoveWindowToMonitorRight);
+        let IpcResponse::Error { message } = response else {
+            panic!("timed-out move must fail");
+        };
+        assert!(message.contains("tiling paused before cross-monitor rollback"));
+        assert!(!message.contains("rollback=Ok"));
+        assert_eq!(state.find_window_workspace(10), Some((1, 0)));
+        assert!(state.paused);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(state.reap_finished_pending_apply_workers(), 1);
+    }
+
+    #[test]
+    fn cross_monitor_move_fence_failure_does_not_mutate_ownership() {
+        let mut state = state_with_monitors(vec![monitor(1, 0), monitor(2, 1920)]);
+        state.paused = false;
+        state.workspaces.get_mut(&1).unwrap()[0]
+            .insert_window(10, Some(700))
+            .unwrap();
+        state.layout_transition = Some(crate::state::LayoutTransition {
+            start_rects: std::collections::HashMap::from([(99, Rect::new(0, 0, 700, 700))]),
+            exit_rects: std::collections::HashMap::from([(99, Rect::new(0, -1040, 700, 700))]),
+            exit_column_indices: std::collections::HashMap::new(),
+            elapsed_ms: 16,
+            duration_ms: 150,
+            easing: leopardwm_core_layout::Easing::default(),
+            requires_compositor_safe_snap: false,
+            ghosted_wids: std::collections::HashSet::new(),
+            exit_park_failures: 0,
+        });
+        state.injected_scratchpad_park_failure = true;
+        let epoch_before = state.apply_epoch.load(std::sync::atomic::Ordering::SeqCst);
+
+        assert!(matches!(
+            state.handle_command(IpcCommand::MoveWindowToMonitorRight),
+            IpcResponse::Error { .. }
+        ));
+        assert_eq!(state.find_window_workspace(10), Some((1, 0)));
+        assert!(!state.workspaces[&2][0].contains_window(10));
+        assert_eq!(state.focused_monitor, 1);
+        assert!(state.layout_transition.is_some());
+        assert!(
+            state.apply_epoch.load(std::sync::atomic::Ordering::SeqCst) > epoch_before,
+            "the shared ownership fence must advance the worker epoch"
+        );
+    }
+
+    #[test]
     fn reduced_motion_workspace_apply_failure_restores_active_workspace() {
         let mut state = state_with_monitors(vec![monitor(1, 0)]);
         state.paused = false;
@@ -2222,6 +2331,35 @@ mod transaction_tests {
             .flat_map(|column| column.windows().iter().copied())
             .collect();
         assert_eq!(order, vec![10, 11, 12]);
+    }
+
+    #[test]
+    fn workspace_timeout_never_reports_paused_rollback_as_success() {
+        let mut state = state_with_monitors(vec![monitor(1, 0)]);
+        state.paused = false;
+        state.reduce_motion = true;
+        state.layout_apply_timeout = Duration::from_millis(10);
+        state.workspaces.get_mut(&1).unwrap()[0]
+            .insert_window(10, Some(700))
+            .unwrap();
+        state.ensure_workspace_exists(1, 1);
+        state.workspaces.get_mut(&1).unwrap()[1]
+            .insert_window(20, Some(700))
+            .unwrap();
+        state.injected_apply_placements_behavior = Some(
+            TestApplyPlacementsBehavior::SleepAndSucceed(Duration::from_millis(40)),
+        );
+
+        let response = state.handle_command(IpcCommand::SwitchWorkspace { index: 2 });
+        let IpcResponse::Error { message } = response else {
+            panic!("timed-out workspace switch must fail");
+        };
+        assert!(message.contains("tiling paused before workspace-switch rollback"));
+        assert!(!message.contains("rollback=Ok"));
+        assert_eq!(state.active_workspace_idx(1), 0);
+        assert!(state.paused);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(state.reap_finished_pending_apply_workers(), 1);
     }
 
     #[test]
