@@ -25,9 +25,8 @@ use windows::Win32::Graphics::Dwm::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     BeginDeferWindowPos, DeferWindowPos, EndDeferWindowPos, GetClassNameW, GetWindowRect,
-    GetWindowThreadProcessId, IsHungAppWindow, IsIconic, IsWindow, IsZoomed, SetWindowPos,
-    ShowWindow, SET_WINDOW_POS_FLAGS, SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-    SWP_NOSIZE, SWP_NOZORDER, SW_RESTORE,
+    IsHungAppWindow, IsIconic, IsWindow, IsZoomed, SetWindowPos, ShowWindow, SET_WINDOW_POS_FLAGS,
+    SWP_ASYNCWINDOWPOS, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER, SW_RESTORE,
 };
 
 /// Undocumented but well-known DWM attribute for cloaking windows.
@@ -516,9 +515,9 @@ static GLOBAL_CLOAKED: Mutex<Option<CloakLedger>> = Mutex::new(None);
 pub struct PlacementCache {
     positions: HashMap<WindowId, (Rect, Visibility)>,
     insets: HashMap<WindowId, (i32, i32, i32, i32)>,
+    /// Exact HWND incarnation owning every value in the three maps above/below.
+    identities: HashMap<WindowId, crate::WindowEventIdentity>,
     /// Renderer classification cached for the lifetime of a placement entry.
-    /// It is pruned as soon as the HWND leaves the current layout, preventing
-    /// recycled handles from inheriting an old animation policy.
     compositor_sensitive: HashMap<WindowId, bool>,
     /// Generation of `GLOBAL_INSET_CACHE` reflected by `insets`. An atomic
     /// generation lets display/theme/DPI changes invalidate the animation
@@ -537,6 +536,7 @@ impl PlacementCache {
         Self {
             positions: HashMap::new(),
             insets: HashMap::new(),
+            identities: HashMap::new(),
             compositor_sensitive: HashMap::new(),
             inset_generation: INSET_CACHE_GENERATION.load(Ordering::Acquire),
         }
@@ -546,6 +546,22 @@ impl PlacementCache {
         self.positions.clear();
         self.compositor_sensitive.clear();
         // Keep inset cache — insets are a window property, not position-dependent.
+        self.identities
+            .retain(|window_id, _| self.insets.contains_key(window_id));
+    }
+
+    fn reconcile_window_identity(
+        &mut self,
+        window_id: WindowId,
+        identity: &crate::WindowEventIdentity,
+    ) {
+        if self.identities.get(&window_id) == Some(identity) {
+            return;
+        }
+        self.positions.remove(&window_id);
+        self.insets.remove(&window_id);
+        self.compositor_sensitive.remove(&window_id);
+        self.identities.insert(window_id, identity.clone());
     }
 
     /// Clear the cached border insets. Call when system theme or DWM metrics
@@ -619,6 +635,7 @@ pub struct ApplyPlacementsResult {
 struct DeferEntry {
     hwnd: HWND,
     window_id: u64,
+    identity: crate::WindowEventIdentity,
     x: i32,
     y: i32,
     w: i32,
@@ -645,31 +662,37 @@ struct DeferEntry {
 /// longer crosses the monitor edge drops the preview registration and the cloak,
 /// so the exact landing would see nothing left to repair. Latching the identity
 /// keeps the repair for the landing, which is the only pass that may resize.
-static PENDING_RETURN_REPAIR: OnceLock<Mutex<HashSet<WindowId>>> = OnceLock::new();
+static PENDING_RETURN_REPAIR: OnceLock<Mutex<HashMap<WindowId, crate::WindowEventIdentity>>> =
+    OnceLock::new();
 
-fn pending_return_repair() -> &'static Mutex<HashSet<WindowId>> {
-    PENDING_RETURN_REPAIR.get_or_init(|| Mutex::new(HashSet::new()))
+fn pending_return_repair() -> &'static Mutex<HashMap<WindowId, crate::WindowEventIdentity>> {
+    PENDING_RETURN_REPAIR.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn latch_return_repair(window_id: WindowId) {
+fn latch_return_repair(window_id: WindowId, identity: &crate::WindowEventIdentity) {
     pending_return_repair()
         .lock()
         .unwrap_or_else(crate::recover_poisoned_mutex)
-        .insert(window_id);
+        .insert(window_id, identity.clone());
 }
 
 /// Claim only repair receipts owned by this exact landing. A disjoint batch
 /// must leave another HWND's renderer-repair obligation intact.
-fn take_return_repairs_for(window_ids: &HashSet<WindowId>) -> HashSet<WindowId> {
+fn take_return_repairs_for(
+    window_ids: &HashSet<WindowId>,
+    expected_identities: &HashMap<WindowId, crate::WindowEventIdentity>,
+) -> HashSet<WindowId> {
     let mut pending = pending_return_repair()
         .lock()
         .unwrap_or_else(crate::recover_poisoned_mutex);
     let claimed: HashSet<WindowId> = pending
         .iter()
-        .filter(|window_id| window_ids.contains(window_id))
-        .copied()
+        .filter_map(|(window_id, identity)| {
+            (window_ids.contains(window_id) && expected_identities.get(window_id) == Some(identity))
+                .then_some(*window_id)
+        })
         .collect();
-    pending.retain(|window_id| !claimed.contains(window_id));
+    pending.retain(|window_id, _| !window_ids.contains(window_id));
     claimed
 }
 
@@ -843,6 +866,7 @@ pub fn apply_placements_with_regions_fenced(
     } = build_defer_entries(
         placements,
         region_clips,
+        expected_identities,
         &mut cache,
         animation_frame,
         config.animation_placement_policy,
@@ -981,6 +1005,7 @@ pub fn apply_placements_with_regions_fenced(
             placements.iter().map(|p| p.window_id).collect();
         cache.positions.retain(|id, _| current_ids.contains(id));
         cache.insets.retain(|id, _| current_ids.contains(id));
+        cache.identities.retain(|id, _| current_ids.contains(id));
         cache
             .compositor_sensitive
             .retain(|id, _| current_ids.contains(id));
@@ -1020,7 +1045,7 @@ pub fn apply_placements_with_regions_fenced(
             })
             .map(|entry| entry.window_id)
             .collect();
-        let returned_from_park = take_return_repairs_for(&repairable_ids);
+        let returned_from_park = take_return_repairs_for(&repairable_ids, expected_identities);
         let nudge_targets: Vec<NudgeTarget> = entries
             .iter()
             .filter(|e| {
@@ -1030,6 +1055,7 @@ pub fn apply_placements_with_regions_fenced(
             .map(|e| NudgeTarget {
                 window_id: e.window_id,
                 hwnd: e.hwnd,
+                identity: e.identity.clone(),
                 x: e.x,
                 y: e.y,
                 w: e.w,
@@ -1037,7 +1063,9 @@ pub fn apply_placements_with_regions_fenced(
             })
             .collect();
         for window_id in nudge_sticky_compositor_windows(&nudge_targets) {
-            latch_return_repair(window_id);
+            if let Some(identity) = expected_identities.get(&window_id) {
+                latch_return_repair(window_id, identity);
+            }
             failed_window_ids.insert(window_id);
         }
 
@@ -1234,6 +1262,7 @@ struct DeferBuild {
 fn build_defer_entries(
     placements: &[WindowPlacement],
     region_clips: &[WindowRegionClip],
+    expected_identities: &HashMap<WindowId, crate::WindowEventIdentity>,
     cache: &mut Option<&mut PlacementCache>,
     animation_frame: bool,
     policy: AnimationPlacementPolicy,
@@ -1273,6 +1302,10 @@ fn build_defer_entries(
     }
 
     for requested in placements {
+        let identity = &expected_identities[&requested.window_id];
+        if let Some(cache) = cache.as_deref_mut() {
+            cache.reconcile_window_identity(requested.window_id, identity);
+        }
         let region_clip = region_clips
             .iter()
             .find(|clip| clip.window_id == requested.window_id);
@@ -1292,7 +1325,7 @@ fn build_defer_entries(
         let (inset_l, inset_t, inset_r, inset_b) = if high_contrast {
             (0, 0, 0, 0)
         } else {
-            cached_border_insets(hwnd, requested.window_id, cache.as_deref_mut())
+            cached_border_insets(hwnd, requested.window_id, identity, cache.as_deref_mut())
         };
         let target_frame_w = requested.rect.width + inset_l + inset_r;
         let target_frame_h = requested.rect.height + inset_t + inset_b;
@@ -1407,6 +1440,7 @@ fn build_defer_entries(
             entries.push(DeferEntry {
                 hwnd,
                 window_id: placement.window_id,
+                identity: identity.clone(),
                 x: placement.rect.x.saturating_sub(inset_l),
                 y: placement.rect.y.saturating_sub(inset_t),
                 w: target_frame_w.max(1),
@@ -1434,11 +1468,12 @@ fn build_defer_entries(
                 // Latched rather than acted on here: only the exact landing may
                 // resize, and an animation frame would otherwise consume the
                 // evidence before the landing sees it.
-                latch_return_repair(placement.window_id);
+                latch_return_repair(placement.window_id, identity);
             }
             entries.push(DeferEntry {
                 hwnd,
                 window_id: placement.window_id,
+                identity: identity.clone(),
                 x: placement.rect.x - inset_l,
                 y: placement.rect.y - inset_t,
                 w: frame_w,
@@ -1461,6 +1496,7 @@ fn build_defer_entries(
             entries.push(DeferEntry {
                 hwnd,
                 window_id: placement.window_id,
+                identity: identity.clone(),
                 x,
                 y,
                 w: frame_w,
@@ -1711,9 +1747,26 @@ fn verify_preview_source_landings(
 /// workspaces, so a window is only re-measured when its workspace next lands.
 /// Entries are evicted on window destroy (`clear_suspected_oversize`) so the map
 /// stays bounded and a recycled HWND never inherits a stale suspect bit.
-static SUSPECTED_OVERSIZE: Mutex<Option<HashMap<u64, (bool, bool)>>> = Mutex::new(None);
+type OversizeReceipt = (crate::WindowEventIdentity, bool, bool);
+static SUSPECTED_OVERSIZE: Mutex<Option<HashMap<u64, OversizeReceipt>>> = Mutex::new(None);
 
-fn lock_suspected_oversize() -> std::sync::MutexGuard<'static, Option<HashMap<u64, (bool, bool)>>> {
+fn previous_oversize_suspects(
+    cache: &mut HashMap<WindowId, OversizeReceipt>,
+    window_id: WindowId,
+    identity: &crate::WindowEventIdentity,
+) -> (bool, bool) {
+    match cache.get(&window_id) {
+        Some((cached_identity, width, height)) if cached_identity == identity => (*width, *height),
+        Some(_) => {
+            cache.remove(&window_id);
+            (false, false)
+        }
+        None => (false, false),
+    }
+}
+
+fn lock_suspected_oversize() -> std::sync::MutexGuard<'static, Option<HashMap<u64, OversizeReceipt>>>
+{
     SUSPECTED_OVERSIZE
         .lock()
         .unwrap_or_else(crate::recover_poisoned_mutex)
@@ -1930,11 +1983,14 @@ fn detect_size_violations(
         let (record_w, suspect_w, record_h, suspect_h) = {
             let mut guard = lock_suspected_oversize();
             let map = guard.get_or_insert_with(HashMap::new);
-            let (was_w, was_h) = map.get(&entry.window_id).copied().unwrap_or((false, false));
+            let (was_w, was_h) = previous_oversize_suspects(map, entry.window_id, &entry.identity);
             let (record_w, suspect_w) = classify_oversize(w_over, looks_stale_w, was_w, absurd_w);
             let (record_h, suspect_h) = classify_oversize(h_over, looks_stale_h, was_h, absurd_h);
             if suspect_w || suspect_h {
-                map.insert(entry.window_id, (suspect_w, suspect_h));
+                map.insert(
+                    entry.window_id,
+                    (entry.identity.clone(), suspect_w, suspect_h),
+                );
             } else {
                 map.remove(&entry.window_id);
             }
@@ -2085,21 +2141,23 @@ fn window_class_name(hwnd: HWND) -> String {
 struct NudgeTarget {
     window_id: WindowId,
     hwnd: HWND,
+    identity: crate::WindowEventIdentity,
     x: i32,
     y: i32,
     w: i32,
     h: i32,
 }
 
-fn window_incarnation_identity(hwnd: HWND) -> Option<(u32, u32, String)> {
-    if !unsafe { IsWindow(Some(hwnd)).as_bool() } {
-        return None;
-    }
-    let mut process_id = 0u32;
-    let thread_id = unsafe { GetWindowThreadProcessId(hwnd, Some(&mut process_id)) };
-    let class = window_class_name(hwnd);
-    (process_id != 0 && thread_id != 0 && !class.is_empty())
-        .then_some((process_id, thread_id, class))
+fn nudge_identity_matches(
+    current: Option<&crate::WindowEventIdentity>,
+    expected: &crate::WindowEventIdentity,
+) -> bool {
+    current == Some(expected)
+}
+
+fn nudge_target_is_current(target: &NudgeTarget) -> bool {
+    let current = crate::current_window_event_identity(target.window_id);
+    nudge_identity_matches(current.as_ref(), &target.identity)
 }
 
 /// Send a (w-1 -> w) synchronous SetWindowPos pair to each known
@@ -2110,12 +2168,12 @@ fn nudge_sticky_compositor_windows(targets: &[NudgeTarget]) -> Vec<WindowId> {
     let mut repaired = Vec::new();
     let mut failed = Vec::new();
     for t in targets {
-        let Some(identity) = window_incarnation_identity(t.hwnd) else {
+        if !nudge_target_is_current(t) {
             failed.push(t.window_id);
             continue;
-        };
-        let class = identity.2.clone();
-        if !crate::thumbnail::is_compositor_sensitive_class_str(&class) {
+        }
+        let class = &t.identity.class_name;
+        if !crate::thumbnail::is_compositor_sensitive_class_str(class) {
             continue;
         }
         let flags = SWP_NOZORDER | SWP_NOACTIVATE;
@@ -2124,14 +2182,9 @@ fn nudge_sticky_compositor_windows(targets: &[NudgeTarget]) -> Vec<WindowId> {
                 failed.push(t.window_id);
                 continue;
             }
-            // Re-validate the HWND between the pair: the first SetWindowPos
-            // pumps messages on the target thread and can cause the window to
-            // be destroyed; the handle could be recycled for an unrelated
-            // window before the restore call lands. Re-checking both the
-            // handle validity and the class name catches recycling. If either
-            // fails the target is left at w-1 rather than risk resizing the
-            // wrong window — next apply pass will correct it.
-            if window_incarnation_identity(t.hwnd).as_ref() != Some(&identity) {
+            // The first synchronous write can pump target-window messages.
+            // Never send the restore to a replacement reusing the numeric HWND.
+            if !nudge_target_is_current(t) {
                 failed.push(t.window_id);
                 continue;
             }
@@ -2148,7 +2201,7 @@ fn nudge_sticky_compositor_windows(targets: &[NudgeTarget]) -> Vec<WindowId> {
                 continue;
             }
         }
-        if window_incarnation_identity(t.hwnd).as_ref() != Some(&identity) {
+        if !nudge_target_is_current(t) {
             failed.push(t.window_id);
             continue;
         }
@@ -2167,7 +2220,23 @@ fn nudge_sticky_compositor_windows(targets: &[NudgeTarget]) -> Vec<WindowId> {
     failed
 }
 
-type InsetMap = HashMap<WindowId, (i32, i32, i32, i32)>;
+type Insets = (i32, i32, i32, i32);
+type InsetMap = HashMap<WindowId, (crate::WindowEventIdentity, Insets)>;
+
+fn matching_cached_insets(
+    cache: &mut InsetMap,
+    window_id: WindowId,
+    identity: &crate::WindowEventIdentity,
+) -> Option<Insets> {
+    match cache.get(&window_id).cloned() {
+        Some((cached_identity, insets)) if cached_identity == *identity => Some(insets),
+        Some(_) => {
+            cache.remove(&window_id);
+            None
+        }
+        None => None,
+    }
+}
 
 /// Global inset cache for the `apply_layout` path (which passes `cache: None`).
 /// Ensures windows returning from off-screen get correct insets even without
@@ -2213,26 +2282,29 @@ fn invalidate_window_insets(window_id: WindowId, cache: &mut Option<&mut Placeme
 fn cached_border_insets(
     hwnd: HWND,
     window_id: WindowId,
-    local_cache: Option<&mut PlacementCache>,
-) -> (i32, i32, i32, i32) {
-    // Check local (per-worker) cache first
-    if let Some(cached) = local_cache
-        .as_ref()
-        .and_then(|c| c.insets.get(&window_id).copied())
-    {
-        return cached;
-    }
-    // Check global cache (shared across apply_layout threads)
-    if let Ok(global) = GLOBAL_INSET_CACHE.lock() {
-        if let Some(cached) = global.as_ref().and_then(|m| m.get(&window_id).copied()) {
-            // Promote to local cache for fast subsequent lookups
-            if let Some(cache) = local_cache {
-                cache.insets.insert(window_id, cached);
-            }
+    identity: &crate::WindowEventIdentity,
+    mut local_cache: Option<&mut PlacementCache>,
+) -> Insets {
+    // Check local (per-worker) cache first.
+    if let Some(cache) = local_cache.as_deref_mut() {
+        cache.reconcile_window_identity(window_id, identity);
+        if let Some(cached) = cache.insets.get(&window_id).copied() {
             return cached;
         }
     }
-    // No cache — query DWM and cache if non-zero
+    // Check the identity-bearing global cache shared by exact landing workers.
+    if let Ok(mut global) = GLOBAL_INSET_CACHE.lock() {
+        if let Some(insets) = global
+            .as_mut()
+            .and_then(|map| matching_cached_insets(map, window_id, identity))
+        {
+            if let Some(cache) = local_cache.as_deref_mut() {
+                cache.insets.insert(window_id, insets);
+            }
+            return insets;
+        }
+    }
+    // No matching cache — query DWM and cache if non-zero.
     let fresh = invisible_border_insets(hwnd);
     if fresh != (0, 0, 0, 0) {
         if let Some(cache) = local_cache {
@@ -2241,7 +2313,7 @@ fn cached_border_insets(
         if let Ok(mut global) = GLOBAL_INSET_CACHE.lock() {
             global
                 .get_or_insert_with(HashMap::new)
-                .insert(window_id, fresh);
+                .insert(window_id, (identity.clone(), fresh));
         }
     }
     fresh
@@ -2349,6 +2421,15 @@ pub(crate) fn invisible_border_insets(hwnd: HWND) -> (i32, i32, i32, i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn identity(token: u64) -> crate::WindowEventIdentity {
+        crate::WindowEventIdentity {
+            token,
+            process_id: 7,
+            thread_id: 11,
+            class_name: "PlacementTest".into(),
+        }
+    }
 
     #[test]
     fn test_classify_oversize() {
@@ -2486,6 +2567,7 @@ mod tests {
             .positions
             .insert(wid, (Rect::new(1, 2, 300, 200), Visibility::Visible));
         cache.insets.insert(wid, (8, 0, 8, 8));
+        cache.identities.insert(wid, identity(1));
 
         clear_inset_cache();
         cache.sync_inset_generation();
@@ -2502,6 +2584,7 @@ mod tests {
             .positions
             .insert(wid, (Rect::new(1, 2, 300, 200), Visibility::Visible));
         cache.insets.insert(wid, (8, 0, 8, 8));
+        cache.identities.insert(wid, identity(1));
         cache.compositor_sensitive.insert(wid, true);
 
         cache.clear();
@@ -2509,6 +2592,39 @@ mod tests {
         assert!(cache.positions.is_empty());
         assert!(cache.compositor_sensitive.is_empty());
         assert_eq!(cache.insets.get(&wid), Some(&(8, 0, 8, 8)));
+        assert_eq!(cache.identities.get(&wid), Some(&identity(1)));
+    }
+
+    #[test]
+    fn recycled_hwnd_cannot_hit_placement_caches() {
+        let wid = 0x7fff_ff04;
+        let original = identity(41);
+        let replacement = identity(42);
+        let mut cache = PlacementCache::new();
+        cache.identities.insert(wid, original.clone());
+        cache
+            .positions
+            .insert(wid, (Rect::new(1, 2, 300, 200), Visibility::Visible));
+        cache.insets.insert(wid, (8, 0, 8, 8));
+        cache.compositor_sensitive.insert(wid, true);
+
+        cache.reconcile_window_identity(wid, &replacement);
+
+        assert!(!cache.positions.contains_key(&wid));
+        assert!(!cache.insets.contains_key(&wid));
+        assert!(!cache.compositor_sensitive.contains_key(&wid));
+        assert_eq!(cache.identities.get(&wid), Some(&replacement));
+
+        let mut global = HashMap::from([(wid, (original.clone(), (8, 0, 8, 8)))]);
+        assert_eq!(matching_cached_insets(&mut global, wid, &replacement), None);
+        assert!(!global.contains_key(&wid));
+
+        let mut oversize = HashMap::from([(wid, (original, true, true))]);
+        assert_eq!(
+            previous_oversize_suspects(&mut oversize, wid, &replacement),
+            (false, false)
+        );
+        assert!(!oversize.contains_key(&wid));
     }
 
     #[test]
@@ -2549,10 +2665,21 @@ mod tests {
     }
 
     #[test]
+    fn recycled_hwnd_is_rejected_before_compositor_nudge() {
+        let original = identity(41);
+        let replacement = identity(42);
+
+        assert!(nudge_identity_matches(Some(&original), &original));
+        assert!(!nudge_identity_matches(Some(&replacement), &original));
+        assert!(!nudge_identity_matches(None, &original));
+    }
+
+    #[test]
     fn invalid_nudge_target_is_reported_as_failed() {
         let failed = nudge_sticky_compositor_windows(&[NudgeTarget {
             window_id: 77,
             hwnd: HWND::default(),
+            identity: identity(1),
             x: 0,
             y: 0,
             w: 800,
@@ -2698,7 +2825,16 @@ mod visible_landing_policy_tests {
 mod compositor_return_repair_tests {
     use super::{latch_return_repair, returns_from_offscreen_park, take_return_repairs_for};
     use leopardwm_core_layout::{Rect, Visibility};
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
+
+    fn identity(token: u64) -> crate::WindowEventIdentity {
+        crate::WindowEventIdentity {
+            token,
+            process_id: 7,
+            thread_id: 11,
+            class_name: "ReturnRepairTest".into(),
+        }
+    }
 
     fn parked() -> Option<(Rect, Visibility)> {
         Some((
@@ -2795,13 +2931,29 @@ mod compositor_return_repair_tests {
     fn disjoint_exact_landing_keeps_another_window_repair_receipt() {
         let returning = 0x7fff_ff10;
         let unrelated = 0x7fff_ff11;
-        latch_return_repair(returning);
+        let returning_identity = identity(1);
+        latch_return_repair(returning, &returning_identity);
 
         let unrelated_ids = HashSet::from([unrelated]);
-        assert!(take_return_repairs_for(&unrelated_ids).is_empty());
+        let unrelated_identities = HashMap::from([(unrelated, identity(2))]);
+        assert!(take_return_repairs_for(&unrelated_ids, &unrelated_identities).is_empty());
 
         let returning_ids = HashSet::from([returning]);
-        assert_eq!(take_return_repairs_for(&returning_ids), returning_ids);
+        let returning_identities = HashMap::from([(returning, returning_identity)]);
+        assert_eq!(
+            take_return_repairs_for(&returning_ids, &returning_identities),
+            returning_ids
+        );
+    }
+
+    #[test]
+    fn recycled_hwnd_cannot_claim_old_return_repair() {
+        let returning = 0x7fff_ff12;
+        latch_return_repair(returning, &identity(41));
+        let ids = HashSet::from([returning]);
+        let replacements = HashMap::from([(returning, identity(42))]);
+
+        assert!(take_return_repairs_for(&ids, &replacements).is_empty());
     }
 }
 
@@ -2816,6 +2968,12 @@ mod persistent_preview_placement_tests {
         DeferEntry {
             hwnd: HWND::default(),
             window_id: 1,
+            identity: crate::WindowEventIdentity {
+                token: 1,
+                process_id: 7,
+                thread_id: 11,
+                class_name: "PreviewTest".into(),
+            },
             x: 0,
             y: 0,
             w: 750,

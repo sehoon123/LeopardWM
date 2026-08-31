@@ -427,7 +427,7 @@ async fn reload_config_and_hotkeys(
     settings::push_failed_binds(&hotkey_state.failed_binds);
     sync_tray_toggles(tray_manager, &new_config);
     if let Some(ref overlay) = snap_hint_overlay {
-        overlay.set_opacity(new_config.snap_hints.opacity);
+        publish_resize_preview(|| overlay.set_opacity(new_config.snap_hints.opacity));
     }
 }
 
@@ -723,6 +723,66 @@ async fn stop_animation_worker_and_run_recovery(
     run_visibility_recovery_pass(&managed_window_ids, "post-animation-worker");
 }
 
+/// Serialize generation validation with every write and with overlay teardown.
+/// The generation atomics select the owner; this gate makes that check and the
+/// raw HWND mutation one indivisible publication step.
+static RESIZE_PREVIEW_WRITER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_resize_preview_writer(writer: &std::sync::Mutex<()>) -> std::sync::MutexGuard<'_, ()> {
+    writer
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn with_resize_preview_writer(writer: &std::sync::Mutex<()>, action: impl FnOnce()) {
+    let _writer = lock_resize_preview_writer(writer);
+    action();
+}
+
+fn publish_resize_preview(publish: impl FnOnce()) {
+    with_resize_preview_writer(&RESIZE_PREVIEW_WRITER, publish);
+}
+
+fn replace_resize_preview_with(
+    writer: &std::sync::Mutex<()>,
+    invalidate: impl FnOnce(),
+    replace: impl FnOnce(),
+) {
+    with_resize_preview_writer(writer, || {
+        invalidate();
+        replace();
+    });
+}
+
+fn replace_resize_preview(state: &mut AppState, replace: impl FnOnce()) {
+    replace_resize_preview_with(
+        &RESIZE_PREVIEW_WRITER,
+        || state.invalidate_resize_preview_animation(),
+        replace,
+    );
+}
+
+fn invalidate_resize_preview_animation_fenced(state: &mut AppState) {
+    replace_resize_preview(state, || {});
+}
+
+fn publish_resize_preview_if_owned(
+    generation: u64,
+    cancel: &std::sync::atomic::AtomicBool,
+    current_generation: &std::sync::atomic::AtomicU64,
+    writer: &std::sync::Mutex<()>,
+    publish: impl FnOnce(),
+) -> bool {
+    use std::sync::atomic::Ordering;
+
+    let _writer = lock_resize_preview_writer(writer);
+    if cancel.load(Ordering::Acquire) || current_generation.load(Ordering::Acquire) != generation {
+        return false;
+    }
+    publish();
+    true
+}
+
 /// Clear resize-preview activity only when this thread still owns the active
 /// generation. Kept separate from the Win32 loop so generation ownership is
 /// deterministically testable without DwmFlush.
@@ -797,10 +857,18 @@ fn resize_preview_animation_loop(animation: ResizePreviewAnimation) {
             crate::state::lerp_i32(start.width, target.width, t),
             crate::state::lerp_i32(start.height, target.height, t),
         );
-        // Direct SetWindowPos — zero indirection, zero channel latency. The
-        // generation check immediately above prevents a delayed DwmFlush from
-        // writing a replacement overlay generation or a destroyed overlay HWND.
-        leopardwm_platform_win32::overlay::reposition_overlay(overlay_hwnd, rect);
+        // Recheck ownership while holding the same gate used by direct
+        // replacement writes and teardown. A generation invalidated after the
+        // quick check above can no longer pass this publication point.
+        if !publish_resize_preview_if_owned(
+            generation,
+            &cancel,
+            &current_generation,
+            &RESIZE_PREVIEW_WRITER,
+            || leopardwm_platform_win32::overlay::reposition_overlay(overlay_hwnd, rect),
+        ) {
+            break;
+        }
         if done {
             break;
         }
@@ -1861,8 +1929,10 @@ async fn handle_ipc_command(
                 handle.abort();
             }
 
-            // Show the snap hint
-            overlay.show_snap_target(rect);
+            // Replace any border-resize writer and show the command hint.
+            let mut state = ctx.state.lock().await;
+            replace_resize_preview(&mut state, || overlay.show_snap_target(rect));
+            drop(state);
 
             // Schedule hide after duration
             let hide_tx = ctx.event_tx.clone();
@@ -2177,7 +2247,7 @@ async fn process_window_event(ctx: &mut EventLoopCtx<'_>, daemon_event: DaemonWi
                     if matches!(win_event, WindowEvent::MoveSizeEnd(_))
                         && state.resize_hwnd == Some(hwnd)
                     {
-                        state.invalidate_resize_preview_animation();
+                        invalidate_resize_preview_animation_fenced(&mut state);
                     }
                 }
             }
@@ -2207,15 +2277,17 @@ async fn process_window_event(ctx: &mut EventLoopCtx<'_>, daemon_event: DaemonWi
                 if let Some(ref overlay) = ctx.snap_hint_overlay {
                     match hint {
                         crate::state::DragHintAction::ShowGhost { rect } => {
-                            overlay.show_snap_target(leopardwm_core_layout::Rect::new(
-                                rect.x,
-                                rect.y,
-                                rect.width,
-                                rect.height,
-                            ));
+                            replace_resize_preview(&mut state, || {
+                                overlay.show_snap_target(leopardwm_core_layout::Rect::new(
+                                    rect.x,
+                                    rect.y,
+                                    rect.width,
+                                    rect.height,
+                                ));
+                            });
                         }
                         crate::state::DragHintAction::Hide => {
-                            overlay.hide();
+                            replace_resize_preview(&mut state, || overlay.hide());
                         }
                     }
                 }
@@ -2243,9 +2315,12 @@ async fn process_window_event(ctx: &mut EventLoopCtx<'_>, daemon_event: DaemonWi
             // dropping that raw-overlay handle and creating a second writer.
             if let Some(req) = state.pending_resize_animation.take() {
                 if let Some(ref overlay) = ctx.snap_hint_overlay {
-                    state.invalidate_resize_preview_animation();
+                    invalidate_resize_preview_animation_fenced(&mut state);
                     if state.reap_resize_preview_thread() {
-                        let (generation, cancel) = state.begin_resize_preview_animation();
+                        let (generation, cancel) = {
+                            let _writer = lock_resize_preview_writer(&RESIZE_PREVIEW_WRITER);
+                            state.begin_resize_preview_animation()
+                        };
                         let current_generation = state.resize_preview_generation.clone();
                         let active_generation = state.resize_animation_active_generation.clone();
                         let active = state.resize_animation_active.clone();
@@ -2268,12 +2343,16 @@ async fn process_window_event(ctx: &mut EventLoopCtx<'_>, daemon_event: DaemonWi
                             Err(error) => {
                                 warn!("Failed to spawn resize-preview animation: {error}");
                                 state.resize_preview_display_rect = Some(req.target_rect);
-                                overlay.show_snap_target(req.target_rect);
+                                replace_resize_preview(&mut state, || {
+                                    overlay.show_snap_target(req.target_rect)
+                                });
                             }
                         }
                     } else {
                         state.resize_preview_display_rect = Some(req.target_rect);
-                        overlay.show_snap_target(req.target_rect);
+                        replace_resize_preview(&mut state, || {
+                            overlay.show_snap_target(req.target_rect)
+                        });
                     }
                 }
             }
@@ -2344,8 +2423,10 @@ async fn handle_hotkey_event(
                 handle.abort();
             }
 
-            // Show the snap hint
-            overlay.show_snap_target(rect);
+            // Replace any border-resize writer and show the command hint.
+            let mut state = ctx.state.lock().await;
+            replace_resize_preview(&mut state, || overlay.show_snap_target(rect));
+            drop(state);
 
             // Schedule hide after duration
             let hide_tx = ctx.event_tx.clone();
@@ -4096,7 +4177,8 @@ async fn run_daemon_event_loop(
             }
             DaemonEvent::HideSnapHint => {
                 if let Some(overlay) = ctx.snap_hint_overlay {
-                    overlay.hide();
+                    let mut state = ctx.state.lock().await;
+                    replace_resize_preview(&mut state, || overlay.hide());
                     debug!("Snap hint hidden");
                 }
             }
@@ -4252,7 +4334,7 @@ async fn main() -> Result<()> {
     // drag ghost preview always works regardless.
     let snap_hint_overlay: Option<OverlayWindow> = match OverlayWindow::new() {
         Ok(overlay) => {
-            overlay.set_opacity(config.snap_hints.opacity);
+            publish_resize_preview(|| overlay.set_opacity(config.snap_hints.opacity));
             info!(
                 "Overlay initialized (snap hints {}, opacity {})",
                 if config.snap_hints.enabled {
@@ -4395,8 +4477,15 @@ async fn main() -> Result<()> {
     // this generation before another SetWindowPos.
     {
         let mut state = state.lock().await;
-        state.invalidate_resize_preview_animation();
+        invalidate_resize_preview_animation_fenced(&mut state);
         let _ = state.reap_resize_preview_thread();
+    }
+    {
+        // Crossing this gate proves that an old generation cannot still be
+        // between ownership validation and a raw-HWND write. Keep it held
+        // while the overlay destroys that HWND.
+        let _writer = lock_resize_preview_writer(&RESIZE_PREVIEW_WRITER);
+        drop(snap_hint_overlay);
     }
     if let Some(forwarder) = hotkey_state.forwarder.take() {
         thread_handles.push(forwarder);

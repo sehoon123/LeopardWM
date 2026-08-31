@@ -64,6 +64,49 @@ fn test_resize_preview_only_owning_generation_clears_active() {
 }
 
 #[test]
+fn resize_preview_replacement_rejects_stale_writer() {
+    use std::sync::{Mutex, TryLockError};
+
+    let writer = Mutex::new(());
+    let generation = std::sync::atomic::AtomicU64::new(1);
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    let writes = Mutex::new(Vec::new());
+    let gate_is_held = || matches!(writer.try_lock(), Err(TryLockError::WouldBlock));
+
+    assert!(publish_resize_preview_if_owned(
+        1,
+        &cancel,
+        &generation,
+        &writer,
+        || {
+            assert!(gate_is_held(), "validation and raw write must be atomic");
+            writes.lock().unwrap().push(1);
+        },
+    ));
+    replace_resize_preview_with(
+        &writer,
+        || {
+            assert!(gate_is_held(), "invalidation must own the write gate");
+            generation.store(2, Ordering::Release);
+            cancel.store(true, Ordering::Release);
+        },
+        || {
+            assert!(gate_is_held(), "replacement must share invalidation's gate");
+            writes.lock().unwrap().push(2);
+        },
+    );
+
+    assert!(!publish_resize_preview_if_owned(
+        1,
+        &cancel,
+        &generation,
+        &writer,
+        || writes.lock().unwrap().push(1),
+    ));
+    assert_eq!(*writes.lock().unwrap(), vec![1, 2]);
+}
+
+#[test]
 fn stale_tab_workspace_identity_is_rejected() {
     let mut app = AppState::new_with_config(test_config(), test_monitors());
     app.paused = true;

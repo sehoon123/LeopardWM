@@ -19,7 +19,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
 use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
 
-use crate::window_id_to_hwnd;
+use crate::{current_window_event_identity, window_id_to_hwnd, WindowEventIdentity};
 use leopardwm_core_layout::WindowId;
 
 /// `PW_RENDERFULLCONTENT` (Win 8.1+): asks DWM to render the window's
@@ -46,7 +46,7 @@ pub struct Snapshot {
 /// LRU-ish snapshot store: entries are stamped at insert; eviction drops
 /// the smallest stamp. Plain data, unit-testable without GDI.
 struct SnapshotCache {
-    entries: HashMap<u64, (u64, Arc<Snapshot>)>,
+    entries: HashMap<u64, (u64, WindowEventIdentity, Arc<Snapshot>)>,
     next_stamp: u64,
 }
 
@@ -58,15 +58,15 @@ impl SnapshotCache {
         }
     }
 
-    fn insert(&mut self, wid: u64, snap: Snapshot) {
+    fn insert(&mut self, wid: u64, identity: WindowEventIdentity, snap: Snapshot) {
         let stamp = self.next_stamp;
         self.next_stamp += 1;
-        self.entries.insert(wid, (stamp, Arc::new(snap)));
+        self.entries.insert(wid, (stamp, identity, Arc::new(snap)));
         while self.entries.len() > MAX_ENTRIES {
             let Some(&oldest) = self
                 .entries
                 .iter()
-                .min_by_key(|(_, (stamp, _))| *stamp)
+                .min_by_key(|(_, (stamp, _, _))| *stamp)
                 .map(|(wid, _)| wid)
             else {
                 break;
@@ -75,8 +75,16 @@ impl SnapshotCache {
         }
     }
 
-    fn get(&self, wid: u64) -> Option<Arc<Snapshot>> {
-        self.entries.get(&wid).map(|(_, snap)| Arc::clone(snap))
+    fn get(&mut self, wid: u64, identity: &WindowEventIdentity) -> Option<Arc<Snapshot>> {
+        if self
+            .entries
+            .get(&wid)
+            .is_some_and(|(_, cached, _)| cached != identity)
+        {
+            self.entries.remove(&wid);
+            return None;
+        }
+        self.entries.get(&wid).map(|(_, _, snap)| Arc::clone(snap))
     }
 
     fn remove(&mut self, wid: u64) {
@@ -90,23 +98,47 @@ fn cache() -> MutexGuard<'static, SnapshotCache> {
     CACHE.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+fn capture_stable_snapshot(
+    mut current_identity: impl FnMut() -> Option<WindowEventIdentity>,
+    capture: impl FnOnce() -> Option<Snapshot>,
+) -> Option<(WindowEventIdentity, Snapshot)> {
+    let identity = current_identity()?;
+    let snapshot = capture()?;
+    (current_identity().as_ref() == Some(&identity)).then_some((identity, snapshot))
+}
+
 /// Capture `wid` into the snapshot cache (replacing any previous entry).
-/// Returns false when the window is gone or the capture fails; the old
-/// cached snapshot (if any) is kept in that case.
+/// Returns false when the window is gone, capture fails, or the HWND changes
+/// incarnation during the potentially slow PrintWindow operation.
 pub fn snapshot_capture(wid: WindowId) -> bool {
     let Ok(hwnd) = window_id_to_hwnd(wid) else {
         return false;
     };
-    let Some(snap) = (unsafe { capture_window(hwnd) }) else {
+    let Some((identity, snapshot)) = capture_stable_snapshot(
+        || current_window_event_identity(wid),
+        || unsafe { capture_window(hwnd) },
+    ) else {
         return false;
     };
-    cache().insert(wid, snap);
+    cache().insert(wid, identity, snapshot);
     true
 }
 
-/// Fetch the cached snapshot for `wid`, if any.
+fn get_stable_snapshot(
+    mut current_identity: impl FnMut() -> Option<WindowEventIdentity>,
+    get: impl FnOnce(&WindowEventIdentity) -> Option<Arc<Snapshot>>,
+) -> Option<Arc<Snapshot>> {
+    let identity = current_identity()?;
+    let snapshot = get(&identity)?;
+    (current_identity().as_ref() == Some(&identity)).then_some(snapshot)
+}
+
+/// Fetch the cached snapshot for the current incarnation of `wid`, if any.
 pub fn snapshot_get(wid: WindowId) -> Option<Arc<Snapshot>> {
-    cache().get(wid)
+    get_stable_snapshot(
+        || current_window_event_identity(wid),
+        |identity| cache().get(wid, identity),
+    )
 }
 
 /// Drop the cached snapshot for `wid` (window destroyed / unmanaged).
@@ -237,21 +269,32 @@ mod tests {
         }
     }
 
+    fn identity(token: u64) -> WindowEventIdentity {
+        WindowEventIdentity {
+            token,
+            process_id: 7,
+            thread_id: 11,
+            class_name: "SnapshotTest".into(),
+        }
+    }
+
     #[test]
     fn test_cache_evicts_oldest_beyond_capacity() {
         let mut cache = SnapshotCache::new();
         for wid in 0..(MAX_ENTRIES as u64 + 5) {
-            cache.insert(wid, dummy(4, 4));
+            cache.insert(wid, identity(wid + 1), dummy(4, 4));
         }
         assert_eq!(cache.entries.len(), MAX_ENTRIES);
         for wid in 0..5 {
             assert!(
-                cache.get(wid).is_none(),
+                cache.get(wid, &identity(wid + 1)).is_none(),
                 "oldest entry {wid} must be evicted"
             );
         }
         assert!(
-            cache.get(MAX_ENTRIES as u64 + 4).is_some(),
+            cache
+                .get(MAX_ENTRIES as u64 + 4, &identity(MAX_ENTRIES as u64 + 5))
+                .is_some(),
             "newest entry stays"
         );
     }
@@ -260,15 +303,18 @@ mod tests {
     fn test_cache_reinsert_refreshes_stamp() {
         let mut cache = SnapshotCache::new();
         for wid in 0..MAX_ENTRIES as u64 {
-            cache.insert(wid, dummy(4, 4));
+            cache.insert(wid, identity(wid + 1), dummy(4, 4));
         }
         // Refresh wid 0, then overflow by one: wid 1 (now oldest) goes.
-        cache.insert(0, dummy(8, 8));
-        cache.insert(999, dummy(4, 4));
-        assert!(cache.get(0).is_some(), "refreshed entry survives");
-        assert!(cache.get(1).is_none(), "stale entry evicted");
+        cache.insert(0, identity(100), dummy(8, 8));
+        cache.insert(999, identity(999), dummy(4, 4));
+        assert!(
+            cache.get(0, &identity(100)).is_some(),
+            "refreshed entry survives"
+        );
+        assert!(cache.get(1, &identity(2)).is_none(), "stale entry evicted");
         assert_eq!(
-            cache.get(0).unwrap().width,
+            cache.get(0, &identity(100)).unwrap().width,
             8,
             "refresh replaced the snapshot"
         );
@@ -277,9 +323,50 @@ mod tests {
     #[test]
     fn test_cache_remove() {
         let mut cache = SnapshotCache::new();
-        cache.insert(7, dummy(4, 4));
+        cache.insert(7, identity(7), dummy(4, 4));
         cache.remove(7);
-        assert!(cache.get(7).is_none());
+        assert!(cache.get(7, &identity(7)).is_none());
+    }
+
+    #[test]
+    fn snapshot_capture_requires_stable_identity() {
+        let old = identity(41);
+        let replacement = identity(42);
+        let mut identities = [Some(old), Some(replacement)].into_iter();
+
+        assert!(
+            capture_stable_snapshot(|| identities.next().flatten(), || Some(dummy(4, 4)),)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn snapshot_retrieval_requires_stable_identity() {
+        let old = identity(41);
+        let replacement = identity(42);
+        let mut identities = [Some(old.clone()), Some(replacement)].into_iter();
+        let mut cache = SnapshotCache::new();
+        cache.insert(7, old, dummy(4, 4));
+
+        assert!(get_stable_snapshot(
+            || identities.next().flatten(),
+            |identity| cache.get(7, identity),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn snapshot_cache_rejects_recycled_hwnd_identity() {
+        let mut cache = SnapshotCache::new();
+        let old = identity(41);
+        let replacement = identity(42);
+
+        cache.insert(7, old.clone(), dummy(4, 4));
+        assert!(cache.get(7, &replacement).is_none());
+
+        cache.insert(7, replacement.clone(), dummy(8, 8));
+        assert_eq!(cache.get(7, &replacement).unwrap().width, 8);
+        assert!(cache.get(7, &old).is_none());
     }
 
     #[test]

@@ -2,6 +2,27 @@
 
 All notable changes to LeopardWM will be documented in this file.
 
+## 0.2.16-sehoon.33
+
+### Fixes
+
+- Serialize resize-preview generation invalidation, raw overlay publication,
+  direct replacement, and HWND teardown under one writer gate. A stale DWM-flush
+  thread can no longer overwrite a newer hint, reshow a hidden overlay, or write
+  through a destroyed/recycled overlay handle.
+- Bind animation position, inset, renderer classification, oversize-confirmation,
+  and compositor-return receipts to the exact `WindowEventIdentity`. A recycled
+  numeric HWND cannot inherit a placement skip or physical-repair obligation.
+- Carry the expected incarnation through compositor nudges and validate it before,
+  between, and after the resize pair.
+- Bind overview snapshot pixels to the capturing HWND incarnation and reject an
+  identity change during capture or retrieval.
+
+### Tests
+
+- Add deterministic writer-gate, recycled-placement/nudge/return-repair, and
+  stable snapshot capture/retrieval regressions.
+
 ## 0.2.15-sehoon.32
 
 ### Fixes
