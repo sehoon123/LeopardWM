@@ -4923,6 +4923,137 @@ fn test_slow_successful_apply_refreshes_moved_or_resized_suppression() {
 }
 
 #[test]
+fn persistent_geometry_mismatch_is_excluded_after_guarded_retry() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.paused = false;
+    state
+        .focused_workspace_mut()
+        .unwrap()
+        .insert_window(100, Some(800))
+        .unwrap();
+    state.injected_apply_placements_behavior =
+        Some(TestApplyPlacementsBehavior::SleepAndSucceedWithGeometryMismatch(Duration::ZERO, 100));
+
+    state
+        .apply_layout()
+        .expect("one guarded geometry retry is nonfatal");
+    assert_eq!(
+        state.injected_apply_placements_count.load(Ordering::SeqCst),
+        2,
+        "the first refusal gets exactly one guarded corrective pass"
+    );
+    assert!(
+        state.last_placed_layout_rects.contains_key(&100),
+        "the guarded refusal must retain its desired-rect receipt"
+    );
+
+    // If the unchanged-layout cache was discarded again by the guarded pass,
+    // this injected failure runs and the second apply fails. A retained receipt
+    // takes the fast path without another physical attempt.
+    state.injected_apply_placements_behavior = Some(TestApplyPlacementsBehavior::FailIfWorkerRuns);
+    state
+        .apply_layout()
+        .expect("an unchanged refused rect must not be retried indefinitely");
+    assert_eq!(
+        state.injected_apply_placements_count.load(Ordering::SeqCst),
+        2,
+        "an unchanged direct apply must not start another worker"
+    );
+}
+
+#[test]
+fn settled_geometry_mismatch_suppresses_only_identical_delayed_feedback() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.paused = false;
+    state
+        .focused_workspace_mut()
+        .unwrap()
+        .insert_window(100, Some(800))
+        .unwrap();
+    let viewport = state.layout_viewport(1);
+    let requested = state
+        .focused_workspace()
+        .unwrap()
+        .compute_placements(viewport)[0]
+        .rect;
+    let observed = Rect::new(
+        requested.x + 100,
+        requested.y,
+        requested.width + 100,
+        requested.height,
+    );
+    state.last_placed_layout_rects.insert(100, requested);
+    state.window_incarnations.insert(
+        100,
+        crate::events::WindowIncarnation {
+            token: 7,
+            process_id: 1,
+            thread_id: 1,
+            class_name: "probe".into(),
+        },
+    );
+    state.settled_geometry_mismatches.insert(
+        100,
+        SettledGeometryMismatch {
+            requested,
+            observed,
+            incarnation_token: 7,
+        },
+    );
+    state.injected_window_visible_rects.insert(100, observed);
+    state.injected_apply_placements_behavior = Some(TestApplyPlacementsBehavior::FailIfWorkerRuns);
+
+    state.handle_window_event(WindowEvent::MovedOrResized(100));
+    assert_eq!(
+        state.injected_apply_placements_count.load(Ordering::SeqCst),
+        0,
+        "identical delayed feedback must not restart placement"
+    );
+    assert!(state.settled_geometry_mismatches.contains_key(&100));
+
+    // A recycled incarnation is new information: revoke the receipt and try
+    // one physical landing instead of suppressing the replacement HWND.
+    state.window_incarnations.get_mut(&100).unwrap().token = 8;
+    state.handle_window_event(WindowEvent::MovedOrResized(100));
+    assert_eq!(
+        state.injected_apply_placements_count.load(Ordering::SeqCst),
+        1,
+        "identity change must attempt a fresh placement"
+    );
+    assert!(!state.settled_geometry_mismatches.contains_key(&100));
+
+    let receipt = SettledGeometryMismatch {
+        requested,
+        observed,
+        incarnation_token: 8,
+    };
+    assert!(!receipt.still_matches(
+        Rect::new(
+            requested.x,
+            requested.y,
+            requested.width + 1,
+            requested.height
+        ),
+        observed,
+        Some(8),
+        20,
+    ));
+    assert!(!receipt.still_matches(
+        requested,
+        Rect::new(observed.x + 21, observed.y, observed.width, observed.height),
+        Some(8),
+        20,
+    ));
+
+    state.settled_geometry_mismatches.insert(100, receipt);
+    state.handle_window_event(WindowEvent::MoveSizeStart(100));
+    assert!(
+        !state.settled_geometry_mismatches.contains_key(&100),
+        "a real OS move loop must revoke the settled refusal"
+    );
+}
+
+#[test]
 fn test_move_size_start_releases_placement_event_suppression() {
     let mut state = AppState::new_with_config(test_config(), test_monitors());
     state.paused = false;

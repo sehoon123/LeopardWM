@@ -1626,6 +1626,7 @@ impl AppState {
         // A real OS move loop owns this HWND now. Do not let completion-relative
         // suppression intended for our last SetWindowPos hide user movement.
         self.moved_or_resized_suppression.remove(&hwnd);
+        self.settled_geometry_mismatches.remove(&hwnd);
 
         // Distinguish resize (border drag) from move (title bar drag).
         // Only create drag state for moves — resizes should not trigger
@@ -1836,6 +1837,15 @@ impl AppState {
         leopardwm_platform_win32::set_dwm_transitions_disabled(hwnd, false);
     }
 
+    #[cfg_attr(not(test), allow(clippy::unused_self))]
+    fn event_visible_rect(&self, hwnd: u64) -> Option<Rect> {
+        #[cfg(test)]
+        if let Some(rect) = self.injected_window_visible_rects.get(&hwnd) {
+            return Some(*rect);
+        }
+        leopardwm_platform_win32::get_window_visible_rect(hwnd)
+    }
+
     /// Handle a window move/resize notification.
     fn on_window_moved_or_resized(&mut self, hwnd: u64) {
         // Skip events triggered by our own apply_layout() to avoid feedback loop.
@@ -1965,7 +1975,32 @@ impl AppState {
                 // of pixels off, so 20px comfortably separates them.
                 const POSITION_EPSILON_PX: i32 = 20;
                 let expected = self.last_placed_layout_rects.get(&hwnd).copied();
-                let dwm_actual = leopardwm_platform_win32::get_window_visible_rect(hwnd);
+                let dwm_actual = self.event_visible_rect(hwnd);
+                let incarnation_token =
+                    self.window_incarnations.get(&hwnd).map(|value| value.token);
+                let settled_refusal =
+                    expected.zip(dwm_actual).is_some_and(|(requested, actual)| {
+                        self.settled_geometry_mismatches
+                            .get(&hwnd)
+                            .is_some_and(|receipt| {
+                                receipt.still_matches(
+                                    requested,
+                                    actual,
+                                    incarnation_token,
+                                    POSITION_EPSILON_PX,
+                                )
+                            })
+                    });
+                if settled_refusal {
+                    debug!(
+                        "Ignoring repeated MovedOrResized for {} — same settled geometry refusal",
+                        hwnd
+                    );
+                    return;
+                }
+                // Any different identity, target or observed rectangle is new
+                // information and deserves one fresh physical landing.
+                self.settled_geometry_mismatches.remove(&hwnd);
                 // Cross-check with GetWindowRect — for Chromium /
                 // Firefox / Cascadia under the swap-chain-stale bug,
                 // EXTENDED_FRAME_BOUNDS reports the visual content

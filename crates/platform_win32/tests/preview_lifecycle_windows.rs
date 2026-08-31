@@ -731,6 +731,26 @@ fn ordered_real_preview_lifecycle_contract() {
         "moving a published preview must keep the host surface shown; hiding it blanks the edge strip for the whole withdraw/republish round-trip"
     );
 
+    let busy_hit_source = SourceWindow::new();
+    assert!(
+        integration_probe::armed_hit_test_fails_closed_when_preview_state_is_busy(
+            busy_hit_source.hwnd as u64,
+            Rect::new(140, 40, 200, 150),
+        )
+        .expect("busy-state armed hit-test probe must run"),
+        "an armed WM_NCHITTEST must answer HTTRANSPARENT without blocking the pump on preview state"
+    );
+
+    let retry_transaction_source = SourceWindow::new();
+    assert!(
+        integration_probe::pending_retry_cannot_hide_newer_exact_commit(
+            retry_transaction_source.hwnd as u64,
+            Rect::new(190, 40, 200, 150),
+        )
+        .expect("retry transaction ordering probe must run"),
+        "a retry waiting behind an exact commit must not hide that commit before it owns the preview transaction"
+    );
+
     let cloak_source = SourceWindow::new();
     assert!(
         integration_probe::placement_cloak_failure_is_not_cached(cloak_source.hwnd as u64),

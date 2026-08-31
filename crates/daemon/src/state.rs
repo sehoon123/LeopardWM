@@ -174,8 +174,37 @@ pub(crate) const EDIT_CONFIG_PULL_TTL: Duration = Duration::from_secs(10);
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum TestApplyPlacementsBehavior {
     SleepAndSucceed(Duration),
+    SleepAndSucceedWithGeometryMismatch(Duration, u64),
     SleepAndFail(Duration),
+    FailIfWorkerRuns,
     FailWorkerSpawn,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SettledGeometryMismatch {
+    pub(crate) requested: Rect,
+    pub(crate) observed: Rect,
+    pub(crate) incarnation_token: u64,
+}
+
+impl SettledGeometryMismatch {
+    pub(crate) fn still_matches(
+        self,
+        requested: Rect,
+        observed: Rect,
+        incarnation_token: Option<u64>,
+        tolerance: i32,
+    ) -> bool {
+        let tolerance = i64::from(tolerance.max(0));
+        let within =
+            |left: i32, right: i32| (i64::from(left) - i64::from(right)).abs() <= tolerance;
+        self.requested == requested
+            && incarnation_token == Some(self.incarnation_token)
+            && within(self.observed.x, observed.x)
+            && within(self.observed.y, observed.y)
+            && within(self.observed.width, observed.width)
+            && within(self.observed.height, observed.height)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -488,6 +517,10 @@ pub(crate) struct AppState {
     /// rect within a few pixels, the layout is already correct and we skip
     /// the expensive full-retile snap-back.
     pub(crate) last_placed_layout_rects: HashMap<u64, leopardwm_core_layout::Rect>,
+    /// A window that refused the same desired rectangle twice. The receipt is
+    /// incarnation- and observed-geometry-bound so repeated LOCATIONCHANGE
+    /// feedback is ignored without masking a real state/identity/target change.
+    pub(crate) settled_geometry_mismatches: HashMap<u64, SettledGeometryMismatch>,
     /// Cooperative cancellation flag for placement workers during shutdown/revert.
     pub(crate) apply_worker_cancelled: Arc<AtomicBool>,
     /// Monotonic token to invalidate stale workers when shutdown starts.
@@ -616,9 +649,15 @@ pub(crate) struct AppState {
     /// entries from this map instead of calling `enumerate_windows()`.
     #[cfg(test)]
     pub(crate) injected_window_info: HashMap<u64, leopardwm_platform_win32::WindowInfo>,
+    /// Injected visible HWND geometry for deterministic MovedOrResized tests.
+    #[cfg(test)]
+    pub(crate) injected_window_visible_rects: HashMap<u64, Rect>,
     /// Optional test-only behavior override for placement application.
     #[cfg(test)]
     pub(crate) injected_apply_placements_behavior: Option<TestApplyPlacementsBehavior>,
+    /// Number of injected placement-worker executions.
+    #[cfg(test)]
+    pub(crate) injected_apply_placements_count: Arc<AtomicUsize>,
     /// Fault injection for scratchpad's direct verified park/raise operations.
     #[cfg(test)]
     pub(crate) injected_scratchpad_park_failure: bool,
@@ -888,6 +927,7 @@ impl AppState {
             pending_drag_hint: None,
             moved_or_resized_suppression: HashMap::new(),
             last_placed_layout_rects: HashMap::new(),
+            settled_geometry_mismatches: HashMap::new(),
             apply_worker_cancelled: Arc::new(AtomicBool::new(false)),
             apply_epoch: Arc::new(AtomicU64::new(0)),
             pending_apply_workers: Vec::new(),
@@ -924,7 +964,11 @@ impl AppState {
             #[cfg(test)]
             injected_window_info: HashMap::new(),
             #[cfg(test)]
+            injected_window_visible_rects: HashMap::new(),
+            #[cfg(test)]
             injected_apply_placements_behavior: None,
+            #[cfg(test)]
+            injected_apply_placements_count: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             injected_scratchpad_park_failure: false,
             #[cfg(test)]

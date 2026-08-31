@@ -340,6 +340,28 @@ fn resolve_dwm_handle(handle: isize) -> isize {
         .unwrap_or(handle)
 }
 
+#[cfg_attr(test, allow(dead_code))]
+fn resolve_dwm_handle_nonblocking(handle: isize) -> Option<isize> {
+    match Z_ORDER_STATE.try_lock() {
+        Ok(state) => Some(
+            state
+                .registrations
+                .get(&handle)
+                .map(|ownership| ownership.dwm_handle)
+                .unwrap_or(handle),
+        ),
+        Err(std::sync::TryLockError::Poisoned(error)) => Some(
+            error
+                .into_inner()
+                .registrations
+                .get(&handle)
+                .map(|ownership| ownership.dwm_handle)
+                .unwrap_or(handle),
+        ),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
 fn unregister_dwm_handle(dwm_handle: isize) -> Result<(), Win32Error> {
     #[cfg(feature = "integration-probes")]
     if FORCE_NEXT_UNREGISTER_FAILURE.swap(false, Ordering::AcqRel) {
@@ -733,6 +755,27 @@ struct RegistrationFenceProbe {
 }
 #[cfg(feature = "integration-probes")]
 static REGISTRATION_FENCE_PROBE: Mutex<Option<RegistrationFenceProbe>> = Mutex::new(None);
+#[cfg(feature = "integration-probes")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryTransactionProbeOutcome {
+    Completed { retry_needed: bool },
+    Cancelled,
+}
+#[cfg(feature = "integration-probes")]
+struct RetryTransactionProbe {
+    token: u64,
+    reached: mpsc::SyncSender<()>,
+    release: mpsc::Receiver<()>,
+    completed: mpsc::SyncSender<RetryTransactionProbeOutcome>,
+}
+#[cfg(feature = "integration-probes")]
+static RETRY_TRANSACTION_PROBE: Mutex<Option<RetryTransactionProbe>> = Mutex::new(None);
+#[cfg(feature = "integration-probes")]
+static NEXT_RETRY_TRANSACTION_PROBE_TOKEN: AtomicU64 = AtomicU64::new(1);
+#[cfg(feature = "integration-probes")]
+static LATEST_RETRY_TRANSACTION_PROBE_TOKEN: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "integration-probes")]
+static CANCELLED_RETRY_TRANSACTION_PROBE_TOKEN: AtomicU64 = AtomicU64::new(0);
 #[cfg(not(test))]
 static PREVIEW_RETRY_TX: Mutex<Option<mpsc::SyncSender<()>>> = Mutex::new(None);
 #[cfg(not(test))]
@@ -811,6 +854,24 @@ fn preview_source_invalidation_generation(window_id: WindowId) -> Option<u64> {
         .as_ref()?
         .get(&window_id)
         .map(|invalidation| invalidation.generation)
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn preview_source_is_invalidated_nonblocking(window_id: WindowId) -> Option<bool> {
+    match INVALIDATED_PREVIEW_SOURCES.try_lock() {
+        Ok(sources) => Some(
+            sources
+                .as_ref()
+                .is_some_and(|sources| sources.contains_key(&window_id)),
+        ),
+        Err(std::sync::TryLockError::Poisoned(error)) => Some(
+            error
+                .into_inner()
+                .as_ref()
+                .is_some_and(|sources| sources.contains_key(&window_id)),
+        ),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
 }
 
 pub(crate) fn preview_source_is_invalidated(window_id: WindowId) -> bool {
@@ -908,6 +969,15 @@ fn lock_persistent_previews() -> std::sync::MutexGuard<'static, PersistentPrevie
     persistent_previews()
         .lock()
         .unwrap_or_else(crate::recover_poisoned_mutex)
+}
+
+fn try_lock_persistent_previews() -> Option<std::sync::MutexGuard<'static, PersistentPreviewState>>
+{
+    match persistent_previews().try_lock() {
+        Ok(state) => Some(state),
+        Err(std::sync::TryLockError::Poisoned(error)) => Some(error.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
 }
 
 pub(crate) fn lock_persistent_preview_transaction() -> std::sync::MutexGuard<'static, ()> {
@@ -1041,13 +1111,7 @@ pub(crate) fn prepare_persistent_preview(window_id: WindowId) -> bool {
 }
 
 fn persistent_preview_presence_nonblocking(window_id: WindowId) -> Option<bool> {
-    match persistent_previews().try_lock() {
-        Ok(state) => Some(state.previews.contains_key(&window_id)),
-        Err(std::sync::TryLockError::Poisoned(error)) => {
-            Some(error.into_inner().previews.contains_key(&window_id))
-        }
-        Err(std::sync::TryLockError::WouldBlock) => None,
-    }
+    try_lock_persistent_previews().map(|state| state.previews.contains_key(&window_id))
 }
 
 pub(crate) fn has_persistent_preview_nonblocking(window_id: WindowId) -> bool {
@@ -1101,10 +1165,19 @@ pub fn current_persistent_preview_rect(
     }
     #[cfg(not(test))]
     {
-        if preview_source_is_invalidated(window_id) {
+        // Per-source invalidation is also preview-owned state. Contention must
+        // fail closed just like the publication lookup below; blocking here
+        // would still park the input pump before it reached that lookup.
+        if preview_source_is_invalidated_nonblocking(window_id) != Some(false) {
             return None;
         }
-        let state = lock_persistent_previews();
+        // This function is called from WM_NCHITTEST on the input pump. A
+        // re-anchor waits for that same pump's raise acknowledgement while
+        // holding preview state, so blocking here prevents the pump from ever
+        // reaching the raise. Hit testing is fail-closed: contention means the
+        // overlay is transparent for this message, never that identity checks
+        // may be skipped.
+        let state = try_lock_persistent_previews()?;
         if !state.host_anchored || state.lifecycle_epoch != preview_lifecycle_epoch() {
             return None;
         }
@@ -1123,7 +1196,9 @@ pub fn current_persistent_preview_rect(
             && preview.source_thread_id == live_thread_id
             && preview.source_class_at_register == class_name_hwnd(source)
             && preview.publication_generation == publication_generation
-            && source_size(preview.handle.as_isize()).is_some())
+            // Resolving the opaque DWM token normally takes Z_ORDER_STATE.
+            // Hit testing cannot wait for that preview-owned mutex either.
+            && source_size_nonblocking(preview.handle.as_isize()).is_some())
         .then_some(published.request.destination_screen_rect)
     }
 }
@@ -1533,6 +1608,16 @@ fn schedule_preview_retry() {
         return;
     }
     PREVIEW_RETRY_PENDING.store(true, Ordering::Release);
+    #[cfg(feature = "integration-probes")]
+    {
+        let token = RETRY_TRANSACTION_PROBE
+            .lock()
+            .unwrap_or_else(crate::recover_poisoned_mutex)
+            .as_ref()
+            .map(|probe| probe.token)
+            .unwrap_or(0);
+        LATEST_RETRY_TRANSACTION_PROBE_TOKEN.store(token, Ordering::Release);
+    }
     let mut slot = PREVIEW_RETRY_TX
         .lock()
         .unwrap_or_else(crate::recover_poisoned_mutex);
@@ -1551,46 +1636,116 @@ fn schedule_preview_retry() {
             // new token for the next loop iteration.
             PREVIEW_RETRY_PENDING.store(false, Ordering::Release);
             let mut retry_round = 0u32;
+            #[cfg(feature = "integration-probes")]
+            let retry_token = LATEST_RETRY_TRANSACTION_PROBE_TOKEN.load(Ordering::Acquire);
             loop {
                 retry_round += 1;
-                let _ = host().hide_surface();
-                crate::preview_input::set_preview_targets_armed(false);
-                // A host restart or a previous failed registration can leave a
-                // desired request without a handle. Re-attempt registration
-                // outside the state lock, then publish the exact newest desire.
-                let desired_for_registration = lock_persistent_previews().desired.clone();
-                for request in &desired_for_registration {
-                    if !preview_source_is_invalidated(request.window_id) {
-                        let _ = prepare_persistent_preview(request.window_id);
-                    }
-                }
-                let retry_state = {
-                    let _transaction = lock_persistent_preview_transaction();
-                    let mut state = lock_persistent_previews();
-                    let requests = state.desired.clone();
-                    let preview_generation = state.generation;
-                    let outcome = publish_preview_requests_locked(&mut state, &requests, true);
-                    let input_generation = sync_published_preview_targets(&state);
-                    (preview_generation, outcome.retry_needed, input_generation)
-                };
-                let (preview_generation, mut retry_needed, input_generation) = retry_state;
-                let input_applied = input_generation.is_some_and(|generation| {
-                    crate::preview_input::wait_for_applied_generation(
-                        generation,
-                        Duration::from_millis(150),
-                    )
-                });
-                if input_applied {
-                    let _transaction = lock_persistent_preview_transaction();
-                    let mut state = lock_persistent_previews();
-                    if state.generation != preview_generation {
+                // A deterministic probe pauses immediately before transaction
+                // acquisition. It is bound to this exact wake token, so an old
+                // sleeping round cannot satisfy a newer probe. Timeout or an
+                // explicit cancellation aborts before withdrawal.
+                #[cfg(feature = "integration-probes")]
+                let mut retry_probe_completion = None;
+                #[cfg(feature = "integration-probes")]
+                {
+                    let probe = {
+                        let mut slot = RETRY_TRANSACTION_PROBE
+                            .lock()
+                            .unwrap_or_else(crate::recover_poisoned_mutex);
+                        if slot
+                            .as_ref()
+                            .is_some_and(|probe| probe.token == retry_token)
+                        {
+                            slot.take()
+                        } else {
+                            None
+                        }
+                    };
+                    if CANCELLED_RETRY_TRANSACTION_PROBE_TOKEN.load(Ordering::Acquire)
+                        == retry_token
+                        && retry_token != 0
+                    {
+                        if let Some(probe) = probe {
+                            let _ = probe
+                                .completed
+                                .send(RetryTransactionProbeOutcome::Cancelled);
+                        }
+                        PREVIEW_RETRY_PENDING.store(false, Ordering::Release);
                         break;
                     }
-                    retry_needed |= !activate_published_surface(&mut state);
-                } else {
-                    // Keep handles and desire for another bounded retry,
-                    // but never expose pixels without acknowledged input.
-                    retry_needed = true;
+                    if let Some(probe) = probe {
+                        let released = probe.reached.send(()).is_ok()
+                            && probe.release.recv_timeout(Duration::from_secs(2)).is_ok()
+                            && CANCELLED_RETRY_TRANSACTION_PROBE_TOKEN.load(Ordering::Acquire)
+                                != retry_token;
+                        if !released {
+                            let _ = probe
+                                .completed
+                                .send(RetryTransactionProbeOutcome::Cancelled);
+                            PREVIEW_RETRY_PENDING.store(false, Ordering::Release);
+                            break;
+                        }
+                        retry_probe_completion = Some(probe.completed);
+                    }
+                }
+                // Withdrawal is part of the same transaction as registration,
+                // publication, input acknowledgement and activation. Hiding
+                // before taking this guard let a stale retry blank a newer exact
+                // landing and then wait behind that landing with the host hidden.
+                let retry_state = {
+                    let _transaction = lock_persistent_preview_transaction();
+                    let _ = host().hide_surface();
+                    crate::preview_input::set_preview_targets_armed(false);
+                    // A host restart or a previous failed registration can leave
+                    // a desired request without a handle. Re-attempt registration
+                    // outside the state lock, then publish the exact newest desire.
+                    let desired_for_registration = lock_persistent_previews().desired.clone();
+                    for request in &desired_for_registration {
+                        if !preview_source_is_invalidated(request.window_id) {
+                            let _ = prepare_persistent_preview(request.window_id);
+                        }
+                    }
+                    let (preview_generation, mut retry_needed, input_generation) = {
+                        let mut state = lock_persistent_previews();
+                        let requests = state.desired.clone();
+                        let preview_generation = state.generation;
+                        let outcome = publish_preview_requests_locked(&mut state, &requests, true);
+                        let input_generation = sync_published_preview_targets(&state);
+                        (preview_generation, outcome.retry_needed, input_generation)
+                    };
+                    let input_applied = input_generation.is_some_and(|generation| {
+                        crate::preview_input::wait_for_applied_generation(
+                            generation,
+                            Duration::from_millis(150),
+                        )
+                    });
+                    if input_applied {
+                        let mut state = lock_persistent_previews();
+                        if state.generation != preview_generation {
+                            None
+                        } else {
+                            retry_needed |= !activate_published_surface(&mut state);
+                            Some((preview_generation, retry_needed))
+                        }
+                    } else {
+                        // Keep handles and desire for another bounded retry,
+                        // but never expose pixels without acknowledged input.
+                        Some((preview_generation, true))
+                    }
+                };
+                let Some((preview_generation, retry_needed)) = retry_state else {
+                    #[cfg(feature = "integration-probes")]
+                    if let Some(completed) = retry_probe_completion {
+                        let _ = completed.send(RetryTransactionProbeOutcome::Completed {
+                            retry_needed: false,
+                        });
+                    }
+                    break;
+                };
+                #[cfg(feature = "integration-probes")]
+                if let Some(completed) = retry_probe_completion {
+                    let _ =
+                        completed.send(RetryTransactionProbeOutcome::Completed { retry_needed });
                 }
                 if !retry_needed {
                     PREVIEW_RETRY_PENDING.store(false, Ordering::Release);
@@ -2184,6 +2339,16 @@ pub fn source_size(handle: isize) -> Option<(i32, i32)> {
         return None;
     }
     Some((size.cx, size.cy))
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn source_size_nonblocking(handle: isize) -> Option<(i32, i32)> {
+    if handle == 0 {
+        return None;
+    }
+    let size =
+        unsafe { DwmQueryThumbnailSourceSize(resolve_dwm_handle_nonblocking(handle)?) }.ok()?;
+    (size.cx > 0 && size.cy > 0).then_some((size.cx, size.cy))
 }
 
 /// Unregister a thumbnail by its opaque transfer token. Used by the worker
@@ -3045,11 +3210,12 @@ pub mod integration_probe {
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, DispatchMessageW, EnumWindows, GetClassNameW, GetCursorPos,
-        GetWindowLongPtrW, IsWindow, IsWindowVisible, PeekMessageW, SendMessageW, SetCursorPos,
-        SetWindowPos, SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WindowFromPoint,
-        GWLP_USERDATA, HTTRANSPARENT, HWND_TOPMOST, LLMHF_INJECTED, LLMHF_LOWER_IL_INJECTED, MSG,
-        MSLLHOOKSTRUCT, PM_REMOVE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, WH_MOUSE_LL,
-        WM_LBUTTONDOWN, WM_NCHITTEST,
+        GetWindowLongPtrW, IsWindow, IsWindowVisible, PeekMessageW, SendMessageTimeoutW,
+        SendMessageW, SetCursorPos, SetWindowPos, SetWindowsHookExW, TranslateMessage,
+        UnhookWindowsHookEx, WindowFromPoint, GWLP_USERDATA, HTTRANSPARENT, HWND_TOPMOST,
+        LLMHF_INJECTED, LLMHF_LOWER_IL_INJECTED, MSG, MSLLHOOKSTRUCT, PM_REMOVE,
+        SEND_MESSAGE_TIMEOUT_FLAGS, SMTO_ABORTIFHUNG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+        WH_MOUSE_LL, WM_LBUTTONDOWN, WM_NCHITTEST,
     };
 
     /// Provenance detector for the physical-click gate.
@@ -3221,6 +3387,23 @@ pub mod integration_probe {
             )
             .0
         }
+    }
+
+    fn bounded_hit_test(hwnd: HWND, point: POINT) -> Option<isize> {
+        let packed = ((point.y as u16 as u32) << 16) | point.x as u16 as u32;
+        let mut result = 0usize;
+        let sent = unsafe {
+            SendMessageTimeoutW(
+                hwnd,
+                WM_NCHITTEST,
+                WPARAM(0),
+                LPARAM(packed as isize),
+                SEND_MESSAGE_TIMEOUT_FLAGS(SMTO_ABORTIFHUNG.0),
+                100,
+                Some(&mut result),
+            )
+        };
+        (sent.0 != 0).then_some(result as isize)
     }
 
     pub fn two_target_z_order_is_valid() -> bool {
@@ -3620,6 +3803,162 @@ pub mod integration_probe {
             && hides_during_move == 0)
     }
 
+    /// An armed hit test must answer immediately when preview state is busy.
+    /// Before the nonblocking lookup, this SendMessage parked the input pump on
+    /// the mutex and prevented it from processing the raise being acknowledged.
+    pub fn armed_hit_test_fails_closed_when_preview_state_is_busy(
+        window_id: WindowId,
+        destination: Rect,
+    ) -> Result<bool, Win32Error> {
+        #[cfg(test)]
+        {
+            let _ = (window_id, destination);
+            Ok(false)
+        }
+        #[cfg(not(test))]
+        {
+            invalidate_persistent_preview_surface();
+            clear_persistent_previews()?;
+            let result = (|| {
+                let epoch = preview_lifecycle_epoch();
+                if !prepare_persistent_preview(window_id) {
+                    return Ok(false);
+                }
+                let request = probe_request(window_id, destination)?;
+                let live = commit_persistent_previews(&[request], true, epoch, None, true)?;
+                let Some(target_raw) = probe_windows()
+                    .into_iter()
+                    .find(|(_, class, id)| {
+                        class == "LeopardWMPreviewClickTarget" && *id == window_id
+                    })
+                    .map(|(raw, _, _)| raw)
+                else {
+                    return Ok(false);
+                };
+                let target = HWND(target_raw as *mut c_void);
+                let point = POINT {
+                    x: destination.x + destination.width / 2,
+                    y: destination.y + destination.height / 2,
+                };
+                let preview_state_transparent = {
+                    let _busy = lock_persistent_previews();
+                    bounded_hit_test(target, point) == Some(HTTRANSPARENT as isize)
+                };
+                let invalidation_state_transparent = {
+                    let _busy = INVALIDATED_PREVIEW_SOURCES
+                        .lock()
+                        .unwrap_or_else(crate::recover_poisoned_mutex);
+                    bounded_hit_test(target, point) == Some(HTTRANSPARENT as isize)
+                };
+                let z_order_state_transparent = {
+                    let _busy = Z_ORDER_STATE
+                        .lock()
+                        .unwrap_or_else(crate::recover_poisoned_mutex);
+                    bounded_hit_test(target, point) == Some(HTTRANSPARENT as isize)
+                };
+                Ok(live == 1
+                    && preview_state_transparent
+                    && invalidation_state_transparent
+                    && z_order_state_transparent)
+            })();
+            invalidate_persistent_preview_surface();
+            let clear = clear_persistent_previews();
+            match (result, clear) {
+                (Ok(proven), Ok(())) => Ok(proven),
+                (Err(error), _) => Err(error),
+                (_, Err(error)) => Err(error),
+            }
+        }
+    }
+
+    /// A retry may wait behind an exact landing, but it must not withdraw that
+    /// landing before it owns the transaction that will republish it.
+    pub fn pending_retry_cannot_hide_newer_exact_commit(
+        window_id: WindowId,
+        destination: Rect,
+    ) -> Result<bool, Win32Error> {
+        #[cfg(test)]
+        {
+            let _ = (window_id, destination);
+            Ok(false)
+        }
+        #[cfg(not(test))]
+        {
+            invalidate_persistent_preview_surface();
+            clear_persistent_previews()?;
+            PREVIEW_RETRY_PENDING.store(false, Ordering::Release);
+            let result = (|| {
+                let epoch = preview_lifecycle_epoch();
+                if !prepare_persistent_preview(window_id) {
+                    return Ok(false);
+                }
+                let request = probe_request(window_id, destination)?;
+                let live = commit_persistent_previews(&[request], true, epoch, None, true)?;
+                let shown = unsafe { IsWindowVisible(host().hwnd()) }.as_bool();
+                let token = NEXT_RETRY_TRANSACTION_PROBE_TOKEN
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                        Some(value.wrapping_add(1).max(1))
+                    })
+                    .unwrap_or_else(|value| value);
+                let (reached_tx, reached_rx) = mpsc::sync_channel(1);
+                let (release_tx, release_rx) = mpsc::sync_channel(1);
+                let (completed_tx, completed_rx) = mpsc::sync_channel(1);
+                *RETRY_TRANSACTION_PROBE
+                    .lock()
+                    .unwrap_or_else(crate::recover_poisoned_mutex) = Some(RetryTransactionProbe {
+                    token,
+                    reached: reached_tx,
+                    release: release_rx,
+                    completed: completed_tx,
+                });
+                let transaction = lock_persistent_preview_transaction();
+                let hides_before = HOST_HIDE_COUNT.load(Ordering::Acquire);
+                schedule_preview_retry();
+                let reached = reached_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+                let hides_while_owned = HOST_HIDE_COUNT.load(Ordering::Acquire) - hides_before;
+                if !reached {
+                    CANCELLED_RETRY_TRANSACTION_PROBE_TOKEN.store(token, Ordering::Release);
+                }
+                let _ = release_tx.send(());
+                drop(transaction);
+                let completed_without_retry = completed_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .is_ok_and(|outcome| {
+                        outcome
+                            == RetryTransactionProbeOutcome::Completed {
+                                retry_needed: false,
+                            }
+                    });
+                if !completed_without_retry {
+                    // The worker reports before its next backoff/round. Revoke
+                    // this exact token on every failed outcome so teardown cannot
+                    // be followed by another hide from the same probed wake.
+                    CANCELLED_RETRY_TRANSACTION_PROBE_TOKEN.store(token, Ordering::Release);
+                }
+                if !reached {
+                    let mut slot = RETRY_TRANSACTION_PROBE
+                        .lock()
+                        .unwrap_or_else(crate::recover_poisoned_mutex);
+                    if slot.as_ref().is_some_and(|probe| probe.token == token) {
+                        slot.take();
+                    }
+                }
+                Ok(live == 1
+                    && shown
+                    && reached
+                    && hides_while_owned == 0
+                    && completed_without_retry)
+            })();
+            invalidate_persistent_preview_surface();
+            let clear = clear_persistent_previews();
+            match (result, clear) {
+                (Ok(proven), Ok(())) => Ok(proven),
+                (Err(error), _) => Err(error),
+                (_, Err(error)) => Err(error),
+            }
+        }
+    }
+
     pub fn placement_cloak_failure_is_not_cached(source_window_id: WindowId) -> bool {
         use leopardwm_core_layout::{Visibility, WindowPlacement};
 
@@ -3964,7 +4303,20 @@ pub mod integration_probe {
             x: destination.x + destination.width / 2,
             y: destination.y + destination.height / 2,
         };
-        let armed_hit_test = hit_test(target, point) != HTTRANSPARENT as isize;
+        // Production receives repeated hit tests as the pointer moves. A
+        // nonblocking identity check may transparently reject one message while
+        // another preview-owned mutex is briefly busy, so the controlled probe
+        // waits boundedly for the first fully validated armed answer.
+        let hit_deadline = Instant::now() + Duration::from_millis(500);
+        let mut armed_hit_test = false;
+        while Instant::now() < hit_deadline {
+            armed_hit_test = bounded_hit_test(target, point)
+                .is_some_and(|value| value != HTTRANSPARENT as isize);
+            if armed_hit_test {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
         let mut point_owner = unsafe { WindowFromPoint(point) };
         if point_owner != target {
             // A user's unrelated normal-band window may cover the fixed probe
@@ -3999,7 +4351,7 @@ pub mod integration_probe {
         let mut previous_cursor = POINT::default();
         let cursor_saved =
             !require_physical_click && unsafe { GetCursorPos(&mut previous_cursor) }.is_ok();
-        let routed_input_sent = if require_physical_click {
+        let click_event_delivered = if require_physical_click {
             // BEL: this gate depends on a human reacting inside 60 seconds, and
             // the prompt otherwise scrolls past in a build log.
             eprintln!(
@@ -4009,41 +4361,61 @@ pub mod integration_probe {
                 physical_click_timeout().as_secs()
             );
             point_hits_target
+                && wait_for_physical_click(
+                    &click_rx,
+                    expected_click_target,
+                    physical_click_timeout(),
+                )
         } else {
-            point_hits_target
-                && unsafe { SetCursorPos(point.x, point.y) }.is_ok()
-                && unsafe {
-                    let inputs = [
-                        INPUT {
-                            r#type: INPUT_MOUSE,
-                            Anonymous: INPUT_0 {
-                                mi: MOUSEINPUT {
-                                    dwFlags: MOUSEEVENTF_LEFTDOWN,
-                                    ..Default::default()
+            // A real pointer produces repeated hit tests. The automated path
+            // must do the same because one message may intentionally fail closed
+            // while preview identity state is briefly busy.
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let mut delivered = false;
+            while Instant::now() < deadline {
+                let target_ready = bounded_hit_test(target, point)
+                    .is_some_and(|value| value != HTTRANSPARENT as isize)
+                    && unsafe { WindowFromPoint(point) } == target;
+                let sent = target_ready
+                    && unsafe { SetCursorPos(point.x, point.y) }.is_ok()
+                    && unsafe {
+                        let inputs = [
+                            INPUT {
+                                r#type: INPUT_MOUSE,
+                                Anonymous: INPUT_0 {
+                                    mi: MOUSEINPUT {
+                                        dwFlags: MOUSEEVENTF_LEFTDOWN,
+                                        ..Default::default()
+                                    },
                                 },
                             },
-                        },
-                        INPUT {
-                            r#type: INPUT_MOUSE,
-                            Anonymous: INPUT_0 {
-                                mi: MOUSEINPUT {
-                                    dwFlags: MOUSEEVENTF_LEFTUP,
-                                    ..Default::default()
+                            INPUT {
+                                r#type: INPUT_MOUSE,
+                                Anonymous: INPUT_0 {
+                                    mi: MOUSEINPUT {
+                                        dwFlags: MOUSEEVENTF_LEFTUP,
+                                        ..Default::default()
+                                    },
                                 },
                             },
-                        },
-                    ];
-                    SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) == inputs.len() as u32
+                        ];
+                        SendInput(&inputs, std::mem::size_of::<INPUT>() as i32)
+                            == inputs.len() as u32
+                    };
+                if sent
+                    && click_rx
+                        .recv_timeout(Duration::from_millis(100))
+                        .is_ok_and(|event| {
+                            click_receipt_matches_target(event, expected_click_target)
+                        })
+                {
+                    delivered = true;
+                    break;
                 }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            delivered
         };
-        let click_event_delivered = routed_input_sent
-            && if require_physical_click {
-                wait_for_physical_click(&click_rx, expected_click_target, physical_click_timeout())
-            } else {
-                click_rx
-                    .recv_timeout(Duration::from_secs(1))
-                    .is_ok_and(|event| click_receipt_matches_target(event, expected_click_target))
-            };
         if cursor_saved {
             let _ = unsafe { SetCursorPos(previous_cursor.x, previous_cursor.y) };
         }

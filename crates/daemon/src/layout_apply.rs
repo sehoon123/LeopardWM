@@ -956,7 +956,11 @@ impl AppState {
         // Tests that inject worker behavior need the worker to actually
         // run, so they opt out of the fast path.
         #[cfg(test)]
-        let bypass_fast_path = self.injected_apply_placements_behavior.is_some();
+        let bypass_fast_path = self
+            .injected_apply_placements_behavior
+            .is_some_and(|behavior| {
+                !matches!(behavior, TestApplyPlacementsBehavior::FailIfWorkerRuns)
+            });
         #[cfg(not(test))]
         let bypass_fast_path = false;
         let identities_current = all_placements.iter().all(|placement| {
@@ -970,6 +974,8 @@ impl AppState {
         if !identities_current {
             for placement in &all_placements {
                 self.last_placed_layout_rects.remove(&placement.window_id);
+                self.settled_geometry_mismatches
+                    .remove(&placement.window_id);
             }
         }
         if identities_current
@@ -997,6 +1003,7 @@ impl AppState {
                         window_id
                     );
                     self.last_placed_layout_rects.remove(&window_id);
+                    self.settled_geometry_mismatches.remove(&window_id);
                 }
             }
         }
@@ -1022,6 +1029,7 @@ impl AppState {
             Ok(worker) => worker,
             Err(error) => {
                 self.last_placed_layout_rects.clear();
+                self.settled_geometry_mismatches.clear();
                 self.moved_or_resized_suppression.clear();
                 self.applying_layout = false;
                 return Err(error);
@@ -1046,11 +1054,20 @@ impl AppState {
                     false
                 };
                 let geometry_changed = result.is_ok() && !geometry_mismatches.is_empty();
+                if result.is_ok() {
+                    let mismatched: std::collections::HashSet<_> =
+                        geometry_mismatches.iter().copied().collect();
+                    for window_id in &timeout_candidate_ids {
+                        if !mismatched.contains(window_id) {
+                            self.settled_geometry_mismatches.remove(window_id);
+                        }
+                    }
+                }
                 // A geometry-only correction has the same desired layout
                 // rectangles, so evict just the mismatched HWNDs before the
                 // guarded re-apply; otherwise the fast-path would skip the
                 // SetWindowPos that needs to use freshly queried insets.
-                if geometry_changed {
+                if geometry_changed && !self.reapplying_after_violation {
                     for hwnd in &geometry_mismatches {
                         self.last_placed_layout_rects.remove(hwnd);
                     }
@@ -1066,12 +1083,29 @@ impl AppState {
                 if geometry_changed && self.reapplying_after_violation {
                     // The placement itself succeeded; these windows simply
                     // refused the rect they were given, which a window in its
-                    // own fullscreen mode always will. Failing the whole apply
-                    // for them discarded a layout that had already landed for
-                    // every other window, and since the next event re-applied
-                    // and failed again, one uncooperative window made the
-                    // manager look completely dead. Report it, stop correcting
-                    // those windows, and keep the layout that did land.
+                    // own fullscreen mode always will. Bind the refusal to its
+                    // incarnation, requested rect and observed rect. Identical
+                    // delayed LOCATIONCHANGE feedback is then harmless, while a
+                    // real target/identity/geometry change gets one fresh try.
+                    for window_id in &geometry_mismatches {
+                        self.settled_geometry_mismatches.remove(window_id);
+                        if let (Some(requested), Some(observed), Some(incarnation_token)) = (
+                            self.last_placed_layout_rects.get(window_id).copied(),
+                            leopardwm_platform_win32::get_window_visible_rect(*window_id),
+                            self.window_incarnations
+                                .get(window_id)
+                                .map(|identity| identity.token),
+                        ) {
+                            self.settled_geometry_mismatches.insert(
+                                *window_id,
+                                SettledGeometryMismatch {
+                                    requested,
+                                    observed,
+                                    incarnation_token,
+                                },
+                            );
+                        }
+                    }
                     warn!(
                         "Keeping the applied layout; {} window(s) would not accept their \
                          requested geometry and are left as they are: {:?}",
@@ -1150,6 +1184,7 @@ impl AppState {
             // failed or timed-out batch did not reliably apply them, so an
             // identical next layout must retry instead of returning early.
             self.last_placed_layout_rects.clear();
+            self.settled_geometry_mismatches.clear();
         }
         self.applying_layout = false;
 
@@ -1320,10 +1355,25 @@ impl AppState {
         // "no extra entries" guard fails forever after the first
         // Ctrl+Alt+1-9 — silently nullifying the rapid-Ctrl+Alt+Right/Left
         // perf fix for every multi-workspace user.
-        let active_ids: std::collections::HashSet<u64> =
-            all_placements.iter().map(|p| p.window_id).collect();
+        let active_rects: HashMap<u64, leopardwm_core_layout::Rect> = all_placements
+            .iter()
+            .filter(|placement| {
+                matches!(
+                    placement.visibility,
+                    leopardwm_core_layout::Visibility::Visible
+                )
+            })
+            .map(|placement| (placement.window_id, placement.rect))
+            .collect();
         self.last_placed_layout_rects
-            .retain(|id, _| active_ids.contains(id));
+            .retain(|id, _| active_rects.contains_key(id));
+        let incarnations = &self.window_incarnations;
+        self.settled_geometry_mismatches.retain(|id, receipt| {
+            active_rects.get(id) == Some(&receipt.requested)
+                && incarnations
+                    .get(id)
+                    .is_some_and(|identity| identity.token == receipt.incarnation_token)
+        });
         for p in all_placements {
             if matches!(p.visibility, leopardwm_core_layout::Visibility::Visible) {
                 self.last_placed_layout_rects.insert(p.window_id, p.rect);
@@ -1369,6 +1419,8 @@ impl AppState {
         #[cfg(test)]
         let injected_behavior = self.injected_apply_placements_behavior;
         #[cfg(test)]
+        let injected_apply_placements_count = self.injected_apply_placements_count.clone();
+        #[cfg(test)]
         let late_worker_recovery_count = self.late_worker_recovery_count.clone();
 
         #[cfg(test)]
@@ -1395,15 +1447,32 @@ impl AppState {
 
                 #[cfg(test)]
                 if let Some(behavior) = injected_behavior {
-                    let result = match behavior {
+                    injected_apply_placements_count.fetch_add(1, Ordering::SeqCst);
+                    let (result, geometry_mismatches) = match behavior {
                         TestApplyPlacementsBehavior::SleepAndSucceed(delay) => {
                             std::thread::sleep(delay);
-                            Ok(())
+                            (Ok(()), Vec::new())
+                        }
+                        TestApplyPlacementsBehavior::SleepAndSucceedWithGeometryMismatch(
+                            delay,
+                            window_id,
+                        ) => {
+                            std::thread::sleep(delay);
+                            (Ok(()), vec![window_id])
                         }
                         TestApplyPlacementsBehavior::SleepAndFail(delay) => {
                             std::thread::sleep(delay);
-                            Err(anyhow!("injected apply_placements failure"))
+                            (
+                                Err(anyhow!("injected apply_placements failure")),
+                                Vec::new(),
+                            )
                         }
+                        TestApplyPlacementsBehavior::FailIfWorkerRuns => (
+                            Err(anyhow!(
+                                "injected worker ran after settled geometry refusal"
+                            )),
+                            Vec::new(),
+                        ),
                         TestApplyPlacementsBehavior::FailWorkerSpawn => unreachable!(
                             "spawn-failure injection returns before creating the worker"
                         ),
@@ -1418,7 +1487,7 @@ impl AppState {
                         let _ = tx.send((Ok(()), Vec::new(), Vec::new(), Vec::new()));
                         return;
                     }
-                    let _ = tx.send((result, Vec::new(), Vec::new(), Vec::new()));
+                    let _ = tx.send((result, Vec::new(), Vec::new(), geometry_mismatches));
                     return;
                 }
 

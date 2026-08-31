@@ -2,6 +2,30 @@
 
 All notable changes to LeopardWM will be documented in this file.
 
+## 0.2.14-sehoon.31
+
+### Fixes
+
+- Make every armed preview hit-test identity lookup nonblocking. Contention on
+  source-invalidation, publication, or DWM ownership state now fails closed to
+  `HTTRANSPARENT`, so the input pump can always process the z-order raise whose
+  acknowledgement is being awaited.
+- Serialize autonomous preview withdrawal, registration, publication, input
+  acknowledgement, and activation under one transaction. A stale retry can no
+  longer hide a newer exact landing while waiting behind it.
+- Remember a twice-refused placement by HWND incarnation, requested rectangle,
+  and observed rectangle. Identical delayed WinEvents no longer restart two
+  synchronous placement passes after the 250 ms feedback window; identity,
+  target, observed geometry, or a real user move still gets one fresh attempt.
+
+### Tests
+
+- Add bounded real-HWND probes for all three preview-owned mutexes and a
+  token-bound retry-order barrier that cannot pass from stale or late work.
+- Add deterministic placement fault injection covering the two-pass guard,
+  unchanged commands, delayed geometry feedback, identity/target changes, and
+  user-move invalidation.
+
 ## 0.2.13-sehoon.30
 
 ### Fixes

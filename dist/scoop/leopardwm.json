@@ -6,7 +6,7 @@
     "architecture": {
         "64bit": {
             "url": "https://github.com/sehoon123/LeopardWM/releases/download/v0.2.13-sehoon.30/LeopardWM-0.2.13-sehoon.30-x86_64-windows.zip",
-            "hash": "7837cfb5c55ec8a9706adbf76c52206a7581f15247ef75dcfb0b21ac7a176a05",
+            "hash": "a8df4631422a0e1766e550e5e68d940e44e33869f644d88f27aea3bfc5855b3e",
             "extract_dir": "LeopardWM-0.2.13-sehoon.30-x86_64-windows"
         }
     },
