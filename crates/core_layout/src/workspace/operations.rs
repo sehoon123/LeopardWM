@@ -348,6 +348,8 @@ impl Workspace {
             self.expel_to_left();
             return;
         }
+        self.queue_column_min_size_clears(self.focused_column);
+        self.queue_column_min_size_clears(self.focused_column - 1);
         let Some(wid) =
             self.columns[self.focused_column].remove_at_index(self.focused_window_in_column)
         else {
@@ -378,6 +380,8 @@ impl Workspace {
             self.expel_to_right();
             return;
         }
+        self.queue_column_min_size_clears(self.focused_column);
+        self.queue_column_min_size_clears(self.focused_column + 1);
         let Some(wid) =
             self.columns[self.focused_column].remove_at_index(self.focused_window_in_column)
         else {
@@ -404,6 +408,7 @@ impl Workspace {
         if !self.has_valid_focus() || self.columns[self.focused_column].len() <= 1 {
             return;
         }
+        self.queue_column_min_size_clears(self.focused_column);
         let Some(wid) =
             self.columns[self.focused_column].remove_at_index(self.focused_window_in_column)
         else {
@@ -429,6 +434,7 @@ impl Workspace {
         if !self.has_valid_focus() || self.columns[self.focused_column].len() <= 1 {
             return;
         }
+        self.queue_column_min_size_clears(self.focused_column);
         let Some(wid) =
             self.columns[self.focused_column].remove_at_index(self.focused_window_in_column)
         else {
@@ -457,6 +463,8 @@ impl Workspace {
         if right >= self.columns.len() {
             return;
         }
+        self.queue_column_min_size_clears(self.focused_column);
+        self.queue_column_min_size_clears(right);
         let Some(wid) = self.columns[right].remove_at_index(0) else {
             return;
         };
@@ -480,6 +488,8 @@ impl Workspace {
             return;
         }
         let left = self.focused_column - 1;
+        self.queue_column_min_size_clears(self.focused_column);
+        self.queue_column_min_size_clears(left);
         let Some(wid) = self.columns[left].remove_at_index(0) else {
             return;
         };

@@ -65,6 +65,15 @@ pub(crate) fn fullscreen_focus_guard(
 
 const FOCUS_INPUT_RECENT_MS: u32 = 1500;
 
+/// Consume a resize transaction only when the terminal event belongs to it.
+pub(crate) fn take_matching_resize(active: &mut Option<u64>, ended_hwnd: u64) -> bool {
+    if *active != Some(ended_hwnd) {
+        return false;
+    }
+    *active = None;
+    true
+}
+
 /// A same-column foreground event is safe to suppress only when it has neither
 /// a matching deliberate tab intent nor evidence of recent user input. Callers
 /// that suppress it must actively restore the prior foreground HWND; otherwise
@@ -1899,6 +1908,19 @@ impl AppState {
     fn on_move_size_end(&mut self, hwnd: u64) {
         debug!("User finished dragging/resizing window {}", hwnd);
 
+        if self.resize_hwnd.is_some_and(|active| active != hwnd) {
+            debug!("Ignoring MoveSizeEnd for {hwnd} — resize active for another window");
+            return;
+        }
+        if self
+            .drag_state
+            .as_ref()
+            .is_some_and(|drag| drag.hwnd != hwnd)
+        {
+            debug!("Ignoring MoveSizeEnd for {hwnd} — drag active for another window");
+            return;
+        }
+
         // The dragged/resized window has physically drifted from its
         // layout slot. Evict its last_placed entry so apply_layout's
         // fast-path can't short-circuit on no-layout-change drop
@@ -1910,26 +1932,12 @@ impl AppState {
         self.last_placed_layout_rects.remove(&hwnd);
 
         // Handle resize completion (border drag) — snap to nearest preset.
-        if self.resize_hwnd.take() == Some(hwnd) {
+        if take_matching_resize(&mut self.resize_hwnd, hwnd) {
             self.handle_resize_complete(hwnd);
             // Re-enable DWM transitions before returning (paired
             // with MoveSizeStart's disable). Each early-return path
             // needs this — otherwise the window's transitions stay
             // suppressed for the rest of its lifetime.
-            leopardwm_platform_win32::set_dwm_transitions_disabled(hwnd, false);
-            return;
-        }
-
-        // Verify this MoveSizeEnd matches the active drag — a mismatched
-        // event for a different window should not tear down the drag state.
-        if self.drag_state.as_ref().is_some_and(|d| d.hwnd != hwnd) {
-            debug!(
-                "Ignoring MoveSizeEnd for {} — drag active for different window",
-                hwnd
-            );
-            // Mismatched event — re-enable transitions on the hwnd
-            // we just got the event for; the original drag's hwnd
-            // will re-enable on its own MoveSizeEnd.
             leopardwm_platform_win32::set_dwm_transitions_disabled(hwnd, false);
             return;
         }

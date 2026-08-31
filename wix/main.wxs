@@ -71,6 +71,11 @@
                                 DiskId='1'
                                 Source='$(var.CargoTargetBinDir)\leopardwm.exe'
                                 KeyPath='yes'/>
+                            <RemoveFile
+                                Id='RemoveLegacyBuildInfo'
+                                Name='BUILDINFO.txt'
+                                Directory='Bin'
+                                On='both'/>
                         </Component>
                         <Component Id='CliExe' Guid='*'>
                             <File

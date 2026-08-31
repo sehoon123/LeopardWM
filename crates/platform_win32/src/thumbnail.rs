@@ -3225,16 +3225,48 @@ pub mod integration_probe {
     /// tooling — satisfies it and the hardware evidence can be fabricated. A
     /// low-level mouse hook is the only place the provenance survives.
     ///
-    /// `LLMHF_INJECTED` alone cannot be the rejection rule: vendor HID stacks
-    /// exist whose ordinary hardware clicks arrive flagged, carrying a nonzero
-    /// `dwExtraInfo` signature. Unprovenanced software injection is what this
-    /// tooling produces and what must be refused: flagged, with no extra info.
-    /// The accepted provenance is printed so a release receipt records exactly
-    /// what was proven. `LEOPARDWM_REQUIRE_NONINJECTED_CLICK` additionally
-    /// refuses any flagged click, for hosts with a clean input stack.
-    static PHYSICAL_CLICK_FLAGS: AtomicU32 = AtomicU32::new(0);
-    static PHYSICAL_CLICK_EXTRA: AtomicU64 = AtomicU64::new(0);
-    static PHYSICAL_CLICK_SEEN: AtomicBool = AtomicBool::new(false);
+    /// Each hook record is retained until the click target reports the exact
+    /// button-down message time, extra info, and screen point. A later genuine
+    /// click therefore cannot overwrite provenance for an injected target click.
+    #[derive(Debug, Clone, Copy)]
+    struct PhysicalClickProvenance {
+        message_time: u32,
+        extra_info: u64,
+        point: (i32, i32),
+        flags: u32,
+    }
+
+    static PHYSICAL_CLICK_PROVENANCE: LazyLock<
+        Mutex<std::collections::VecDeque<PhysicalClickProvenance>>,
+    > = LazyLock::new(|| Mutex::new(std::collections::VecDeque::new()));
+
+    pub fn click_provenance_key_matches(
+        event: crate::preview_input::PreviewClickEvent,
+        message_time: u32,
+        extra_info: u64,
+        point: (i32, i32),
+    ) -> bool {
+        event.press_message_time == message_time
+            && event.press_extra_info == extra_info
+            && event.press_point == point
+    }
+
+    fn take_click_provenance(
+        event: crate::preview_input::PreviewClickEvent,
+    ) -> Option<PhysicalClickProvenance> {
+        let mut records = PHYSICAL_CLICK_PROVENANCE
+            .lock()
+            .unwrap_or_else(crate::recover_poisoned_mutex);
+        let index = records.iter().position(|record| {
+            click_provenance_key_matches(
+                event,
+                record.message_time,
+                record.extra_info,
+                record.point,
+            )
+        })?;
+        records.remove(index)
+    }
 
     unsafe extern "system" fn injection_detector_proc(
         code: i32,
@@ -3243,9 +3275,18 @@ pub mod integration_probe {
     ) -> LRESULT {
         if code >= 0 && wparam.0 as u32 == WM_LBUTTONDOWN {
             let info = &*(lparam.0 as *const MSLLHOOKSTRUCT);
-            PHYSICAL_CLICK_FLAGS.store(info.flags, Ordering::Release);
-            PHYSICAL_CLICK_EXTRA.store(info.dwExtraInfo as u64, Ordering::Release);
-            PHYSICAL_CLICK_SEEN.store(true, Ordering::Release);
+            let mut records = PHYSICAL_CLICK_PROVENANCE
+                .lock()
+                .unwrap_or_else(crate::recover_poisoned_mutex);
+            records.push_back(PhysicalClickProvenance {
+                message_time: info.time,
+                extra_info: info.dwExtraInfo as u64,
+                point: (info.pt.x, info.pt.y),
+                flags: info.flags,
+            });
+            while records.len() > 64 {
+                records.pop_front();
+            }
         }
         CallNextHookEx(None, code, wparam, lparam)
     }
@@ -3271,9 +3312,10 @@ pub mod integration_probe {
         expected: crate::preview_input::PreviewClickTarget,
         timeout: Duration,
     ) -> bool {
-        PHYSICAL_CLICK_SEEN.store(false, Ordering::Release);
-        PHYSICAL_CLICK_FLAGS.store(0, Ordering::Release);
-        PHYSICAL_CLICK_EXTRA.store(0, Ordering::Release);
+        PHYSICAL_CLICK_PROVENANCE
+            .lock()
+            .unwrap_or_else(crate::recover_poisoned_mutex)
+            .clear();
         let installed =
             unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(injection_detector_proc), None, 0) };
         let Ok(hook) = installed else {
@@ -3281,7 +3323,7 @@ pub mod integration_probe {
             return false;
         };
         let deadline = Instant::now() + timeout;
-        let mut matched = false;
+        let mut matched = None;
         while Instant::now() < deadline {
             let mut message = MSG::default();
             while unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
@@ -3290,7 +3332,9 @@ pub mod integration_probe {
             }
             match click_rx.try_recv() {
                 Ok(event) => {
-                    matched = click_receipt_matches_target(event, expected);
+                    if click_receipt_matches_target(event, expected) {
+                        matched = take_click_provenance(event);
+                    }
                     break;
                 }
                 Err(mpsc::TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(5)),
@@ -3298,15 +3342,14 @@ pub mod integration_probe {
             }
         }
         let _ = unsafe { UnhookWindowsHookEx(hook) };
-        if !matched {
+        let Some(provenance) = matched else {
+            eprintln!(
+                "PHYSICAL_CLICK_REJECTED: no exact button-down provenance matched the preview receipt"
+            );
             return false;
-        }
-        if !PHYSICAL_CLICK_SEEN.load(Ordering::Acquire) {
-            eprintln!("PHYSICAL_CLICK_REJECTED: no button-down provenance was observed");
-            return false;
-        }
-        let flags = PHYSICAL_CLICK_FLAGS.load(Ordering::Acquire);
-        let extra = PHYSICAL_CLICK_EXTRA.load(Ordering::Acquire);
+        };
+        let flags = provenance.flags;
+        let extra = provenance.extra_info;
         let injected = flags & (LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED) != 0;
         eprintln!("PHYSICAL_CLICK_PROVENANCE: flags=0x{flags:X} extra_info=0x{extra:X}");
         if injected && extra == 0 {

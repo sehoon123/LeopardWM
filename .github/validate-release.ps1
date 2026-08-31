@@ -212,6 +212,65 @@ function Get-MsiFileNames {
     }
 }
 
+function Get-MsiRemoveFiles {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Database
+    )
+
+    $view = $Database.OpenView("SELECT ``FileKey``, ``Component_``, ``FileName``, ``DirProperty``, ``InstallMode`` FROM ``RemoveFile``")
+    try {
+        [void]$view.Execute()
+        while ($true) {
+            $record = $view.Fetch()
+            if ($null -eq $record) {
+                break
+            }
+            [pscustomobject]@{
+                FileKey = $record.StringData(1)
+                Component = $record.StringData(2)
+                FileName = ($record.StringData(3) -split '\|')[-1]
+                DirProperty = $record.StringData(4)
+                InstallMode = $record.IntegerData(5)
+            }
+        }
+    }
+    finally {
+        [void]$view.Close()
+    }
+}
+
+function Assert-MsiFileContract {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$ActualFiles,
+        [Parameter(Mandatory = $true)]
+        [object[]]$RemoveFiles
+    )
+
+    $expectedFiles = @('leopardwm.exe', 'leopardwm-cli.exe', 'lwm.exe', 'leopardwm-watchdog.exe', 'License.rtf')
+    if ($ActualFiles.Count -ne $expectedFiles.Count) {
+        throw "MSI file table must contain exactly $($expectedFiles.Count) files, got $($ActualFiles.Count)"
+    }
+    foreach ($expectedFile in $expectedFiles) {
+        if ($ActualFiles -cnotcontains $expectedFile) {
+            throw "MSI is missing expected file $expectedFile"
+        }
+    }
+
+    if ($RemoveFiles.Count -ne 1) {
+        throw "MSI RemoveFile table must contain exactly the legacy BUILDINFO cleanup row"
+    }
+    $cleanup = $RemoveFiles[0]
+    if ($cleanup.FileKey -cne 'RemoveLegacyBuildInfo' -or
+        $cleanup.Component -cne 'DaemonExe' -or
+        $cleanup.FileName -cne 'BUILDINFO.txt' -or
+        $cleanup.DirProperty -cne 'Bin' -or
+        [int]$cleanup.InstallMode -ne 3) {
+        throw "MSI daemon component must remove BUILDINFO.txt from Bin on install and uninstall"
+    }
+}
+
 function Assert-MsiIdentity {
     param(
         [Parameter(Mandatory = $true)]
@@ -235,13 +294,9 @@ function Assert-MsiIdentity {
             throw "MSI ProductVersion must match Cargo version $CargoVersion, got $productVersion"
         }
 
-        $expectedFiles = @('leopardwm.exe', 'leopardwm-cli.exe', 'lwm.exe', 'leopardwm-watchdog.exe', 'License.rtf')
         $actualFiles = @(Get-MsiFileNames -Database $database)
-        foreach ($expectedFile in $expectedFiles) {
-            if ($actualFiles -cnotcontains $expectedFile) {
-                throw "MSI is missing expected file $expectedFile"
-            }
-        }
+        $removeFiles = @(Get-MsiRemoveFiles -Database $database)
+        Assert-MsiFileContract -ActualFiles $actualFiles -RemoveFiles $removeFiles
     }
     finally {
         if ($null -ne $database) {

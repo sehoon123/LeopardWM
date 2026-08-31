@@ -496,6 +496,7 @@ impl Workspace {
             self.window_min_widths.remove(&window_id);
             self.window_min_heights.remove(&window_id);
             self.pending_min_size_clears.remove(&window_id);
+            self.minimized_windows.remove(&window_id);
             self.float_origin_column.remove(&window_id);
             if self.fullscreen_window == Some(window_id) {
                 self.fullscreen_window = None;

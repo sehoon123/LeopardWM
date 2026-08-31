@@ -44,7 +44,7 @@ use state::*;
 
 use anyhow::Result;
 use clap::Parser;
-use config::Config;
+use config::{ConditionalConfigSave, Config};
 use leopardwm_core_layout::Rect;
 use leopardwm_ipc::{preferred_pipe_name, IpcCommand, IpcResponse};
 use leopardwm_platform_win32::{
@@ -2540,6 +2540,40 @@ async fn launch_config_editor(ctx: &mut EventLoopCtx<'_>) {
     leopardwm_platform_win32::shell::open(&path);
 }
 
+fn persist_tray_config_with(
+    config: &mut Config,
+    previous: Config,
+    action: &str,
+    save: impl FnOnce(&Config, &str) -> Result<ConditionalConfigSave>,
+) -> bool {
+    let expected_revision = match previous.revision() {
+        Ok(revision) => revision,
+        Err(error) => {
+            *config = previous;
+            warn!("Tray: {action} could not identify the current config: {error}");
+            return false;
+        }
+    };
+    match save(config, &expected_revision) {
+        Ok(ConditionalConfigSave::Saved { .. }) => true,
+        Ok(ConditionalConfigSave::Conflict { .. }) => {
+            *config = previous;
+            warn!("Tray: {action} was rejected because Settings saved a newer config");
+            false
+        }
+        Err(error) => {
+            *config = previous;
+            warn!("Tray: {action} was not saved; restored previous value: {error}");
+            false
+        }
+    }
+}
+
+fn persist_tray_config(config: &mut Config, previous: Config, action: &str) -> bool {
+    persist_tray_config_with(config, previous, action, Config::save_if_current_revision)
+}
+
+#[allow(clippy::too_many_lines)]
 async fn handle_tray_event(ctx: &mut EventLoopCtx<'_>, tray_event: tray::TrayEvent) -> bool {
     match tray_event {
         tray::TrayEvent::Refresh => {
@@ -2687,64 +2721,74 @@ async fn handle_tray_event(ctx: &mut EventLoopCtx<'_>, tray_event: tray::TrayEve
         }
         tray::TrayEvent::ToggleActiveBorder => {
             let mut state = ctx.state.lock().await;
+            let previous = state.config.clone();
             state.config.appearance.active_border = !state.config.appearance.active_border;
             let on = state.config.appearance.active_border;
-            info!("Tray: Active border toggled to {}", on);
-            if on {
-                if let Some(hwnd) = state.previous_focused_hwnd {
-                    state.show_border(hwnd);
+            if persist_tray_config(&mut state.config, previous, "active-border change") {
+                info!("Tray: Active border toggled to {}", on);
+                if on {
+                    if let Some(hwnd) = state.previous_focused_hwnd {
+                        state.show_border(hwnd);
+                    }
+                } else {
+                    state.hide_border();
                 }
-            } else {
-                state.hide_border();
             }
-            let _ = state.config.save();
+            sync_tray_toggles(ctx.tray_manager, &state.config);
         }
         tray::TrayEvent::ToggleFocusNewWindows => {
             let mut state = ctx.state.lock().await;
+            let previous = state.config.clone();
             state.config.behavior.focus_new_windows = !state.config.behavior.focus_new_windows;
-            info!(
-                "Tray: Focus new windows toggled to {}",
-                state.config.behavior.focus_new_windows
-            );
-            let _ = state.config.save();
+            let enabled = state.config.behavior.focus_new_windows;
+            if persist_tray_config(&mut state.config, previous, "focus-new-windows change") {
+                info!("Tray: Focus new windows toggled to {}", enabled);
+            }
+            sync_tray_toggles(ctx.tray_manager, &state.config);
         }
         tray::TrayEvent::ToggleFocusFollowsMouse => {
             let enabled = {
                 let mut state = ctx.state.lock().await;
+                let previous = state.config.clone();
                 state.config.behavior.focus_follows_mouse =
                     !state.config.behavior.focus_follows_mouse;
-                info!(
-                    "Tray: Focus follows mouse toggled to {}",
-                    state.config.behavior.focus_follows_mouse
-                );
-                let _ = state.config.save();
-                state.config.behavior.focus_follows_mouse
+                let enabled = state.config.behavior.focus_follows_mouse;
+                persist_tray_config(&mut state.config, previous, "focus-follows-mouse change")
+                    .then_some(enabled)
             };
-            // Install or drop the hook now so the toggle takes effect without a
-            // restart; clear any pending focus when turning it off.
-            sync_mouse_hook(
-                enabled,
-                ctx.mouse_hook_handle,
-                ctx.event_tx,
-                ctx.forwarding_threads,
-            );
-            if !enabled {
-                if let Some(handle) = ctx.focus_follows_mouse_timer.take() {
-                    handle.abort();
+            if let Some(enabled) = enabled {
+                info!("Tray: Focus follows mouse toggled to {}", enabled);
+                // Install or drop the hook only after the setting is durable.
+                sync_mouse_hook(
+                    enabled,
+                    ctx.mouse_hook_handle,
+                    ctx.event_tx,
+                    ctx.forwarding_threads,
+                );
+                if !enabled {
+                    if let Some(handle) = ctx.focus_follows_mouse_timer.take() {
+                        handle.abort();
+                    }
                 }
             }
+            let state = ctx.state.lock().await;
+            sync_tray_toggles(ctx.tray_manager, &state.config);
         }
         tray::TrayEvent::ToggleHideOffscreenTaskbar => {
             let mut state = ctx.state.lock().await;
+            let previous = state.config.clone();
             state.config.behavior.hide_offscreen_taskbar_buttons =
                 !state.config.behavior.hide_offscreen_taskbar_buttons;
-            info!(
-                "Tray: Hide off-screen taskbar buttons toggled to {}",
-                state.config.behavior.hide_offscreen_taskbar_buttons
-            );
-            let _ = state.config.save();
-            // Apply live: hide off-view buttons, or restore all when turned off.
-            state.sync_taskbar_buttons();
+            let enabled = state.config.behavior.hide_offscreen_taskbar_buttons;
+            if persist_tray_config(&mut state.config, previous, "taskbar-button change") {
+                info!(
+                    "Tray: Hide off-screen taskbar buttons toggled to {}",
+                    enabled
+                );
+                // Apply live only after the setting is durable.
+                state.sync_taskbar_buttons();
+            }
+            sync_tray_toggles(ctx.tray_manager, &state.config);
         }
         tray::TrayEvent::ToggleAutoStart => {
             use leopardwm_platform_win32::autostart;
@@ -2773,14 +2817,16 @@ async fn handle_tray_event(ctx: &mut EventLoopCtx<'_>, tray_event: tray::TrayEve
         tray::TrayEvent::SetCenteringCenter => {
             let mut state = ctx.state.lock().await;
             if state.config.layout.centering_mode != config::CenteringModeConfig::Center {
+                let previous = state.config.clone();
                 state.config.layout.centering_mode = config::CenteringModeConfig::Center;
-                info!("Tray: Centering mode set to Center");
-                let cfg = state.config.clone();
-                state.apply_config(cfg);
-                if let Err(e) = state.apply_layout() {
-                    warn!("Layout apply after centering change failed: {}", e);
+                if persist_tray_config(&mut state.config, previous, "centering-mode change") {
+                    info!("Tray: Centering mode set to Center");
+                    let cfg = state.config.clone();
+                    state.apply_config(cfg);
+                    if let Err(e) = state.apply_layout() {
+                        warn!("Layout apply after centering change failed: {}", e);
+                    }
                 }
-                let _ = state.config.save();
             }
             sync_tray_toggles(ctx.tray_manager, &state.config);
         }
@@ -2791,46 +2837,54 @@ async fn handle_tray_event(ctx: &mut EventLoopCtx<'_>, tray_event: tray::TrayEve
         tray::TrayEvent::SetCenteringJustInView => {
             let mut state = ctx.state.lock().await;
             if state.config.layout.centering_mode != config::CenteringModeConfig::JustInView {
+                let previous = state.config.clone();
                 state.config.layout.centering_mode = config::CenteringModeConfig::JustInView;
-                info!("Tray: Centering mode set to JustInView");
-                let cfg = state.config.clone();
-                state.apply_config(cfg);
-                if let Err(e) = state.apply_layout() {
-                    warn!("Layout apply after centering change failed: {}", e);
+                if persist_tray_config(&mut state.config, previous, "centering-mode change") {
+                    info!("Tray: Centering mode set to JustInView");
+                    let cfg = state.config.clone();
+                    state.apply_config(cfg);
+                    if let Err(e) = state.apply_layout() {
+                        warn!("Layout apply after centering change failed: {}", e);
+                    }
                 }
-                let _ = state.config.save();
             }
             sync_tray_toggles(ctx.tray_manager, &state.config);
         }
         tray::TrayEvent::SetCenteringOnOverflow => {
             let mut state = ctx.state.lock().await;
             if state.config.layout.centering_mode != config::CenteringModeConfig::OnOverflow {
+                let previous = state.config.clone();
                 state.config.layout.centering_mode = config::CenteringModeConfig::OnOverflow;
-                info!("Tray: Centering mode set to OnOverflow");
-                let cfg = state.config.clone();
-                state.apply_config(cfg);
-                if let Err(e) = state.apply_layout() {
-                    warn!("Layout apply after centering change failed: {}", e);
+                if persist_tray_config(&mut state.config, previous, "centering-mode change") {
+                    info!("Tray: Centering mode set to OnOverflow");
+                    let cfg = state.config.clone();
+                    state.apply_config(cfg);
+                    if let Err(e) = state.apply_layout() {
+                        warn!("Layout apply after centering change failed: {}", e);
+                    }
                 }
-                let _ = state.config.save();
             }
             sync_tray_toggles(ctx.tray_manager, &state.config);
         }
         tray::TrayEvent::SetPlacementNewColumn => {
             let mut state = ctx.state.lock().await;
             if state.config.behavior.new_window_placement != config::NewWindowPlacement::NewColumn {
+                let previous = state.config.clone();
                 state.config.behavior.new_window_placement = config::NewWindowPlacement::NewColumn;
-                info!("Tray: New-window placement set to NewColumn");
-                let _ = state.config.save();
+                if persist_tray_config(&mut state.config, previous, "new-window-placement change") {
+                    info!("Tray: New-window placement set to NewColumn");
+                }
             }
             sync_tray_toggles(ctx.tray_manager, &state.config);
         }
         tray::TrayEvent::SetPlacementInColumn => {
             let mut state = ctx.state.lock().await;
             if state.config.behavior.new_window_placement != config::NewWindowPlacement::InColumn {
+                let previous = state.config.clone();
                 state.config.behavior.new_window_placement = config::NewWindowPlacement::InColumn;
-                info!("Tray: New-window placement set to InColumn");
-                let _ = state.config.save();
+                if persist_tray_config(&mut state.config, previous, "new-window-placement change") {
+                    info!("Tray: New-window placement set to InColumn");
+                }
             }
             sync_tray_toggles(ctx.tray_manager, &state.config);
         }
@@ -2937,6 +2991,7 @@ async fn handle_preview_gesture(
         publication_generation,
         preview_rect,
         gesture,
+        ..
     } = event;
     let mut state = ctx.state.lock().await;
     // The overview owns the screen while it is open and its model is not rebuilt

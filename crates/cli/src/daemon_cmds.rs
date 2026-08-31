@@ -17,7 +17,7 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncBufRead, AsyncWrite, AsyncWriteExt};
 
 fn watchdog_binary_name() -> &'static str {
     if cfg!(windows) {
@@ -583,10 +583,17 @@ pub(crate) async fn handle_subscribe(events: Option<Vec<String>>) -> Result<()> 
     // Each frame is a single line of JSON; raw passthrough to stdout so
     // users can pipe into `jq` etc.
     let mut stdout = tokio::io::stdout();
+    stream_subscription(&mut buf, &mut stdout).await
+}
+
+pub(crate) async fn stream_subscription<R, W>(reader: &mut R, output: &mut W) -> Result<()>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     loop {
-        let Some(event_line) = read_ipc_frame_bounded(&mut buf, MAX_IPC_MESSAGE_SIZE).await? else {
-            // Daemon closed the pipe (shutdown, restart, etc.)
-            break;
+        let Some(event_line) = read_ipc_frame_bounded(reader, MAX_IPC_MESSAGE_SIZE).await? else {
+            anyhow::bail!("Daemon disconnected from subscription stream");
         };
         // Validate as IpcEvent so we surface daemon-side bugs noisily,
         // but pass the raw bytes through to stdout to preserve any
@@ -599,13 +606,15 @@ pub(crate) async fn handle_subscribe(events: Option<Vec<String>>) -> Result<()> 
             );
             continue;
         }
-        stdout
+        output
             .write_all(&event_line)
             .await
             .context("Failed to write event to stdout")?;
-        stdout.flush().await.ok();
+        output
+            .flush()
+            .await
+            .context("Failed to flush event output")?;
     }
-    Ok(())
 }
 
 /// Handle the autostart command (enable/disable Registry run key).

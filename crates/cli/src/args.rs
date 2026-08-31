@@ -239,13 +239,23 @@ pub(crate) enum ScrollDirection {
     /// Scroll viewport left
     Left {
         /// Pixels to scroll (default: 100)
-        #[arg(short, long, default_value = "100")]
+        #[arg(
+            short,
+            long,
+            default_value = "100",
+            value_parser = clap::value_parser!(i32).range(0..)
+        )]
         pixels: i32,
     },
     /// Scroll viewport right
     Right {
         /// Pixels to scroll (default: 100)
-        #[arg(short, long, default_value = "100")]
+        #[arg(
+            short,
+            long,
+            default_value = "100",
+            value_parser = clap::value_parser!(i32).range(0..)
+        )]
         pixels: i32,
     },
 }

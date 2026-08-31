@@ -2,6 +2,32 @@
 
 All notable changes to LeopardWM will be documented in this file.
 
+## 0.2.18-sehoon.35
+
+### Fixes
+
+- Invalidate learned minimum sizes whenever windows move between, leave, or
+  join stacked columns, while retaining unrelated column constraints.
+- Clear minimized ownership when a floating window leaves a workspace and make
+  mismatched move/resize terminal events exact-transaction no-ops.
+- Reject negative named scroll magnitudes and return an error when a long-lived
+  event subscription loses its daemon connection.
+- Make config reload tests independent of the developer profile and retry atomic
+  state-file allocation without deleting another writer's colliding temp file.
+- Acknowledge Settings auto-start writes with registry readback, preserve errors
+  across unrelated saves, and condition tray writes on the exact disk revision
+  before applying native checkmarks, hooks, borders, or taskbar effects.
+- Remove legacy `bin/BUILDINFO.txt` during MSI upgrades and validate the complete
+  MSI file/removal-table contract.
+- Require a protected, exact-SHA, dual-monitor, strictly noninjected physical
+  click attestation before a tag workflow can build or publish artifacts.
+- Rebuild the daemon resource when its embedded icon changes.
+
+### Tests
+
+- Add deterministic regressions for all remaining full-audit state, CLI,
+  persistence, Settings, MSI, and physical-attestation findings.
+
 ## 0.2.17-sehoon.34
 
 ### Fixes

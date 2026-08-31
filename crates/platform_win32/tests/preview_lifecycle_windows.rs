@@ -107,9 +107,30 @@ fn physical_click_receipt_requires_exact_publication_identity() {
         publication_generation: target.publication_generation,
         preview_rect: target.rect,
         gesture: PreviewGesture::Click,
+        press_message_time: 123,
+        press_extra_info: 456,
+        press_point: (110, 220),
     };
     assert!(integration_probe::click_receipt_matches_target(
         event, target
+    ));
+    assert!(integration_probe::click_provenance_key_matches(
+        event,
+        123,
+        456,
+        (110, 220),
+    ));
+    assert!(!integration_probe::click_provenance_key_matches(
+        event,
+        124,
+        456,
+        (110, 220),
+    ));
+    assert!(!integration_probe::click_provenance_key_matches(
+        event,
+        123,
+        456,
+        (500, 600),
     ));
     assert!(!integration_probe::click_receipt_matches_target(
         PreviewClickEvent {

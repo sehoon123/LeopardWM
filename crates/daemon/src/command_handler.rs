@@ -857,7 +857,14 @@ impl AppState {
 
     /// Handle `IpcCommand::Reload`.
     fn handle_reload(&mut self) -> IpcResponse {
-        match Config::load() {
+        self.handle_reload_with(Config::load)
+    }
+
+    pub(crate) fn handle_reload_with(
+        &mut self,
+        load: impl FnOnce() -> anyhow::Result<Config>,
+    ) -> IpcResponse {
+        match load() {
             Ok(new_config) => {
                 self.apply_config(new_config);
                 if let Err(e) = self.apply_layout() {

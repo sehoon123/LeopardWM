@@ -9,6 +9,9 @@ jobs:
       - name: Test release validation policy
         shell: pwsh
         run: ./.github/tests/release-validation.tests.ps1
+      - name: Test physical attestation policy
+        shell: pwsh
+        run: ./.github/tests/physical-attestation.tests.ps1
       - name: Verify formatting
         run: cargo fmt --all -- --check
       - run: cargo build --workspace --release --locked

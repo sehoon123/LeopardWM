@@ -1,4 +1,5 @@
 fn main() {
+    println!("cargo:rerun-if-changed=../../assets/leopardwm.ico");
     let mut res = winresource::WindowsResource::new();
     res.set_icon("../../assets/leopardwm.ico");
     res.set_manifest(

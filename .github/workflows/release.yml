@@ -12,17 +12,80 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  physical-gate:
+    # This runner must be launched interactively in the release user's desktop
+    # session so the probe can observe a real human click, not injected input.
+    permissions:
+      contents: read
+    environment: release-hardware
+    runs-on: [self-hosted, Windows, X64, leopardwm-release-hardware]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - name: Verify exact release candidate provenance
+        shell: pwsh
+        run: ./.github/validate-release.ps1 -RepoRoot (Get-Location).Path -Tag $env:GITHUB_REF_NAME
+      - name: Verify no LeopardWM process owns the probe desktop
+        shell: pwsh
+        run: ./.github/verify-no-leopardwm-daemon.ps1
+      - name: Run strict dual-monitor physical-click gate
+        shell: pwsh
+        env:
+          LEOPARDWM_REQUIRE_DUAL_MONITOR: '1'
+          LEOPARDWM_REQUIRE_PHYSICAL_CLICK: '1'
+          LEOPARDWM_REQUIRE_NONINJECTED_CLICK: '1'
+          LEOPARDWM_PHYSICAL_CLICK_TIMEOUT_SECS: '300'
+        run: cargo test -p leopardwm-platform-win32 --features integration-probes --test preview_lifecycle_windows --locked -- --nocapture --test-threads=1
+      - name: Write exact-SHA physical attestation
+        shell: pwsh
+        run: |
+          [ordered]@{
+            schema_version = 1
+            commit_sha = '${{ github.sha }}'
+            repository = '${{ github.repository }}'
+            workflow_run_id = '${{ github.run_id }}'
+            run_attempt = '${{ github.run_attempt }}'
+            dual_monitor = $true
+            physical_click = $true
+            noninjected_click = $true
+            conclusion = 'success'
+          } | ConvertTo-Json | Set-Content -LiteralPath physical-attestation.json -Encoding UTF8
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: physical-gate-${{ github.sha }}-${{ github.run_attempt }}
+          path: physical-attestation.json
+          if-no-files-found: error
+          retention-days: 30
+
   build:
+    needs: physical-gate
     # A version-coherent v* tag can build only once per Cargo/MSI core. The
     # validator requires exact origin/main provenance and a core bump before
     # any later artifact, including another prerelease suffix.
     permissions:
       contents: write
+      actions: read
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: physical-gate-${{ github.sha }}-${{ github.run_attempt }}
+          path: physical-gate
+      - name: Verify exact-SHA physical attestation
+        shell: pwsh
+        run: |
+          ./.github/verify-physical-attestation.ps1 `
+            -Path physical-gate/physical-attestation.json `
+            -CandidateSha '${{ github.sha }}' `
+            -Repository '${{ github.repository }}' `
+            -RunId '${{ github.run_id }}' `
+            -RunAttempt '${{ github.run_attempt }}'
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
           components: rustfmt, clippy

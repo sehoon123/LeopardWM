@@ -1688,7 +1688,8 @@ function init(cfg) {
     document.getElementById('appearance-active_border_color').disabled = true;
   }
 
-  setChecked('startup-auto_start', !!cfg.auto_start);
+  window._autoStartConfirmed = !!cfg.auto_start;
+  setChecked('startup-auto_start', window._autoStartConfirmed);
   setChecked('behavior-check_for_updates', cfg.behavior.check_for_updates !== false);
   setChecked('behavior-focus_new_windows', cfg.behavior.focus_new_windows);
   setChecked('behavior-track_focus_changes', cfg.behavior.track_focus_changes);
@@ -2495,9 +2496,10 @@ wrapAllInputs();
 var _saveTimer = null;
 var _saveInFlight = false;
 var _saveQueued = false;
-function showSaveNotice(title, message, isError) {
+function showSaveNotice(title, message, isError, source) {
   var bar = document.getElementById('save-conflict-bar');
   if (!bar) return;
+  bar.dataset.noticeSource = source || 'config';
   bar.classList.toggle('error', !!isError);
   bar.classList.toggle('warning', !isError);
   document.getElementById('save-conflict-title').textContent = title;
@@ -2506,13 +2508,28 @@ function showSaveNotice(title, message, isError) {
 }
 function handleSaveResult(result) {
   if (!result || !result.status) return;
+  if (result.status === 'auto_start') {
+    var autoStart = document.getElementById('startup-auto_start');
+    window._autoStartConfirmed = !!result.enabled;
+    if (window._initConfig) window._initConfig.auto_start = window._autoStartConfirmed;
+    if (autoStart) {
+      autoStart.checked = window._autoStartConfirmed;
+      autoStart.disabled = false;
+    }
+    if (result.error) {
+      showSaveNotice('Auto-start was not changed.', result.error, true, 'auto_start');
+    } else {
+      showSaveNotice('Auto-start updated.', window._autoStartConfirmed ? 'LeopardWM will start when you sign in.' : 'LeopardWM will not start automatically.', false, 'auto_start');
+    }
+    return;
+  }
   var queued = _saveQueued;
   _saveInFlight = false;
   _saveQueued = false;
   var bar = document.getElementById('save-conflict-bar');
   if (result.status === 'saved') {
     window._configRevision = result.revision || window._configRevision;
-    if (bar) bar.hidden = true;
+    if (bar && bar.dataset.noticeSource !== 'auto_start') bar.hidden = true;
     if (queued) autoSave(0);
     return;
   }
@@ -2522,7 +2539,7 @@ function handleSaveResult(result) {
        next autosave. Runtime-only UI fields stay from this window. */
     clearTimeout(_saveTimer);
     result.config.high_contrast = window._initConfig && window._initConfig.high_contrast;
-    result.config.auto_start = window._initConfig && window._initConfig.auto_start;
+    result.config.auto_start = !!window._autoStartConfirmed;
     result.config.config_revision = result.revision || '';
     init(result.config);
     showSaveNotice('External settings change kept.', 'Your pending edit was not saved. Review the current settings and make the change again.', false);
@@ -2558,7 +2575,13 @@ document.querySelectorAll('input[type="checkbox"], input[type="color"], input[ty
   var el = document.getElementById('startup-auto_start');
   if (!el) return;
   el.addEventListener('change', function() {
-    window.ipc.postMessage(JSON.stringify({ action: 'set_auto_start', enabled: el.checked }));
+    var requested = el.checked;
+    el.disabled = true;
+    window.ipc.postMessage(JSON.stringify({
+      action: 'set_auto_start',
+      enabled: requested,
+      previous: !!window._autoStartConfirmed
+    }));
   });
 })();
 

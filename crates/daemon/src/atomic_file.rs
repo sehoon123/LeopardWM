@@ -1,6 +1,6 @@
 //! Crash-safe, same-directory file replacement for persisted daemon state.
 
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -8,22 +8,27 @@ use std::time::Duration;
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const REPLACE_RETRIES: usize = 4;
+const TEMP_CREATE_RETRIES: usize = 128;
 
 pub(crate) fn write(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> io::Result<()> {
     let path = path.as_ref();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let temp = unique_sibling(path);
-    let result = write_then_replace(&temp, path, contents.as_ref());
+    let (temp, file) = create_unique_sibling(path)?;
+    let result = write_then_replace(file, &temp, path, contents.as_ref());
     if result.is_err() {
         let _ = fs::remove_file(&temp);
     }
     result
 }
 
-fn write_then_replace(temp: &Path, destination: &Path, contents: &[u8]) -> io::Result<()> {
-    let mut file = OpenOptions::new().write(true).create_new(true).open(temp)?;
+fn write_then_replace(
+    mut file: File,
+    temp: &Path,
+    destination: &Path,
+    contents: &[u8],
+) -> io::Result<()> {
     file.write_all(contents)?;
     file.flush()?;
     file.sync_all()?;
@@ -42,9 +47,34 @@ fn write_then_replace(temp: &Path, destination: &Path, contents: &[u8]) -> io::R
     Err(last_error.unwrap_or_else(|| io::Error::other("file replacement failed")))
 }
 
-fn unique_sibling(path: &Path) -> PathBuf {
-    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let pid = std::process::id();
+fn create_unique_sibling(path: &Path) -> io::Result<(PathBuf, File)> {
+    create_unique_sibling_with(path, std::process::id(), &TEMP_SEQUENCE)
+}
+
+fn create_unique_sibling_with(
+    path: &Path,
+    pid: u32,
+    sequence: &AtomicU64,
+) -> io::Result<(PathBuf, File)> {
+    for _ in 0..TEMP_CREATE_RETRIES {
+        let candidate = sibling_path(path, pid, sequence.fetch_add(1, Ordering::Relaxed));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => return Ok((candidate, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique sibling temp file",
+    ))
+}
+
+fn sibling_path(path: &Path, pid: u32, sequence: u64) -> PathBuf {
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -108,6 +138,25 @@ mod tests {
             fs::read_dir(&dir).unwrap().filter_map(Result::ok).count(),
             1
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn colliding_temp_is_preserved_and_a_new_sibling_is_used() {
+        let dir = test_dir("collision");
+        fs::create_dir_all(&dir).unwrap();
+        let destination = dir.join("state.json");
+        let sequence = AtomicU64::new(0);
+        let collision = sibling_path(&destination, 42, 0);
+        fs::write(&collision, b"other writer").unwrap();
+
+        let (temp, file) = create_unique_sibling_with(&destination, 42, &sequence).unwrap();
+        assert_ne!(temp, collision);
+        write_then_replace(file, &temp, &destination, b"new state").unwrap();
+
+        assert_eq!(fs::read(&collision).unwrap(), b"other writer");
+        assert_eq!(fs::read(&destination).unwrap(), b"new state");
+        assert!(!temp.exists());
         fs::remove_dir_all(dir).unwrap();
     }
 

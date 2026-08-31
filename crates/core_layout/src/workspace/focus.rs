@@ -174,13 +174,9 @@ impl Workspace {
             ));
         }
 
-        // Schedule min-size constraint clear for existing windows — the column
-        // composition is changing so constraints learned under the old window
-        // count are invalid. Deferred to apply-time so a timed-out / paused
-        // layout can't strand the column with cleared constraints.
-        for &wid in self.columns[column_index].windows() {
-            self.pending_min_size_clears.insert(wid);
-        }
+        // Constraints belong to the old column membership. Defer their removal
+        // until the placement cycle that will measure the new composition.
+        self.queue_column_min_size_clears(column_index);
 
         self.columns[column_index].add_window(window_id);
         Ok(())
@@ -205,13 +201,9 @@ impl Workspace {
             ));
         }
 
-        // Schedule min-size constraint clear for existing windows — the column
-        // composition is changing so constraints learned under the old window
-        // count are invalid. Deferred to apply-time so a timed-out / paused
-        // layout can't strand the column with cleared constraints.
-        for &wid in self.columns[column_index].windows() {
-            self.pending_min_size_clears.insert(wid);
-        }
+        // Constraints belong to the old column membership. Defer their removal
+        // until the placement cycle that will measure the new composition.
+        self.queue_column_min_size_clears(column_index);
 
         let clamped = window_index.min(self.columns[column_index].len());
         self.columns[column_index].insert_at(clamped, window_id);

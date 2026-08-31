@@ -13,6 +13,10 @@ $validatorSource = Get-Content -LiteralPath $validator -Raw
 if ($validatorSource -notmatch '\$actualHash\s+-ine\s+\$records\[\$name\]') {
     throw 'Release checksum comparison must accept lowercase sha256sum output'
 }
+$daemonBuildScript = Get-Content -LiteralPath (Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) 'crates/daemon/build.rs') -Raw
+if ($daemonBuildScript -notmatch 'cargo:rerun-if-changed=\.\./\.\./assets/leopardwm\.ico') {
+    throw 'Daemon build script must rerun when the embedded icon changes'
+}
 
 function Invoke-TestGit {
     param(
@@ -120,6 +124,42 @@ try {
     $fileResult = @(Get-MsiFileNames -Database $msiFileDatabase)
     if ($fileResult.Count -ne 1 -or $fileResult[0] -cne 'leopardwm.exe') {
         throw "MSI file helper leaked COM output: $($fileResult -join ', ')"
+    }
+
+    $expectedMsiFiles = @('leopardwm.exe', 'leopardwm-cli.exe', 'lwm.exe', 'leopardwm-watchdog.exe', 'License.rtf')
+    $cleanup = [pscustomobject]@{
+        FileKey = 'RemoveLegacyBuildInfo'
+        Component = 'DaemonExe'
+        FileName = 'BUILDINFO.txt'
+        DirProperty = 'Bin'
+        InstallMode = 3
+    }
+    Assert-MsiFileContract -ActualFiles $expectedMsiFiles -RemoveFiles @($cleanup)
+    foreach ($invalid in @(
+        [pscustomobject]@{ Files = @($expectedMsiFiles + 'BUILDINFO.txt'); Rows = @($cleanup) },
+        [pscustomobject]@{ Files = $expectedMsiFiles; Rows = @() },
+        [pscustomobject]@{
+            Files = $expectedMsiFiles
+            Rows = @([pscustomobject]@{
+                FileKey = 'RemoveLegacyBuildInfo'; Component = 'DaemonExe'; FileName = 'BUILDINFO.txt'
+                DirProperty = 'APPLICATIONFOLDER'; InstallMode = 1
+            })
+        },
+        [pscustomobject]@{
+            Files = $expectedMsiFiles
+            Rows = @([pscustomobject]@{
+                FileKey = 'RemoveLegacyBuildInfo'; Component = 'Path'; FileName = 'BUILDINFO.txt'
+                DirProperty = 'Bin'; InstallMode = 3
+            })
+        }
+    )) {
+        try {
+            Assert-MsiFileContract -ActualFiles $invalid.Files -RemoveFiles $invalid.Rows
+            throw 'Invalid MSI file/removal contract was accepted'
+        }
+        catch {
+            if ($_.Exception.Message -eq 'Invalid MSI file/removal contract was accepted') { throw }
+        }
     }
 
     & git init --bare $remote | Out-Null

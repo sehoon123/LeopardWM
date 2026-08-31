@@ -88,6 +88,44 @@ fn test_to_ipc_command_scroll_right() {
 }
 
 #[test]
+fn scroll_pixel_magnitude_rejects_negative_values() {
+    for direction in ["left", "right"] {
+        assert!(
+            Cli::try_parse_from(["leopardwm-cli", "scroll", direction, "--pixels=-1",]).is_err()
+        );
+        assert!(Cli::try_parse_from(["leopardwm-cli", "scroll", direction]).is_ok());
+        assert!(
+            Cli::try_parse_from(["leopardwm-cli", "scroll", direction, "--pixels=250",]).is_ok()
+        );
+    }
+}
+
+#[tokio::test]
+async fn subscription_disconnect_is_an_error_after_emitting_complete_events() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut frame =
+        serde_json::to_vec(&leopardwm_ipc::IpcEvent::Heartbeat { uptime_seconds: 7 }).unwrap();
+    frame.push(b'\n');
+
+    let (mut input_writer, input_reader) = tokio::io::duplex(1024);
+    input_writer.write_all(&frame).await.unwrap();
+    drop(input_writer);
+    let mut input = tokio::io::BufReader::new(input_reader);
+    let (mut output_writer, mut output_reader) = tokio::io::duplex(1024);
+
+    let error = crate::daemon_cmds::stream_subscription(&mut input, &mut output_writer)
+        .await
+        .unwrap_err();
+    drop(output_writer);
+    let mut emitted = Vec::new();
+    output_reader.read_to_end(&mut emitted).await.unwrap();
+
+    assert_eq!(emitted, frame);
+    assert!(error.to_string().contains("disconnected"));
+}
+
+#[test]
 fn test_to_ipc_command_move_left() {
     let cmd = Commands::Move {
         direction: MoveDirection::Left,

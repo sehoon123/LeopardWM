@@ -41,14 +41,15 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::WM_QUIT;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClassInfoW, GetCursorPos,
-    GetMessageW, GetWindow, GetWindowLongPtrW, GetWindowThreadProcessId, IsWindow, IsWindowVisible,
-    KillTimer, LoadCursorW, PeekMessageW, PostThreadMessageW, RegisterClassW, SetCursor,
-    SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    TranslateMessage, UnregisterClassW, GWLP_USERDATA, GW_HWNDNEXT, HTTRANSPARENT, HWND_TOP,
-    IDC_HAND, LWA_ALPHA, MA_NOACTIVATE, MSG, PM_NOREMOVE, SM_CXDRAG, SM_CYDRAG, SWP_NOACTIVATE,
-    SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, WM_APP, WM_CAPTURECHANGED, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WM_SETCURSOR, WM_TIMER,
-    WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+    GetMessageExtraInfo, GetMessageTime, GetMessageW, GetWindow, GetWindowLongPtrW,
+    GetWindowThreadProcessId, IsWindow, IsWindowVisible, KillTimer, LoadCursorW, PeekMessageW,
+    PostThreadMessageW, RegisterClassW, SetCursor, SetLayeredWindowAttributes, SetTimer,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, UnregisterClassW, GWLP_USERDATA,
+    GW_HWNDNEXT, HTTRANSPARENT, HWND_TOP, IDC_HAND, LWA_ALPHA, MA_NOACTIVATE, MSG, PM_NOREMOVE,
+    SM_CXDRAG, SM_CYDRAG, SWP_NOACTIVATE, SWP_NOZORDER, SW_HIDE, SW_SHOWNOACTIVATE, WM_APP,
+    WM_CAPTURECHANGED, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_NCHITTEST,
+    WM_PAINT, WM_SETCURSOR, WM_TIMER, WNDCLASSW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_POPUP,
 };
 
 const PREVIEW_TARGET_CLASS: &str = "LeopardWMPreviewClickTarget";
@@ -102,6 +103,10 @@ pub struct PreviewClickEvent {
     pub publication_generation: u64,
     pub preview_rect: Rect,
     pub gesture: PreviewGesture,
+    /// Identity of the button-down Windows delivered to the click target.
+    pub press_message_time: u32,
+    pub press_extra_info: u64,
+    pub press_point: (i32, i32),
 }
 
 #[derive(Default)]
@@ -173,7 +178,13 @@ pub fn clear_click_sender() {
         .unwrap_or_else(crate::recover_poisoned_mutex) = None;
 }
 
-fn emit_gesture(target: PreviewClickTarget, gesture: PreviewGesture) {
+fn emit_gesture(
+    target: PreviewClickTarget,
+    gesture: PreviewGesture,
+    press_message_time: u32,
+    press_extra_info: u64,
+    press_point: (i32, i32),
+) {
     let window_id = target.window_id;
     let guard = click_sender()
         .lock()
@@ -191,6 +202,9 @@ fn emit_gesture(target: PreviewClickTarget, gesture: PreviewGesture) {
         publication_generation: target.publication_generation,
         preview_rect: target.rect,
         gesture,
+        press_message_time,
+        press_extra_info,
+        press_point,
     }) {
         Ok(()) => debug!("Preview {gesture:?} on {window_id:#x} sent"),
         Err(error) => warn!("Preview {gesture:?} on {window_id:#x} dropped: {error}"),
@@ -1091,6 +1105,8 @@ struct PressState {
     hwnd: HWND,
     target: PreviewClickTarget,
     origin: (i32, i32),
+    press_message_time: u32,
+    press_extra_info: u64,
     drag_threshold: (i32, i32),
     handed_off: bool,
 }
@@ -1318,6 +1334,8 @@ unsafe extern "system" fn target_proc(
                     hwnd,
                     target,
                     origin,
+                    press_message_time: unsafe { GetMessageTime() as u32 },
+                    press_extra_info: unsafe { GetMessageExtraInfo().0 as u64 },
                     drag_threshold: drag_threshold_for_window(hwnd),
                     handed_off: false,
                 });
@@ -1371,16 +1389,29 @@ unsafe extern "system" fn target_proc(
                         let mut press = press.borrow_mut();
                         let state = press.as_mut()?;
                         state.handed_off = true;
-                        Some((state.hwnd, state.target))
+                        Some((
+                            state.hwnd,
+                            state.target,
+                            state.press_message_time,
+                            state.press_extra_info,
+                            state.origin,
+                        ))
                     });
-                    if let Some((pressed_hwnd, target)) = drag {
+                    if let Some((pressed_hwnd, target, press_time, press_extra, press_point)) = drag
+                    {
                         // Let go first: the real window's move loop needs capture.
                         unsafe {
                             let _ = KillTimer(Some(pressed_hwnd), PRESS_TIMER_ID);
                             let _ = ReleaseCapture();
                         }
                         if source_process_still_matches(target) {
-                            emit_gesture(target, PreviewGesture::Drag);
+                            emit_gesture(
+                                target,
+                                PreviewGesture::Drag,
+                                press_time,
+                                press_extra,
+                                press_point,
+                            );
                         } else {
                             warn!("Preview drag dropped: source publication became stale");
                         }
@@ -1402,12 +1433,15 @@ unsafe extern "system" fn target_proc(
                 }
                 let _ = ReleaseCapture();
             }
-            if let Some(target) = pressed
-                .filter(|state| !state.handed_off)
-                .map(|state| state.target)
-            {
-                if source_process_still_matches(target) {
-                    emit_gesture(target, PreviewGesture::Click);
+            if let Some(press) = pressed.filter(|state| !state.handed_off) {
+                if source_process_still_matches(press.target) {
+                    emit_gesture(
+                        press.target,
+                        PreviewGesture::Click,
+                        press.press_message_time,
+                        press.press_extra_info,
+                        press.origin,
+                    );
                 } else {
                     warn!("Preview click dropped: source publication became stale");
                 }
@@ -1446,7 +1480,13 @@ unsafe extern "system" fn target_proc(
                             "Preview release recovered outside overlay for generation {}",
                             press.target.publication_generation
                         );
-                        emit_gesture(press.target, PreviewGesture::Click);
+                        emit_gesture(
+                            press.target,
+                            PreviewGesture::Click,
+                            press.press_message_time,
+                            press.press_extra_info,
+                            press.origin,
+                        );
                     } else {
                         debug!(
                             "Preview press generation {} cancelled after release left overlay",

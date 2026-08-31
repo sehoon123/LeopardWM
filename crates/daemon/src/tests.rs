@@ -33,6 +33,72 @@ fn scaled_layout_params_saturate_unvalidated_gap_arithmetic() {
 }
 
 #[test]
+fn failed_tray_config_save_restores_value_and_skips_live_effect() {
+    let mut config = Config::default();
+    let previous = config.clone();
+    config.behavior.focus_follows_mouse = !config.behavior.focus_follows_mouse;
+    let live_effect_ran = std::cell::Cell::new(false);
+
+    if persist_tray_config_with(&mut config, previous.clone(), "test change", |_, _| {
+        Err(anyhow::anyhow!("injected write failure"))
+    }) {
+        live_effect_ran.set(true);
+    }
+
+    assert_eq!(
+        config.behavior.focus_follows_mouse,
+        previous.behavior.focus_follows_mouse
+    );
+    assert!(!live_effect_ran.get());
+
+    config.behavior.focus_follows_mouse = !config.behavior.focus_follows_mouse;
+    let expected = previous.revision().unwrap();
+    assert!(!persist_tray_config_with(
+        &mut config,
+        previous.clone(),
+        "stale tray change",
+        |_, revision| {
+            assert_eq!(revision, expected);
+            Ok(ConditionalConfigSave::Conflict {
+                current: Box::new(Config::default()),
+                revision: "newer-settings-revision".into(),
+            })
+        },
+    ));
+    assert_eq!(
+        config.behavior.focus_follows_mouse,
+        previous.behavior.focus_follows_mouse
+    );
+}
+
+#[test]
+fn mismatched_move_size_end_preserves_active_resize() {
+    let mut active = Some(100);
+    assert!(!crate::event_handler::take_matching_resize(
+        &mut active,
+        200
+    ));
+    assert_eq!(active, Some(100));
+    assert!(crate::event_handler::take_matching_resize(&mut active, 100));
+    assert_eq!(active, None);
+
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    state.resize_hwnd = Some(100);
+    state
+        .injected_window_info
+        .insert(200, make_test_window_info(200));
+    let placed = Rect::new(10, 20, 300, 400);
+    state.last_placed_layout_rects.insert(200, placed);
+    assert!(state.pending_drag_hint.is_none());
+
+    state.handle_window_event(WindowEvent::MoveSizeEnd(200));
+
+    assert_eq!(state.resize_hwnd, Some(100));
+    assert_eq!(state.last_placed_layout_rects.get(&200), Some(&placed));
+    assert!(state.pending_drag_hint.is_none());
+}
+
+#[test]
 fn test_app_state_new() {
     let state = AppState::new_with_config(test_config(), test_monitors());
     assert_eq!(state.workspaces.len(), 1);
@@ -2957,12 +3023,18 @@ fn test_cmd_refresh() {
 }
 
 #[test]
-fn test_cmd_reload() {
+fn config_reload_uses_an_injected_loader_and_keeps_state_on_error() {
     let mut state = AppState::new_with_config(test_config(), test_monitors());
-    let resp = state.handle_command(IpcCommand::Reload);
-    assert_eq!(resp, IpcResponse::Ok);
-    // Config was reloaded (default since no config file in test env)
-    assert_eq!(state.config.layout.gap, Config::default().layout.gap);
+    state.paused = true;
+    let mut loaded = Config::default();
+    loaded.layout.gap = 37;
+
+    assert_eq!(state.handle_reload_with(|| Ok(loaded)), IpcResponse::Ok);
+    assert_eq!(state.config.layout.gap, 37);
+
+    let response = state.handle_reload_with(|| Err(anyhow::anyhow!("injected parse failure")));
+    assert!(matches!(response, IpcResponse::Error { .. }));
+    assert_eq!(state.config.layout.gap, 37);
 }
 
 #[test]

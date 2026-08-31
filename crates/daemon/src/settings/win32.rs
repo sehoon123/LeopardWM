@@ -534,23 +534,31 @@ fn handle_ipc(body: &str, event_tx: &mpsc::Sender<SettingsEvent>, _hwnd: HWND) {
                 warn!("Settings IPC: set_auto_start missing or non-bool 'enabled' field; ignoring");
                 return;
             };
-            use leopardwm_platform_win32::autostart;
-            let result = if enabled {
-                match std::env::current_exe() {
-                    Ok(exe) => {
-                        let target = autostart::preferred_autostart_executable(&exe);
-                        autostart::enable_autostart(&target).map(|()| Some(target))
-                    }
-                    Err(e) => Err(anyhow::anyhow!("resolve daemon executable: {}", e)),
-                }
-            } else {
-                autostart::disable_autostart().map(|()| None)
+            let Some(previous) = msg.get("previous").and_then(|v| v.as_bool()) else {
+                warn!("Settings IPC: set_auto_start missing confirmed previous state; ignoring");
+                return;
             };
-            match result {
-                Ok(Some(exe)) => info!("Auto-start enabled via Settings (path: {})", exe.display()),
-                Ok(None) => info!("Auto-start disabled via Settings"),
-                Err(e) => warn!("Settings: failed to update auto-start: {}", e),
+            use leopardwm_platform_win32::autostart;
+            let operation = if enabled {
+                std::env::current_exe()
+                    .map_err(anyhow::Error::from)
+                    .and_then(|exe| {
+                        let target = autostart::preferred_autostart_executable(&exe);
+                        autostart::enable_autostart(&target)
+                    })
+            } else {
+                autostart::disable_autostart()
+            };
+            let result =
+                auto_start_result(enabled, previous, operation, autostart::get_autostart());
+            if let SettingsSaveResult::AutoStart { error, .. } = &result {
+                if let Some(error) = error {
+                    warn!("Settings: failed to update auto-start: {}", error);
+                } else {
+                    info!("Auto-start updated via Settings: {}", enabled);
+                }
             }
+            push_save_result(&result);
         }
         "open_url" => {
             let Some(url) = msg.get("url").and_then(|v| v.as_str()) else {
@@ -579,6 +587,59 @@ enum SettingsSaveResult {
         revision: String,
     },
     Failed,
+    AutoStart {
+        enabled: bool,
+        error: Option<String>,
+    },
+}
+
+fn auto_start_result(
+    requested: bool,
+    previous: bool,
+    operation: Result<()>,
+    readback: Result<bool>,
+) -> SettingsSaveResult {
+    match (operation, readback) {
+        (Ok(()), Ok(actual)) if actual == requested => SettingsSaveResult::AutoStart {
+            enabled: actual,
+            error: None,
+        },
+        (Ok(()), Ok(actual)) => SettingsSaveResult::AutoStart {
+            enabled: actual,
+            error: Some("Windows did not retain the requested auto-start state".into()),
+        },
+        (Ok(()), Err(error)) => SettingsSaveResult::AutoStart {
+            enabled: requested,
+            error: Some(format!(
+                "could not verify the saved auto-start state: {error}"
+            )),
+        },
+        (Err(error), readback) => SettingsSaveResult::AutoStart {
+            enabled: readback.unwrap_or(previous),
+            error: Some(error.to_string()),
+        },
+    }
+}
+
+fn save_result_json(result: &SettingsSaveResult) -> String {
+    match result {
+        SettingsSaveResult::Saved { revision } => {
+            serde_json::json!({ "status": "saved", "revision": revision }).to_string()
+        }
+        SettingsSaveResult::Conflict { current, revision } => serde_json::json!({
+            "status": "conflict",
+            "revision": revision,
+            "config": current,
+        })
+        .to_string(),
+        SettingsSaveResult::Failed => serde_json::json!({ "status": "failed" }).to_string(),
+        SettingsSaveResult::AutoStart { enabled, error } => serde_json::json!({
+            "status": "auto_start",
+            "enabled": enabled,
+            "error": error,
+        })
+        .to_string(),
+    }
 }
 
 /// Stage a result for delivery on the window thread; `WebView` itself never
@@ -590,18 +651,7 @@ fn push_save_result(result: &SettingsSaveResult) {
     };
     let Some(thread_id) = thread_id else { return };
 
-    let json = match result {
-        SettingsSaveResult::Saved { revision } => {
-            serde_json::json!({ "status": "saved", "revision": revision }).to_string()
-        }
-        SettingsSaveResult::Conflict { current, revision } => serde_json::json!({
-            "status": "conflict",
-            "revision": revision,
-            "config": current,
-        })
-        .to_string(),
-        SettingsSaveResult::Failed => serde_json::json!({ "status": "failed" }).to_string(),
-    };
+    let json = save_result_json(result);
 
     let Ok(mut pending) = PENDING_SAVE_RESULTS.lock() else {
         return;
@@ -780,6 +830,20 @@ unsafe fn apply_win11_theming(hwnd: HWND, dark: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_start_failure_reports_authoritative_readback() {
+        let result = auto_start_result(
+            true,
+            true,
+            Err(anyhow::anyhow!("injected registry failure")),
+            Ok(false),
+        );
+        let json: serde_json::Value = serde_json::from_str(&save_result_json(&result)).unwrap();
+        assert_eq!(json["status"], "auto_start");
+        assert_eq!(json["enabled"], false);
+        assert!(json["error"].as_str().unwrap().contains("injected"));
+    }
 
     #[test]
     fn settings_window_style_is_resizable_and_child_flicker_safe() {

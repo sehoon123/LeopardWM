@@ -101,6 +101,15 @@ impl Workspace {
         self.window_min_heights.clear();
     }
 
+    /// Queue every member of a column for deferred constraint invalidation.
+    /// Learned minima belong to the exact column composition that produced them.
+    pub(crate) fn queue_column_min_size_clears(&mut self, column_index: usize) {
+        if let Some(column) = self.columns.get(column_index) {
+            self.pending_min_size_clears
+                .extend(column.windows().iter().copied());
+        }
+    }
+
     /// Drain the pending_min_size_clears queue and remove corresponding entries
     /// from window_min_widths / window_min_heights. Called at the start of a
     /// layout apply pass so column-composition changes only take effect when a

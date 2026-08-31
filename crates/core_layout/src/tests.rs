@@ -2057,10 +2057,12 @@ mod tests {
 
         ws.add_floating(1, rect).unwrap();
         assert!(ws.contains_window(1));
+        assert!(ws.mark_minimized(1));
 
         let removed = ws.remove_floating(1);
         assert!(removed);
         assert!(!ws.contains_window(1));
+        assert!(!ws.is_minimized(1));
         assert_eq!(ws.floating_count(), 0);
     }
 
@@ -4510,6 +4512,101 @@ mod tests {
         assert!(!widths
             .compute_placements(Rect::new(0, 0, 500, 600))
             .is_empty());
+    }
+
+    #[test]
+    fn moving_windows_queues_only_affected_column_minimums() {
+        fn fixture() -> Workspace {
+            let mut ws = Workspace::new();
+            ws.insert_window(1, Some(400)).unwrap();
+            ws.insert_window_in_column(2, 0).unwrap();
+            ws.insert_window(3, Some(400)).unwrap();
+            ws.insert_window_in_column(4, 1).unwrap();
+            ws.insert_window(9, Some(400)).unwrap();
+            ws.commit_pending_min_size_clears();
+            for id in [1, 2, 3, 4, 9] {
+                ws.set_window_min_width(id, 500 + id as i32);
+                ws.set_window_min_height(id, 300 + id as i32);
+            }
+            ws
+        }
+
+        type Operation = fn(&mut Workspace);
+        let cases: &[(&str, Operation, &[WindowId])] = &[
+            (
+                "move left",
+                |ws| {
+                    ws.set_focus(1, 0).unwrap();
+                    ws.move_window_left();
+                },
+                &[1, 2, 3, 4],
+            ),
+            (
+                "move right",
+                |ws| {
+                    ws.set_focus(0, 0).unwrap();
+                    ws.move_window_right();
+                },
+                &[1, 2, 3, 4],
+            ),
+            (
+                "expel left",
+                |ws| {
+                    ws.set_focus(0, 0).unwrap();
+                    ws.expel_to_left();
+                },
+                &[1, 2],
+            ),
+            (
+                "expel right",
+                |ws| {
+                    ws.set_focus(0, 0).unwrap();
+                    ws.expel_to_right();
+                },
+                &[1, 2],
+            ),
+            (
+                "consume right",
+                |ws| {
+                    ws.set_focus(0, 0).unwrap();
+                    ws.consume_from_right();
+                },
+                &[1, 2, 3, 4],
+            ),
+            (
+                "consume left",
+                |ws| {
+                    ws.set_focus(1, 0).unwrap();
+                    ws.consume_from_left();
+                },
+                &[1, 2, 3, 4],
+            ),
+        ];
+
+        for (name, operation, affected) in cases {
+            let mut ws = fixture();
+            operation(&mut ws);
+            assert_eq!(ws.pending_min_size_clears.len(), affected.len(), "{name}");
+            for id in [1, 2, 3, 4, 9] {
+                assert_eq!(
+                    ws.pending_min_size_clears.contains(&id),
+                    affected.contains(&id),
+                    "{name}: hwnd {id}"
+                );
+            }
+            assert!(ws.commit_pending_min_size_clears(), "{name}");
+            for id in affected.iter() {
+                assert!(!ws.window_min_widths.contains_key(id), "{name}: hwnd {id}");
+                assert!(!ws.window_min_heights.contains_key(id), "{name}: hwnd {id}");
+            }
+            for id in [1, 2, 3, 4, 9]
+                .into_iter()
+                .filter(|id| !affected.contains(id))
+            {
+                assert!(ws.window_min_widths.contains_key(&id), "{name}: hwnd {id}");
+                assert!(ws.window_min_heights.contains_key(&id), "{name}: hwnd {id}");
+            }
+        }
     }
 
     #[test]

@@ -249,6 +249,26 @@ mod tests {
     }
 
     #[test]
+    fn auto_start_waits_for_registry_ack_and_restores_readback() {
+        for marker in [
+            "window._autoStartConfirmed = !!cfg.auto_start;",
+            "el.disabled = true;",
+            "previous: !!window._autoStartConfirmed",
+            "result.status === 'auto_start'",
+            "autoStart.checked = window._autoStartConfirmed;",
+            "window._initConfig.auto_start = window._autoStartConfirmed;",
+            "result.config.auto_start = !!window._autoStartConfirmed;",
+            "bar.dataset.noticeSource !== 'auto_start'",
+            "Auto-start was not changed.",
+        ] {
+            assert!(
+                SETTINGS_HTML.contains(marker),
+                "missing auto-start ack marker: {marker}"
+            );
+        }
+    }
+
+    #[test]
     fn default_width_preset_is_a_bounded_dynamic_select() {
         assert!(SETTINGS_HTML.contains("class=\"card\" id=\"default-width-preset-card\""));
         assert!(SETTINGS_HTML

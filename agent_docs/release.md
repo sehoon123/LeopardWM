@@ -17,7 +17,9 @@ Release tags must be `vX.Y.Z` or that same core version followed by a SemVer pre
 3. The tag core version equals `[workspace.package].version`, its optional suffix is valid SemVer prerelease syntax, and no other tag uses that core.
 4. `CHANGELOG.md` contains the exact matching section.
 
-The workflow then formats, runs the locked workspace suite, and runs both controlled Win32 probes (`floating_return_windows` and `preview_lifecycle_windows`) serially. Each probe has a fail-closed daemon-absence preflight; it never stops a process automatically. It builds locked release binaries, verifies the daemon and watchdog PE GUI subsystems, and packages:
+The tag workflow first waits for its `physical-gate` job on the protected `release-hardware` environment. That job must run interactively on a Windows self-hosted runner labeled `leopardwm-release-hardware`; it verifies exact tag/main provenance and runs `preview_lifecycle_windows` with dual-monitor, physical-click, and strict noninjected-input requirements enabled. It uploads an exact-SHA/run-attempt attestation. The hosted `build` job downloads and validates that same-run attestation before it can format, test, package, or publish. If a later job fails, use **Re-run all jobs**: re-running failed jobs alone deliberately lacks a new-attempt physical attestation and fails closed.
+
+The hosted job then runs the locked workspace suite and both controlled Win32 probes (`floating_return_windows` and `preview_lifecycle_windows`) serially. Each probe has a fail-closed daemon-absence preflight; it never stops a process automatically. It builds locked release binaries, verifies the daemon and watchdog PE GUI subsystems, and packages:
 
 - `LeopardWM-{tag-without-v}-x86_64-windows.zip` containing the daemon, both CLI names, watchdog, README, LICENSE, and CHANGELOG;
 - `LeopardWM-{tag-without-v}-x86_64.msi` from `wix/main.wxs`; and
@@ -65,16 +67,17 @@ The header must be exactly `## X.Y.Z` (or `## X.Y.Z-prerelease` for a prerelease
    .\.github\verify-no-leopardwm-daemon.ps1
    $env:LEOPARDWM_REQUIRE_DUAL_MONITOR = '1'
    $env:LEOPARDWM_REQUIRE_PHYSICAL_CLICK = '1'
+   $env:LEOPARDWM_REQUIRE_NONINJECTED_CLICK = '1'
    $env:LEOPARDWM_PHYSICAL_CLICK_TIMEOUT_SECS = '300'   # optional, default 60, max 1800
    cargo test -p leopardwm-platform-win32 --features integration-probes --test preview_lifecycle_windows --locked -- --nocapture --test-threads=1
-   Remove-Item Env:LEOPARDWM_REQUIRE_DUAL_MONITOR, Env:LEOPARDWM_REQUIRE_PHYSICAL_CLICK, Env:LEOPARDWM_PHYSICAL_CLICK_TIMEOUT_SECS -ErrorAction SilentlyContinue
+   Remove-Item Env:LEOPARDWM_REQUIRE_DUAL_MONITOR, Env:LEOPARDWM_REQUIRE_PHYSICAL_CLICK, Env:LEOPARDWM_REQUIRE_NONINJECTED_CLICK, Env:LEOPARDWM_PHYSICAL_CLICK_TIMEOUT_SECS -ErrorAction SilentlyContinue
    ```
 5. Commit the release preparation and independently review the exact diff from the prior release.
 6. Push the candidate to `main` without force and wait for the required `check` workflow.
 7. Confirm `origin/main` still equals the reviewed candidate and that the tag does not already exist.
-8. Create and push the tag only after those checks. Do not retag a changed candidate.
-9. Monitor the release workflow and verify the GitHub Release, ZIP/MSI contents, checksums, and release notes.
-10. Update the repository Scoop manifest and submit any Winget update manually from the published MSI.
+8. Launch the self-hosted runner **interactively in the release user's desktop session** with the `leopardwm-release-hardware` label, then create and push the tag. Do not run this runner as a service: a service cannot supply or observe the physical desktop click.
+9. Approve the protected `release-hardware` environment, physically click the coordinate printed by the strict noninjected probe, and verify that the hosted build accepts the exact-SHA attestation before publishing.
+10. Verify the GitHub Release, ZIP/MSI contents, checksums, and release notes. Update the repository Scoop manifest and submit any Winget update manually from the published MSI.
 
 Any candidate change after verification or review requires the complete gate and review again before publication.
 
