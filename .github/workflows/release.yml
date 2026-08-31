@@ -24,7 +24,17 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - name: Select pinned MSVC toolchain
+        shell: pwsh
+        run: |
+          $toolchain = '1.98.0-x86_64-pc-windows-msvc'
+          $cargoBin = Join-Path $env:USERPROFILE '.cargo\bin'
+          & (Join-Path $cargoBin 'rustup.exe') toolchain install $toolchain --profile minimal
+          if ($LASTEXITCODE -ne 0) { throw 'rustup toolchain install failed' }
+          $version = & (Join-Path $cargoBin 'rustup.exe') run $toolchain rustc --version
+          if ($version -notmatch '^rustc 1\.98\.0 ') { throw "Unexpected rustc: $version" }
+          $cargoBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "RUSTUP_TOOLCHAIN=$toolchain" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Verify exact release candidate provenance
         shell: pwsh
         run: ./.github/validate-release.ps1 -RepoRoot (Get-Location).Path -Tag $env:GITHUB_REF_NAME

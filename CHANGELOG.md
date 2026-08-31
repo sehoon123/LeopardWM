@@ -2,6 +2,14 @@
 
 All notable changes to LeopardWM will be documented in this file.
 
+## 0.2.19-sehoon.36
+
+### Fixes
+
+- Select the pinned Windows MSVC toolchain with native PowerShell on the
+  protected release runner, avoiding WSL `bash.exe` path translation before the
+  exact-SHA physical gate.
+
 ## 0.2.18-sehoon.35
 
 ### Fixes

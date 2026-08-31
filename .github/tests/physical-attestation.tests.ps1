@@ -7,6 +7,7 @@ $verifier = Join-Path $githubDir 'verify-physical-attestation.ps1'
 $workflow = Get-Content -LiteralPath (Join-Path $githubDir 'workflows/release.yml') -Raw
 foreach ($marker in @(
     'environment: release-hardware',
+    "`$toolchain = '1.98.0-x86_64-pc-windows-msvc'",
     'needs: physical-gate',
     "LEOPARDWM_REQUIRE_DUAL_MONITOR: '1'",
     "LEOPARDWM_REQUIRE_PHYSICAL_CLICK: '1'",
