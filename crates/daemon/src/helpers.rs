@@ -54,7 +54,7 @@ impl ScaledLayoutParams {
         // active tab — same spacing as between adjacent columns and
         // within a Vertical column. Reusing `layout.gap` keeps the
         // visual rhythm consistent across the workspace.
-        let strip_with_gap = appearance.tab_strip_height as i32 + layout.gap.max(0);
+        let strip_with_gap = (appearance.tab_strip_height as i32).saturating_add(layout.gap.max(0));
         let tab_strip_reserve_px = scale_px(strip_with_gap, scale_factor);
 
         // Compute default column width using scaled gap values (mirrors LayoutConfig::default_column_width_px)

@@ -686,16 +686,24 @@ fn win_event_callback_inner(
         return;
     };
     if let Some(sender) = try_clone_event_sender_from_callback() {
-        match sender.try_send(payload) {
-            Ok(()) => {}
-            Err(mpsc::TrySendError::Full(_)) if priority => {
-                EVENT_RESCAN_REQUIRED.store(true, Ordering::Release);
-            }
-            Err(mpsc::TrySendError::Full(_)) => {
+        try_send_callback_payload(&sender, payload, priority);
+    }
+}
+
+fn try_send_callback_payload(
+    sender: &mpsc::SyncSender<HookWindowEvent>,
+    payload: HookWindowEvent,
+    priority: bool,
+) {
+    match sender.try_send(payload) {
+        Ok(()) => {}
+        Err(mpsc::TrySendError::Full(_)) => {
+            EVENT_RESCAN_REQUIRED.store(true, Ordering::Release);
+            if !priority {
                 tracing::trace!("Coalescing high-frequency WinEvent backlog");
             }
-            Err(mpsc::TrySendError::Disconnected(_)) => {}
         }
+        Err(mpsc::TrySendError::Disconnected(_)) => {}
     }
 }
 
@@ -800,6 +808,29 @@ mod tests {
             assert!(callback_payload(event).is_none());
             assert!(EVENT_RESCAN_REQUIRED.load(Ordering::Acquire));
         }
+    }
+
+    #[test]
+    fn full_nonpriority_callback_queue_retains_rescan_obligation() {
+        let _serialized = RESCAN_FLAG_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        EVENT_RESCAN_REQUIRED.store(false, Ordering::Release);
+        let (tx, _rx) = mpsc::sync_channel(1);
+        tx.try_send(HookWindowEvent {
+            event: WindowEvent::AppearanceChanged,
+            identity: None,
+        })
+        .unwrap();
+
+        try_send_callback_payload(
+            &tx,
+            HookWindowEvent {
+                event: WindowEvent::MovedOrResized(42),
+                identity: None,
+            },
+            false,
+        );
+
+        assert!(EVENT_RESCAN_REQUIRED.load(Ordering::Acquire));
     }
 
     #[test]

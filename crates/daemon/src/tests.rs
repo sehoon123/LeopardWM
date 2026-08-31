@@ -18,6 +18,21 @@ fn test_monitors() -> Vec<MonitorInfo> {
 }
 
 #[test]
+fn scaled_layout_params_saturate_unvalidated_gap_arithmetic() {
+    let mut config = Config::default();
+    config.layout.gap = i32::MAX;
+
+    let params = crate::helpers::ScaledLayoutParams::from_config(
+        &config.layout,
+        &config.appearance,
+        1.0,
+        1920,
+    );
+
+    assert_eq!(params.tab_strip_reserve_px, i32::MAX);
+}
+
+#[test]
 fn test_app_state_new() {
     let state = AppState::new_with_config(test_config(), test_monitors());
     assert_eq!(state.workspaces.len(), 1);
@@ -2974,6 +2989,21 @@ fn test_cmd_close_window_empty() {
 }
 
 #[test]
+fn close_window_prefers_observed_floating_focus() {
+    let mut state = AppState::new_with_config(test_config(), test_monitors());
+    let workspace = state.focused_workspace_mut().unwrap();
+    workspace.insert_window(100, Some(800)).unwrap();
+    workspace
+        .add_floating(200, Rect::new(100, 100, 500, 400))
+        .unwrap();
+    state.previous_focused_hwnd = Some(200);
+
+    assert_eq!(state.managed_focused_window(), Some(200));
+    state.previous_focused_hwnd = Some(999);
+    assert_eq!(state.managed_focused_window(), Some(100));
+}
+
+#[test]
 fn test_cmd_toggle_floating_empty() {
     let mut state = AppState::new_with_config(test_config(), test_monitors());
     state.paused = false;
@@ -4352,6 +4382,7 @@ fn tray_exit_does_not_wait_for_normal_queue_capacity() {
             animation_worker::AnimationWorkerHandle::spawn(animation_tx, cancelled, epoch).unwrap();
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1);
         event_tx.try_send(DaemonEvent::HideSnapHint).unwrap();
+        let mut update_check_worker = update_check::UpdateCheckWorker::new();
         let mut hotkey_state = HotkeyState {
             handle: None,
             hook: None,
@@ -4378,6 +4409,7 @@ fn tray_exit_does_not_wait_for_normal_queue_capacity() {
             state: &state,
             event_tx: &event_tx,
             hotkey_state: &mut hotkey_state,
+            update_check_worker: &mut update_check_worker,
             tray_manager: &tray_manager,
             snap_hint_overlay: &snap_hint_overlay,
             settings_sync_tx: &settings_sync_tx,

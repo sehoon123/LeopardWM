@@ -387,46 +387,55 @@ fn disabled_hotkey_state() -> HotkeyState {
     }
 }
 
-async fn reload_config_and_hotkeys(
-    state: &Arc<Mutex<AppState>>,
-    hotkey_state: &mut HotkeyState,
+fn reconcile_update_checker(
+    worker: &mut update_check::UpdateCheckWorker,
+    enabled: bool,
     event_tx: &mpsc::Sender<DaemonEvent>,
-    tray_manager: &Option<tray::TrayManager>,
-    snap_hint_overlay: &Option<OverlayWindow>,
-    mouse_hook_handle: &mut Option<MouseHookHandle>,
-    forwarding_threads: &mut Vec<ForwardingThreadHandle>,
 ) {
+    let tx = event_tx.clone();
+    worker.reconcile(enabled, move |tag, generation| {
+        // Best-effort: receiver loss means shutdown already owns cleanup.
+        let _ = tx.blocking_send(DaemonEvent::UpdateAvailable { tag, generation });
+    });
+}
+
+async fn reload_config_and_hotkeys(ctx: &mut EventLoopCtx<'_>) {
     // Drop both handles BEFORE setup_hotkeys rebuilds them: assignment drops the
     // old HotkeyState last, so an unhook-then-reinstall must happen here or the
     // keyboard hook's double-install guard would reject the new one.
-    let disabled_by_cli = hotkey_state.disabled_by_cli;
-    hotkey_state.handle = None;
-    if let Some(mut forwarder) = hotkey_state.forwarder.take() {
+    let disabled_by_cli = ctx.hotkey_state.disabled_by_cli;
+    ctx.hotkey_state.handle = None;
+    if let Some(mut forwarder) = ctx.hotkey_state.forwarder.take() {
         let _ = forwarder.join_with_timeout(Duration::from_millis(500));
     }
-    hotkey_state.hook = None;
+    ctx.hotkey_state.hook = None;
     let new_config = {
-        let state = state.lock().await;
+        let state = ctx.state.lock().await;
         state.config.clone()
     };
-    *hotkey_state = if disabled_by_cli {
+    *ctx.hotkey_state = if disabled_by_cli {
         disabled_hotkey_state()
     } else {
-        setup_hotkeys(&new_config, event_tx.clone())
+        setup_hotkeys(&new_config, ctx.event_tx.clone())
     };
     // Apply a focus-follows-mouse change from the reloaded config (e.g. the
     // Settings toggle) without waiting for a restart.
     sync_mouse_hook(
         new_config.behavior.focus_follows_mouse,
-        mouse_hook_handle,
-        event_tx,
-        forwarding_threads,
+        ctx.mouse_hook_handle,
+        ctx.event_tx,
+        ctx.forwarding_threads,
     );
     // Refresh the rejected-hotkey warning in an open settings window so it
     // reflects the new registration instead of the snapshot taken at open.
-    settings::push_failed_binds(&hotkey_state.failed_binds);
-    sync_tray_toggles(tray_manager, &new_config);
-    if let Some(ref overlay) = snap_hint_overlay {
+    settings::push_failed_binds(&ctx.hotkey_state.failed_binds);
+    reconcile_update_checker(
+        ctx.update_check_worker,
+        new_config.behavior.check_for_updates,
+        ctx.event_tx,
+    );
+    sync_tray_toggles(ctx.tray_manager, &new_config);
+    if let Some(ref overlay) = ctx.snap_hint_overlay {
         publish_resize_preview(|| overlay.set_opacity(new_config.snap_hints.opacity));
     }
 }
@@ -886,6 +895,7 @@ struct EventLoopCtx<'a> {
     state: &'a Arc<Mutex<AppState>>,
     event_tx: &'a mpsc::Sender<DaemonEvent>,
     hotkey_state: &'a mut HotkeyState,
+    update_check_worker: &'a mut update_check::UpdateCheckWorker,
     tray_manager: &'a Option<tray::TrayManager>,
     snap_hint_overlay: &'a Option<OverlayWindow>,
     settings_sync_tx: &'a std::sync::mpsc::Sender<settings::SettingsEvent>,
@@ -1881,19 +1891,13 @@ async fn handle_ipc_command(
         (response, animating, rect, duration)
     };
 
-    // If config was reloaded successfully, also reload hotkeys
-    if is_reload && matches!(response, IpcResponse::Ok) {
-        reload_config_and_hotkeys(
-            ctx.state,
-            ctx.hotkey_state,
-            ctx.event_tx,
-            ctx.tray_manager,
-            ctx.snap_hint_overlay,
-            ctx.mouse_hook_handle,
-            ctx.forwarding_threads,
-        )
-        .await;
-        info!("Hotkeys reloaded after config reload");
+    // Reconcile live workers with the actual in-memory config even when its
+    // physical layout apply reported an error after loading the new values.
+    if is_reload {
+        reload_config_and_hotkeys(ctx).await;
+        if matches!(&response, IpcResponse::Ok) {
+            info!("Hotkeys reloaded after config reload");
+        }
     }
 
     // Log if client disconnected before receiving response
@@ -2553,18 +2557,8 @@ async fn handle_tray_event(ctx: &mut EventLoopCtx<'_>, tray_event: tray::TrayEve
                 state.handle_command(IpcCommand::Reload)
             };
 
-            // If config was reloaded successfully, also reload hotkeys
-            if matches!(response, IpcResponse::Ok) {
-                reload_config_and_hotkeys(
-                    ctx.state,
-                    ctx.hotkey_state,
-                    ctx.event_tx,
-                    ctx.tray_manager,
-                    ctx.snap_hint_overlay,
-                    ctx.mouse_hook_handle,
-                    ctx.forwarding_threads,
-                )
-                .await;
+            reload_config_and_hotkeys(ctx).await;
+            if matches!(&response, IpcResponse::Ok) {
                 info!("Hotkeys reloaded after tray config reload");
             } else if let IpcResponse::Error { message } = response {
                 warn!("Reload failed: {}", message);
@@ -3451,17 +3445,8 @@ async fn handle_settings_event(
                 let mut state = ctx.state.lock().await;
                 state.handle_command(IpcCommand::Reload)
             };
-            if matches!(response, IpcResponse::Ok) {
-                reload_config_and_hotkeys(
-                    ctx.state,
-                    ctx.hotkey_state,
-                    ctx.event_tx,
-                    ctx.tray_manager,
-                    ctx.snap_hint_overlay,
-                    ctx.mouse_hook_handle,
-                    ctx.forwarding_threads,
-                )
-                .await;
+            reload_config_and_hotkeys(ctx).await;
+            if matches!(&response, IpcResponse::Ok) {
                 info!("Hotkeys reloaded after settings save");
             } else if let IpcResponse::Error { message } = response {
                 warn!("Reload after settings save failed: {}", message);
@@ -3480,16 +3465,7 @@ async fn handle_settings_event(
             // hook still installed is a no-op.
             if ctx.hotkey_state.recording {
                 debug!("Settings: recording ended, resuming hotkeys");
-                reload_config_and_hotkeys(
-                    ctx.state,
-                    ctx.hotkey_state,
-                    ctx.event_tx,
-                    ctx.tray_manager,
-                    ctx.snap_hint_overlay,
-                    ctx.mouse_hook_handle,
-                    ctx.forwarding_threads,
-                )
-                .await;
+                reload_config_and_hotkeys(ctx).await;
             }
         }
     }
@@ -4144,9 +4120,13 @@ async fn run_daemon_event_loop(
                     break;
                 }
             }
-            DaemonEvent::UpdateAvailable(tag) => {
-                if let Some(manager) = ctx.tray_manager {
-                    manager.set_available_update(Some(tag));
+            DaemonEvent::UpdateAvailable { tag, generation } => {
+                if ctx.update_check_worker.accepts(generation) {
+                    if let Some(manager) = ctx.tray_manager {
+                        manager.set_available_update(Some(tag));
+                    }
+                } else {
+                    debug!("Discarded stale update notification generation {generation}");
                 }
             }
             DaemonEvent::TabStripIconPoll => handle_tab_strip_icon_poll(ctx.state).await,
@@ -4358,17 +4338,13 @@ async fn main() -> Result<()> {
     // Initialize system tray icon
     let tray_manager = setup_tray(&config, &event_tx, &mut thread_handles);
 
-    // Update checker — daily GitHub Releases poll, opt-out via behavior.check_for_updates.
-    let update_check_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let mut update_check_thread = None;
-    if config.behavior.check_for_updates {
-        let tx = event_tx.clone();
-        let cancel = update_check_cancel.clone();
-        update_check_thread = update_check::spawn_update_checker(cancel, move |tag| {
-            // Best-effort send — if the receiver is gone we're already shutting down.
-            let _ = tx.blocking_send(DaemonEvent::UpdateAvailable(tag));
-        });
-    }
+    // Update checker — one live-reloadable, process-owned worker generation.
+    let mut update_check_worker = update_check::UpdateCheckWorker::new();
+    reconcile_update_checker(
+        &mut update_check_worker,
+        config.behavior.check_for_updates,
+        &event_tx,
+    );
 
     // Tab-strip icon poll: Windows has no MSAA event for icon-only
     // changes (e.g., Discord/Slack swapping in a notification-badge
@@ -4454,6 +4430,7 @@ async fn main() -> Result<()> {
         state: &state,
         event_tx: &event_tx,
         hotkey_state: &mut hotkey_state,
+        update_check_worker: &mut update_check_worker,
         tray_manager: &tray_manager,
         snap_hint_overlay: &snap_hint_overlay,
         settings_sync_tx: &settings_sync_tx,
@@ -4512,10 +4489,12 @@ async fn main() -> Result<()> {
     // blocked in `blocking_send` after the main loop stopped draining it.
     drop(event_rx);
 
-    // Stop the update-checker worker so it doesn't hold up shutdown.
-    update_check_cancel.store(true, std::sync::atomic::Ordering::SeqCst);
-    if !join_with_timeout(&mut update_check_thread, SHUTDOWN_FINAL_JOIN_TIMEOUT) {
-        warn!("Update checker did not exit within shutdown budget");
+    // Cancel now, but retain a timed-out handle through the rest of cleanup.
+    let mut update_check_thread = update_check_worker.shutdown();
+    let update_check_stopped =
+        join_with_timeout(&mut update_check_thread, SHUTDOWN_FINAL_JOIN_TIMEOUT);
+    if !update_check_stopped {
+        warn!("Update checker still owns an in-flight request; retrying after cleanup");
     }
     stop_animation_worker_and_run_recovery(animation_worker, &state).await;
 
@@ -4531,6 +4510,15 @@ async fn main() -> Result<()> {
     }
 
     join_forwarding_threads(thread_handles);
+
+    if !update_check_stopped
+        && !join_with_timeout(
+            &mut update_check_thread,
+            update_check::SHUTDOWN_JOIN_TIMEOUT,
+        )
+    {
+        warn!("Update checker exceeded its request timeout during final shutdown join");
+    }
 
     info!("LeopardWM daemon shutting down.");
     Ok(())

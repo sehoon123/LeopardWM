@@ -65,38 +65,49 @@ pub fn scoped_pipe_name_for_user(scope: &str) -> String {
     }
 }
 
-/// Preferred pipe name for this process/user with legacy fallback available.
-///
-/// Resolution order:
-/// 1. `LEOPARDWM_PIPE_SCOPE` environment override
-/// 2. `USERDOMAIN\\USERNAME`
-/// 3. legacy global `PIPE_NAME`
-pub fn preferred_pipe_name() -> String {
-    if let Ok(scope) = std::env::var("LEOPARDWM_PIPE_SCOPE") {
-        let scoped = scoped_pipe_name_for_user(&scope);
-        if scoped != PIPE_NAME {
-            return scoped;
-        }
-    }
-
-    let domain = std::env::var("USERDOMAIN").ok();
-    let user = std::env::var("USERNAME").ok();
-    match (domain, user) {
-        (Some(domain), Some(user)) if !domain.trim().is_empty() && !user.trim().is_empty() => {
-            scoped_pipe_name_for_user(&format!("{domain}\\{user}"))
-        }
-        _ => PIPE_NAME.to_string(),
+/// Build an endpoint identity that cannot collide across Windows sessions.
+pub fn scoped_pipe_name_for_user_and_session(scope: &str, session_id: u32) -> String {
+    let segment = sanitize_pipe_scope_segment(scope);
+    if segment.is_empty() {
+        format!("{PIPE_NAME}_session_{session_id}")
+    } else {
+        format!("{PIPE_NAME}_{segment}_session_{session_id}")
     }
 }
 
-/// Candidate pipe names in preference order with legacy compatibility fallback.
-pub fn pipe_name_candidates() -> Vec<String> {
-    let preferred = preferred_pipe_name();
-    if preferred == PIPE_NAME {
-        vec![preferred]
+fn current_session_id_or_isolated_process() -> u32 {
+    use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+
+    let process_id = unsafe { GetCurrentProcessId() };
+    let mut session_id = 0;
+    if unsafe { ProcessIdToSessionId(process_id, &mut session_id) }.is_ok() {
+        session_id
     } else {
-        vec![preferred, PIPE_NAME.to_string()]
+        // Fail closed: another process receives a different endpoint rather
+        // than falling back to a machine-global name.
+        process_id | 0x8000_0000
     }
+}
+
+/// Preferred pipe name for this user and authoritative Windows session.
+pub fn preferred_pipe_name() -> String {
+    let scope = std::env::var("LEOPARDWM_PIPE_SCOPE")
+        .ok()
+        .filter(|scope| !sanitize_pipe_scope_segment(scope).is_empty())
+        .or_else(|| {
+            let domain = std::env::var("USERDOMAIN").ok()?;
+            let user = std::env::var("USERNAME").ok()?;
+            (!domain.trim().is_empty() && !user.trim().is_empty())
+                .then(|| format!("{domain}\\{user}"))
+        })
+        .unwrap_or_else(|| "local".to_string());
+    scoped_pipe_name_for_user_and_session(&scope, current_session_id_or_isolated_process())
+}
+
+/// The one session-local endpoint accepted by this process.
+pub fn pipe_name_candidates() -> Vec<String> {
+    vec![preferred_pipe_name()]
 }
 
 /// Return the protocol identifier for this crate version.
@@ -992,10 +1003,14 @@ mod tests {
     }
 
     #[test]
-    fn test_pipe_name_candidates_include_legacy_fallback() {
-        let candidates = pipe_name_candidates();
-        assert!(!candidates.is_empty());
-        assert_eq!(candidates.last().unwrap(), PIPE_NAME);
+    fn pipe_identity_distinguishes_windows_sessions() {
+        let first = scoped_pipe_name_for_user_and_session("ACME\\Alice", 1);
+        let same = scoped_pipe_name_for_user_and_session("ACME\\Alice", 1);
+        let second = scoped_pipe_name_for_user_and_session("ACME\\Alice", 2);
+        assert_eq!(first, same);
+        assert_ne!(first, second);
+        assert!(first.ends_with("acme_alice_session_1"));
+        assert_eq!(pipe_name_candidates(), vec![preferred_pipe_name()]);
     }
 
     #[test]

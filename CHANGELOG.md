@@ -2,6 +2,34 @@
 
 All notable changes to LeopardWM will be documented in this file.
 
+## 0.2.17-sehoon.34
+
+### Fixes
+
+- Scope IPC endpoints to both user and authoritative Windows session, remove the
+  machine-global legacy fallback, and reject clients/servers whose peer PID is
+  not in the current session.
+- Reconcile update checking on every live config reload. Disabled workers perform
+  no new network checks, false/true transitions mint generations so stale fetches
+  cannot notify, and shutdown retains the worker through a request-timeout join.
+- Clamp inner and outer layout gaps to the Settings contract and saturate the
+  downstream tab-strip reserve calculation.
+- Require a new Cargo/MSI core for every artifact tag and reject same-version MSI
+  upgrades, preserving monotonic installer and updater identity.
+- Swallow both edges of successfully claimed hotkeys while allowing a key held
+  before hook installation to release normally.
+- Make CloseWindow prefer the OS-observed managed floating/scratchpad focus.
+- Release hidden and shown scratchpad designations only after exact-incarnation
+  uncloak, restore, and show all succeed.
+- Retain a coalesced full rescan whenever any WinEvent callback is dropped by a
+  full bounded queue, including final location and title changes.
+
+### Tests
+
+- Add deterministic session identity, update ABA/toggle, numeric-bound,
+  release-core, hotkey-edge, scratchpad release, CloseWindow, and WinEvent queue
+  regressions plus a real daemon/CLI session-pipe smoke test.
+
 ## 0.2.16-sehoon.33
 
 ### Fixes

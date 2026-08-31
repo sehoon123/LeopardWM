@@ -800,7 +800,7 @@ impl AppState {
         IpcResponse::Ok
     }
 
-    fn managed_focused_window(&self) -> Option<u64> {
+    pub(crate) fn managed_focused_window(&self) -> Option<u64> {
         let workspace = self.focused_workspace()?;
         self.previous_focused_hwnd
             .filter(|hwnd| workspace.contains_window(*hwnd))
@@ -885,7 +885,7 @@ impl AppState {
 
     /// Handle `IpcCommand::CloseWindow`.
     fn handle_close_window(&mut self) -> IpcResponse {
-        if let Some(hwnd) = self.focused_workspace().and_then(|ws| ws.focused_window()) {
+        if let Some(hwnd) = self.managed_focused_window() {
             if let Err(e) = leopardwm_platform_win32::close_window(hwnd) {
                 return IpcResponse::error(format!("Failed to close window: {}", e));
             }

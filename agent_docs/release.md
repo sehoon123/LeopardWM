@@ -6,7 +6,7 @@ Guide for all agents and contributors releasing LeopardWM.
 
 The workspace version in `Cargo.toml` is a three-part SemVer core version (`X.Y.Z`), which is also the MSI `ProductVersion`.
 
-Release tags must be `vX.Y.Z` or that same core version followed by a SemVer prerelease suffix. For example, with Cargo version `0.2.6`, both `v0.2.6` and the established `v0.2.6-sehoon.24-rc2` form are valid. Build metadata and a different core version are rejected. The changelog header is the tag without its leading `v`, including any prerelease suffix.
+Release tags must be `vX.Y.Z` or that same core version followed by a SemVer prerelease suffix. For example, with Cargo version `0.2.6`, `v0.2.6-sehoon.24-rc2` is valid. Build metadata and a different core version are rejected. **Only one tag may use each core version:** bump `[workspace.package].version` for every published artifact, even when changing only the suffix. The changelog header is the tag without its leading `v`, including any prerelease suffix.
 
 ## Release workflow
 
@@ -14,7 +14,7 @@ Release tags must be `vX.Y.Z` or that same core version followed by a SemVer pre
 
 1. The tag resolves to the checked-out commit.
 2. That commit exactly equals the fetched `origin/main` candidate.
-3. The tag core version equals `[workspace.package].version` and its optional suffix is valid SemVer prerelease syntax.
+3. The tag core version equals `[workspace.package].version`, its optional suffix is valid SemVer prerelease syntax, and no other tag uses that core.
 4. `CHANGELOG.md` contains the exact matching section.
 
 The workflow then formats, runs the locked workspace suite, and runs both controlled Win32 probes (`floating_return_windows` and `preview_lifecycle_windows`) serially. Each probe has a fail-closed daemon-absence preflight; it never stops a process automatically. It builds locked release binaries, verifies the daemon and watchdog PE GUI subsystems, and packages:
@@ -51,7 +51,7 @@ The header must be exactly `## X.Y.Z` (or `## X.Y.Z-prerelease` for a prerelease
 ## Pre-release checklist
 
 1. Update `CHANGELOG.md` with the exact planned tag section and all notable user-facing changes.
-2. Bump `[workspace.package].version` in `Cargo.toml` and update `Cargo.lock` only when preparing a new version.
+2. Bump `[workspace.package].version` in `Cargo.toml` and update `Cargo.lock`; every artifact requires a new core version.
 3. Run the local gate and inspect every result:
    - `cargo build --release`
    - `pwsh ./.github/verify-gui-subsystems.ps1`

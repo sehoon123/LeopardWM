@@ -149,6 +149,10 @@ version = "0.2.6"
 
 - Candidate coverage.
 
+## 0.2.6-sehoon.25-rc1
+
+- Duplicate-core rejection coverage.
+
 ## 0.2.6-rc1
 
 - Off-main coverage.
@@ -164,6 +168,11 @@ version = "0.2.6"
     Invoke-TestGit -Repository $repository -Arguments @('push', 'origin', '--tags')
     Invoke-TestGit -Repository $repository -Arguments @('checkout', '--detach', 'v0.2.6-sehoon.24-rc2')
     & $validator -RepoRoot $repository -Tag 'v0.2.6-sehoon.24-rc2'
+
+    # A second artifact with the same Cargo/MSI core has no monotonic installer
+    # identity and must be rejected even when its suffix and changelog are valid.
+    Invoke-TestGit -Repository $repository -Arguments @('tag', 'v0.2.6-sehoon.25-rc1')
+    Assert-ValidatorRejects -Repository $repository -Tag 'v0.2.6-sehoon.25-rc1'
 
     # Tags with a different core version or invalid syntax must not publish.
     Invoke-TestGit -Repository $repository -Arguments @('tag', 'v0.2.7')

@@ -15,30 +15,134 @@ use tracing::{debug, info, warn};
 /// unrelated upstream version is "newer" than its own prerelease.
 const RELEASES_API: &str = "https://api.github.com/repos/sehoon123/LeopardWM/releases?per_page=1";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// Final shutdown retry covers the maximum in-flight HTTP request plus margin.
+pub(crate) const SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(12);
 const STARTUP_DELAY: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_secs(60 * 60 * 24);
 
 /// Public release URL for the GUI / tray click action.
 pub const RELEASES_PAGE_URL: &str = "https://github.com/sehoon123/LeopardWM/releases";
 
+/// One process-owned update worker. Disabling checks leaves the thread dormant
+/// so a rapid false→true toggle cannot race a canceled worker or create two.
+pub struct UpdateCheckWorker {
+    enabled: Arc<AtomicBool>,
+    generation: Arc<std::sync::atomic::AtomicU64>,
+    cancel: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl UpdateCheckWorker {
+    pub fn new() -> Self {
+        Self {
+            enabled: Arc::new(AtomicBool::new(false)),
+            generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            cancel: Arc::new(AtomicBool::new(false)),
+            thread: None,
+        }
+    }
+
+    pub fn reconcile<F>(&mut self, enabled: bool, on_update_found: F)
+    where
+        F: Fn(String, u64) + Send + 'static,
+    {
+        self.reconcile_with(enabled, |cancel, worker_enabled, generation| {
+            spawn_update_checker(cancel, worker_enabled, generation, on_update_found)
+        });
+    }
+
+    fn reconcile_with<F>(&mut self, enabled: bool, spawn: F)
+    where
+        F: FnOnce(
+            Arc<AtomicBool>,
+            Arc<AtomicBool>,
+            Arc<std::sync::atomic::AtomicU64>,
+        ) -> Option<std::thread::JoinHandle<()>>,
+    {
+        if self
+            .thread
+            .as_ref()
+            .is_some_and(|thread| thread.is_finished())
+        {
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+        if self.enabled.swap(enabled, Ordering::AcqRel) != enabled {
+            self.generation.fetch_add(1, Ordering::AcqRel);
+        }
+        if enabled && self.thread.is_none() {
+            self.cancel.store(false, Ordering::Release);
+            self.thread = spawn(
+                self.cancel.clone(),
+                self.enabled.clone(),
+                self.generation.clone(),
+            );
+        }
+    }
+
+    pub fn accepts(&self, generation: u64) -> bool {
+        self.enabled.load(Ordering::Acquire)
+            && self.generation.load(Ordering::Acquire) == generation
+    }
+
+    pub fn shutdown(&mut self) -> Option<std::thread::JoinHandle<()>> {
+        if self.enabled.swap(false, Ordering::AcqRel) {
+            self.generation.fetch_add(1, Ordering::AcqRel);
+        }
+        self.cancel.store(true, Ordering::Release);
+        self.thread.take()
+    }
+}
+
 /// Spawn the background update-checker thread.
 ///
 /// `on_update_found` runs on the worker thread when a newer release tag is
-/// observed. `cancel` lets shutdown abort sleeps early.
-pub fn spawn_update_checker<F>(
+/// observed. `cancel` stops the process-owned thread; `enabled` suspends all
+/// network work without destroying the worker generation.
+fn spawn_update_checker<F>(
     cancel: Arc<AtomicBool>,
+    enabled: Arc<AtomicBool>,
+    generation: Arc<std::sync::atomic::AtomicU64>,
     on_update_found: F,
 ) -> Option<std::thread::JoinHandle<()>>
 where
-    F: Fn(String) + Send + 'static,
+    F: Fn(String, u64) + Send + 'static,
 {
     match std::thread::Builder::new()
         .name("leopardwm-update-check".to_string())
         .spawn(move || {
-            interruptible_sleep(STARTUP_DELAY, &cancel);
-            while !cancel.load(Ordering::SeqCst) {
-                run_check_once(&on_update_found);
-                interruptible_sleep(POLL_INTERVAL, &cancel);
+            while !cancel.load(Ordering::Acquire) {
+                while !enabled.load(Ordering::Acquire) && !cancel.load(Ordering::Acquire) {
+                    interruptible_sleep(Duration::from_secs(1), &cancel);
+                }
+                let active_generation = generation.load(Ordering::Acquire);
+                if cancel.load(Ordering::Acquire)
+                    || !interruptible_sleep_while_enabled(
+                        STARTUP_DELAY,
+                        &cancel,
+                        &enabled,
+                        &generation,
+                        active_generation,
+                    )
+                {
+                    continue;
+                }
+                while enabled.load(Ordering::Acquire)
+                    && generation.load(Ordering::Acquire) == active_generation
+                    && !cancel.load(Ordering::Acquire)
+                {
+                    run_check_once(&on_update_found, &enabled, &generation, active_generation);
+                    if !interruptible_sleep_while_enabled(
+                        POLL_INTERVAL,
+                        &cancel,
+                        &enabled,
+                        &generation,
+                        active_generation,
+                    ) {
+                        break;
+                    }
+                }
             }
         }) {
         Ok(handle) => Some(handle),
@@ -49,13 +153,43 @@ where
     }
 }
 
-fn run_check_once(on_update_found: &impl Fn(String)) {
-    match fetch_latest_release_tag() {
+fn run_check_once(
+    on_update_found: &impl Fn(String, u64),
+    enabled: &AtomicBool,
+    generation: &std::sync::atomic::AtomicU64,
+    expected_generation: u64,
+) {
+    run_check_once_with(
+        fetch_latest_release_tag,
+        on_update_found,
+        enabled,
+        generation,
+        expected_generation,
+    );
+}
+
+fn run_check_once_with(
+    fetch: impl FnOnce() -> Option<String>,
+    on_update_found: &impl Fn(String, u64),
+    enabled: &AtomicBool,
+    generation: &std::sync::atomic::AtomicU64,
+    expected_generation: u64,
+) {
+    if !enabled.load(Ordering::Acquire) || generation.load(Ordering::Acquire) != expected_generation
+    {
+        return;
+    }
+    match fetch() {
         Some(tag) => {
+            if !enabled.load(Ordering::Acquire)
+                || generation.load(Ordering::Acquire) != expected_generation
+            {
+                return;
+            }
             let current = env!("CARGO_PKG_VERSION");
             if is_newer(&tag, current) {
                 info!("Update available: {} (current: {})", tag, current);
-                on_update_found(tag);
+                on_update_found(tag, expected_generation);
             } else {
                 debug!("Up to date (latest: {}, current: {})", tag, current);
             }
@@ -110,7 +244,7 @@ fn interruptible_sleep(total: Duration, cancel: &AtomicBool) {
     let chunk = Duration::from_secs(1);
     let mut remaining = total;
     while remaining > Duration::ZERO {
-        if cancel.load(Ordering::SeqCst) {
+        if cancel.load(Ordering::Acquire) {
             return;
         }
         let step = remaining.min(chunk);
@@ -119,9 +253,95 @@ fn interruptible_sleep(total: Duration, cancel: &AtomicBool) {
     }
 }
 
+fn interruptible_sleep_while_enabled(
+    total: Duration,
+    cancel: &AtomicBool,
+    enabled: &AtomicBool,
+    generation: &std::sync::atomic::AtomicU64,
+    expected_generation: u64,
+) -> bool {
+    let chunk = Duration::from_secs(1);
+    let mut remaining = total;
+    while remaining > Duration::ZERO {
+        if cancel.load(Ordering::Acquire)
+            || !enabled.load(Ordering::Acquire)
+            || generation.load(Ordering::Acquire) != expected_generation
+        {
+            return false;
+        }
+        let step = remaining.min(chunk);
+        std::thread::sleep(step);
+        remaining = remaining.saturating_sub(step);
+    }
+    !cancel.load(Ordering::Acquire)
+        && enabled.load(Ordering::Acquire)
+        && generation.load(Ordering::Acquire) == expected_generation
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_check_toggle_reconciles_running_worker() {
+        use std::sync::atomic::AtomicUsize;
+
+        let starts = Arc::new(AtomicUsize::new(0));
+        let mut worker = UpdateCheckWorker::new();
+        worker.reconcile_with(false, |_, _, _| panic!("disabled startup must not spawn"));
+        assert!(worker.thread.is_none());
+
+        let starts_for_spawn = starts.clone();
+        worker.reconcile_with(true, move |cancel, _, _| {
+            starts_for_spawn.fetch_add(1, Ordering::SeqCst);
+            Some(std::thread::spawn(move || {
+                while !cancel.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+            }))
+        });
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+        assert!(worker.enabled.load(Ordering::Acquire));
+        let first_generation = worker.generation.load(Ordering::Acquire);
+        assert!(worker.accepts(first_generation));
+
+        worker.reconcile_with(true, |_, _, _| panic!("duplicate enable must not spawn"));
+        worker.reconcile_with(false, |_, _, _| panic!("disable must not spawn"));
+        assert!(!worker.enabled.load(Ordering::Acquire));
+        assert!(!worker.accepts(first_generation));
+        worker.reconcile_with(true, |_, _, _| panic!("dormant worker must be reused"));
+        assert!(worker.enabled.load(Ordering::Acquire));
+        assert!(!worker.accepts(first_generation));
+        assert!(worker.accepts(worker.generation.load(Ordering::Acquire)));
+        assert_eq!(starts.load(Ordering::SeqCst), 1);
+
+        let mut thread = worker.shutdown();
+        thread.take().unwrap().join().unwrap();
+        assert!(!worker.enabled.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn disabled_generation_cannot_notify_after_false_true_aba() {
+        let enabled = AtomicBool::new(true);
+        let generation = std::sync::atomic::AtomicU64::new(1);
+        let delivered = AtomicBool::new(false);
+
+        run_check_once_with(
+            || {
+                enabled.store(false, Ordering::Release);
+                generation.store(2, Ordering::Release);
+                enabled.store(true, Ordering::Release);
+                generation.store(3, Ordering::Release);
+                Some("v999.0.0".to_string())
+            },
+            &|_, _| delivered.store(true, Ordering::Release),
+            &enabled,
+            &generation,
+            1,
+        );
+
+        assert!(!delivered.load(Ordering::Acquire));
+    }
 
     #[test]
     fn newer_basic() {

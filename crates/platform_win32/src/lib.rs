@@ -76,8 +76,10 @@ pub use placement::{
     ApplyPlacementsResult, HeightViolation, PlacementCache, WidthViolation, EDGE_EPSILON_PX,
 };
 pub use system::{
-    are_animations_enabled, get_system_highlight_color_bgr, is_high_contrast_enabled,
-    is_on_battery_or_power_saver, other_process_in_current_session, scale_px, set_dpi_awareness,
+    are_animations_enabled, current_session_id, get_system_highlight_color_bgr,
+    is_high_contrast_enabled, is_on_battery_or_power_saver, named_pipe_client_in_current_session,
+    named_pipe_server_in_current_session, other_process_in_current_session, scale_px,
+    set_dpi_awareness,
 };
 pub use types::{
     AnimationPlacementPolicy, MonitorId, MonitorInfo, PlatformConfig, Win32Error, WindowInfo,

@@ -2,9 +2,10 @@
 
 use anyhow::{Context, Result};
 use leopardwm_ipc::{pipe_name_candidates, IpcCommand, IpcResponse, MAX_IPC_MESSAGE_SIZE};
+use std::os::windows::io::AsRawHandle;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
-use tokio::net::windows::named_pipe::ClientOptions;
+use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
 use tokio::time::{sleep, timeout};
 
 /// Timeout budget for establishing an IPC connection to the daemon.
@@ -147,10 +148,23 @@ pub(crate) fn error_chain_has_connect_timeout(err: &anyhow::Error) -> bool {
     })
 }
 
+fn verify_server_session(client: &NamedPipeClient) -> Result<()> {
+    match leopardwm_platform_win32::named_pipe_server_in_current_session(
+        client.as_raw_handle() as isize
+    ) {
+        Ok(true) => Ok(()),
+        Ok(false) => anyhow::bail!("IPC server belongs to another Windows session"),
+        Err(error) => anyhow::bail!("Could not verify IPC server Windows session: {error}"),
+    }
+}
+
 pub(crate) fn probe_daemon_running() -> Result<bool> {
     for pipe_name in pipe_name_candidates() {
         match ClientOptions::new().open(&pipe_name) {
-            Ok(_) => return Ok(true),
+            Ok(client) => {
+                verify_server_session(&client)?;
+                return Ok(true);
+            }
             Err(e) => match classify_pipe_probe_error(&e) {
                 Some(true) => return Ok(true),
                 Some(false) => continue,
@@ -193,7 +207,10 @@ pub(crate) async fn open_pipe_with_retry(
 
     loop {
         let preferred_error = match ClientOptions::new().open(preferred_pipe) {
-            Ok(client) => return Ok(client),
+            Ok(client) => {
+                verify_server_session(&client)?;
+                return Ok(client);
+            }
             Err(error) if is_pipe_busy(&error) => {
                 // A busy preferred pipe proves that this endpoint exists. Do
                 // not probe the legacy name now or on a later retry: it could
@@ -217,7 +234,10 @@ pub(crate) async fn open_pipe_with_retry(
         if let (Some(legacy_pipe), Some(preferred_error)) = (legacy_pipe, preferred_error) {
             if legacy_fallback_is_safe(preferred_endpoint_seen, &preferred_error) {
                 match ClientOptions::new().open(legacy_pipe) {
-                    Ok(client) => return Ok(client),
+                    Ok(client) => {
+                        verify_server_session(&client)?;
+                        return Ok(client);
+                    }
                     Err(error) if is_pipe_busy(&error) => saw_busy = true,
                     Err(error) if is_pipe_not_found(&error) => saw_not_found = true,
                     Err(error) => {

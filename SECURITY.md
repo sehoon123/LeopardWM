@@ -77,7 +77,7 @@ LeopardWM's attack surface is minimal by design:
 
 ### Named Pipe Security
 
-The IPC server normally uses a user-scoped pipe name. It derives `\\.\pipe\leopardwm_<scope>` from `LEOPARDWM_PIPE_SCOPE` or `USERDOMAIN\USERNAME`; if neither produces a scope, it uses the legacy `\\.\pipe\leopardwm` name. Clients try the legacy name after a scoped name for compatibility.
+The IPC server uses one user-and-session-scoped pipe name: `\\.\pipe\leopardwm_<scope>_session_<id>`. The scope comes from `LEOPARDWM_PIPE_SCOPE` or `USERDOMAIN\USERNAME`, and the session ID comes from `ProcessIdToSessionId`. The machine-global legacy endpoint is not accepted. Both server and client validate the connected peer process's Windows session before exchanging commands.
 
 - The server normally supplies an explicit security descriptor: `D:(A;;FA;;;<current-user-SID>)(A;;FA;;;SY)S:(ML;;NW;;;ME)`. Its DACL grants full access to the current user's SID and SYSTEM, and its mandatory label is Medium integrity with no-write-up.
 - That Medium label lets a non-elevated client for the same user connect when an elevated daemon created the pipe.

@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.16"
+version = "0.2.17"
 edition = "2021"
 license = "GPL-3.0"
 repository = "https://github.com/sehoon123/LeopardWM"
@@ -33,6 +33,7 @@ windows = { version = "0.62", features = [
     "Win32_System_ProcessStatus",
     "Win32_System_LibraryLoader",
     "Win32_System_Power",
+    "Win32_System_Pipes",
     "Win32_System_Registry",
     "Win32_System_SystemInformation",
     "Win32_System_Com",

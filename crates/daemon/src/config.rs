@@ -990,6 +990,8 @@ pub struct AnimationConfig {
 /// Upper bound for any configured animation duration (ms). Guards against
 /// a typo making the WM feel frozen.
 pub const MAX_ANIMATION_DURATION_MS: u64 = 2000;
+/// Maximum inner/outer layout gap accepted by both TOML and Settings.
+pub const MAX_LAYOUT_GAP: i32 = 100;
 
 fn default_layout_duration() -> u64 {
     150
@@ -1307,28 +1309,24 @@ impl Config {
             }
         }
 
-        // gap must be >= 0
-        if self.layout.gap < 0 {
-            warnings.push(ConfigWarning {
-                field: "layout.gap".to_string(),
-                message: format!("Negative gap ({}) clamped to 0", self.layout.gap),
-            });
-            self.layout.gap = 0;
-        }
-
-        // outer gaps must be >= 0
-        for (field, val) in [
+        // Match the Settings contract at the shared TOML/WebView boundary.
+        for (field, value) in [
+            ("layout.gap", &mut self.layout.gap),
             ("layout.outer_gap_left", &mut self.layout.outer_gap_left),
             ("layout.outer_gap_right", &mut self.layout.outer_gap_right),
             ("layout.outer_gap_top", &mut self.layout.outer_gap_top),
             ("layout.outer_gap_bottom", &mut self.layout.outer_gap_bottom),
         ] {
-            if *val < 0 {
+            let original = *value;
+            *value = original.clamp(0, MAX_LAYOUT_GAP);
+            if *value != original {
                 warnings.push(ConfigWarning {
                     field: field.to_string(),
-                    message: format!("Negative {} ({}) clamped to 0", field, *val),
+                    message: format!(
+                        "{field} ({original}) outside 0..={MAX_LAYOUT_GAP}, clamped to {}",
+                        *value
+                    ),
                 });
-                *val = 0;
             }
         }
 
@@ -2745,6 +2743,29 @@ mod tests {
         let compiled = config.compile_window_rules();
         assert_eq!(compiled[0].width, None);
         assert_eq!(compiled[0].height, None);
+    }
+
+    #[test]
+    fn test_validate_settings_numeric_bounds() {
+        let mut config = Config::default();
+        config.layout.gap = i32::MAX;
+        config.layout.outer_gap_left = i32::MAX;
+        config.layout.outer_gap_right = i32::MAX;
+        config.layout.outer_gap_top = i32::MAX;
+        config.layout.outer_gap_bottom = i32::MAX;
+
+        let warnings = config.validate();
+
+        for (field, value) in [
+            ("layout.gap", config.layout.gap),
+            ("layout.outer_gap_left", config.layout.outer_gap_left),
+            ("layout.outer_gap_right", config.layout.outer_gap_right),
+            ("layout.outer_gap_top", config.layout.outer_gap_top),
+            ("layout.outer_gap_bottom", config.layout.outer_gap_bottom),
+        ] {
+            assert_eq!(value, MAX_LAYOUT_GAP);
+            assert!(warnings.iter().any(|warning| warning.field == field));
+        }
     }
 
     #[test]

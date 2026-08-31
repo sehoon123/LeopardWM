@@ -363,7 +363,7 @@ pub fn dwm_cloak_window(window_id: WindowId) -> bool {
 ///
 /// Bypasses `apply_cloak_state`'s OR-check: the intent here is "force
 /// visible" regardless of why the window was originally cloaked.
-pub fn dwm_uncloak_window(window_id: WindowId) {
+pub fn dwm_uncloak_window(window_id: WindowId) -> bool {
     let _commit = lock_cloak_commit();
     let global = global_cloak_receipt(window_id);
     let ghost = ghost_cloak_receipt(window_id);
@@ -383,10 +383,10 @@ pub fn dwm_uncloak_window(window_id: WindowId) {
     }
 
     let Some(expected) = expected else {
-        return;
+        return true;
     };
     if crate::event_hooks::current_window_event_identity(window_id).as_ref() != Some(&expected) {
-        return;
+        return false;
     }
     let uncloaked = window_id_to_hwnd(window_id)
         .ok()
@@ -394,7 +394,7 @@ pub fn dwm_uncloak_window(window_id: WindowId) {
             IsWindow(Some(hwnd)).as_bool() && dwm_set_cloak(hwnd, false)
         });
     if uncloaked {
-        return;
+        return true;
     }
 
     if let Some(identity) = global {
@@ -412,6 +412,7 @@ pub fn dwm_uncloak_window(window_id: WindowId) {
             .get_or_insert_with(HashMap::new)
             .insert(window_id, identity);
     }
+    false
 }
 
 /// Force-uncloak every tracked window from both sets. Called during

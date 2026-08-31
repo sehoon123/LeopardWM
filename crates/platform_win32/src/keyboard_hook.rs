@@ -217,10 +217,13 @@ pub fn install_keyboard_hook(
         *HOOK_HELD
             .lock()
             .map_err(|_| Win32Error::HookInstallFailed("Hook held mutex poisoned".to_string()))? =
-            physically_held.clone();
-        *HOOK_CLAIMED.lock().map_err(|_| {
-            Win32Error::HookInstallFailed("Hook claimed mutex poisoned".to_string())
-        })? = physically_held;
+            physically_held;
+        // These downs predate this hook generation, so their ups must pass
+        // through. Seed only HOOK_HELD to suppress repeat-triggering.
+        HOOK_CLAIMED
+            .lock()
+            .map_err(|_| Win32Error::HookInstallFailed("Hook claimed mutex poisoned".to_string()))?
+            .clear();
         *HOOK_FN_HELD.lock().map_err(|_| {
             Win32Error::HookInstallFailed("Hook fn-held mutex poisoned".to_string())
         })? = physically_held_fn;
@@ -324,6 +327,17 @@ unsafe extern "system" fn keyboard_ll_hook_proc(
     }
 }
 
+fn release_claimed_key(vk: i32) -> bool {
+    HOOK_HELD
+        .lock()
+        .unwrap_or_else(recover_poisoned_mutex)
+        .retain(|&key| key != vk);
+    let mut claimed = HOOK_CLAIMED.lock().unwrap_or_else(recover_poisoned_mutex);
+    let was_claimed = claimed.contains(&vk);
+    claimed.retain(|&key| key != vk);
+    was_claimed
+}
+
 unsafe fn keyboard_ll_hook_inner(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if ncode < 0 || ACTIVE_KEYBOARD_THREAD.load(Ordering::Acquire) != GetCurrentThreadId() {
         return CallNextHookEx(None, ncode, wparam, lparam);
@@ -348,13 +362,9 @@ unsafe fn keyboard_ll_hook_inner(ncode: i32, wparam: WPARAM, lparam: LPARAM) -> 
                 return LRESULT(1);
             }
         }
-        let mut held = HOOK_HELD.lock().unwrap_or_else(recover_poisoned_mutex);
-        held.retain(|&k| k != vk);
-        drop(held);
-        HOOK_CLAIMED
-            .lock()
-            .unwrap_or_else(recover_poisoned_mutex)
-            .retain(|&key| key != vk);
+        if release_claimed_key(vk) {
+            return LRESULT(1);
+        }
         return CallNextHookEx(None, ncode, wparam, lparam);
     }
 
@@ -600,6 +610,33 @@ mod tests {
             .lock()
             .unwrap_or_else(recover_poisoned_mutex)
             .is_none());
+    }
+
+    #[test]
+    fn claimed_hotkey_swallows_both_edges() {
+        let _guard = KEYBOARD_GLOBAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex);
+        clear_keyboard_globals();
+        HOOK_HELD
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex)
+            .push(0x48);
+        HOOK_CLAIMED
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex)
+            .push(0x48);
+
+        assert!(release_claimed_key(0x48));
+        assert!(!release_claimed_key(0x48));
+        assert!(HOOK_HELD
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex)
+            .is_empty());
+        assert!(HOOK_CLAIMED
+            .lock()
+            .unwrap_or_else(recover_poisoned_mutex)
+            .is_empty());
     }
 
     #[test]

@@ -13,9 +13,9 @@ concurrency:
 
 jobs:
   build:
-    # Any version-coherent v* tag can build. The validation step below requires
-    # the tag to resolve to the current origin/main commit and treats a
-    # prerelease suffix (including -sehoon.24-rcN) as a prerelease channel.
+    # A version-coherent v* tag can build only once per Cargo/MSI core. The
+    # validator requires exact origin/main provenance and a core bump before
+    # any later artifact, including another prerelease suffix.
     permissions:
       contents: write
     runs-on: windows-latest

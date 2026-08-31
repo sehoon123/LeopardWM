@@ -7,9 +7,9 @@ Validates the provenance and package identity of a LeopardWM release candidate.
 The release workflow calls this script before building and again after packaging.
 A valid tag resolves to the checked-out commit, that commit is exactly origin/main,
 the tag's core version equals [workspace.package].version, and CHANGELOG.md has a
-matching section. A SemVer prerelease suffix is allowed so tags such as
-v0.2.6-sehoon.24-rc2 remain valid while the MSI retains Cargo's 0.2.6 version.
-When artifact paths are supplied, the script also validates ZIP inventory, MSI
+matching section. A SemVer prerelease suffix is allowed, but each Cargo/MSI
+core version may publish exactly one tag so installer/updater ordering stays
+monotonic. When artifact paths are supplied, the script also validates ZIP inventory, MSI
 properties/files, and checksums before publication.
 #>
 param(
@@ -323,6 +323,13 @@ if ($headCommit -cne $tagCommit) {
 }
 if ($headCommit -cne $mainCommit) {
     throw "Tag $Tag resolves to $headCommit but origin/main resolves to $mainCommit"
+}
+
+$coreTagText = Invoke-RepositoryGit -Arguments @('tag', '--list', "v$cargoVersion", "v$cargoVersion-*")
+$coreTags = @($coreTagText -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+$otherCoreTags = @($coreTags | Where-Object { $_ -cne $Tag })
+if ($otherCoreTags.Count -ne 0) {
+    throw "Cargo/MSI version $cargoVersion already has another release tag: $($otherCoreTags -join ', '). Bump [workspace.package].version before publishing another artifact."
 }
 
 $hasZip = -not [string]::IsNullOrWhiteSpace($ZipPath)

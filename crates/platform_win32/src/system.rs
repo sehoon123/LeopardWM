@@ -27,16 +27,68 @@ pub fn is_on_battery_or_power_saver() -> bool {
     }
 }
 
+fn process_session_id(process_id: u32) -> Result<u32, String> {
+    use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+
+    let mut session_id = 0;
+    unsafe { ProcessIdToSessionId(process_id, &mut session_id) }
+        .map_err(|error| format!("session query failed for process {process_id}: {error}"))?;
+    Ok(session_id)
+}
+
+/// Authoritative Windows session ID for this process.
+pub fn current_session_id() -> Result<u32, String> {
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+
+    process_session_id(unsafe { GetCurrentProcessId() })
+}
+
+fn session_ids_match(current: u32, peer: u32) -> bool {
+    current == peer
+}
+
+fn same_session_as_current(process_id: u32) -> Result<bool, String> {
+    Ok(session_ids_match(
+        current_session_id()?,
+        process_session_id(process_id)?,
+    ))
+}
+
+fn named_pipe_peer_in_current_session(raw_handle: isize, client: bool) -> Result<bool, String> {
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::Pipes::{GetNamedPipeClientProcessId, GetNamedPipeServerProcessId};
+
+    let pipe = HANDLE(raw_handle as *mut core::ffi::c_void);
+    let mut process_id = 0;
+    let result = unsafe {
+        if client {
+            GetNamedPipeClientProcessId(pipe, &mut process_id)
+        } else {
+            GetNamedPipeServerProcessId(pipe, &mut process_id)
+        }
+    };
+    result.map_err(|error| format!("named-pipe peer query failed: {error}"))?;
+    same_session_as_current(process_id)
+}
+
+/// Validate the client connected to a server-side named-pipe handle.
+pub fn named_pipe_client_in_current_session(raw_handle: isize) -> Result<bool, String> {
+    named_pipe_peer_in_current_session(raw_handle, true)
+}
+
+/// Validate the server behind a client-side named-pipe handle.
+pub fn named_pipe_server_in_current_session(raw_handle: isize) -> Result<bool, String> {
+    named_pipe_peer_in_current_session(raw_handle, false)
+}
+
 /// Whether another process with `executable_name` runs in this interactive
-/// session. Used only to distinguish an inaccessible legacy daemon pipe owned
-/// by another session from an elevated same-session daemon.
+/// session.
 pub fn other_process_in_current_session(executable_name: &str) -> Result<bool, String> {
     use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_NO_MORE_FILES, HANDLE};
     use windows::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
         TH32CS_SNAPPROCESS,
     };
-    use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
     use windows::Win32::System::Threading::GetCurrentProcessId;
 
     struct Snapshot(HANDLE);
@@ -50,9 +102,7 @@ pub fn other_process_in_current_session(executable_name: &str) -> Result<bool, S
 
     unsafe {
         let current_pid = GetCurrentProcessId();
-        let mut current_session = 0;
-        ProcessIdToSessionId(current_pid, &mut current_session)
-            .map_err(|error| format!("current session query failed: {error}"))?;
+        let current_session = current_session_id()?;
         let snapshot = Snapshot(
             CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
                 .map_err(|error| format!("process snapshot failed: {error}"))?,
@@ -71,17 +121,10 @@ pub fn other_process_in_current_session(executable_name: &str) -> Result<bool, S
                     .position(|character| *character == 0)
                     .unwrap_or(entry.szExeFile.len());
                 let name = String::from_utf16_lossy(&entry.szExeFile[..name_end]);
-                if name.eq_ignore_ascii_case(executable_name) {
-                    let mut session = 0;
-                    ProcessIdToSessionId(entry.th32ProcessID, &mut session).map_err(|error| {
-                        format!(
-                            "session query failed for matching process {}: {error}",
-                            entry.th32ProcessID
-                        )
-                    })?;
-                    if session == current_session {
-                        return Ok(true);
-                    }
+                if name.eq_ignore_ascii_case(executable_name)
+                    && process_session_id(entry.th32ProcessID)? == current_session
+                {
+                    return Ok(true);
                 }
             }
             if let Err(error) = Process32NextW(snapshot.0, &mut entry) {
@@ -197,6 +240,17 @@ mod tests {
     fn test_scale_px_125_percent() {
         assert_eq!(scale_px(10, 1.25), 13); // 12.5 rounds to 13
         assert_eq!(scale_px(8, 1.25), 10);
+    }
+
+    #[test]
+    fn pipe_peer_policy_rejects_other_windows_session() {
+        assert!(session_ids_match(7, 7));
+        assert!(!session_ids_match(7, 8));
+    }
+
+    #[test]
+    fn current_process_has_a_queryable_session() {
+        assert!(current_session_id().is_ok());
     }
 
     #[test]

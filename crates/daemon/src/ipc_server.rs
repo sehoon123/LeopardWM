@@ -5,13 +5,13 @@ use crate::events::SubscribeStartup;
 use anyhow::{Context, Result};
 use leopardwm_ipc::{
     preferred_pipe_name, EventKind, IpcCommand, IpcEvent, IpcResponse, MAX_IPC_MESSAGE_SIZE,
-    PIPE_NAME,
 };
 use std::collections::BTreeSet;
+use std::os::windows::io::AsRawHandle;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeServer, PipeMode, ServerOptions};
+use tokio::net::windows::named_pipe::{NamedPipeServer, PipeMode, ServerOptions};
 use tokio::sync::{broadcast, mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, error, warn};
 
@@ -41,7 +41,6 @@ pub(crate) const MAX_IPC_SUBSCRIBERS: usize = 32;
 pub(crate) struct IpcServerOwnership {
     pipe_name: String,
     first_server: NamedPipeServer,
-    legacy: Option<(String, NamedPipeServer)>,
     pipe_security_ptr: Option<usize>,
 }
 
@@ -84,56 +83,6 @@ pub(crate) fn acquire_ipc_server_ownership() -> Result<IpcServerOwnership> {
             pipe_name
         )
     })?;
-    let legacy = if pipe_name == PIPE_NAME {
-        None
-    } else {
-        match create_pipe_server(PIPE_NAME, true, pipe_security_ptr) {
-            Ok(server) => Some((PIPE_NAME.to_string(), server)),
-            Err(create_error) => match ClientOptions::new().open(PIPE_NAME) {
-                Ok(_) => {
-                    return Err(anyhow::anyhow!(
-                        "An older same-user daemon already owns legacy IPC endpoint '{}'",
-                        PIPE_NAME
-                    ));
-                }
-                Err(probe_error) if probe_error.raw_os_error() == Some(5) => {
-                    match leopardwm_platform_win32::other_process_in_current_session(
-                        "leopardwm.exe",
-                    ) {
-                        Ok(true) => {
-                            return Err(anyhow::anyhow!(
-                                "An elevated daemon in this session may own inaccessible legacy IPC endpoint '{}'",
-                                PIPE_NAME
-                            ));
-                        }
-                        Ok(false) => {
-                            // Named pipes share a machine namespace, while HWND
-                            // management is session-local. An inaccessible alias
-                            // with no same-session daemon belongs to another
-                            // signed-in session and must not block this user.
-                            warn!(
-                                "Legacy IPC alias belongs to another session; serving only {}",
-                                pipe_name
-                            );
-                            None
-                        }
-                        Err(error) => {
-                            return Err(anyhow::anyhow!(
-                                "Could not prove inaccessible legacy IPC endpoint is outside this session: {error}"
-                            ));
-                        }
-                    }
-                }
-                Err(probe_error) => {
-                    return Err(anyhow::anyhow!(
-                        "Failed to acquire legacy IPC endpoint '{}': create={create_error}; probe={probe_error}",
-                        PIPE_NAME
-                    ));
-                }
-            },
-        }
-    };
-
     // `create_with_security_attributes_raw` borrows this descriptor. Later
     // pipe instances need the same descriptor, so retain it for the daemon
     // process lifetime rather than letting the backing allocation disappear.
@@ -144,7 +93,6 @@ pub(crate) fn acquire_ipc_server_ownership() -> Result<IpcServerOwnership> {
     Ok(IpcServerOwnership {
         pipe_name,
         first_server,
-        legacy,
         pipe_security_ptr,
     })
 }
@@ -166,21 +114,10 @@ pub(crate) async fn run_ipc_server_with_ownership(
     let IpcServerOwnership {
         pipe_name,
         first_server,
-        legacy,
         pipe_security_ptr,
     } = ownership;
     let command_limit = Arc::new(Semaphore::new(MAX_IPC_COMMAND_HANDLERS));
     let subscriber_limit = Arc::new(Semaphore::new(MAX_IPC_SUBSCRIBERS));
-    let _legacy_task = legacy.map(|(legacy_name, legacy_server)| {
-        tokio::spawn(run_ipc_accept_loop(
-            event_tx.clone(),
-            legacy_name,
-            legacy_server,
-            pipe_security_ptr,
-            command_limit.clone(),
-            subscriber_limit.clone(),
-        ))
-    });
     run_ipc_accept_loop(
         event_tx,
         pipe_name,
@@ -230,6 +167,21 @@ async fn run_ipc_accept_loop(
             error!(%error, "Failed to accept client connection");
             drop(permit);
             continue;
+        }
+        match leopardwm_platform_win32::named_pipe_client_in_current_session(
+            server.as_raw_handle() as isize
+        ) {
+            Ok(true) => {}
+            Ok(false) => {
+                warn!("Rejected IPC client from another Windows session");
+                drop(permit);
+                continue;
+            }
+            Err(error) => {
+                warn!("Rejected IPC client whose Windows session could not be verified: {error}");
+                drop(permit);
+                continue;
+            }
         }
 
         debug!("Client connected");

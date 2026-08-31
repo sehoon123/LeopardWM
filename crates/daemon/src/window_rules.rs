@@ -1,6 +1,7 @@
 //! Window rule evaluation and application: tile/float/ignore decisions and rule-driven enumeration.
 
 use crate::config;
+use crate::events::WindowIncarnation;
 use crate::state::*;
 use anyhow::Result;
 use leopardwm_core_layout::Rect;
@@ -8,6 +9,34 @@ use leopardwm_platform_win32::{
     find_monitor_for_rect, get_process_executable, scale_px, MonitorId,
 };
 use tracing::{debug, info, warn};
+
+fn release_window_for_ignore_with(
+    expected: &WindowIncarnation,
+    mut current: impl FnMut() -> Option<WindowIncarnation>,
+    uncloak: impl FnOnce() -> bool,
+    restore: impl FnOnce() -> Result<()>,
+    show: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let still_current = |identity: Option<WindowIncarnation>| identity.as_ref() == Some(expected);
+    if !still_current(current()) {
+        anyhow::bail!("ignored window changed incarnation before release");
+    }
+    if !uncloak() {
+        anyhow::bail!("ignored window could not be uncloaked");
+    }
+    if !still_current(current()) {
+        anyhow::bail!("ignored window changed incarnation after uncloak");
+    }
+    restore()?;
+    if !still_current(current()) {
+        anyhow::bail!("ignored window changed incarnation after restore");
+    }
+    show()?;
+    if !still_current(current()) {
+        anyhow::bail!("ignored window changed incarnation after show");
+    }
+    Ok(())
+}
 
 impl AppState {
     /// Re-evaluate window rules for all managed windows.
@@ -22,7 +51,14 @@ impl AppState {
         }
 
         // Collect all managed windows with their current state
-        let mut transitions: Vec<(u64, MonitorId, usize, config::WindowAction, bool)> = Vec::new();
+        let mut transitions: Vec<(
+            u64,
+            MonitorId,
+            usize,
+            config::WindowAction,
+            bool,
+            WindowIncarnation,
+        )> = Vec::new();
 
         for (&monitor_id, ws_vec) in &self.workspaces {
             for (ws_idx, workspace) in ws_vec.iter().enumerate() {
@@ -36,19 +72,47 @@ impl AppState {
                             &win_info.title,
                             &executable,
                         );
-                        transitions.push((wid, monitor_id, ws_idx, action, is_floating));
+                        transitions.push((
+                            wid,
+                            monitor_id,
+                            ws_idx,
+                            action,
+                            is_floating,
+                            WindowIncarnation::from_window_info(&win_info),
+                        ));
                     }
                 }
             }
         }
 
+        // A hidden scratchpad owns a live HWND outside every workspace, so the
+        // workspace scan above cannot see an Ignore rule for it.
+        let hidden_scratchpad_ignore = self.scratchpad.and_then(|scratchpad| {
+            if transitions
+                .iter()
+                .any(|(window_id, _, _, _, _, _)| *window_id == scratchpad.window_id)
+            {
+                return None;
+            }
+            let info = self.lookup_window_info(scratchpad.window_id)?;
+            let executable = get_process_executable(info.process_id).unwrap_or_default();
+            (self.evaluate_window_rules(&info.class_name, &info.title, &executable)
+                == config::WindowAction::Ignore)
+                .then(|| {
+                    (
+                        scratchpad.window_id,
+                        WindowIncarnation::from_window_info(&info),
+                    )
+                })
+        });
+
         // Pre-compute floating rects before mutating workspaces (avoids borrow conflicts)
         let float_rects: std::collections::HashMap<u64, Rect> = transitions
             .iter()
-            .filter(|(_, _, _, action, is_floating)| {
+            .filter(|(_, _, _, action, is_floating, _)| {
                 *action == config::WindowAction::Float && !is_floating
             })
-            .filter_map(|(wid, monitor_id, _, _, _)| {
+            .filter_map(|(wid, monitor_id, _, _, _, _)| {
                 let win_info = self.lookup_window_info(*wid)?;
                 let executable = get_process_executable(win_info.process_id).unwrap_or_default();
                 let rect = self.get_floating_rect_from_rules(
@@ -62,7 +126,7 @@ impl AppState {
             })
             .collect();
 
-        for (wid, monitor_id, ws_idx, action, is_floating) in transitions {
+        for (wid, monitor_id, ws_idx, action, is_floating, identity) in transitions {
             match action {
                 config::WindowAction::Float if !is_floating => {
                     let viewport = self
@@ -103,7 +167,7 @@ impl AppState {
                     // exists. Dropping the workspace entry first made a parked /
                     // cloaked / clipped HWND permanently unreachable by layout
                     // recovery and shutdown.
-                    if let Err(error) = self.release_window_for_ignore(wid) {
+                    if let Err(error) = self.release_window_for_ignore(wid, &identity) {
                         warn!(
                             "Rule change retained management for {} because physical release failed: {}",
                             wid, error
@@ -124,8 +188,7 @@ impl AppState {
                             }
                         });
                     if removed {
-                        self.window_managed_at.remove(&wid);
-                        self.window_last_maximized_at.remove(&wid);
+                        self.forget_ignored_window_metadata(wid);
                         info!("Rule change: unmanaged window {} (ignore)", wid);
                     } else {
                         warn!(
@@ -136,6 +199,35 @@ impl AppState {
                 }
                 _ => {} // No change needed
             }
+        }
+
+        if let Some((wid, identity)) = hidden_scratchpad_ignore {
+            if let Err(error) = self.release_window_for_ignore(wid, &identity) {
+                warn!(
+                    "Rule change retained hidden scratchpad {} because physical release failed: {}",
+                    wid, error
+                );
+            } else {
+                self.restore_snap_for_window(wid);
+                leopardwm_platform_win32::taskbar::taskbar_show(wid);
+                self.forget_ignored_window_metadata(wid);
+                info!("Rule change: released hidden scratchpad {} (ignore)", wid);
+            }
+        }
+    }
+
+    fn forget_ignored_window_metadata(&mut self, wid: u64) {
+        self.clear_recycled_hwnd_metadata(wid);
+        self.last_placed_layout_rects.remove(&wid);
+        self.hidden_column_widths.remove(&wid);
+        self.tab_title_overrides.remove(&wid);
+        self.window_managed_at.remove(&wid);
+        self.window_last_maximized_at.remove(&wid);
+        self.recently_hidden_hwnds.remove(&wid);
+        self.moved_or_resized_suppression.remove(&wid);
+        self.settled_geometry_mismatches.remove(&wid);
+        if self.previous_focused_hwnd == Some(wid) {
+            self.previous_focused_hwnd = None;
         }
     }
 
@@ -208,23 +300,35 @@ impl AppState {
     /// Physically release a window before an Ignore rule drops the model record
     /// that owns its recovery receipts. `restore_window_moved_offscreen` also
     /// clears a LeopardWM-owned region for this HWND.
-    fn release_window_for_ignore(&self, wid: u64) -> Result<()> {
+    fn release_window_for_ignore(&self, wid: u64, expected: &WindowIncarnation) -> Result<()> {
         #[cfg(test)]
         {
-            if self.injected_scratchpad_park_failure {
-                return Err(anyhow::anyhow!("injected ignore release failure"));
-            }
             let _ = wid;
-            Ok(())
+            let fail = self.injected_scratchpad_park_failure;
+            release_window_for_ignore_with(
+                expected,
+                || Some(expected.clone()),
+                || !fail,
+                || Ok(()),
+                || Ok(()),
+            )
         }
         #[cfg(not(test))]
         {
-            leopardwm_platform_win32::dwm_uncloak_window(wid);
-            leopardwm_platform_win32::restore_window_moved_offscreen(wid)
-                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-            leopardwm_platform_win32::show_window_no_activate(wid)
-                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-            Ok(())
+            release_window_for_ignore_with(
+                expected,
+                || WindowIncarnation::capture(wid),
+                || leopardwm_platform_win32::dwm_uncloak_window(wid),
+                || {
+                    leopardwm_platform_win32::restore_window_moved_offscreen(wid)
+                        .map(|_| ())
+                        .map_err(|error| anyhow::anyhow!(error.to_string()))
+                },
+                || {
+                    leopardwm_platform_win32::show_window_no_activate(wid)
+                        .map_err(|error| anyhow::anyhow!(error.to_string()))
+                },
+            )
         }
     }
 
@@ -547,6 +651,109 @@ mod transaction_tests {
         let (column, _) = workspace.find_window_location(10).unwrap();
         assert_eq!(workspace.columns()[column].width(), 777);
         assert_eq!(workspace.focused_window(), Some(11));
+    }
+
+    fn identity(token: u64) -> WindowIncarnation {
+        WindowIncarnation {
+            token,
+            process_id: 10,
+            thread_id: 20,
+            class_name: "RuleTarget".into(),
+        }
+    }
+
+    #[test]
+    fn ignore_release_rejects_failed_physical_uncloak() {
+        let touched = std::cell::Cell::new(false);
+        let expected = identity(1);
+        let result = release_window_for_ignore_with(
+            &expected,
+            || Some(expected.clone()),
+            || false,
+            || {
+                touched.set(true);
+                Ok(())
+            },
+            || {
+                touched.set(true);
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert!(!touched.get());
+    }
+
+    #[test]
+    fn ignore_release_rejects_recycled_hwnd_before_mutation() {
+        let touched = std::cell::Cell::new(false);
+        let result = release_window_for_ignore_with(
+            &identity(1),
+            || Some(identity(2)),
+            || {
+                touched.set(true);
+                true
+            },
+            || Ok(()),
+            || Ok(()),
+        );
+        assert!(result.is_err());
+        assert!(!touched.get());
+    }
+
+    fn scratchpad(window_id: u64, shown: bool) -> ScratchpadState {
+        ScratchpadState {
+            window_id,
+            shown,
+            origin_column: 0,
+            origin_sibling: None,
+            origin_width: Some(700),
+            last_size: None,
+        }
+    }
+
+    #[test]
+    fn ignore_rule_releases_hidden_scratchpad_designation() {
+        let mut state = AppState::new_with_config(Config::default(), vec![monitor()]);
+        inject_target(&mut state);
+        state.scratchpad = Some(scratchpad(10, false));
+        state.config.window_rules = vec![rule(config::WindowAction::Ignore)];
+        state.compiled_rules = state.config.compile_window_rules();
+
+        state.reapply_window_rules();
+
+        assert!(state.scratchpad.is_none());
+        assert!(state.find_window_workspace(10).is_none());
+    }
+
+    #[test]
+    fn ignore_rule_releases_shown_scratchpad_designation() {
+        let mut state = AppState::new_with_config(Config::default(), vec![monitor()]);
+        state.workspaces.get_mut(&1).unwrap()[0]
+            .add_floating(10, Rect::new(0, 0, 700, 500))
+            .unwrap();
+        inject_target(&mut state);
+        state.scratchpad = Some(scratchpad(10, true));
+        state.config.window_rules = vec![rule(config::WindowAction::Ignore)];
+        state.compiled_rules = state.config.compile_window_rules();
+
+        state.reapply_window_rules();
+
+        assert!(state.scratchpad.is_none());
+        assert!(state.find_window_workspace(10).is_none());
+    }
+
+    #[test]
+    fn failed_hidden_scratchpad_ignore_release_retains_designation() {
+        let mut state = AppState::new_with_config(Config::default(), vec![monitor()]);
+        inject_target(&mut state);
+        state.scratchpad = Some(scratchpad(10, false));
+        state.config.window_rules = vec![rule(config::WindowAction::Ignore)];
+        state.compiled_rules = state.config.compile_window_rules();
+        state.injected_scratchpad_park_failure = true;
+
+        state.reapply_window_rules();
+
+        assert!(state.scratchpad.is_some_and(|scratchpad| !scratchpad.shown));
     }
 
     #[test]

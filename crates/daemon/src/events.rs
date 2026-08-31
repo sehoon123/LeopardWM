@@ -183,8 +183,8 @@ pub(crate) enum DaemonEvent {
     DisplayChangeSettled { generation: u64 },
     /// Power state changed (AC/battery or power saver toggled).
     PowerStateChanged { on_battery_or_saver: bool },
-    /// Update checker observed a newer release tag (e.g. `v0.1.11`).
-    UpdateAvailable(String),
+    /// Update checker observed a newer release for one exact enabled generation.
+    UpdateAvailable { tag: String, generation: u64 },
     /// User invoked an action on a tab in the tab strip overlay. The
     /// strip captures the column identity (`monitor`, `workspace_idx`,
     /// `column_idx`) at `show()` time so the action routes to the column
